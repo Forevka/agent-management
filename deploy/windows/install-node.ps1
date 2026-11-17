@@ -198,9 +198,33 @@ while ($true) {
 Set-Content -Path $Launcher -Value $launcherBody -Encoding UTF8
 
 if ($Ticket) {
+    # `fleet join` admits this node and then keeps running as the node, so it
+    # never returns on success. Run it only until the orchestrator has accepted
+    # the key (the "connected to orchestrator" log line), then stop it: from
+    # then on the scheduled task's `fleet node` connects with the known key. A
+    # refused or already-used invite makes join exit early with an error.
     Write-Host 'Joining the fleet...'
-    & $ExePath join $Ticket
-    if ($LASTEXITCODE -ne 0) { throw "fleet join failed (exit code $LASTEXITCODE)." }
+    $joinLog = Join-Path $LogDir 'join.log'
+    $proc = Start-Process -FilePath 'cmd.exe' -WindowStyle Hidden -PassThru `
+        -ArgumentList '/d', '/c', "`"`"$ExePath`" join $Ticket > `"$joinLog`" 2>&1`""
+    $deadline = (Get-Date).AddSeconds(90)
+    $joined = $false
+    while ((Get-Date) -lt $deadline -and -not $proc.HasExited) {
+        Start-Sleep -Seconds 1
+        if ((Test-Path $joinLog) -and (Select-String -Path $joinLog -Pattern 'connected to orchestrator' -Quiet)) {
+            $joined = $true
+            break
+        }
+    }
+    # Stopping fleet.exe also ends its cmd.exe wrapper; Stop-Process covers
+    # the case where the wrapper is still around.
+    Stop-FleetNode
+    if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+    if (-not $joined) {
+        $tail = if (Test-Path $joinLog) { (Get-Content $joinLog -Tail 15) -join "`n" } else { '' }
+        throw "fleet join did not connect to the orchestrator. Output ($joinLog):`n$tail"
+    }
+    Write-Host 'Joined.'
 }
 
 # -WindowStyle Hidden keeps the console out of the way (a window may flash

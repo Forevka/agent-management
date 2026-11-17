@@ -165,6 +165,8 @@ On each node, first log in to Claude Code as the user the node will run as
 ```sh
 U=<user logged into Claude Code>
 sudo install -m 0755 fleet-*-x86_64-unknown-linux-gnu /usr/local/bin/fleet
+# `fleet join` keeps running as the node after joining. Stop it (Ctrl+C) once
+# it logs "connected to orchestrator"; the service below takes over.
 sudo -u "$U" env FLEET_DATA_DIR=/home/$U/.local/share/fleet FLEET_RELAY=https://relay.<domain> \
   fleet join <ticket>
 sudo install -d -m 0755 /etc/fleet
