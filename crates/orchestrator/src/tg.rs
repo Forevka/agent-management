@@ -265,7 +265,13 @@ pub async fn run_agent_bot_callbacks(o: Arc<Orchestrator>, chat: Arc<TelegramCha
                             Ok(updates) => {
                                 for u in updates {
                                     offset = Some(u.update_id + 1);
-                                    handle_update(&o, &bot, chat_id, u).await;
+                                    // Only button presses. allowed_updates does not drop updates
+                                    // queued before it took effect, and agent bots that are group
+                                    // admins receive every group message: handling those here
+                                    // would run the owner's commands once per agent bot.
+                                    if u.callback_query.is_some() {
+                                        handle_update(&o, &bot, chat_id, u).await;
+                                    }
                                 }
                             }
                             Err(e) => {
