@@ -31,6 +31,9 @@ pub struct SpawnAgent {
     /// Secrets for this task, written as `.env` files outside the project and deleted when
     /// the agent exits.
     pub secret_files: Vec<SecretFile>,
+    /// Identifies this particular process run. Every event of the run carries it, so the
+    /// orchestrator can ignore late events of a run it has already replaced.
+    pub run_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -66,6 +69,8 @@ pub struct ToolResult {
 pub struct StopAgent {
     pub agent_id: String,
     pub task_id: String,
+    /// Close the session's input and let Claude finish its turn, instead of killing it.
+    pub graceful: bool,
 }
 
 /// Something that happened in an agent session on a node.
@@ -74,6 +79,8 @@ pub struct AgentEvent {
     pub agent_id: String,
     pub task_id: String,
     pub kind: AgentEventKind,
+    /// The run (see [`SpawnAgent::run_id`]) this event belongs to; empty when none applies.
+    pub run_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -91,4 +98,7 @@ pub enum AgentEventKind {
     Exited { code: Option<i32> },
     /// The node could not start the agent at all (unknown project, bad command...).
     SpawnFailed { reason: String },
+    /// A message for the agent arrived while it was not running on this node (for example after
+    /// the node restarted). The text comes back so the orchestrator can resume the session with it.
+    Undelivered { text: String },
 }

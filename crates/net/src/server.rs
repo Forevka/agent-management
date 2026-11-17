@@ -78,6 +78,13 @@ impl Server {
         self.session(node).send(body);
     }
 
+    /// Drops a node's live connection, e.g. after revoking it; it is checked again on reconnect.
+    pub fn disconnect(&self, node: EndpointId) {
+        if let Some(s) = self.inner.sessions.lock().unwrap().get(&node) {
+            s.disconnect();
+        }
+    }
+
     pub fn is_connected(&self, node: EndpointId) -> bool {
         self.inner
             .sessions

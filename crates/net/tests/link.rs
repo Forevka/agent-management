@@ -119,6 +119,7 @@ fn info(n: u32) -> Body {
         projects: vec![],
         max_agents: n,
         running_agents: vec![],
+        running_runs: vec![],
     })
 }
 
@@ -347,4 +348,33 @@ async fn orchestrator_restart_resets_the_stream() {
         text(2),
         "not mistaken for a duplicate of the old stream"
     );
+}
+
+/// Revoking a node drops its live connection; with its key no longer allowed, it stays out.
+#[tokio::test]
+async fn disconnect_drops_the_live_connection() {
+    let auth = TestAuth::default();
+    let key = SecretKey::generate();
+    auth.allowed.lock().unwrap().insert(key.public());
+    let (_router, server, mut orch_rx, orch_addr) = start_orchestrator(auth.clone()).await;
+    let (client, _node_rx) = Client::new(orch_addr.clone());
+    let ep = node_endpoint(&key).await;
+    let (c, cf) = (client.clone(), cfg(&orch_addr, None));
+    let run = tokio::spawn(async move { c.run(&ep, cf).await });
+    assert!(matches!(
+        next(&mut orch_rx).await,
+        Inbound::Connected { .. }
+    ));
+    auth.allowed.lock().unwrap().clear();
+    server.disconnect(key.public());
+    assert!(matches!(
+        next(&mut orch_rx).await,
+        Inbound::Disconnected { .. }
+    ));
+    let res = tokio::time::timeout(Duration::from_secs(20), run)
+        .await
+        .expect("client should give up")
+        .unwrap();
+    assert!(res.is_err(), "the reconnect is refused");
+    assert!(!server.is_connected(key.public()));
 }

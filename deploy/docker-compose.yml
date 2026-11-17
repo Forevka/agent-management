@@ -40,7 +40,8 @@ services:
     shm_size: 256m
 
   # ---------------------------------------------------------------------------
-  # Hindsight: memory server with an MCP endpoint per bank at /mcp/{bank_id}/.
+  # Hindsight: the fleet's single memory server (one bank per agent prefix and
+  # per project), reached only by the orchestrator through its HTTP API.
   # Image `hindsight` = API (8888) + control-plane UI (9999); `hindsight-api` is
   # the API alone. The full (non -slim) image runs embeddings and reranking
   # locally, so only the fact-extraction LLM is external (Anthropic, Haiku).
@@ -68,8 +69,10 @@ services:
     # reranker models are baked into the image (a volume would pin old models
     # across upgrades).
     # Loopback only. Docker publishes ports past ufw/firewalld, so never bind
-    # these to 0.0.0.0. The VPS node and the brain session (both on the host)
-    # use http://127.0.0.1:8888/mcp/{bank}/. The UI is reached over SSH:
+    # these to 0.0.0.0. Agents never talk to Hindsight directly: they use
+    # `fleet agent memory`, which the orchestrator forwards over the Compose
+    # network (HINDSIGHT_URL). 8888 is published for health checks and manual
+    # inspection; the UI is reached over SSH:
     #   ssh -L 9999:127.0.0.1:9999 vps   then open http://localhost:9999
     ports:
       - "127.0.0.1:8888:8888"
@@ -116,8 +119,8 @@ services:
     environment:
       DATABASE_URL: postgres://fleet:${FLEET_DB_PASSWORD}@postgres:5432/fleet
       FLEET_DATA_DIR: /var/lib/fleet
-      # For orchestrator-side memory calls (agents and the brain reach Hindsight
-      # through their own MCP config).
+      # Agents' `fleet agent memory` calls are forwarded here by the orchestrator,
+      # authenticated with HINDSIGHT_API_KEY (from .env).
       HINDSIGHT_URL: http://hindsight:8888
       RUST_LOG: ${RUST_LOG:-info}
     ports:
@@ -174,8 +177,6 @@ services:
       FLEET_DOMAIN: ${FLEET_DOMAIN:?set FLEET_DOMAIN in .env}
       RELAY_DOMAIN: ${RELAY_DOMAIN}
       ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in .env}
-      # Only used by the optional Hindsight block at the end of the Caddyfile.
-      MEMORY_DOMAIN: ${MEMORY_DOMAIN:-}
     ports:
       - "80:80"
       - "443:443"

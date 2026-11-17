@@ -24,7 +24,7 @@ Two kinds of things also flow into Telegram:
 - Slack messages are mirrored into project feed topics, where agents can see them.
 - Anything that needs your input goes to per-project "needs you" and "FYI" topics.
 
-The orchestrator remembers projects and tasks over time through **Hindsight**, a self-hosted memory server.
+The fleet remembers projects and tasks over time through **Hindsight**, one self-hosted memory server shared by the orchestrator and all agents.
 
 This is a new project, unrelated to `stoneshard-mod`. It goes in **`Forevka/agent-management`**, cloned into this session.
 
@@ -52,8 +52,9 @@ This is a new project, unrelated to `stoneshard-mod`. It goes in **`Forevka/agen
 | Secrets | A free-form secrets manager on the server: folders of key/value pairs, with presets such as Jira. At spawn time the node writes a `.env` file **outside the project**. The brief says how to read a single key (`fleet secret get` / your skills' scripts) so the whole file never lands in the transcript. |
 | Feeds | Slack first, behind an adapter interface so other sources can be added later. Each Slack channel maps to a project feed topic. **Only your own Slack user token is available: no Slack app, no bot, no Socket Mode.** So the adapter **polls** the Web API (`conversations.history` / `conversations.replies`) with that token. It polls at an adaptive interval and backs off on HTTP 429. It can only see channels you are in. Agents only read Slack. The orchestrator can **propose tasks** and **propose replies**. An approved reply goes out through `chat.postMessage` with your token, so it **appears as you**. Approval is therefore always required, and the proposal shows the exact text. |
 | Unanswered questions | Reminders only. Agents never answer on your behalf. |
-| Memory | Hindsight on the VPS, used as an MCP server by the orchestrator brain and by agents (one memory bank per project and per agent). Its internal LLM is **Haiku via an Anthropic API key**. |
-| Orchestrator brain | A long-lived Claude Code session on the VPS with the fleet and Hindsight MCP servers. |
+| Memory | **One** Hindsight instance on the VPS for all agents and the orchestrator, internal to the Compose network. Agents use it through `fleet agent memory ...`, which the orchestrator forwards. Each agent gets its own bank prefix (`agent-<id>`, plus any `agent-<id>--<name>`); a project's agents share `project-<slug>`; the brain may use any bank. Nodes need no Hindsight URL or key. Its internal LLM is **Haiku via an Anthropic API key**. |
+| Orchestrator brain | A long-lived Claude Code session on the VPS node. Like every agent, it acts through `fleet agent ...` commands, with extra orchestration commands. |
+| Agent ↔ fleet interface | **No Telegram MCP, and no MCP for agent tools.** Only the orchestrator's Rust code talks to Telegram. Agents use the `fleet agent` CLI from their shell, taught by a `fleet` skill that the node loads into each session as a plugin (`--plugin-dir`). The only MCP server is the fleet's tiny permission hook, which Claude Code requires for `--permission-prompt-tool` (plan approval, questions, tool permissions). |
 | Web UI (v1) | Plan pages (magic links), project setup and secrets, nodes, agents and the bot pool. |
 | Deploy | Docker Compose on the VPS: orchestrator, Postgres+pgvector, Hindsight, iroh-relay, Caddy (HTTPS on your subdomain). |
 | Updates | Signed releases. They are pushed to nodes after you approve in Telegram. Busy nodes update once their agents finish. |
@@ -69,7 +70,7 @@ This is a new project, unrelated to `stoneshard-mod`. It goes in **`Forevka/agen
  Slack ◄─ poll (user tk)─┤  ├─ feeds: Source trait → SlackSource (more later)                    │
  Browser ── HTTPS ───────┤  ├─ web: axum + htmx (plan pages, projects/secrets, nodes/agents)     │
                          │  ├─ router/bus, scheduler, human queue, secrets vault (age-encrypted) │
-                         │  ├─ brain: Claude Code session (fleet-orch MCP + Hindsight MCP)      │
+                         │  ├─ brain: Claude Code session on the VPS node (`fleet agent` CLI)   │
                          │  └─ net: iroh endpoint (ALPN fleet/1)                                 │
                          │ postgres+pgvector · hindsight · iroh-relay · caddy · fleet node (VPS) │
                          └──────────────────────────────▲─────────────────────────────────────────┘
@@ -77,7 +78,7 @@ This is a new project, unrelated to `stoneshard-mod`. It goes in **`Forevka/agen
                      ┌──────────────────────────────────┴──────────────┐
                fleet node (Windows service)                      fleet node (…)
                 ├─ agent supervisor → claude -p (stream-json) per agent session
-                ├─ local IPC (named pipe / unix socket) ← `fleet mcp` stdio shim (fleet tools for Claude)
+                ├─ loopback IPC (token per agent) ← `fleet agent ...` CLI + `fleet mcp` permission hook
                 ├─ secrets drop: <data>/secrets/<task>/*.env (user-only ACL, wiped at task end)
                 └─ updater, project mappings, session archive upload
 ```
@@ -87,7 +88,7 @@ This is a new project, unrelated to `stoneshard-mod`. It goes in **`Forevka/agen
 - `crates/net`: the iroh endpoint, ALPN `fleet/1`, length-prefixed frames, reconnect with backoff, and a durable outbox that resends until the other side confirms receipt.
 - `crates/orchestrator`: state (sqlx + Postgres, migrations), scheduler, message router, human queue, Telegram, feeds, web, vault, brain supervisor.
 - `crates/node`: the Claude runner, agent supervisor, IPC server, secrets drop, updater, Windows service (`windows-service`) / systemd.
-- `crates/mcp`: the `fleet mcp --agent <id>` stdio MCP shim (`rmcp`), which talks to the local node over IPC.
+- `crates/node` also holds the `fleet agent` CLI, the `fleet` skill plugin and the `fleet mcp` permission hook (a hand-written stdio JSON-RPC server, no MCP SDK).
 - `crates/cli` → a single binary `fleet` with subcommands: `orchestrator | node | mcp | invite | join | secret | project …`.
 - `deploy/`: `docker-compose.yml`, Caddyfile, iroh-relay config, Hindsight config.
 
@@ -118,7 +119,7 @@ This is a new project, unrelated to `stoneshard-mod`. It goes in **`Forevka/agen
    - The orchestrator then creates the topic `{proj}-{ticket}` and sends `SpawnAgent` to the node that has the project (preferring the agent's usual host). If that node is offline, the task waits in a queue and you get a note in `needs you`.
 4. **Agent run on the node:**
    - The node writes the secrets `.env` files.
-   - It runs the configured start command with `-p --input-format stream-json --output-format stream-json --verbose --model opus --permission-mode plan --mcp-config <fleet+hindsight> --permission-prompt-tool mcp__fleet__permission --append-system-prompt <role + brief + worktree/secrets/milestone instructions>`, or adds `--resume <session_id>` when resuming.
+   - It runs the configured start command with `-p --input-format stream-json --output-format stream-json --verbose --model opus --permission-mode plan --mcp-config <fleet permission hook> --permission-prompt-tool mcp__fleet__permission --plugin-dir <fleet skill> --append-system-prompt-file <role + brief + worktree/secrets/milestone instructions>`, or adds `--resume <session_id>` when resuming.
    - It streams events back to the orchestrator, which saves the transcript.
 5. **Plan approval:**
    - The agent calls `ExitPlanMode`. It goes to the `fleet.permission` tool, which turns it into a **plan page**, along with any `AskUserQuestion` calls made during planning.
@@ -129,7 +130,7 @@ This is a new project, unrelated to `stoneshard-mod`. It goes in **`Forevka/agen
    - The agent calls `fleet.milestones_set([...])` once and `fleet.milestone_done(i)` as it goes, which edits the checklist message.
    - `fleet.ask_human(question, options?, blocking)` creates an item in `{proj} · needs you` (or `fyi`) with buttons, and accepts a free-text reply to that message. The answer goes back into the session.
    - `fleet.ask_agent` / `fleet.post` send messages to other agents through the message bus (stored, confirmed on receipt, with a hop limit to stop loops), and a short copy appears in the topic.
-   - At the end, `fleet.complete(summary)` posts a summary, closes the topic and stores memories in Hindsight.
+   - At the end, `fleet agent complete` posts a summary and closes the topic. The session then ends (freeing the node) and is resumed for follow-ups. The agent stores durable facts with `fleet agent memory retain`.
 7. **Follow-up on old work:** the brain recognises the task or agent. The topic is reopened, and the stored session is resumed with `--resume` on the same node and folder. Session JSONL files are archived on the VPS so a session can be restored if a node is rebuilt.
 8. **Slack (user token, polling):**
    - The adapter keeps a cursor per channel (the last `ts` seen) and polls each mapped channel's history. It also checks threads that are still active (`conversations.replies`) for a while. Busy channels are polled more often and quiet ones less. Every request goes through one rate-limit budget per token.
@@ -138,10 +139,10 @@ This is a new project, unrelated to `stoneshard-mod`. It goes in **`Forevka/agen
    - The brain may post a **task proposal** or a **reply proposal** in `needs you`. A reply is sent to Slack only after you approve it.
 9. **Reminders:** open `needs you` items are re-pinged after 2 hours, never auto-answered. `/queue` lists open items across projects.
 
-### Fleet MCP tools for agents
-`milestones_set`, `milestone_done`, `ask_human`, `ask_agent`, `post`, `inbox`, `feed_read`, `feed_search`, `secret_get` (audited; returns a single key), `complete`, `permission` (internal).
+### `fleet agent` commands (taught by the `fleet` skill)
+`milestones`, `done`, `ask` (with `--option` and `--fyi`), `tell`, `post`, `complete`, `feed read`/`search`, `memory retain`/`recall`/`reflect`/`banks` (`--bank`, `--shared`). Secrets are read with `fleet secret get`/`exec`.
 
-The brain additionally gets `list_projects`, `list_agents`, `create_agent`, `create_task`, `resume_task`, `propose_task`, `propose_slack_reply`.
+The brain additionally gets `projects`, `agents`, `tasks`, `create-task`, `send-to-task`, `stop-task`, `propose-task`, `propose-reply`, `reply`.
 
 ### Telegram details
 - **Orchestrator bot:**
@@ -158,9 +159,9 @@ The brain additionally gets `list_projects`, `list_agents`, `create_agent`, `cre
 
 | # | Scope | Done when |
 |---|---|---|
-| 0. Spikes | (a) Headless plan mode: route `ExitPlanMode` and `AskUserQuestion` through `--permission-prompt-tool`, then switch to `auto` after approval. (b) `--permission-mode auto` in `-p` mode with both auth modes. (c) Can a bot use checklists in a group? (d) Self-hosted iroh-relay, with a PC behind NAT running as a Windows service. (e) `--resume` after a process is killed, and where session files are stored. (f) Hindsight MCP with per-project and per-agent banks. (g) Slack with your user token: which token type it is (`xoxp` from an existing workspace app, or a browser session token), the real rate limits on `conversations.history`, and whether polling covers your channels without being throttled. | Each one shown working in a small throwaway program; findings written up |
+| 0. Spikes | (a) Headless plan mode: route `ExitPlanMode` and `AskUserQuestion` through `--permission-prompt-tool`, then switch to `auto` after approval. (b) `--permission-mode auto` in `-p` mode with both auth modes. (c) Can a bot use checklists in a group? (d) Self-hosted iroh-relay, with a PC behind NAT running as a Windows service. (e) `--resume` after a process is killed, and where session files are stored. (f) Hindsight's HTTP API, reached by the orchestrator, with per-agent bank prefixes. (g) Slack with your user token: which token type it is (`xoxp` from an existing workspace app, or a browser session token), the real rate limits on `conversations.history`, and whether polling covers your channels without being throttled. | Each one shown working in a small throwaway program; findings written up |
 | 1. Skeleton | Workspace; proto and net (outbox, acks); invite/join; compose stack; Postgres migrations; node service; per-node Claude config; start one agent from the CLI and stream its transcript | `fleet task run` on the VPS starts Claude on your PC and the transcript appears on the VPS |
-| 2. Telegram and human queue | Orchestrator bot plus the bot pool, topics, checklist, summary, fleet MCP shim, `ask_human` with buttons and replies, reminders | A task started by hand runs from start to finish through Telegram, including a question you answer |
+| 2. Telegram and human queue | Orchestrator bot plus the bot pool, topics, checklist, summary, `fleet agent` CLI and skill, `ask` with buttons and replies, reminders | A task started by hand runs from start to finish through Telegram, including a question you answer |
 | 3. Brain, planning, memory | Brain session, Hindsight, `create_task` routing to existing agents, plan pages with magic links, session resume for follow-ups | "do X" in General ends with an approved plan and finished work, and a follow-up reuses the same session |
 | 4. Web UI and secrets | Project setup, secrets manager (folders, presets), secrets drop and `secret get`, nodes, agents, bot-pool screens, audit log | A Jira-backed project is set up from the UI and an agent reads one secret without it appearing in its transcript |
 | 5. Slack feeds | `Source` trait, Slack adapter that polls with your user token, channel mapping, digests, `feed_*` tools, task and reply proposals | A Slack bug report leads to a proposal you approve, and a reply goes back to Slack after you approve it |

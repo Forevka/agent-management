@@ -207,12 +207,33 @@ pub async fn dispatch(
         }
         None => bail!("task {} has no agent", task.id),
     };
-    let nodes: Vec<NodeRow> = sqlx::query_as("select * from nodes")
-        .fetch_all(&o.db)
-        .await?;
-    let candidates: Vec<&NodeRow> = nodes
+    // One agent runs one session at a time: a specialist busy with another task takes this one
+    // when it is done (the node would otherwise kill the running session).
+    let busy: Option<String> = sqlx::query_scalar(
+        "select id from tasks where agent_id = $1 and running and id <> $2 limit 1",
+    )
+    .bind(&agent.id)
+    .bind(&task.id)
+    .fetch_optional(&o.db)
+    .await?;
+    if let Some(other) = busy {
+        return queue(
+            o,
+            task,
+            &agent.id,
+            prompt.as_deref(),
+            format!(
+                "⏳ Queued: {} is busy with <b>{}</b>.",
+                esc(&agent.name),
+                esc(&other)
+            ),
+        )
+        .await;
+    }
+    let nodes = node_load(o).await?;
+    let candidates: Vec<&(NodeRow, i64)> = nodes
         .iter()
-        .filter(|n| n.has_project(&task.project))
+        .filter(|(n, _)| n.has_project(&task.project))
         .collect();
     if candidates.is_empty() {
         let note = format!(
@@ -225,63 +246,110 @@ pub async fn dispatch(
     }
     // A resumed session only exists on the node that ran it.
     let pinned = resume.as_ref().and(task.node_id.as_deref());
-    let pick = |n: &&NodeRow| n.online && (n.running.0.len() as i32) < n.max_agents.max(1);
+    let free = |(n, load): &&(NodeRow, i64)| n.online && *load < i64::from(n.max_agents.max(1));
     let chosen = match pinned {
         Some(node_id) => candidates
             .iter()
-            .find(|n| n.id == node_id)
+            .find(|(n, _)| n.id == node_id)
             .copied()
-            .filter(pick),
+            .filter(free),
         None => {
             let preferred = agent.preferred_node.as_deref();
-            let mut free: Vec<&NodeRow> = candidates.iter().copied().filter(pick).collect();
-            free.sort_by_key(|n| (Some(n.id.as_str()) != preferred, n.running.0.len()));
-            free.first().copied()
+            let mut ok: Vec<&(NodeRow, i64)> = candidates.iter().copied().filter(free).collect();
+            ok.sort_by_key(|(n, load)| (Some(n.id.as_str()) != preferred, *load));
+            ok.first().copied()
         }
     };
-    let Some(node) = chosen else {
+    let Some((node, _)) = chosen else {
         let waiting_for = pinned
-            .and_then(|id| nodes.iter().find(|n| n.id == id))
-            .map(|n| n.name.clone())
+            .and_then(|id| nodes.iter().find(|(n, _)| n.id == id))
+            .map(|(n, _)| n.name.clone())
             .unwrap_or_else(|| {
                 candidates
                     .iter()
-                    .map(|n| n.name.as_str())
+                    .map(|(n, _)| n.name.as_str())
                     .collect::<Vec<_>>()
                     .join(", ")
             });
-        sqlx::query("update tasks set status = 'queued', updated_at = now() where id = $1")
-            .bind(&task.id)
-            .execute(&o.db)
-            .await?;
-        if let Some(p) = &prompt {
-            // Keep the follow-up so it is not lost while the task waits.
-            sqlx::query("insert into messages (task_id, to_agent, text) values ($1, $2, $3)")
-                .bind(&task.id)
-                .bind(&agent.id)
-                .bind(p)
-                .execute(&o.db)
-                .await?;
-        }
-        o.post_task(
+        return queue(
+            o,
             task,
-            &format!(
+            &agent.id,
+            prompt.as_deref(),
+            format!(
                 "⏳ Queued: waiting for {} (offline or at capacity).",
                 esc(&waiting_for)
             ),
         )
         .await;
-        return Ok(false);
     };
 
-    let spawn = build_spawn(o, task, &agent, prompt, resume).await?;
-    sqlx::query("update tasks set node_id = $2, updated_at = now() where id = $1")
+    let run_id = crate::web::random_token()[..12].to_owned();
+    let spawn = build_spawn(o, task, &agent, prompt, resume, run_id.clone()).await?;
+    let new_status = if task.id == BRAIN_TASK {
+        status::RUNNING
+    } else if spawn.permission_mode == "plan" {
+        status::PLANNING
+    } else {
+        status::RUNNING
+    };
+    // Claim the run before sending it: from here on the task counts as running (capacity, busy
+    // agent, message delivery), and only events of this run may change it.
+    sqlx::query(
+        "update tasks set node_id = $2, run_id = $3, running = true, dispatched_at = now(), status = $4, updated_at = now() where id = $1",
+    )
+    .bind(&task.id)
+    .bind(&node.id)
+    .bind(&run_id)
+    .bind(new_status)
+    .execute(&o.db)
+    .await?;
+    o.server
+        .send(node.id.parse()?, Body::SpawnAgent(Box::new(spawn)));
+    Ok(true)
+}
+
+/// Leaves a task queued (keeping a follow-up message for when it starts) and says why.
+async fn queue(
+    o: &Orchestrator,
+    task: &TaskRow,
+    agent_id: &str,
+    prompt: Option<&str>,
+    note: String,
+) -> Result<bool> {
+    sqlx::query("update tasks set status = 'queued', updated_at = now() where id = $1")
         .bind(&task.id)
-        .bind(&node.id)
         .execute(&o.db)
         .await?;
-    o.server.send(node.id.parse()?, Body::SpawnAgent(spawn));
-    Ok(true)
+    if let Some(p) = prompt {
+        // Keep the follow-up so it is not lost while the task waits.
+        sqlx::query("insert into messages (task_id, to_agent, text) values ($1, $2, $3)")
+            .bind(&task.id)
+            .bind(agent_id)
+            .bind(p)
+            .execute(&o.db)
+            .await?;
+    }
+    o.post_task(task, &note).await;
+    Ok(false)
+}
+
+/// Every node with the number of agent runs it is assigned (from our own bookkeeping, which is
+/// current even before the node reports back).
+async fn node_load(o: &Orchestrator) -> Result<Vec<(NodeRow, i64)>> {
+    let nodes: Vec<NodeRow> = sqlx::query_as("select * from nodes")
+        .fetch_all(&o.db)
+        .await?;
+    let mut out = Vec::with_capacity(nodes.len());
+    for n in nodes {
+        let load: i64 =
+            sqlx::query_scalar("select count(*) from tasks where node_id = $1 and running")
+                .bind(&n.id)
+                .fetch_one(&o.db)
+                .await?;
+        out.push((n, load));
+    }
+    Ok(out)
 }
 
 async fn build_spawn(
@@ -290,6 +358,7 @@ async fn build_spawn(
     agent: &AgentRow,
     prompt: Option<String>,
     resume: Option<String>,
+    run_id: String,
 ) -> Result<SpawnAgent> {
     let secret_files = secret_files(o, &task.project).await?;
     let names: Vec<String> = secret_files
@@ -298,23 +367,16 @@ async fn build_spawn(
         .collect();
     let is_brain = task.id == BRAIN_TASK;
     let system = if is_brain {
-        prompts::brain_system_prompt(o.cfg.hindsight_mcp_url.is_some())
+        prompts::brain_system_prompt(o.memory.is_some())
     } else {
-        prompts::agent_system_prompt(agent, task, &names, o.cfg.hindsight_mcp_url.is_some())
+        prompts::agent_system_prompt(agent, task, &names, o.memory.is_some())
     };
     // New work starts in plan mode so the human approves the plan; follow-ups to a running or
     // approved task continue in auto mode. The brain never plans.
     let plan_first = !is_brain && (resume.is_none() || task.status == status::DONE);
-    let extra_mcp = o.cfg.hindsight_mcp_url.as_ref().map(|base| {
-        let mut server = json!({"type": "http", "url": format!("{base}/mcp/{}/", task.project)});
-        if let Some(key) = &o.cfg.hindsight_api_key {
-            server["headers"] = json!({"Authorization": format!("Bearer {key}")});
-        }
-        json!({ "hindsight": server }).to_string()
-    });
     // Follow-ups queued while the task waited for a node go first.
     let queued: Vec<String> = sqlx::query_scalar(
-        "delete from messages where task_id = $1 and to_agent = $2 returning text",
+        "delete from messages where task_id = $1 and to_agent = $2 and from_agent is null returning text",
     )
     .bind(&task.id)
     .bind(&agent.id)
@@ -344,8 +406,9 @@ async fn build_spawn(
         after_plan_mode: Some("auto".into()),
         model: Some(o.cfg.model.clone()),
         extra_args: vec![],
-        extra_mcp_servers: extra_mcp,
+        extra_mcp_servers: None,
         secret_files,
+        run_id,
     })
 }
 
@@ -376,18 +439,17 @@ pub async fn secret_files(o: &Orchestrator, project: &str) -> Result<Vec<SecretF
     Ok(files)
 }
 
-/// Delivers text to a task's agent: into the live session, or by resuming it.
+/// Delivers text to a task's agent: into its session if a run is assigned (queued in the link
+/// while the node is offline), or by resuming the session.
 pub async fn deliver(o: &Arc<Orchestrator>, task: &TaskRow, text: String) -> Result<()> {
     let agent_id = task.agent_id.clone().context("task has no agent")?;
-    let live = task.running
-        && match &task.node_id {
-            Some(n) => o.server.is_connected(n.parse()?),
-            None => false,
-        };
-    if live {
-        let node: iroh::EndpointId = task.node_id.as_deref().unwrap_or_default().parse()?;
+    if task.running
+        && let Some(node) = &task.node_id
+    {
+        // If the run is gone by the time this arrives, the node hands the text back
+        // (`Undelivered`) and it is redelivered by resuming.
         o.server.send(
-            node,
+            node.parse()?,
             Body::SendToAgent {
                 agent_id,
                 task_id: task.id.clone(),
@@ -396,40 +458,36 @@ pub async fn deliver(o: &Arc<Orchestrator>, task: &TaskRow, text: String) -> Res
         );
         return Ok(());
     }
-    if task.status == status::DONE
-        || task.status == status::STOPPED
-        || task.status == status::FAILED
+    if matches!(
+        task.status.as_str(),
+        status::DONE | status::STOPPED | status::FAILED
+    ) && let Some(topic) = task.topic_id
     {
-        if let Some(topic) = task.topic_id {
-            let _ = o.chat.reopen_topic(topic).await;
-        }
-        sqlx::query("update tasks set status = 'running', updated_at = now() where id = $1")
-            .bind(&task.id)
-            .execute(&o.db)
-            .await?;
+        let _ = o.chat.reopen_topic(topic).await;
     }
     dispatch(o, task, Some(text), task.session_id.clone()).await?;
     Ok(())
 }
 
-pub async fn stop(o: &Orchestrator, task: &TaskRow) -> Result<()> {
+/// Stops a task's agent. Graceful lets it finish its current turn; the session stays resumable.
+pub async fn stop(o: &Orchestrator, task: &TaskRow, graceful: bool) -> Result<()> {
     if let (Some(node), Some(agent)) = (&task.node_id, &task.agent_id) {
         o.server.send(
             node.parse()?,
             Body::StopAgent(StopAgent {
                 agent_id: agent.clone(),
                 task_id: task.id.clone(),
+                graceful,
             }),
         );
     }
-    sqlx::query("update tasks set status = 'stopped', updated_at = now() where id = $1")
-        .bind(&task.id)
-        .execute(&o.db)
-        .await?;
+    if !graceful {
+        sqlx::query("update tasks set status = 'stopped', updated_at = now() where id = $1 and status <> 'done'").bind(&task.id).execute(&o.db).await?;
+    }
     Ok(())
 }
 
-/// Tries every queued task (after a node connects or frees capacity).
+/// Tries every queued task (after a node connects or an agent frees up).
 pub async fn dispatch_queued(o: &Arc<Orchestrator>) {
     let queued: Vec<TaskRow> = match sqlx::query_as(
         "select * from tasks where status = 'queued' and not running order by created_at",
@@ -441,16 +499,25 @@ pub async fn dispatch_queued(o: &Arc<Orchestrator>) {
         Err(e) => return tracing::warn!("listing queued tasks failed: {e:#}"),
     };
     for task in queued {
-        // Only retry when a node can take it now, so the topic is not spammed with queue notes.
-        let nodes: Vec<NodeRow> = sqlx::query_as("select * from nodes where online")
-            .fetch_all(&o.db)
-            .await
-            .unwrap_or_default();
-        let can_run = nodes.iter().any(|n| {
-            n.has_project(&task.project)
-                && (n.running.0.len() as i32) < n.max_agents.max(1)
-                && (task.session_id.is_none() || task.node_id.as_deref() == Some(n.id.as_str()))
-        });
+        // Only retry when it can start now, so the topic is not spammed with queue notes.
+        let Ok(nodes) = node_load(o).await else {
+            return;
+        };
+        let agent_busy: bool = sqlx::query_scalar(
+            "select exists(select 1 from tasks where agent_id = $1 and running and id <> $2)",
+        )
+        .bind(&task.agent_id)
+        .bind(&task.id)
+        .fetch_one(&o.db)
+        .await
+        .unwrap_or(true);
+        let can_run = !agent_busy
+            && nodes.iter().any(|(n, load)| {
+                n.online
+                    && n.has_project(&task.project)
+                    && *load < i64::from(n.max_agents.max(1))
+                    && (task.session_id.is_none() || task.node_id.as_deref() == Some(n.id.as_str()))
+            });
         if !can_run {
             continue;
         }
@@ -461,7 +528,6 @@ pub async fn dispatch_queued(o: &Arc<Orchestrator>) {
     }
 }
 
-/// Sends the owner's message to the brain, starting or resuming its session as needed.
 pub async fn to_brain(o: &Arc<Orchestrator>, text: String) -> Result<()> {
     ensure_brain(o).await?;
     let task = o.task(BRAIN_TASK).await?.context("brain task missing")?;
@@ -537,5 +603,24 @@ mod tests {
         assert_eq!(slugify_ticket(" ABC-123 "), "ABC-123");
         assert_eq!(env_quote("abc"), "abc");
         assert_eq!(env_quote("a b\"c"), "\"a b\\\"c\"");
+    }
+
+    #[test]
+    fn secret_values_survive_the_trip_to_the_node() {
+        for v in [
+            "plain",
+            "p@ss w\\rd",
+            "say \"hi\"",
+            "-----BEGIN KEY-----\nabc\n-----END KEY-----",
+            "x=y#z 'q'",
+            "$HOME `cmd`",
+        ] {
+            let line = format!("K={}\n", env_quote(v));
+            assert_eq!(
+                fleet_node::secrets::parse_env(&line)["K"],
+                v,
+                "value {v:?} via {line:?}"
+            );
+        }
     }
 }

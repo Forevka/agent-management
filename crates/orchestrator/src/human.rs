@@ -287,11 +287,13 @@ pub async fn answer(o: &Arc<Orchestrator>, id: i64, ans: Answer) -> Result<Strin
     let result = apply(o, &row, ans).await;
     match &result {
         Ok((summary, stored)) => {
-            sqlx::query("update human_items set answer = $2 where id = $1")
-                .bind(id)
-                .bind(stored)
-                .execute(&o.db)
-                .await?;
+            sqlx::query(
+                "update human_items set answer = coalesce(answer, '{}'::jsonb) || $2 where id = $1",
+            )
+            .bind(id)
+            .bind(stored)
+            .execute(&o.db)
+            .await?;
             if let Some(msg) = row.tg_msg {
                 let from = match &row.task_id {
                     Some(t) => match o.task(t).await? {
@@ -311,8 +313,12 @@ pub async fn answer(o: &Arc<Orchestrator>, id: i64, ans: Answer) -> Result<Strin
                     .await;
             }
             if let Some(task_id) = &row.task_id {
-                sqlx::query("update tasks set status = 'running', updated_at = now() where id = $1 and status = 'waiting'")
-                    .bind(task_id)
+                // Still waiting if another blocking question of the task is open.
+                sqlx::query(
+                    "update tasks set status = 'running', updated_at = now() where id = $1 and status = 'waiting'
+                     and not exists (select 1 from human_items where task_id = $1 and state = 'open' and blocking)",
+                )
+                .bind(task_id)
                     .execute(&o.db)
                     .await?;
             }
@@ -500,6 +506,22 @@ async fn pick_implementor(o: &Orchestrator, project: &str) -> Result<Option<Stri
 fn reply_permission(o: &Orchestrator, row: &HumanItemRow, decision: Value) -> Result<()> {
     let node = row.node_id.as_deref().context("item has no node")?;
     let call_id = row.call_id.clone().context("item has no call")?;
+    // Kept so a prompt the node sends again (after an orchestrator restart lost the answer in
+    // flight) is answered the same way. Merged, so it commutes with the summary written later.
+    let (db, id, stored) = (
+        o.db.clone(),
+        row.id,
+        json!({ "decision": decision.clone() }),
+    );
+    tokio::spawn(async move {
+        let _ = sqlx::query(
+            "update human_items set answer = coalesce(answer, '{}'::jsonb) || $2 where id = $1",
+        )
+        .bind(id)
+        .bind(stored)
+        .execute(&db)
+        .await;
+    });
     o.server.send(
         node.parse()?,
         Body::ToolResult(ToolResult {

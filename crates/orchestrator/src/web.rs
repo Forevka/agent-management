@@ -14,7 +14,7 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
     routing::get,
 };
-use pulldown_cmark::{Event, Options, Parser};
+use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use serde_json::{Value, json};
 
 use crate::{
@@ -41,6 +41,7 @@ pub fn router(o: O) -> Router {
         .route("/nodes", get(nodes_page).post(nodes_post))
         .route("/nodes/{id}", get(node_page).post(node_post))
         .route("/agents", get(agents_page).post(agents_post))
+        .layer(axum::middleware::map_response(security_headers))
         .with_state(o)
 }
 
@@ -208,11 +209,66 @@ fn markdown(md: &str) -> String {
     )
     .map(|ev| match ev {
         Event::Html(h) | Event::InlineHtml(h) => Event::Text(h),
+        // Links keep only harmless schemes (no `javascript:` or `data:`). Images become plain
+        // links, so a plan cannot make the browser fetch anything by being viewed.
+        Event::Start(Tag::Link {
+            link_type,
+            dest_url,
+            title,
+            id,
+        }) => Event::Start(Tag::Link {
+            link_type,
+            dest_url: safe_url(dest_url),
+            title,
+            id,
+        }),
+        Event::Start(Tag::Image {
+            link_type,
+            dest_url,
+            title,
+            id,
+        }) => Event::Start(Tag::Link {
+            link_type,
+            dest_url: safe_url(dest_url),
+            title,
+            id,
+        }),
+        Event::End(TagEnd::Image) => Event::End(TagEnd::Link),
         other => other,
     });
     let mut out = String::new();
     pulldown_cmark::html::push_html(&mut out, parser);
     out
+}
+
+fn safe_url(url: pulldown_cmark::CowStr<'_>) -> pulldown_cmark::CowStr<'_> {
+    let lower = url.trim().to_ascii_lowercase();
+    let ok = ["http://", "https://", "mailto:"]
+        .iter()
+        .any(|p| lower.starts_with(p))
+        || lower.starts_with('#')
+        || lower.starts_with('/');
+    if ok { url } else { "#".into() }
+}
+
+/// No scripts at all, nothing loaded from elsewhere, forms only back to us, no framing.
+async fn security_headers(mut resp: Response) -> Response {
+    let h = resp.headers_mut();
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        header::HeaderValue::from_static(
+            "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+        ),
+    );
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        header::HeaderValue::from_static("nosniff"),
+    );
+    h.insert(
+        header::REFERRER_POLICY,
+        header::HeaderValue::from_static("no-referrer"),
+    );
+    resp
 }
 
 fn form(body: &[u8]) -> Vec<(String, String)> {
@@ -1065,6 +1121,9 @@ async fn node_post(
                 Ok(false)
             }
             "revoke" => {
+                if let Ok(node) = id.parse() {
+                    o.server.disconnect(node);
+                }
                 sqlx::query("delete from nodes where id = $1").bind(&id).execute(&o.db).await?;
                 o.audit("owner", "node.revoke", json!({"node": id})).await;
                 Ok(true)
@@ -1178,6 +1237,14 @@ mod tests {
         assert!(!out.contains("<script>"), "{out}");
         assert!(out.contains("&lt;script&gt;"), "{out}");
         assert!(out.contains("<h1>"));
+        let links = markdown(
+            "[a](javascript:alert(1)) [b](https://ok.example) ![c](http://img.example/x.png) [d](JaVaScRiPt:x)",
+        );
+        assert!(!links.to_lowercase().contains("javascript"), "{links}");
+        assert!(
+            links.contains("https://ok.example") && !links.contains("<img"),
+            "{links}"
+        );
     }
 
     #[test]

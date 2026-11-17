@@ -82,7 +82,7 @@ pub enum Body {
     AgentEvent(AgentEvent),
 
     // Orchestrator -> node.
-    SpawnAgent(SpawnAgent),
+    SpawnAgent(Box<SpawnAgent>),
     StopAgent(StopAgent),
     /// Free-form text for an agent's running session (a reply, or a message from another agent).
     SendToAgent {
@@ -167,12 +167,13 @@ mod tests {
                 }],
                 max_agents: 4,
                 running_agents: vec!["a1".into()],
+                running_runs: vec!["r1".into()],
             }),
         });
         roundtrip(Envelope {
             seq: 2,
             ack: 1,
-            body: Body::SpawnAgent(SpawnAgent {
+            body: Body::SpawnAgent(Box::new(SpawnAgent {
                 agent_id: "a1".into(),
                 task_id: "stoneshard-12".into(),
                 project: "stoneshard".into(),
@@ -185,11 +186,12 @@ mod tests {
                 model: Some("opus".into()),
                 extra_args: vec![],
                 extra_mcp_servers: Some("{}".into()),
+                run_id: "r1".into(),
                 secret_files: vec![SecretFile {
                     name: "jira".into(),
                     content: "JIRA_TOKEN=x\n".into(),
                 }],
-            }),
+            })),
         });
         roundtrip(Envelope {
             seq: 3,
@@ -200,6 +202,7 @@ mod tests {
                 kind: AgentEventKind::Output {
                     json: "{\"type\":\"assistant\"}".into(),
                 },
+                run_id: "r1".into(),
             }),
         });
         roundtrip(Envelope {
@@ -208,6 +211,7 @@ mod tests {
             body: Body::StopAgent(StopAgent {
                 agent_id: "a1".into(),
                 task_id: "t".into(),
+                graceful: true,
             }),
         });
         roundtrip(Envelope {

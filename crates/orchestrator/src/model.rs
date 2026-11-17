@@ -18,6 +18,7 @@ pub struct NodeRow {
     pub max_agents: i32,
     pub projects: sqlx::types::Json<Vec<fleet_proto::ProjectMapping>>,
     pub running: sqlx::types::Json<Vec<String>>,
+    pub incarnation: Option<String>,
 }
 
 impl NodeRow {
@@ -61,6 +62,8 @@ pub struct TaskRow {
     pub running: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub run_id: Option<String>,
+    pub dispatched_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, FromRow)]

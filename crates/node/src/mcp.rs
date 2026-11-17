@@ -88,7 +88,7 @@ where
             "tools/list" => {
                 write(
                     &out,
-                    json!({"jsonrpc":"2.0","id":id,"result":{"tools": tools::list(&env.role)}}),
+                    json!({"jsonrpc":"2.0","id":id,"result":{"tools": tools::list()}}),
                 )
                 .await?;
             }
@@ -177,7 +177,7 @@ mod tests {
             .write_all(send(json!({"jsonrpc":"2.0","id":2,"method":"tools/list"})).as_bytes())
             .await
             .unwrap();
-        client.write_all(send(json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"post","arguments":{"text":"hi"}}})).as_bytes()).await.unwrap();
+        client.write_all(send(json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"permission","arguments":{"text":"hi"}}})).as_bytes()).await.unwrap();
         client
             .write_all(send(json!({"jsonrpc":"2.0","id":4,"method":"nope"})).as_bytes())
             .await
@@ -197,15 +197,11 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert!(
-            names.contains(&"permission")
-                && names.contains(&"ask_human")
-                && !names.contains(&"create_task")
-        );
+        assert_eq!(names, ["permission"]);
         assert_eq!(by_id[&3]["result"]["isError"], false);
         assert_eq!(
             by_id[&3]["result"]["content"][0]["text"],
-            r#"post:{"text":"hi"}"#
+            r#"permission:{"text":"hi"}"#
         );
         assert_eq!(by_id[&4]["error"]["code"], -32601);
     }

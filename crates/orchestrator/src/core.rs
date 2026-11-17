@@ -26,6 +26,8 @@ pub struct Orchestrator {
     /// Posts approved Slack replies; set once the feed source is configured.
     pub feed_poster: tokio::sync::RwLock<Option<Arc<dyn crate::feeds::ReplyPoster>>>,
     pub auth: crate::auth::DbAuth,
+    /// The fleet's shared memory, when Hindsight is configured.
+    pub memory: Option<crate::memory::Hindsight>,
     /// The address put in invite tickets (set once the endpoint is bound).
     pub invite_addr: std::sync::RwLock<Option<fleet_net::EndpointAddr>>,
 }
@@ -39,12 +41,18 @@ impl Orchestrator {
         cfg: Config,
         auth: crate::auth::DbAuth,
     ) -> Arc<Self> {
+        let memory = cfg.hindsight_url.as_deref().and_then(|url| {
+            crate::memory::Hindsight::new(url, cfg.hindsight_api_key.clone())
+                .map_err(|e| tracing::warn!("memory disabled: {e:#}"))
+                .ok()
+        });
         Arc::new(Self {
             db,
             vault,
             server,
             chat,
             cfg,
+            memory,
             feed_poster: Default::default(),
             auth,
             invite_addr: Default::default(),
@@ -85,7 +93,7 @@ impl Orchestrator {
         }
     }
 
-    async fn handle_node_event(self: &Arc<Self>, ev: Inbound) -> Result<()> {
+    pub(crate) async fn handle_node_event(self: &Arc<Self>, ev: Inbound) -> Result<()> {
         match ev {
             Inbound::Connected { peer, hello } => {
                 if let Some(h) = hello {
@@ -131,6 +139,34 @@ impl Orchestrator {
 
     async fn node_connected(self: &Arc<Self>, peer: EndpointId, hello: Hello) -> Result<()> {
         let id = peer.to_string();
+        let incarnation = hello.incarnation.to_string();
+        let previous: Option<Option<String>> =
+            sqlx::query_scalar("select incarnation from nodes where id = $1")
+                .bind(&id)
+                .fetch_optional(&self.db)
+                .await?;
+        if let Some(Some(prev)) = previous
+            && prev != incarnation
+        {
+            // The node process restarted: its agents died with it, and so did the tool calls
+            // they were blocked on. Their exit events were lost with the old process.
+            tracing::info!(node = %peer.fmt_short(), "node restarted; its agent runs are gone");
+            sqlx::query("update tasks set running = false where node_id = $1 and running")
+                .bind(&id)
+                .execute(&self.db)
+                .await?;
+            sqlx::query(
+                "update human_items set state = 'cancelled' where node_id = $1 and state = 'open' and kind in ('plan','question','permission')",
+            )
+            .bind(&id)
+            .execute(&self.db)
+            .await?;
+        }
+        sqlx::query("update nodes set incarnation = $2 where id = $1")
+            .bind(&id)
+            .bind(&incarnation)
+            .execute(&self.db)
+            .await?;
         sqlx::query(
             "insert into nodes (id, name, os, app_version, online, last_seen) values ($1, $2, $3, $4, true, now())
              on conflict (id) do update set name = $2, os = $3, app_version = $4, online = true, last_seen = now()",
@@ -172,13 +208,16 @@ impl Orchestrator {
             .bind(info.max_agents as i32)
             .execute(&self.db)
             .await?;
-        // A task we think is running whose agent the node no longer runs has ended (e.g. the node
-        // restarted while we were disconnected and the exit event was lost with its outbox).
-        sqlx::query("update tasks set running = false where node_id = $1 and running and not (agent_id = any($2))")
-            .bind(&id)
-            .bind(&info.running_agents)
-            .execute(&self.db)
-            .await?;
+        // A run we think is alive that the node no longer has has ended, and its exit event was
+        // lost. Runs dispatched in the last minute are spared: this report may predate the spawn.
+        sqlx::query(
+            "update tasks set running = false where node_id = $1 and running
+             and not (coalesce(run_id, '') = any($2)) and coalesce(dispatched_at, now()) < now() - interval '60 seconds'",
+        )
+        .bind(&id)
+        .bind(&info.running_runs)
+        .execute(&self.db)
+        .await?;
         // Capacity or projects may have changed: try queued work.
         crate::tasks::dispatch_queued(self).await;
         Ok(())
@@ -189,53 +228,57 @@ impl Orchestrator {
             agent_id,
             task_id,
             kind,
+            run_id,
         } = ev;
+        let task = self.task(&task_id).await?;
+        // Late events of a replaced run are kept in the transcript but change nothing.
+        let current = task
+            .as_ref()
+            .is_some_and(|t| t.run_id.as_deref() == Some(run_id.as_str()));
         match kind {
             AgentEventKind::Started { .. } => {
-                sqlx::query(
-                    "update tasks set running = true, node_id = $2, updated_at = now(),
-                     status = case when status = 'queued' then 'planning' else status end where id = $1",
-                )
-                .bind(&task_id)
-                .bind(peer.to_string())
-                .execute(&self.db)
-                .await?;
-                sqlx::query(
-                    "update agents set last_active = now(), preferred_node = $2 where id = $1",
-                )
-                .bind(&agent_id)
-                .bind(peer.to_string())
-                .execute(&self.db)
-                .await?;
-            }
-            AgentEventKind::Session { session_id } => {
-                sqlx::query("update tasks set session_id = $2 where id = $1")
-                    .bind(&task_id)
-                    .bind(&session_id)
+                if current {
+                    sqlx::query(
+                        "update agents set last_active = now(), preferred_node = $2 where id = $1",
+                    )
+                    .bind(&agent_id)
+                    .bind(peer.to_string())
                     .execute(&self.db)
                     .await?;
+                }
             }
-            AgentEventKind::Output { json } => {
-                self.record(&task_id, "out", &json).await?;
+            AgentEventKind::Session { session_id } => {
+                if current {
+                    sqlx::query("update tasks set session_id = $2 where id = $1")
+                        .bind(&task_id)
+                        .bind(&session_id)
+                        .execute(&self.db)
+                        .await?;
+                }
             }
-            AgentEventKind::Stderr { line } => {
-                self.record(&task_id, "err", &line).await?;
-            }
+            AgentEventKind::Output { json } => self.record(&task_id, "out", &json).await?,
+            AgentEventKind::Stderr { line } => self.record(&task_id, "err", &line).await?,
             AgentEventKind::Exited { code } => {
                 self.record(&task_id, "exit", &format!("{code:?}")).await?;
-                let task = self.task(&task_id).await?;
+                let Some(task) = task.filter(|_| current) else {
+                    return Ok(());
+                };
                 sqlx::query("update tasks set running = false, updated_at = now() where id = $1")
                     .bind(&task_id)
                     .execute(&self.db)
                     .await?;
                 // Cancel questions the dead session can no longer receive answers for.
-                sqlx::query("update human_items set state = 'cancelled' where task_id = $1 and state = 'open' and kind in ('plan','question','permission')")
-                    .bind(&task_id)
-                    .execute(&self.db)
-                    .await?;
-                if let Some(task) = task
-                    && task.status != status::DONE
-                    && task.id != crate::model::BRAIN_TASK
+                sqlx::query(
+                    "update human_items set state = 'cancelled' where task_id = $1 and state = 'open' and kind in ('plan','question','permission')",
+                )
+                .bind(&task_id)
+                .execute(&self.db)
+                .await?;
+                // An agent that finished, or a session closed while idle, simply rests; anything
+                // else that ends a run is worth telling the owner about.
+                let idle_exit = code == Some(0)
+                    && matches!(task.status.as_str(), status::RUNNING | status::WAITING);
+                if task.status != status::DONE && task.id != crate::model::BRAIN_TASK && !idle_exit
                 {
                     let new_status = if code == Some(0) {
                         status::STOPPED
@@ -257,16 +300,30 @@ impl Orchestrator {
             }
             AgentEventKind::SpawnFailed { reason } => {
                 self.record(&task_id, "spawn_failed", &reason).await?;
+                let Some(task) = task.filter(|_| current) else {
+                    return Ok(());
+                };
                 sqlx::query("update tasks set running = false, status = 'failed', updated_at = now() where id = $1 and status <> 'done'")
                     .bind(&task_id)
                     .execute(&self.db)
                     .await?;
-                if let Some(task) = self.task(&task_id).await? {
-                    self.post_task(
-                        &task,
-                        &format!("⚠️ Could not start the agent: {}", esc(&reason)),
-                    )
-                    .await;
+                self.post_task(
+                    &task,
+                    &format!("⚠️ Could not start the agent: {}", esc(&reason)),
+                )
+                .await;
+            }
+            AgentEventKind::Undelivered { text } => {
+                // The node no longer runs the session (it restarted, or the run just ended):
+                // resume it with the message instead of losing it.
+                self.record(&task_id, "undelivered", &text).await?;
+                if let Some(task) = task {
+                    sqlx::query("update tasks set running = false where id = $1")
+                        .bind(&task.id)
+                        .execute(&self.db)
+                        .await?;
+                    let task = self.task(&task.id).await?.context("task vanished")?;
+                    crate::tasks::deliver(self, &task, text).await?;
                 }
             }
         }

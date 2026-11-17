@@ -155,6 +155,13 @@ impl Session {
         self.state.lock().unwrap().peer_incarnation.unwrap_or(0)
     }
 
+    /// Drops the current connection (e.g. the node was revoked). Queued messages stay queued.
+    pub fn disconnect(&self) {
+        if let Some((_, token)) = self.state.lock().unwrap().current.take() {
+            token.cancel();
+        }
+    }
+
     pub fn is_connected(&self) -> bool {
         self.state.lock().unwrap().current.is_some()
     }
@@ -192,7 +199,18 @@ impl Session {
         let result = tokio::select! {
             r = self.write_loop(&mut send, peer_last_received) => r,
             r = self.read_loop(&mut recv) => r,
-            _ = cancel.cancelled() => return Ended::Replaced,
+            _ = cancel.cancelled() => {
+                // Cancelled either by a newer connection (which installed itself as current) or
+                // by `disconnect` (which left no current connection).
+                let mut st = self.state.lock().unwrap();
+                if st.current.as_ref().is_some_and(|(g, _)| *g != generation) {
+                    return Ended::Replaced;
+                }
+                st.current = None;
+                drop(st);
+                let _ = send.finish();
+                return Ended::Closed(Err(anyhow::anyhow!("disconnected by the local side")));
+            }
         };
 
         let mut st = self.state.lock().unwrap();

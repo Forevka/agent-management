@@ -14,6 +14,7 @@ pub mod config;
 pub mod core;
 pub mod feeds;
 pub mod human;
+pub mod memory;
 pub mod model;
 pub mod prompts;
 pub mod tasks;

@@ -446,7 +446,7 @@ async fn command(
                 arg.to_owned()
             };
             let task = o.task(&id).await?.with_context(|| format!("no task {id}"))?;
-            tasks::stop(o, &task).await?;
+            tasks::stop(o, &task, false).await?;
             format!("Stopping <b>{}</b>.", esc(&id))
         }
         "/web" => format!("<a href=\"{}\">Open the fleet dashboard</a> (link valid for one login).", esc(&crate::web::magic_link(o, "/").await?)),
@@ -457,7 +457,7 @@ async fn command(
         "/brain_reset" => {
             sqlx::query("update tasks set session_id = null where id = 'brain'").execute(&o.db).await?;
             if let Some(t) = o.task(crate::model::BRAIN_TASK).await? {
-                tasks::stop(o, &t).await?;
+                tasks::stop(o, &t, false).await?;
             }
             "The orchestrator brain will start a fresh session on your next message.".into()
         }

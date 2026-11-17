@@ -75,6 +75,9 @@ enum Cmd {
         #[command(subcommand)]
         cmd: SecretCmd,
     },
+    /// Commands for agent sessions: milestones, questions, messages, feeds, memory.
+    #[command(subcommand)]
+    Agent(fleet_node::agent_cli::AgentCmd),
     /// MCP server for an agent session (started by Claude Code, speaks JSON-RPC on stdio).
     Mcp,
     /// Print this host's endpoint id.
@@ -125,6 +128,7 @@ async fn run(cli: Cli) -> Result<()> {
     let data_dir = cli.data_dir.clone().unwrap_or_else(default_data_dir);
     match cli.cmd {
         Cmd::Mcp => fleet_node::mcp::serve_stdio(fleet_node::mcp::ShimEnv::from_env()?).await,
+        Cmd::Agent(cmd) => std::process::exit(fleet_node::agent_cli::run(cmd).await?),
         Cmd::Secret { cmd } => secret(cmd),
         Cmd::Project { cmd } => project(&data_dir, cmd),
         Cmd::Id => {

@@ -22,7 +22,7 @@ Ports on the VPS:
 | 7700/udp | orchestrator | yes | iroh QUIC: nodes connect here |
 | 7842/udp | iroh-relay | yes | QUIC address discovery (iroh 1.x replaced STUN/3478 with this) |
 | 8080/tcp | orchestrator | no (Docker network) | web UI, reached through Caddy |
-| 8888, 9999/tcp | hindsight | 127.0.0.1 only | memory API + MCP, control-plane UI |
+| 8888, 9999/tcp | hindsight | 127.0.0.1 only | memory API (used by the orchestrator), control-plane UI |
 | 5432/tcp | postgres | no (Docker network) | |
 
 ## 1. Prerequisites
@@ -185,9 +185,11 @@ sudo -u "$U" mkdir -p /home/$U/fleet-brain
 sudo -u "$U" env FLEET_DATA_DIR=/home/$U/.local/share/fleet fleet project map fleet /home/$U/fleet-brain
 ```
 
-Agents get Hindsight automatically: the orchestrator adds the `hindsight` MCP
-server (`$FLEET_HINDSIGHT_MCP_BASE/mcp/<project>/`, with the API key) to every
-session it starts.
+Memory needs no setup on nodes: agents call `fleet agent memory ...` (taught by
+the `fleet` skill the node loads into every session), and the orchestrator
+forwards those calls to Hindsight. Each agent owns the banks under its prefix
+`agent-<agent-id>`, a project's agents share `project-<slug>`, and the brain
+may use any bank.
 
 ### A Windows PC
 
@@ -209,11 +211,6 @@ locking the screen is fine.
 Remove it with `install-node.ps1 -Uninstall` (add `-RemoveData` to also delete
 the node's key and state).
 
-Agents on Windows nodes cannot reach `127.0.0.1:8888` on the VPS. To give them
-Hindsight, set `MEMORY_DOMAIN` in `.env`, add its DNS record, uncomment the
-last block of the `Caddyfile`, set `FLEET_HINDSIGHT_MCP_BASE=https://<MEMORY_DOMAIN>`,
-and `docker compose up -d caddy orchestrator`. Every request still needs the
-`HINDSIGHT_API_KEY` bearer token.
 
 ### After the first node: projects, bots, Claude
 

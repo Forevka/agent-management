@@ -9,7 +9,8 @@ Run a fleet of [Claude Code](https://claude.com/claude-code) agents across your 
   3. It finishes with a short summary.
 - **The human queue.** Anything that needs you lands in the project's *needs you* (or *fyi*) topic. You answer with buttons or by replying. Unanswered items get reminders; agents never answer for you.
 - **Feeds.** Slack channels you're in are mirrored into project topics through your user token. Agents can read and search them, and the orchestrator can propose tasks or replies. A reply is only posted (as you) after you approve it.
-- **Memory.** Hindsight gives every project a long-term memory bank, shared by its agents and the orchestrator.
+- **Memory.** One Hindsight instance serves the whole fleet. Every agent has its own bank prefix, each project has a shared bank, and agents reach memory through the orchestrator.
+- **No MCP for agent features.** Agents talk to the fleet with `fleet agent ...` shell commands, taught by a skill. There is no Telegram MCP, and no extra servers per session beyond Claude's permission hook.
 - **Transport.** Nodes connect to the orchestrator over [iroh](https://iroh.computer): encrypted QUIC that gets through NAT, via your own relay. Each message is delivered exactly once, in order, across reconnects and restarts.
 
 ## Quick start

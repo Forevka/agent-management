@@ -10,10 +10,9 @@ pub struct Config {
     pub owner_id: i64,
     /// Default model for agents.
     pub model: String,
-    /// Base URL of Hindsight as agents' hosts reach it (`http://127.0.0.1:8888` on the VPS,
-    /// or `https://memory.example.com` when Windows nodes need it too). Each agent gets the
-    /// `hindsight` MCP server at `<base>/mcp/<project>/`, one memory bank per project.
-    pub hindsight_mcp_url: Option<String>,
+    /// Hindsight's API as the orchestrator reaches it (`http://hindsight:8888` in Compose).
+    /// Agents use memory through the orchestrator, so only the orchestrator needs this.
+    pub hindsight_url: Option<String>,
     /// Hindsight's API key, sent as a bearer token.
     pub hindsight_api_key: Option<String>,
     /// The project the brain session runs in (mapped on the VPS node, e.g. `fleet`).
@@ -38,7 +37,7 @@ impl Config {
                 .parse()
                 .context("TELEGRAM_OWNER_ID must be a number")?,
             model: std::env::var("FLEET_MODEL").unwrap_or_else(|_| "opus".into()),
-            hindsight_mcp_url: std::env::var("FLEET_HINDSIGHT_MCP_BASE")
+            hindsight_url: std::env::var("HINDSIGHT_URL")
                 .ok()
                 .filter(|s| !s.is_empty())
                 .map(|s| s.trim_end_matches('/').to_owned()),
@@ -58,7 +57,7 @@ impl Config {
             public_url: "https://fleet.test".into(),
             owner_id: 42,
             model: "opus".into(),
-            hindsight_mcp_url: Some("http://hindsight:8888".into()),
+            hindsight_url: None,
             hindsight_api_key: Some("hk".into()),
             brain_project: "fleet".into(),
             magic_link_minutes: 60,

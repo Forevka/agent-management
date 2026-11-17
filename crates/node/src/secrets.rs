@@ -52,7 +52,9 @@ pub fn remove(data_dir: &Path, task_id: &str) {
     }
 }
 
-/// Parses `KEY=value` lines. Blank lines and `#` comments are skipped; values may be quoted.
+/// Parses `KEY=value` lines. Blank lines and `#` comments are skipped. Double-quoted values
+/// undo exactly the escaping the orchestrator applies (`\\`, `\"`, `\n`), so any value,
+/// including multi-line keys, arrives byte for byte; single-quoted values are taken literally.
 pub fn parse_env(text: &str) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     for line in text.lines() {
@@ -61,14 +63,34 @@ pub fn parse_env(text: &str) -> BTreeMap<String, String> {
             continue;
         }
         let line = line.strip_prefix("export ").unwrap_or(line);
-        if let Some((k, v)) = line.split_once('=') {
-            let v = v.trim();
-            let v = v
-                .strip_prefix('"')
-                .and_then(|v| v.strip_suffix('"'))
-                .or_else(|| v.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
-                .unwrap_or(v);
-            out.insert(k.trim().to_owned(), v.to_owned());
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let v = v.trim();
+        let value = if let Some(inner) = v.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
+            unescape(inner)
+        } else if let Some(inner) = v.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')) {
+            inner.to_owned()
+        } else {
+            v.to_owned()
+        };
+        out.insert(k.trim().to_owned(), value);
+    }
+    out
+}
+
+fn unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some(other) => out.push(other),
+            None => out.push('\\'),
         }
     }
     out
@@ -140,6 +162,13 @@ mod tests {
         assert_eq!(get(&paths[0], "JIRA_TOKEN").unwrap(), "t o k");
         assert_eq!(get(&paths[0], "JIRA_URL").unwrap(), "https://x");
         assert!(get(&paths[0], "NOPE").is_err());
+        // Exactly what the orchestrator writes for awkward values.
+        let parsed = parse_env(
+            "PW=\"p@ss w\\\\rd\"\nKEY=\"-----BEGIN-----\\nabc\\n-----END-----\"\nQ=\"say \\\"hi\\\"\"\n",
+        );
+        assert_eq!(parsed["PW"], "p@ss w\\rd");
+        assert_eq!(parsed["KEY"], "-----BEGIN-----\nabc\n-----END-----");
+        assert_eq!(parsed["Q"], "say \"hi\"");
         assert!(
             write(
                 &data,

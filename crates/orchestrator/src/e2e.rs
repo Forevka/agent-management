@@ -104,6 +104,27 @@ async fn task_lifecycle_through_a_real_node() {
         return;
     }
 
+    // A Hindsight stand-in that records which bank each call used.
+    let hindsight_calls = Arc::new(std::sync::Mutex::new(Vec::<(String, Value)>::new()));
+    let hindsight = {
+        use axum::{Json, Router as Web, extract::Path as P, routing::post};
+        let calls = hindsight_calls.clone();
+        let app = Web::new().route(
+            "/v1/default/banks/{bank}/{*rest}",
+            post(move |P((bank, rest)): P<(String, String)>, Json(body): Json<Value>| {
+                let calls = calls.clone();
+                async move {
+                    calls.lock().unwrap().push((format!("{bank}/{rest}"), body));
+                    Json(json!({"success": true, "results": [{"text": "Blue was chosen last time", "context": "previous task"}]}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        url
+    };
+
     // Orchestrator.
     let vault = Vault::from_hex(&"11".repeat(32)).unwrap();
     let auth = DbAuth::new(db.clone());
@@ -132,7 +153,10 @@ async fn task_lifecycle_through_a_real_node() {
         vault.clone(),
         server,
         chat.clone(),
-        Config::test(),
+        Config {
+            hindsight_url: Some(hindsight.clone()),
+            ..Config::test()
+        },
         auth.clone(),
     );
     tokio::spawn(o.clone().run_node_events(node_events));
@@ -342,12 +366,19 @@ async fn task_lifecycle_through_a_real_node() {
         "summary"
     );
 
-    // 5. A follow-up resumes the same session on the same node.
+    // 5. `complete` ends the session (it frees the node); a follow-up resumes it, as a new run
+    //    on the same node, in the same Claude session.
+    let first_run = task.run_id.clone();
     let follow_session = task.session_id.clone();
-    wait_for("agent idle", || async {
-        o.task(&task.id).await.unwrap().filter(|t| t.running)
+    wait_for("session ended after complete", || async {
+        o.task(&task.id).await.unwrap().filter(|t| !t.running)
     })
     .await;
+    let task = o.task(&task.id).await.unwrap().unwrap();
+    assert_eq!(
+        task.status, "done",
+        "a finished task stays done when its session ends"
+    );
     tasks::deliver(&o, &task, "[Message from the human] one more coat".into())
         .await
         .unwrap();
@@ -365,20 +396,100 @@ async fn task_lifecycle_through_a_real_node() {
             .cloned()
     })
     .await;
-    assert_eq!(
-        o.task(&task.id).await.unwrap().unwrap().session_id,
-        follow_session
+    let task = o.task(&task.id).await.unwrap().unwrap();
+    assert_eq!(task.session_id, follow_session, "same Claude session");
+    assert_ne!(task.run_id, first_run, "new run");
+    assert!(task.running);
+    assert!(
+        chat.ops
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|op| matches!(op, Op::Reopen(t) if Some(*t) == task.topic_id)),
+        "topic reopened"
     );
 
-    // 6. Stop kills the process and the node reports it.
-    tasks::stop(&o, &task).await.unwrap();
+    // 6. A late "exited" from the first run must not touch the new one.
+    let node_key: fleet_net::EndpointId = node_id.parse().unwrap();
+    o.handle_node_event(fleet_net::Inbound::Message {
+        peer: node_key,
+        body: fleet_proto::Body::AgentEvent(fleet_proto::AgentEvent {
+            agent_id: task.agent_id.clone().unwrap(),
+            task_id: task.id.clone(),
+            kind: fleet_proto::AgentEventKind::Exited { code: Some(1) },
+            run_id: first_run.clone().unwrap(),
+        }),
+    })
+    .await
+    .unwrap();
+    let after = o.task(&task.id).await.unwrap().unwrap();
+    assert!(
+        after.running && after.status != "failed",
+        "stale exit ignored: {} {}",
+        after.running,
+        after.status
+    );
+
+    // 7. A permission prompt sent again after an orchestrator restart gets the stored answer.
+    let plan_call: String =
+        sqlx::query_scalar("select call_id from human_items where task_id = $1 and kind = 'plan'")
+            .bind(&task.id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    let again = crate::tools::handle(
+        &o,
+        node_key,
+        fleet_proto::ToolCall {
+            call_id: plan_call.clone(),
+            agent_id: task.agent_id.clone().unwrap(),
+            task_id: task.id.clone(),
+            tool: "permission".into(),
+            args: json!({"tool_name": "ExitPlanMode", "input": {"plan": "x"}}).to_string(),
+        },
+    )
+    .await
+    .unwrap()
+    .expect("answered from the stored decision");
+    assert_eq!(
+        serde_json::from_str::<Value>(&again.result).unwrap()["behavior"],
+        "allow"
+    );
+    let plans: i64 =
+        sqlx::query_scalar("select count(*) from human_items where task_id = $1 and kind = 'plan'")
+            .bind(&task.id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(plans, 1, "no duplicate plan item");
+
+    // 8. A tool call claiming the task from another node is refused.
+    let foreign = crate::tools::handle(
+        &o,
+        SecretKey::generate().public(),
+        fleet_proto::ToolCall {
+            call_id: "x-1".into(),
+            agent_id: task.agent_id.clone().unwrap(),
+            task_id: task.id.clone(),
+            tool: "post".into(),
+            args: json!({"text": "hi"}).to_string(),
+        },
+    )
+    .await;
+    assert!(foreign.is_err());
+
+    // 9. Stop kills the process and the node reports it; the run's secrets are removed.
+    tasks::stop(&o, &task, false).await.unwrap();
     wait_for("agent stopped", || async {
         o.task(&task.id).await.unwrap().filter(|t| !t.running)
     })
     .await;
+    let leftovers: Vec<_> = std::fs::read_dir(data_dir.join("secrets"))
+        .map(|d| d.flatten().collect())
+        .unwrap_or_default();
     assert!(
-        !data_dir.join("secrets").join("demo-BS-1").exists(),
-        "secrets removed when the agent exits"
+        leftovers.is_empty(),
+        "secrets removed when the runs exit: {leftovers:?}"
     );
     let _ = std::fs::remove_dir_all(&data_dir);
 }

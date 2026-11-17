@@ -4,11 +4,13 @@
 //! how to start Claude), the agent processes it supervises, and a loopback IPC endpoint that the
 //! `fleet mcp` shim inside each agent uses to reach the orchestrator.
 
+pub mod agent_cli;
 pub mod config;
 pub mod ipc;
 pub mod mcp;
 pub mod runner;
 pub mod secrets;
+pub mod skill;
 pub mod tools;
 
 use std::{
@@ -28,12 +30,20 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::{config::NodeConfig, runner::AgentHandle};
 
+/// Ordinary tool calls answer within seconds; one that does not is reported as failed so the
+/// agent's command returns instead of hanging. Permission prompts wait for the human instead.
+const TOOL_CALL_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// A tool call waiting for the orchestrator's answer.
 struct PendingCall {
     reply: oneshot::Sender<ToolResult>,
     agent_id: String,
+    run_id: String,
     /// Set for the permission tool, so an approved `ExitPlanMode` can switch the session's mode.
     permission_tool: Option<String>,
+    /// Kept for permission prompts: they are sent again after every reconnect, because a
+    /// restarted orchestrator may have lost them (it answers duplicates idempotently).
+    resend: Option<ToolCall>,
 }
 
 pub struct Node {
@@ -45,6 +55,8 @@ pub struct Node {
     agents: Mutex<HashMap<String, AgentHandle>>,
     pending: Mutex<HashMap<String, PendingCall>>,
     next_call: AtomicU64,
+    /// Makes call ids unique across node restarts, so a stale answer can never match a new call.
+    call_prefix: String,
     ipc_addr: Mutex<Option<std::net::SocketAddr>>,
 }
 
@@ -59,6 +71,7 @@ impl Node {
             agents: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             next_call: AtomicU64::new(1),
+            call_prefix: runner::random_token()[..8].to_owned(),
             ipc_addr: Mutex::new(None),
         }))
     }
@@ -75,7 +88,10 @@ impl Node {
 
         while let Some(ev) = events.recv().await {
             match ev {
-                Inbound::Connected { .. } => self.send_info(),
+                Inbound::Connected { .. } => {
+                    self.send_info();
+                    self.resend_pending_permissions();
+                }
                 Inbound::Disconnected { .. } => {}
                 Inbound::Message { body, .. } => self.handle(body),
             }
@@ -85,10 +101,10 @@ impl Node {
 
     fn handle(self: &Arc<Self>, body: Body) {
         match body {
-            Body::SpawnAgent(spawn) => self.spawn_agent(spawn),
+            Body::SpawnAgent(spawn) => self.spawn_agent(*spawn),
             Body::StopAgent(stop) => {
                 if let Some(h) = self.agents.lock().unwrap().get(&stop.agent_id) {
-                    h.stop();
+                    h.stop(stop.graceful);
                 }
             }
             Body::SendToAgent {
@@ -101,15 +117,15 @@ impl Node {
                     .lock()
                     .unwrap()
                     .get(&agent_id)
+                    .filter(|h| h.task_id == task_id)
                     .is_some_and(|h| h.send_user_message(&text));
                 if !delivered {
+                    // Hand the text back so the orchestrator can resume the session with it.
                     self.event(
                         &agent_id,
                         &task_id,
-                        AgentEventKind::SpawnFailed {
-                            reason: "agent is not running on this node; message not delivered"
-                                .into(),
-                        },
+                        "",
+                        AgentEventKind::Undelivered { text },
                     );
                 }
             }
@@ -129,8 +145,9 @@ impl Node {
         let (agent_id, task_id) = (spawn.agent_id.clone(), spawn.task_id.clone());
         if let Some(old) = self.agents.lock().unwrap().remove(&agent_id) {
             // The orchestrator only respawns an agent it believes is gone; stop a stale process.
-            old.stop();
+            old.stop(false);
         }
+        let run_id = spawn.run_id.clone();
         let cfg = self.config.lock().unwrap().clone();
         let ipc_addr = self
             .ipc_addr
@@ -152,6 +169,7 @@ impl Node {
             Err(e) => self.event(
                 &agent_id,
                 &task_id,
+                &run_id,
                 AgentEventKind::SpawnFailed {
                     reason: format!("{e:#}"),
                 },
@@ -168,30 +186,76 @@ impl Node {
         }
         drop(agents);
         // Fail any tool call the dead process was waiting on, so nothing leaks.
+        let live: Vec<String> = self
+            .agents
+            .lock()
+            .unwrap()
+            .values()
+            .map(|h| h.run_id.clone())
+            .collect();
         self.pending
             .lock()
             .unwrap()
-            .retain(|_, p| p.agent_id != agent_id);
+            .retain(|_, p| live.contains(&p.run_id));
         self.send_info();
     }
 
-    pub(crate) fn event(&self, agent_id: &str, task_id: &str, kind: AgentEventKind) {
+    /// Stops one run (if it is still the agent's current one).
+    pub(crate) fn stop_run(&self, agent_id: &str, run_id: &str, graceful: bool) {
+        if let Some(h) = self
+            .agents
+            .lock()
+            .unwrap()
+            .get(agent_id)
+            .filter(|h| h.run_id == run_id)
+        {
+            h.stop(graceful);
+        }
+    }
+
+    pub(crate) fn event(&self, agent_id: &str, task_id: &str, run_id: &str, kind: AgentEventKind) {
         self.client.send(Body::AgentEvent(AgentEvent {
             agent_id: agent_id.into(),
             task_id: task_id.into(),
             kind,
+            run_id: run_id.into(),
         }));
     }
 
+    fn resend_pending_permissions(&self) {
+        let calls: Vec<ToolCall> = self
+            .pending
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(|p| p.resend.clone())
+            .collect();
+        for call in calls {
+            self.client.send(Body::ToolCall(call));
+        }
+    }
+
     fn send_info(&self) {
-        let cfg = self.config.lock().unwrap();
-        let info = NodeInfo {
-            projects: cfg.projects.clone(),
-            max_agents: cfg.settings.as_ref().map_or(4, |s| s.max_agents),
-            running_agents: self.agents.lock().unwrap().keys().cloned().collect(),
+        let (projects, max_agents) = {
+            let cfg = self.config.lock().unwrap();
+            (
+                cfg.projects.clone(),
+                cfg.settings.as_ref().map_or(4, |s| s.max_agents),
+            )
         };
-        drop(cfg);
-        self.client.send(Body::NodeInfo(info));
+        let (running_agents, running_runs) = {
+            let agents = self.agents.lock().unwrap();
+            (
+                agents.keys().cloned().collect(),
+                agents.values().map(|h| h.run_id.clone()).collect(),
+            )
+        };
+        self.client.send(Body::NodeInfo(NodeInfo {
+            projects,
+            max_agents,
+            running_agents,
+            running_runs,
+        }));
     }
 
     /// Forwards an agent's tool call to the orchestrator and waits for the answer.
@@ -201,13 +265,13 @@ impl Node {
         tool: String,
         args: String,
     ) -> ToolResult {
-        let Some((agent_id, task_id)) = self
+        let Some((agent_id, task_id, run_id)) = self
             .agents
             .lock()
             .unwrap()
             .values()
             .find(|h| h.ipc_token == ipc_token)
-            .map(|h| (h.agent_id.clone(), h.task_id.clone()))
+            .map(|h| (h.agent_id.clone(), h.task_id.clone(), h.run_id.clone()))
         else {
             return ToolResult {
                 call_id: String::new(),
@@ -215,7 +279,11 @@ impl Node {
                 result: "unknown agent token".into(),
             };
         };
-        let call_id = format!("c{}", self.next_call.fetch_add(1, Ordering::Relaxed));
+        let call_id = format!(
+            "{}-{}",
+            self.call_prefix,
+            self.next_call.fetch_add(1, Ordering::Relaxed)
+        );
         let (tx, rx) = oneshot::channel();
         let permission_tool = (tool == tools::PERMISSION_TOOL)
             .then(|| serde_json::from_str::<serde_json::Value>(&args).ok())
@@ -225,26 +293,44 @@ impl Node {
                     .and_then(|t| t.as_str())
                     .map(str::to_owned)
             });
+        let is_permission = tool == tools::PERMISSION_TOOL;
+        let call = ToolCall {
+            call_id: call_id.clone(),
+            agent_id: agent_id.clone(),
+            task_id,
+            tool,
+            args,
+        };
         self.pending.lock().unwrap().insert(
             call_id.clone(),
             PendingCall {
                 reply: tx,
-                agent_id: agent_id.clone(),
+                agent_id,
+                run_id,
                 permission_tool,
+                resend: is_permission.then(|| call.clone()),
             },
         );
-        self.client.send(Body::ToolCall(ToolCall {
+        self.client.send(Body::ToolCall(call));
+        let failed = |why: &str| ToolResult {
             call_id: call_id.clone(),
-            agent_id,
-            task_id,
-            tool,
-            args,
-        }));
-        rx.await.unwrap_or(ToolResult {
-            call_id,
             ok: false,
-            result: "agent stopped before the answer arrived".into(),
-        })
+            result: why.into(),
+        };
+        if is_permission {
+            return rx
+                .await
+                .unwrap_or_else(|_| failed("agent stopped before the answer arrived"));
+        }
+        match tokio::time::timeout(TOOL_CALL_TIMEOUT, rx).await {
+            Ok(r) => r.unwrap_or_else(|_| failed("agent stopped before the answer arrived")),
+            Err(_) => {
+                self.pending.lock().unwrap().remove(&call_id);
+                failed(
+                    "the orchestrator did not answer in time (it may be restarting); try again in a minute",
+                )
+            }
+        }
     }
 
     fn resolve(&self, result: ToolResult) {

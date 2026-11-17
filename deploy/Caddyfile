@@ -43,12 +43,3 @@
 		}
 	}
 }
-
-# Optional: Hindsight for agents on remote nodes (Windows PCs), which cannot
-# reach 127.0.0.1:8888 on the VPS. Hindsight requires its API key
-# (Authorization: Bearer $HINDSIGHT_API_KEY) on every request, MCP included.
-# Add a DNS record for the name, set MEMORY_DOMAIN in .env, and uncomment:
-#
-# {$MEMORY_DOMAIN} {
-# 	reverse_proxy hindsight:8888
-# }

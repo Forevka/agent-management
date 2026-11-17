@@ -37,6 +37,10 @@ pub async fn handle(
             task.id
         );
     }
+    // Only the node running the task may act for it.
+    if task.node_id.as_deref() != Some(node.to_string().as_str()) {
+        bail!("task {} does not run on this node", task.id);
+    }
     let agent: AgentRow = sqlx::query_as("select * from agents where id = $1")
         .bind(&call.agent_id)
         .fetch_one(&o.db)
@@ -51,10 +55,7 @@ pub async fn handle(
     };
 
     match call.tool.as_str() {
-        "permission" => {
-            permission(o, node, &call, &task, &agent, &args).await?;
-            Ok(None)
-        }
+        "permission" => Ok(permission(o, node, &call, &task, &agent, &args).await?),
         "milestones_set" => {
             let items: Vec<String> = serde_json::from_value(args["items"].clone())
                 .context("items must be a list of strings")?;
@@ -119,6 +120,10 @@ pub async fn handle(
             if target.id == agent.id {
                 bail!("you cannot message yourself");
             }
+            // Agents talk within their project; the orchestrator is reached by the owner only.
+            if target.id == BRAIN_AGENT || (!is_brain && target.project != agent.project) {
+                bail!("{} is not an agent of your project", target.name);
+            }
             let recent: i64 = sqlx::query_scalar(
                 "select count(*) from messages where from_agent = $1 and to_agent = $2 and created_at > now() - interval '10 minutes'",
             )
@@ -177,7 +182,12 @@ pub async fn handle(
             if let Some(topic) = task.topic_id {
                 let _ = o.chat.close_topic(topic).await;
             }
+            // The session ends after this turn, freeing the node; follow-ups resume it.
+            tasks::stop(o, &task, true).await?;
             ok("Task closed. The session stays resumable for follow-ups.".into())
+        }
+        "memory_retain" | "memory_recall" | "memory_reflect" | "memory_banks" => {
+            ok(memory(o, &agent, &task.project, &call.tool, &args).await?)
         }
         "feed_read" => ok(crate::feeds::read(o, &task.project, is_brain, &args).await?),
         "feed_search" => ok(crate::feeds::search(o, &task.project, is_brain, &args).await?),
@@ -244,18 +254,13 @@ pub async fn handle(
             let id = args["task_id"].as_str().context("task_id required")?;
             let text = args["text"].as_str().context("text required")?;
             let t = o.task(id).await?.with_context(|| format!("no task {id}"))?;
-            tasks::deliver(
-                o,
-                &t,
-                format!("[Follow-up from the human, via the orchestrator] {text}"),
-            )
-            .await?;
+            tasks::deliver(o, &t, format!("[Follow-up from the orchestrator] {text}")).await?;
             ok(format!("Sent to {id}."))
         }
         "stop_task" => {
             let id = args["task_id"].as_str().context("task_id required")?;
             let t = o.task(id).await?.with_context(|| format!("no task {id}"))?;
-            tasks::stop(o, &t).await?;
+            tasks::stop(o, &t, false).await?;
             ok(format!("Stopping {id}."))
         }
         "propose_task" | "propose_slack_reply" => {
@@ -315,7 +320,33 @@ async fn permission(
     task: &TaskRow,
     agent: &AgentRow,
     args: &Value,
-) -> Result<()> {
+) -> Result<Option<ToolResult>> {
+    // Nodes send pending permission prompts again after every reconnect (the orchestrator may
+    // have restarted): an open one is already waiting, an answered one gets its answer again.
+    let existing: Option<(String, Option<sqlx::types::Json<Value>>)> =
+        sqlx::query_as("select state, answer from human_items where node_id = $1 and call_id = $2")
+            .bind(node.to_string())
+            .bind(&call.call_id)
+            .fetch_optional(&o.db)
+            .await?;
+    match existing {
+        Some((state, _)) if state == "open" => return Ok(None),
+        Some((_, Some(answer))) if answer.0.get("decision").is_some() => {
+            return Ok(Some(ToolResult {
+                call_id: call.call_id.clone(),
+                ok: true,
+                result: answer.0["decision"].to_string(),
+            }));
+        }
+        Some(_) => {
+            return Ok(Some(ToolResult {
+                call_id: call.call_id.clone(),
+                ok: true,
+                result: json!({"behavior": "deny", "message": "This request was cancelled; ask again if it is still needed."}).to_string(),
+            }));
+        }
+        None => {}
+    }
     let tool = args["tool_name"].as_str().unwrap_or_default();
     let kind = match tool {
         "ExitPlanMode" => "plan",
@@ -337,7 +368,7 @@ async fn permission(
         },
     )
     .await?;
-    Ok(())
+    Ok(None)
 }
 
 /// Posts (first time) or edits the task's milestone checklist.
@@ -399,4 +430,74 @@ async fn list_projects(o: &Orchestrator) -> Result<String> {
         out.push(json!({"slug": slug, "name": name, "description": description, "nodes": on, "open_tasks": open}));
     }
     Ok(serde_json::to_string_pretty(&out)?)
+}
+
+/// `fleet agent memory ...`: forwards to Hindsight under the caller's bank rules.
+async fn memory(
+    o: &Orchestrator,
+    agent: &AgentRow,
+    project: &str,
+    tool: &str,
+    args: &Value,
+) -> Result<String> {
+    use crate::memory::{resolve_bank, visible};
+    let mem = o
+        .memory
+        .as_ref()
+        .context("long-term memory is not configured on this fleet")?;
+    // The brain works in its own pseudo-project; its shared bank is the fleet's.
+    let bank = || {
+        resolve_bank(
+            agent,
+            project,
+            args["bank"].as_str(),
+            args["shared"].as_bool().unwrap_or(false),
+        )
+    };
+    match tool {
+        "memory_retain" => {
+            let content = args["content"].as_str().context("text required")?;
+            mem.retain(&bank()?, content, args["context"].as_str())
+                .await
+        }
+        "memory_recall" => {
+            let query = args["query"].as_str().context("query required")?;
+            mem.recall(
+                &bank()?,
+                query,
+                args["limit"].as_u64().unwrap_or(10).clamp(1, 50) as usize,
+            )
+            .await
+        }
+        "memory_reflect" => {
+            let query = args["query"].as_str().context("query required")?;
+            mem.reflect(&bank()?, query).await
+        }
+        _ => {
+            let mut banks: Vec<String> = mem
+                .banks()
+                .await?
+                .into_iter()
+                .filter(|b| visible(agent, project, b))
+                .collect();
+            for default in [
+                crate::memory::agent_prefix(agent),
+                crate::memory::project_bank(project),
+            ] {
+                if agent.id != BRAIN_AGENT && !banks.contains(&default) {
+                    banks.push(default);
+                }
+            }
+            banks.sort();
+            Ok(format!(
+                "Banks you can use (your prefix: {}):\n{}",
+                crate::memory::agent_prefix(agent),
+                banks
+                    .iter()
+                    .map(|b| format!("- {b}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ))
+        }
+    }
 }

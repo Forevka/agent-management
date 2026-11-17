@@ -14,8 +14,8 @@ The design and every product decision are in `docs/plan.md`; read it before chan
 |---|---|
 | `crates/proto` | Wire types: `Envelope { seq, ack, body }`, `Body` (append-only enum), handshake, spawn/tool-call messages. `PROTOCOL_VERSION`, `ALPN`. |
 | `crates/net` | The control link. `Session` delivers each message exactly once, in order, across reconnects and peer restarts: outbox, acks, connection generations, process incarnations. `Server` is the orchestrator side (with an async `Authorizer`), `Client` the node side (reconnects with backoff). Also `InviteTicket`. |
-| `crates/node` | Node role: `runner.rs` starts and supervises Claude (stream-json in and out, permission prompts through the fleet MCP tool, plan approval switches the session to `auto` with a `set_permission_mode` control request). `ipc.rs` is loopback TCP with a token per agent. `mcp.rs` is the `fleet mcp` stdio shim. `tools.rs` holds tool schemas. `secrets.rs` writes `.env` files outside the project. `config.rs` is `node.json` (project mappings, settings). |
-| `crates/orchestrator` | `core.rs` handles node events. `tasks.rs` creates tasks, places them on nodes, delivers messages and runs the brain. `human.rs` is the human queue: questions, plans, permissions, proposals. `tools.rs` implements the fleet tools. `tg.rs` is the Telegram `Chat` implementation and update loops. `web.rs` is axum, with magic links. `auth.rs` decides node admission. `feeds.rs` covers Slack ingestion and the feed tools. `vault.rs` encrypts at rest. `prompts.rs` holds role prompts. `migrations/` is the SQL schema. `e2e.rs` is the end-to-end test. |
+| `crates/node` | Node role:<br>- `runner.rs` starts and supervises Claude, one process per *run*. It uses stream-json both ways and kills the whole process group or job object on stop. Plan approval switches the session to `auto` with a `set_permission_mode` control request. An idle session is closed and resumed on demand. Secrets are redacted from output.<br>- `agent_cli.rs` is `fleet agent ...`, how agents talk to the fleet.<br>- `skill.rs` writes the `fleet` skill plugin, loaded with `--plugin-dir`.<br>- `mcp.rs` is the `fleet mcp` stdio server. It exposes only the `permission` hook, which `--permission-prompt-tool` requires.<br>- `ipc.rs` is loopback TCP with a token per agent.<br>- `secrets.rs` writes `.env` files outside the project, per run.<br>- `config.rs` is `node.json`. |
+| `crates/orchestrator` | `memory.rs` is the only Hindsight client: one instance for everyone, with bank prefixes per agent and a shared bank per project. `core.rs` handles node events. `tasks.rs` creates tasks, places them on nodes, delivers messages and runs the brain. `human.rs` is the human queue: questions, plans, permissions, proposals. `tools.rs` implements the fleet tools. `tg.rs` is the Telegram `Chat` implementation and update loops. `web.rs` is axum, with magic links. `auth.rs` decides node admission. `feeds.rs` covers Slack ingestion and the feed tools. `vault.rs` encrypts at rest. `prompts.rs` holds role prompts. `migrations/` is the SQL schema. `e2e.rs` is the end-to-end test. |
 | `crates/telegram` | Thin, typed Bot API client: rate limiting, retries, HTML and callback helpers. |
 | `crates/feeds` | Source-agnostic feed model plus `SlackSource`, which polls the Web API with the owner's **user token**. There is no Slack app, no Events API and no Socket Mode. |
 | `crates/fleet` | The CLI: `orchestrator`, `invite`, `join`, `node`, `project map`, `secret get/exec`, `mcp`, `id`. |
@@ -66,12 +66,21 @@ cargo fmt --all
 - **Escaping.**
   - Telegram messages are HTML: escape with `chat::esc`.
   - The web UI escapes everything with `esc`; Markdown from agents goes through `web::markdown`, which turns raw HTML into text.
+- **No MCP for agent features.** Agents use the `fleet agent` CLI plus the skill. Never add a Telegram (or other) MCP server to sessions: it is slow and memory hungry, and every MCP server is a process per session. The only MCP tool is the permission hook.
+- **Runs.**
+  - Every agent process start has a `run_id`.
+  - Only events of a task's current run change its state.
+  - `dispatch` claims the run (`running = true`) before sending it.
+  - An agent runs one session at a time.
+  - Node restarts are detected by incarnation and end that node's runs.
 - **Claude's headless contract.** Verified against the real CLI:
   - plan mode + `--permission-prompt-tool mcp__fleet__permission`;
   - `ExitPlanMode` and `AskUserQuestion` arrive at that tool;
   - an allow decision is `{"behavior":"allow","updatedInput":...}`;
   - a `control_request` with `set_permission_mode` switches the mode;
-  - every token produces a `stream_event` line, which the node drops.
+  - every token produces a `stream_event` line, which the node drops;
+  - `--plugin-dir` loads the skill (it shows as `fleet:fleet`);
+  - `--append-system-prompt-file` works.
 
   Re-verify with a small real run after changing any of it.
 

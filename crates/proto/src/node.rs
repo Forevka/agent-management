@@ -45,6 +45,8 @@ pub struct NodeInfo {
     pub projects: Vec<ProjectMapping>,
     pub max_agents: u32,
     pub running_agents: Vec<String>,
+    /// Run ids of the agent processes alive on this node.
+    pub running_runs: Vec<String>,
 }
 
 /// A server-side project (by slug) mapped to a local directory on the node.
