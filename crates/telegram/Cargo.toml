@@ -1,0 +1,21 @@
+[package]
+name = "fleet-telegram"
+description = "Thin, typed Telegram Bot API client for the orchestrator bot and the per-agent bots"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# reqwest 0.13 renamed `rustls-tls`. `rustls-no-provider` keeps the build on ring (which iroh
+# already pulls in) instead of adding aws-lc; `Bot` installs ring as the process default.
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "multipart", "rustls-no-provider"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["sync", "time"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "sync", "time", "test-util"] }
+wiremock = "0.6.5"

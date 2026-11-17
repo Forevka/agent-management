@@ -1,0 +1,533 @@
+//! Telegram: the [`Chat`] implementation and the update loops that turn the owner's messages
+//! and button presses into orchestrator actions.
+
+use std::{collections::HashMap, sync::Arc, time::Duration};
+
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use fleet_telegram::{
+    Bot, InlineKeyboardButton, InlineKeyboardMarkup, Message, ParseMode, SendMessage, Throttled,
+    Update,
+};
+use tokio::sync::RwLock;
+
+use crate::{
+    chat::{Chat, From, Keyboard, clip, esc},
+    core::Orchestrator,
+    human::{self, Answer},
+    model::TaskRow,
+    tasks,
+};
+
+pub struct TelegramChat {
+    chat_id: i64,
+    /// Bot API base URL when not api.telegram.org (a self-hosted Bot API server).
+    api_url: Option<String>,
+    orchestrator: Throttled,
+    bots: RwLock<HashMap<i64, Throttled>>,
+}
+
+impl TelegramChat {
+    pub fn new(orchestrator: Bot, chat_id: i64, api_url: Option<String>) -> Self {
+        Self {
+            chat_id,
+            api_url,
+            orchestrator: Throttled::new(orchestrator),
+            bots: RwLock::new(HashMap::new()),
+        }
+    }
+
+    fn bot(&self, token: &str) -> Result<Bot> {
+        Ok(match &self.api_url {
+            Some(url) => Bot::with_base_url(token, url.clone())?,
+            None => Bot::new(token)?,
+        })
+    }
+
+    async fn sender(&self, from: From) -> Throttled {
+        match from {
+            From::Orchestrator => self.orchestrator.clone(),
+            // An agent whose bot is unusable still gets its message out, as the orchestrator.
+            From::Bot(id) => self
+                .bots
+                .read()
+                .await
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| self.orchestrator.clone()),
+        }
+    }
+
+    /// Bots whose button presses must be polled (agent bots; the orchestrator polls itself).
+    pub async fn agent_bots(&self) -> Vec<(i64, Bot)> {
+        self.bots
+            .read()
+            .await
+            .iter()
+            .map(|(id, t)| (*id, t.bot().clone()))
+            .collect()
+    }
+}
+
+fn markup(kb: &Keyboard) -> Option<InlineKeyboardMarkup> {
+    if kb.is_empty() {
+        return None;
+    }
+    let mut m = InlineKeyboardMarkup::new();
+    for row in kb {
+        let buttons = row
+            .iter()
+            .map(|b| match (&b.data, &b.url) {
+                (Some(d), _) => InlineKeyboardButton::callback(b.text.clone(), d.clone()),
+                (None, Some(u)) => InlineKeyboardButton::url(b.text.clone(), u.clone()),
+                (None, None) => InlineKeyboardButton::callback(b.text.clone(), "noop"),
+            })
+            .collect();
+        m = m.row(buttons);
+    }
+    Some(m)
+}
+
+fn limit(html: &str) -> String {
+    fleet_telegram::html::truncate_html(html, fleet_telegram::MAX_MESSAGE_LEN)
+}
+
+#[async_trait]
+impl Chat for TelegramChat {
+    async fn create_topic(&self, name: &str) -> Result<i64> {
+        Ok(self
+            .orchestrator
+            .create_forum_topic(self.chat_id, &clip(name, 120))
+            .await?
+            .message_thread_id)
+    }
+    async fn rename_topic(&self, topic: i64, name: &str) -> Result<()> {
+        Ok(self
+            .orchestrator
+            .edit_forum_topic(self.chat_id, topic, &clip(name, 120))
+            .await?)
+    }
+    async fn close_topic(&self, topic: i64) -> Result<()> {
+        Ok(self
+            .orchestrator
+            .bot()
+            .close_forum_topic(self.chat_id, topic)
+            .await?)
+    }
+    async fn reopen_topic(&self, topic: i64) -> Result<()> {
+        Ok(self
+            .orchestrator
+            .bot()
+            .reopen_forum_topic(self.chat_id, topic)
+            .await?)
+    }
+    async fn send(
+        &self,
+        from: From,
+        topic: Option<i64>,
+        html: &str,
+        keyboard: Keyboard,
+        reply_to: Option<i64>,
+    ) -> Result<i64> {
+        let mut msg = SendMessage::new(self.chat_id, limit(html)).html();
+        if let Some(t) = topic {
+            msg = msg.thread(t);
+        }
+        if let Some(m) = markup(&keyboard) {
+            msg = msg.keyboard(m);
+        }
+        if let Some(r) = reply_to {
+            msg = msg.reply_to(r);
+        }
+        Ok(self.sender(from).await.send_message(&msg).await?.message_id)
+    }
+    async fn edit(
+        &self,
+        from: From,
+        message_id: i64,
+        html: &str,
+        keyboard: Keyboard,
+    ) -> Result<()> {
+        let m = markup(&keyboard);
+        Ok(self
+            .sender(from)
+            .await
+            .edit_message_text(
+                self.chat_id,
+                message_id,
+                &limit(html),
+                Some(ParseMode::Html),
+                m.as_ref(),
+            )
+            .await?)
+    }
+    async fn send_file(
+        &self,
+        from: From,
+        topic: Option<i64>,
+        name: &str,
+        bytes: Vec<u8>,
+        caption: &str,
+    ) -> Result<i64> {
+        let caption =
+            fleet_telegram::html::truncate_for_message(caption, fleet_telegram::MAX_CAPTION_LEN);
+        Ok(self
+            .sender(from)
+            .await
+            .send_document(self.chat_id, topic, name, bytes, Some(&caption))
+            .await?
+            .message_id)
+    }
+    async fn inspect_bot(&self, token: &str) -> Result<(i64, String)> {
+        let me = self
+            .bot(token)?
+            .get_me()
+            .await
+            .context("Telegram rejected this bot token")?;
+        Ok((me.id, me.username.unwrap_or_default()))
+    }
+    async fn add_bot(&self, bot_id: i64, token: &str) -> Result<()> {
+        self.bots
+            .write()
+            .await
+            .insert(bot_id, Throttled::new(self.bot(token)?));
+        Ok(())
+    }
+    async fn set_bot_profile(&self, bot_id: i64, name: &str, description: &str) -> Result<()> {
+        let bot = self
+            .bots
+            .read()
+            .await
+            .get(&bot_id)
+            .map(|t| t.bot().clone())
+            .context("bot not loaded")?;
+        bot.set_my_name(name).await?;
+        bot.set_my_description(description).await?;
+        bot.set_my_short_description(&clip(description, 120))
+            .await?;
+        Ok(())
+    }
+}
+
+/// Long-polls the orchestrator bot forever.
+pub async fn run_updates(o: Arc<Orchestrator>, bot: Bot, chat_id: i64) {
+    let key = "tg_offset";
+    let mut offset: Option<i64> =
+        sqlx::query_scalar::<_, serde_json::Value>("select value from kv where key = $1")
+            .bind(key)
+            .fetch_optional(&o.db)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|v| v.as_i64());
+    loop {
+        match bot
+            .get_updates(offset, 50, &["message", "callback_query"])
+            .await
+        {
+            Ok(updates) => {
+                for u in updates {
+                    offset = Some(u.update_id + 1);
+                    handle_update(&o, &bot, chat_id, u).await;
+                }
+                if let Some(off) = offset {
+                    let _ = sqlx::query("insert into kv (key, value) values ($1, $2) on conflict (key) do update set value = $2")
+                        .bind(key)
+                        .bind(serde_json::json!(off))
+                        .execute(&o.db)
+                        .await;
+                }
+            }
+            Err(e) => {
+                tracing::warn!("telegram getUpdates failed: {e}");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        }
+    }
+}
+
+/// Polls agent bots for button presses on the messages they sent. Bots added later are picked
+/// up on the next round.
+pub async fn run_agent_bot_callbacks(o: Arc<Orchestrator>, chat: Arc<TelegramChat>, chat_id: i64) {
+    let mut running: HashMap<i64, tokio::task::JoinHandle<()>> = HashMap::new();
+    loop {
+        for (id, bot) in chat.agent_bots().await {
+            if running.get(&id).is_some_and(|h| !h.is_finished()) {
+                continue;
+            }
+            let o = o.clone();
+            running.insert(
+                id,
+                tokio::spawn(async move {
+                    let mut offset = None;
+                    loop {
+                        match bot.get_updates(offset, 50, &["callback_query"]).await {
+                            Ok(updates) => {
+                                for u in updates {
+                                    offset = Some(u.update_id + 1);
+                                    handle_update(&o, &bot, chat_id, u).await;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::debug!("agent bot {id} getUpdates failed: {e}");
+                                tokio::time::sleep(Duration::from_secs(10)).await;
+                            }
+                        }
+                    }
+                }),
+            );
+        }
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    }
+}
+
+async fn handle_update(o: &Arc<Orchestrator>, bot: &Bot, chat_id: i64, u: Update) {
+    if let Some(cb) = u.callback_query {
+        if cb.from.id != o.cfg.owner_id {
+            let _ = bot
+                .answer_callback_query(&cb.id, Some("Only the fleet owner can answer."))
+                .await;
+            return;
+        }
+        let reply = match cb.data.as_deref().map(callback) {
+            Some(f) => match f {
+                Ok((id, ans)) => human::answer(o, id, ans)
+                    .await
+                    .unwrap_or_else(|e| format!("Failed: {e:#}")),
+                Err(e) => format!("{e:#}"),
+            },
+            None => "Nothing to do.".into(),
+        };
+        let _ = bot
+            .answer_callback_query(&cb.id, Some(&clip(&reply, 190)))
+            .await;
+        return;
+    }
+    let Some(msg) = u.message else { return };
+    if msg.chat.id != chat_id || msg.from.as_ref().map(|f| f.id) != Some(o.cfg.owner_id) {
+        return;
+    }
+    if let Err(e) = owner_message(o, &msg).await {
+        tracing::warn!("handling owner message failed: {e:#}");
+        let _ = o
+            .chat
+            .send(
+                From::Orchestrator,
+                msg.topic_id(),
+                &format!("⚠️ {}", esc(&format!("{e:#}"))),
+                vec![],
+                Some(msg.message_id),
+            )
+            .await;
+    }
+}
+
+/// `kind|item|choice` from our own buttons.
+fn callback(data: &str) -> Result<(i64, Answer)> {
+    let mut parts = data.splitn(3, '|');
+    let (kind, id, choice) = (
+        parts.next().unwrap_or_default(),
+        parts.next().unwrap_or_default(),
+        parts.next().unwrap_or_default(),
+    );
+    let id: i64 = id.parse().context("bad button")?;
+    let ans = match (kind, choice) {
+        ("h" | "q", n) => Answer::Choice(n.parse().context("bad option")?),
+        ("p", _) => Answer::Approve,
+        ("a", "y") => Answer::Allow,
+        ("a", _) => Answer::Deny,
+        ("x", "y") => Answer::Accept,
+        ("x", _) => Answer::Dismiss,
+        _ => anyhow::bail!("unknown button"),
+    };
+    Ok((id, ans))
+}
+
+async fn owner_message(o: &Arc<Orchestrator>, msg: &Message) -> Result<()> {
+    let Some(text) = msg
+        .text_or_caption()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    else {
+        return Ok(());
+    };
+    let topic = msg.topic_id();
+    if text.starts_with('/') {
+        return command(o, msg, topic, text).await;
+    }
+    // A reply to a question answers it, wherever it is.
+    if let Some(reply) = &msg.reply_to_message
+        && let Some(item) = human::by_message(o, reply.message_id).await?
+    {
+        let ans = match item.kind.as_str() {
+            "plan" => Answer::Revise(text.to_owned()),
+            _ => Answer::Text(text.to_owned()),
+        };
+        let res = human::answer(o, item.id, ans).await?;
+        o.chat
+            .send(
+                From::Orchestrator,
+                topic,
+                &esc(&res),
+                vec![],
+                Some(msg.message_id),
+            )
+            .await?;
+        return Ok(());
+    }
+    match topic {
+        None => tasks::to_brain(o, format!("[Message from the owner] {text}")).await,
+        Some(t) => {
+            let task: Option<TaskRow> = sqlx::query_as("select * from tasks where topic_id = $1")
+                .bind(t)
+                .fetch_optional(&o.db)
+                .await?;
+            match task {
+                Some(task) => {
+                    tasks::deliver(o, &task, format!("[Message from the human] {text}")).await
+                }
+                // Human and feed topics only take replies to specific items.
+                None => Ok(()),
+            }
+        }
+    }
+}
+
+async fn command(
+    o: &Arc<Orchestrator>,
+    msg: &Message,
+    topic: Option<i64>,
+    text: &str,
+) -> Result<()> {
+    let (cmd, arg) = text
+        .split_once(char::is_whitespace)
+        .map(|(c, a)| (c, a.trim()))
+        .unwrap_or((text, ""));
+    let cmd = cmd.split('@').next().unwrap_or(cmd);
+    let html = match cmd {
+        "/status" => status(o).await?,
+        "/queue" => {
+            let items = human::open_items(o).await?;
+            if items.is_empty() {
+                "Nothing is waiting on you.".into()
+            } else {
+                let mut s = String::from("<b>Waiting on you</b>\n");
+                for i in items.iter().take(30) {
+                    s.push_str(&format!(
+                        "{} Q-{} · {} · {}\n",
+                        if i.blocking { "🔴" } else { "🟡" },
+                        i.id,
+                        esc(&i.kind),
+                        esc(i.task_id.as_deref().or(i.project.as_deref()).unwrap_or("-"))
+                    ));
+                }
+                s
+            }
+        }
+        "/tasks" => {
+            let rows: Vec<(String, String, String)> =
+                sqlx::query_as("select id, title, status from tasks where id <> 'brain' and status not in ('done') order by updated_at desc limit 30")
+                    .fetch_all(&o.db)
+                    .await?;
+            if rows.is_empty() {
+                "No open tasks.".into()
+            } else {
+                rows.iter().map(|(id, t, s)| format!("<b>{}</b> [{}] {}", esc(id), esc(s), esc(t))).collect::<Vec<_>>().join("\n")
+            }
+        }
+        "/stop" => {
+            let id = if arg.is_empty() {
+                let t: Option<String> = match topic {
+                    Some(t) => sqlx::query_scalar("select id from tasks where topic_id = $1").bind(t).fetch_optional(&o.db).await?,
+                    None => None,
+                };
+                t.context("use /stop <task-id> or send it in the task's topic")?
+            } else {
+                arg.to_owned()
+            };
+            let task = o.task(&id).await?.with_context(|| format!("no task {id}"))?;
+            tasks::stop(o, &task).await?;
+            format!("Stopping <b>{}</b>.", esc(&id))
+        }
+        "/web" => format!("<a href=\"{}\">Open the fleet dashboard</a> (link valid for one login).", esc(&crate::web::magic_link(o, "/").await?)),
+        "/invite" => {
+            let ticket = crate::web::new_invite(o).await?;
+            format!("Run on the new host:\n<code>fleet join {}</code>\nSingle use.", esc(&ticket))
+        }
+        "/brain_reset" => {
+            sqlx::query("update tasks set session_id = null where id = 'brain'").execute(&o.db).await?;
+            if let Some(t) = o.task(crate::model::BRAIN_TASK).await? {
+                tasks::stop(o, &t).await?;
+            }
+            "The orchestrator brain will start a fresh session on your next message.".into()
+        }
+        "/help" | "/start" => "Write in General to talk to the orchestrator. Reply in a task topic to talk to its agent; reply to a question to answer it.\n/status /queue /tasks /stop [task] /web /invite /brain_reset".into(),
+        _ => format!("Unknown command {}. Try /help.", esc(cmd)),
+    };
+    o.chat
+        .send(
+            From::Orchestrator,
+            topic,
+            &html,
+            vec![],
+            Some(msg.message_id),
+        )
+        .await?;
+    Ok(())
+}
+
+async fn status(o: &Orchestrator) -> Result<String> {
+    let nodes: Vec<crate::model::NodeRow> = sqlx::query_as("select * from nodes order by name")
+        .fetch_all(&o.db)
+        .await?;
+    let mut s = String::from("<b>Nodes</b>\n");
+    for n in &nodes {
+        s.push_str(&format!(
+            "{} {} · {}/{} agents · {} projects\n",
+            if n.online { "🟢" } else { "⚪" },
+            esc(&n.name),
+            n.running.0.len(),
+            n.max_agents,
+            n.projects.0.len()
+        ));
+    }
+    if nodes.is_empty() {
+        s.push_str("none yet (/invite)\n");
+    }
+    let (active, waiting): (i64, i64) = sqlx::query_as(
+        "select count(*) filter (where status in ('planning','running','waiting')), count(*) filter (where status = 'queued') from tasks where id <> 'brain'",
+    )
+    .fetch_one(&o.db)
+    .await?;
+    let open: i64 = sqlx::query_scalar("select count(*) from human_items where state = 'open'")
+        .fetch_one(&o.db)
+        .await?;
+    let free_bots: i64 = sqlx::query_scalar("select count(*) from bots where agent_id is null")
+        .fetch_one(&o.db)
+        .await?;
+    s.push_str(&format!("\n<b>Tasks</b>: {active} active, {waiting} queued\n<b>Waiting on you</b>: {open}\n<b>Free bots</b>: {free_bots}"));
+    if free_bots < 2 {
+        s.push_str(" ⚠️ add bots on the web Agents page");
+    }
+    Ok(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn callback_parsing() {
+        assert!(matches!(
+            callback("h|12|3").unwrap(),
+            (12, Answer::Choice(3))
+        ));
+        assert!(matches!(callback("p|5|ok").unwrap(), (5, Answer::Approve)));
+        assert!(matches!(callback("a|5|y").unwrap(), (5, Answer::Allow)));
+        assert!(matches!(callback("a|5|n").unwrap(), (5, Answer::Deny)));
+        assert!(matches!(callback("x|5|y").unwrap(), (5, Answer::Accept)));
+        assert!(matches!(callback("x|5|n").unwrap(), (5, Answer::Dismiss)));
+        assert!(callback("zz|5|n").is_err());
+        assert!(callback("h|x|1").is_err());
+    }
+}

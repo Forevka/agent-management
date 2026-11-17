@@ -1,0 +1,29 @@
+[package]
+name = "fleet-orchestrator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fleet-proto.workspace = true
+fleet-net.workspace = true
+fleet-telegram = { path = "../telegram" }
+fleet-feeds = { path = "../feeds" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+rand.workspace = true
+data-encoding.workspace = true
+iroh.workspace = true
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "migrate", "json", "chrono"] }
+chrono = { version = "0.4", features = ["serde"] }
+axum = { version = "0.8", features = ["form", "query"] }
+chacha20poly1305 = "0.10"
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+async-trait = "0.1"
+form_urlencoded = "1"
+
+[dev-dependencies]
+fleet-node = { path = "../node" }

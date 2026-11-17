@@ -1,0 +1,22 @@
+[package]
+name = "fleet-feeds"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Read-only feeds from external chat channels (Slack first), polled with the user's own token."
+
+[dependencies]
+async-trait = "0.1.92"
+# `rustls-no-provider` keeps TLS on ring (which iroh already uses) instead of compiling aws-lc;
+# `Api::new` installs ring as the process default. `query` is opt-in since reqwest 0.13.
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls-no-provider", "query"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tokio = { version = "1.48.0", features = ["time"] }
+tracing = "0.1.41"
+
+[dev-dependencies]
+axum = "0.8.9"
+tokio = { version = "1.48.0", features = ["full"] }

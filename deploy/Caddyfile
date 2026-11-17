@@ -1,0 +1,54 @@
+# Caddy terminates HTTPS for both public hostnames and gets their
+# certificates from Let's Encrypt automatically (HTTP-01 / TLS-ALPN-01 on
+# ports 80/443, so both DNS records must point at this VPS first).
+#
+# FLEET_DOMAIN, RELAY_DOMAIN and ACME_EMAIL come from deploy/.env through the
+# caddy service's environment.
+
+{
+	email {$ACME_EMAIL}
+}
+
+# Web UI: plan pages (magic links), projects and secrets, nodes, agents.
+{$FLEET_DOMAIN} {
+	encode zstd gzip
+	reverse_proxy orchestrator:8080
+}
+
+# iroh relay.
+#
+# Why Caddy fronts the relay instead of the relay doing its own ACME:
+# iroh-relay's built-in Let's Encrypt mode answers TLS-ALPN-01 challenges and
+# so must own public port 443, which Caddy already holds on this IP. Instead,
+# Caddy obtains the relay's certificate and the relay reads it from Caddy's
+# storage (iroh-relay.toml, cert_mode = "Reloading"). The relay needs a real
+# certificate anyway for QUIC address discovery on 7842/udp, which clients
+# reach directly, not through Caddy.
+#
+# The relay protocol is a WebSocket upgrade on /relay (plus a /ping latency
+# probe), which reverse_proxy passes through as is. The upstream is the relay's
+# own HTTPS listener, verified against the same hostname.
+{$RELAY_DOMAIN} {
+	# Pin the issuer to Let's Encrypt. Caddy would otherwise fall back to
+	# ZeroSSL, and the relay looks for the certificate under the Let's Encrypt
+	# directory in Caddy's storage.
+	tls {
+		issuer acme {
+			email {$ACME_EMAIL}
+		}
+	}
+	reverse_proxy https://iroh-relay:3443 {
+		transport http {
+			tls_server_name {$RELAY_DOMAIN}
+		}
+	}
+}
+
+# Optional: Hindsight for agents on remote nodes (Windows PCs), which cannot
+# reach 127.0.0.1:8888 on the VPS. Hindsight requires its API key
+# (Authorization: Bearer $HINDSIGHT_API_KEY) on every request, MCP included.
+# Add a DNS record for the name, set MEMORY_DOMAIN in .env, and uncomment:
+#
+# {$MEMORY_DOMAIN} {
+# 	reverse_proxy hindsight:8888
+# }

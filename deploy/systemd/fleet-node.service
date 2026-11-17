@@ -1,0 +1,61 @@
+# fleet node on the VPS host (outside Docker).
+#
+# It runs as the Linux user who is logged into Claude Code, because Claude's
+# login (~/.claude), git credentials and the repositories live in that user's
+# home. The VPS node also hosts the orchestrator's "brain" Claude session.
+#
+# Install (as root), with U set to that user's name (Group= below assumes a
+# primary group of the same name, as on Debian/Ubuntu; adjust if not):
+#   U=alice
+#   install -m 0755 fleet /usr/local/bin/fleet
+#   install -d -m 0755 /etc/fleet
+#   sed "s/CHANGE_ME/$U/g" deploy/systemd/node.env.example > /etc/fleet/node.env
+#   chown root:"$U" /etc/fleet/node.env && chmod 0640 /etc/fleet/node.env
+#   sed "s/CHANGE_ME/$U/g" deploy/systemd/fleet-node.service > /etc/systemd/system/fleet-node.service
+#   systemctl daemon-reload && systemctl enable --now fleet-node
+#   journalctl -u fleet-node -f
+#
+# Log in to Claude Code as that user first (`claude`, then /login), and check
+# it works non-interactively: `claude -p "say hi"`.
+
+[Unit]
+Description=fleet node (Claude Code agent host)
+Documentation=https://github.com/Forevka/agent-management
+Wants=network-online.target
+After=network-online.target docker.service
+# Never give up restarting, however often it fails (see Restart= below).
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=CHANGE_ME
+# The user's primary group.
+Group=CHANGE_ME
+# "~" is the home directory of User=; systemd also sets HOME, USER, SHELL.
+WorkingDirectory=~
+
+# FLEET_DATA_DIR, FLEET_RELAY, PATH (so `claude` and `git` are found), and
+# optionally CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY. "-" = optional file.
+EnvironmentFile=-/etc/fleet/node.env
+
+ExecStart=/usr/local/bin/fleet node
+
+# Always come back: after a crash, after a self-update (the node exits so the
+# new binary starts), and after the orchestrator asks it to restart.
+Restart=always
+RestartSec=5
+
+# On stop, SIGTERM the node first so it can checkpoint its Claude sessions,
+# then the rest of the cgroup (the Claude processes it started).
+KillMode=mixed
+TimeoutStopSec=90
+
+# Agents run builds and tests; the defaults are too low for that.
+LimitNOFILE=65536
+
+# No sandboxing options here on purpose (ProtectHome=, NoNewPrivileges=, ...):
+# agents work in arbitrary repositories in the user's home and may run sudo,
+# package managers, docker, etc., exactly as the user would.
+
+[Install]
+WantedBy=multi-user.target

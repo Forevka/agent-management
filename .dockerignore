@@ -1,0 +1,22 @@
+# Build output (also target-*, e.g. per-tool target dirs)
+target
+target*
+**/target
+
+# VCS and CI
+.git
+.github
+
+# Local runtime data and deployment secrets
+fleet-data
+**/fleet-data
+deploy
+*.env
+.env*
+
+# Not needed to build the binary
+docs
+*.md
+!crates/**/*.md
+.idea
+.vscode

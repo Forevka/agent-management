@@ -1,0 +1,20 @@
+[package]
+name = "fleet-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fleet-proto.workspace = true
+anyhow.workspace = true
+iroh.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+postcard.workspace = true
+serde.workspace = true
+data-encoding.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+tracing-subscriber.workspace = true

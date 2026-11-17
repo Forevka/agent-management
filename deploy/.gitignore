@@ -1,0 +1,3 @@
+# Real secrets and local backups never go into git.
+.env
+backups/

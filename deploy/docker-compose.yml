@@ -1,0 +1,192 @@
+# The fleet's server side on the VPS: orchestrator, Postgres (+pgvector),
+# Hindsight (agent memory), a self-hosted iroh relay, and Caddy for HTTPS.
+#
+# Nodes (`fleet node`) are NOT here: they run on the host (systemd) and on the
+# Windows PCs, because they need the user's Claude Code login and repositories.
+#
+# Usage (from this directory):
+#   cp .env.example .env && $EDITOR .env
+#   docker compose up -d --build
+#
+# Compose reads ./.env for the ${VAR} substitutions below. See README.md.
+
+name: fleet
+
+services:
+  # ---------------------------------------------------------------------------
+  # Postgres 16 with pgvector. One server, two databases (`fleet`, `hindsight`),
+  # each owned by its own role; created on first start by postgres-init/.
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: postgres
+      # Read by postgres-init/01-create-databases.sh on the very first start only.
+      FLEET_DB_PASSWORD: ${FLEET_DB_PASSWORD:?set FLEET_DB_PASSWORD in .env}
+      HINDSIGHT_DB_PASSWORD: ${HINDSIGHT_DB_PASSWORD:?set HINDSIGHT_DB_PASSWORD in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro
+    # No published port: only containers on this network reach it. To connect
+    # from the host for maintenance: docker compose exec postgres psql -U postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    shm_size: 256m
+
+  # ---------------------------------------------------------------------------
+  # Hindsight: memory server with an MCP endpoint per bank at /mcp/{bank_id}/.
+  # Image `hindsight` = API (8888) + control-plane UI (9999); `hindsight-api` is
+  # the API alone. The full (non -slim) image runs embeddings and reranking
+  # locally, so only the fact-extraction LLM is external (Anthropic, Haiku).
+  hindsight:
+    image: ghcr.io/vectorize-io/hindsight:${HINDSIGHT_VERSION:-1.2.1}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      HINDSIGHT_API_DATABASE_URL: postgresql://hindsight:${HINDSIGHT_DB_PASSWORD}@postgres:5432/hindsight
+      HINDSIGHT_API_LLM_PROVIDER: anthropic
+      HINDSIGHT_API_LLM_API_KEY: ${HINDSIGHT_ANTHROPIC_API_KEY:?set HINDSIGHT_ANTHROPIC_API_KEY in .env}
+      HINDSIGHT_API_LLM_MODEL: ${HINDSIGHT_LLM_MODEL:-claude-haiku-5-5}
+      # Every API and MCP request must carry "Authorization: Bearer <key>".
+      HINDSIGHT_API_TENANT_EXTENSION: hindsight_api.extensions.builtin.tenant:ApiKeyTenantExtension
+      HINDSIGHT_API_TENANT_API_KEY: ${HINDSIGHT_API_KEY:?set HINDSIGHT_API_KEY in .env}
+      # Stable worker identity, so tasks in flight survive a container restart.
+      HINDSIGHT_API_WORKER_ID: hindsight-fleet
+      # Control-plane UI: talks to the API above, protected by its own key.
+      HINDSIGHT_CP_DATAPLANE_API_URL: http://localhost:8888
+      HINDSIGHT_CP_DATAPLANE_API_KEY: ${HINDSIGHT_API_KEY}
+      HINDSIGHT_CP_ACCESS_KEY: ${HINDSIGHT_CP_ACCESS_KEY:?set HINDSIGHT_CP_ACCESS_KEY in .env}
+    # No volume: all memory lives in Postgres, and the local embedding and
+    # reranker models are baked into the image (a volume would pin old models
+    # across upgrades).
+    # Loopback only. Docker publishes ports past ufw/firewalld, so never bind
+    # these to 0.0.0.0. The VPS node and the brain session (both on the host)
+    # use http://127.0.0.1:8888/mcp/{bank}/. The UI is reached over SSH:
+    #   ssh -L 9999:127.0.0.1:9999 vps   then open http://localhost:9999
+    ports:
+      - "127.0.0.1:8888:8888"
+      - "127.0.0.1:9999:9999"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8888/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      # First start runs migrations and loads the local models.
+      start_period: 300s
+    # Hindsight needs up to 60 s to hand its tasks back on shutdown.
+    stop_grace_period: 75s
+    shm_size: 1g
+
+  # ---------------------------------------------------------------------------
+  # The orchestrator: iroh endpoint for nodes (7700/udp, public), web UI (8080,
+  # only via Caddy), Telegram bot.
+  orchestrator:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    # `docker compose up --build` tags the local build with this name. To run a
+    # released image instead, set FLEET_IMAGE=ghcr.io/<owner>/fleet:<version>
+    # and use `docker compose pull orchestrator && docker compose up -d`.
+    image: ${FLEET_IMAGE:-fleet:local}
+    restart: unless-stopped
+    init: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+      hindsight:
+        condition: service_started
+    command:
+      - orchestrator
+      - --bind
+      - 0.0.0.0:7700
+      - --public-addr
+      - ${FLEET_PUBLIC_ADDR:?set FLEET_PUBLIC_ADDR (VPS public IP:7700) in .env}
+      - --web-bind
+      - 0.0.0.0:8080
+    # FLEET_MASTER_KEY, FLEET_PUBLIC_URL, FLEET_RELAY, TELEGRAM_* come from here.
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://fleet:${FLEET_DB_PASSWORD}@postgres:5432/fleet
+      FLEET_DATA_DIR: /var/lib/fleet
+      # For orchestrator-side memory calls (agents and the brain reach Hindsight
+      # through their own MCP config).
+      HINDSIGHT_URL: http://hindsight:8888
+      RUST_LOG: ${RUST_LOG:-info}
+    ports:
+      - "7700:7700/udp"
+    expose:
+      - "8080"
+    volumes:
+      - fleet_data:/var/lib/fleet
+
+  # ---------------------------------------------------------------------------
+  # Self-hosted iroh relay (official image, same version as the iroh crate).
+  #
+  # HTTPS: Caddy owns 80/443 and gets the certificate for RELAY_DOMAIN. It
+  # proxies https://RELAY_DOMAIN to the relay's own HTTPS listener (3443,
+  # internal). The relay reads that same certificate from Caddy's data volume
+  # (cert_mode = "Reloading"), which it also needs for QUIC address discovery
+  # on 7842/udp. That port must be public: clients derive it from the relay URL
+  # (default port 7842) and it cannot go through Caddy.
+  #
+  # On the very first start the certificate does not exist yet; the relay exits
+  # and is restarted until Caddy has obtained it (usually under a minute).
+  iroh-relay:
+    image: n0computer/iroh-relay:${IROH_RELAY_VERSION:-v1.4.1}
+    restart: unless-stopped
+    depends_on:
+      - caddy
+    environment:
+      RELAY_DOMAIN: ${RELAY_DOMAIN:?set RELAY_DOMAIN in .env}
+      RUST_LOG: ${IROH_RELAY_LOG:-info}
+      # Uncomment together with `access.shared_token` in iroh-relay.toml.
+      # IROH_RELAY_ACCESS_TOKEN: ${IROH_RELAY_ACCESS_TOKEN}
+    # The TOML file cannot read environment variables, so the domain (part of
+    # the certificate path in Caddy's storage) is filled in at start.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        sed "s/__RELAY_DOMAIN__/$${RELAY_DOMAIN}/g" /config/iroh-relay.toml > /tmp/iroh-relay.toml
+        && exec /iroh-relay --config-path /tmp/iroh-relay.toml
+    volumes:
+      - ./iroh-relay.toml:/config/iroh-relay.toml:ro
+      - caddy_data:/caddy-data:ro
+    ports:
+      - "7842:7842/udp"
+    expose:
+      - "3443"
+      - "9090"
+
+  # ---------------------------------------------------------------------------
+  # Caddy: automatic HTTPS (Let's Encrypt) for FLEET_DOMAIN and RELAY_DOMAIN.
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    environment:
+      FLEET_DOMAIN: ${FLEET_DOMAIN:?set FLEET_DOMAIN in .env}
+      RELAY_DOMAIN: ${RELAY_DOMAIN}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in .env}
+      # Only used by the optional Hindsight block at the end of the Caddyfile.
+      MEMORY_DOMAIN: ${MEMORY_DOMAIN:-}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp" # HTTP/3
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  postgres_data:
+  fleet_data:
+  caddy_data:
+  caddy_config:

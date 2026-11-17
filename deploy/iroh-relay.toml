@@ -1,0 +1,61 @@
+# iroh-relay 1.x server configuration (see the `Config` struct in iroh-relay's
+# src/main.rs, and iroh-relay/README.md, in github.com/n0-computer/iroh).
+#
+# __RELAY_DOMAIN__ is replaced with $RELAY_DOMAIN when the container starts
+# (TOML cannot read environment variables). Everything else is literal.
+#
+# Ports (inside the container):
+#   3340/tcp  plain HTTP. With [tls] set, it only serves the captive-portal
+#             check; not published.
+#   3443/tcp  HTTPS: the relay itself (/relay WebSocket, /ping). Reached only
+#             through Caddy, which serves it publicly on 443.
+#   7842/udp  QUIC address discovery (QAD). Published on the VPS as is:
+#             clients use port 7842 for any relay URL unless told otherwise.
+#   9090/tcp  Prometheus metrics; internal only.
+#
+# iroh 1.x no longer uses STUN (the old 3478/udp); QAD over QUIC replaced it.
+
+# Relay traffic between endpoints that cannot connect directly.
+enable_relay = true
+
+# Lets endpoints learn their public address (needed for hole punching).
+# Requires [tls].
+enable_quic_addr_discovery = true
+
+# IPv4 only: Docker's default bridge network has no IPv6.
+http_bind_addr = "0.0.0.0:3340"
+
+enable_metrics = true
+metrics_bind_addr = "0.0.0.0:9090"
+
+# Access control. The default lets every iroh endpoint use this relay
+# (traffic is end-to-end encrypted either way; this only limits who can spend
+# the VPS's bandwidth). To require a shared secret, uncomment this, set
+# IROH_RELAY_ACCESS_TOKEN for the iroh-relay service (it replaces the list
+# below), and give the same token to every fleet endpoint
+# (iroh RelayConfig::with_auth_token). The fleet binary must support that
+# first, or all relaying stops.
+#
+# access.shared_token = ["overridden-by-IROH_RELAY_ACCESS_TOKEN"]
+#
+# Alternatively, allow only known endpoint IDs:
+# access.allowlist = ["<endpoint-id>", "<endpoint-id>"]
+
+[tls]
+https_bind_addr = "0.0.0.0:3443"
+quic_bind_addr = "0.0.0.0:7842"
+
+# Read the certificate Caddy obtained for RELAY_DOMAIN (caddy_data is mounted
+# read-only at /caddy-data). "Reloading" re-reads the files every 24 hours, so
+# Caddy's renewals are picked up without a restart.
+cert_mode = "Reloading"
+manual_cert_path = "/caddy-data/caddy/certificates/acme-v02.api.letsencrypt.org-directory/__RELAY_DOMAIN__/__RELAY_DOMAIN__.crt"
+manual_key_path = "/caddy-data/caddy/certificates/acme-v02.api.letsencrypt.org-directory/__RELAY_DOMAIN__/__RELAY_DOMAIN__.key"
+
+# Optional rate limits (unlimited when absent).
+# [limits]
+# accept_conn_limit = 50.0
+# accept_conn_burst = 100
+# [limits.client.rx]
+# bytes_per_second = 4194304
+# max_burst_bytes = 8388608
