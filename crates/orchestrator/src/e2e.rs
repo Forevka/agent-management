@@ -149,10 +149,6 @@ fn incoming(
 struct MemSource {
     events: Vec<fleet_feeds::FeedEvent>,
     restored: Option<Value>,
-    /// `None` everywhere except the one reply-draft test that needs a working poster: every
-    /// other use of this source proves the rest of the fleet works with nothing able to post
-    /// back, which `reply_draft` must itself refuse.
-    posts: Option<Arc<std::sync::Mutex<Vec<(String, Option<String>, String)>>>>,
 }
 
 /// Records what [`MemSource`] was asked to post, as the owner, once `reply_draft`'s Send is
@@ -203,15 +199,8 @@ impl fleet_feeds::Source for MemSource {
     fn capabilities(&self) -> fleet_feeds::Capabilities {
         fleet_feeds::Capabilities {
             push: true,
-            can_reply: self.posts.is_some(),
-            can_reply_in_thread: true,
             ..Default::default()
         }
-    }
-    fn replier(&self) -> Option<Arc<dyn fleet_feeds::Replier>> {
-        self.posts
-            .clone()
-            .map(|p| Arc::new(MemReplier(p)) as Arc<dyn fleet_feeds::Replier>)
     }
     async fn run(&mut self, sink: fleet_feeds::FeedSink) -> Result<(), fleet_feeds::FeedError> {
         for e in self.events.drain(..) {
@@ -228,7 +217,6 @@ async fn deliver_feed(o: &Arc<Orchestrator>, events: Vec<fleet_feeds::FeedEvent>
     let mut src = MemSource {
         events,
         restored: None,
-        posts: None,
     };
     crate::feeds::drive(o, &mut src, "feed_cursor_memchat")
         .await
@@ -902,7 +890,6 @@ async fn secretary_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeCha
             FeedEvent::Checkpoint(json!({"upto": "r1"})),
         ],
         restored: None,
-        posts: None,
     };
     crate::feeds::drive_with(o, &mut src, "feed_cursor_retry", |m| {
         let first = tries.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
@@ -1365,15 +1352,17 @@ async fn secretary_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeCha
 
     // Give "memchat" a working reply handle, as a real source would once the owner configures
     // one, then ask again: now a card appears, with Send / Edit / Cancel, nothing posted yet.
+    // `drive()` only holds a source's poster for as long as it runs, and `MemSource::run` (like
+    // a real source's connection) ends as soon as it has delivered its events; registering the
+    // handle directly is what a long-lived source keeps doing for the whole time it runs.
     let posts: Arc<std::sync::Mutex<Vec<(String, Option<String>, String)>>> = Default::default();
-    let mut enable = MemSource {
-        events: vec![],
-        restored: None,
-        posts: Some(posts.clone()),
-    };
-    crate::feeds::drive(o, &mut enable, "feed_cursor_memchat_replies")
-        .await
-        .unwrap();
+    crate::feeds::offer_replier(
+        o,
+        "memchat",
+        Arc::new(MemReplier(posts.clone())) as Arc<dyn fleet_feeds::Replier>,
+        true,
+    )
+    .await;
     crate::tg::owner_message(o, &ask_dave(9301)).await.unwrap();
     let draft: HumanItemRow = wait_for("the reply draft", || async {
         sqlx::query_as("select * from human_items where kind = 'reply' order by id desc limit 1")
