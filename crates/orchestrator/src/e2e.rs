@@ -56,22 +56,68 @@ fn has_python() -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
-async fn wait_for<T, F, Fut>(what: &str, mut f: F) -> T
+async fn wait_for<T, F, Fut>(what: &str, f: F) -> T
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Option<T>>,
 {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    match try_wait_for(Duration::from_secs(30), f).await {
+        Some(v) => v,
+        None => panic!("timed out waiting for {what}"),
+    }
+}
+
+/// [`wait_for`] that gives up with `None`, so the caller can say what it saw instead.
+async fn try_wait_for<T, F, Fut>(within: Duration, mut f: F) -> Option<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    let deadline = tokio::time::Instant::now() + within;
     loop {
         if let Some(v) = f().await {
-            return v;
+            return Some(v);
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for {what}"
-        );
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// What the fleet did about a builtin session lately, for a failure message: its recent task
+/// events (kind and the start of the data) and what was posted about it.
+async fn builtin_trail(db: &sqlx::PgPool, chat: &FakeChat, task: &str) -> String {
+    let events: Vec<(String, String)> = sqlx::query_as(
+        "select kind, left(data, 160) from task_events where task_id = $1 and kind <> 'out' order by id desc limit 12",
+    )
+    .bind(task)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    let (status, running, run): (String, bool, Option<String>) =
+        sqlx::query_as("select status, running, run_id from tasks where id = $1")
+            .bind(task)
+            .fetch_one(db)
+            .await
+            .unwrap();
+    let waiting: i64 = sqlx::query_scalar(
+        "select count(*) from messages where task_id = $1 and run_id is null and from_agent is null",
+    )
+    .bind(task)
+    .fetch_one(db)
+    .await
+    .unwrap();
+    let posts: Vec<String> = chat
+        .sent()
+        .iter()
+        .rev()
+        .take(6)
+        .map(|(_, _, h, _)| h.chars().take(120).collect())
+        .collect();
+    format!(
+        "{task}: status {status}, running {running}, run {run:?}, {waiting} texts waiting\nrecent events (newest first): {events:?}\nrecent posts (newest first): {posts:?}"
+    )
 }
 
 /// A message from the in-memory test source (no Slack anywhere).
@@ -1016,7 +1062,13 @@ async fn secretary_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeCha
         .await
         .unwrap();
     wait_for("the brain fails to start", || failed_after(None)).await;
-    assert_eq!(could_not(), told_before + 1, "the owner is told");
+    if could_not() != told_before + 1 {
+        panic!(
+            "the first failure was not told once ({} posts)\n{}",
+            could_not() - told_before,
+            builtin_trail(db, chat, "brain").await
+        );
+    }
     // The first round only arms the first wait: no dispatch yet (the node settings pushed above
     // must not have made it due).
     let first_failure = o.task("brain").await.unwrap().unwrap().dispatched_at;
@@ -1032,7 +1084,15 @@ async fn secretary_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeCha
         let at = o.task("brain").await.unwrap().unwrap().dispatched_at;
         tasks::retry_due_now(o, "brain");
         tasks::retry_stuck_builtins(o).await;
-        wait_for("the retry fails on the node", || failed_after(at)).await;
+        if try_wait_for(Duration::from_secs(20), || failed_after(at))
+            .await
+            .is_none()
+        {
+            panic!(
+                "a forced retry did not fail on the node\n{}",
+                builtin_trail(db, chat, "brain").await
+            );
+        }
         waits.push(o.builtin_retry.lock().unwrap()["brain"].wait.as_secs());
     }
     assert_eq!(waits, [600, 1200, 1800], "backing off");
@@ -1052,21 +1112,56 @@ async fn secretary_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeCha
     }))
     .unwrap();
     crate::tg::owner_message(o, &ping).await.unwrap();
-    wait_for("the owner's message fails on the node", || failed_after(at)).await;
-    wait_for("the owner is told again", || async {
+    // Each step says what it saw if it does not happen, rather than only timing out.
+    if try_wait_for(Duration::from_secs(20), || failed_after(at))
+        .await
+        .is_none()
+    {
+        panic!(
+            "the owner's message did not start a run that failed on the node\n{}",
+            builtin_trail(db, chat, "brain").await
+        );
+    }
+    if try_wait_for(Duration::from_secs(10), || async {
         (could_not() == told_before + 2).then_some(())
     })
-    .await;
+    .await
+    .is_none()
+    {
+        panic!(
+            "the owner was not told again ({} \"Could not start\" posts, expected {})\n{}",
+            could_not(),
+            told_before + 2,
+            builtin_trail(db, chat, "brain").await
+        );
+    }
     // A "fix" that fails the same way is told too: the settings change starts a new episode.
     set_brain_command(vec!["/nonexistent/another-claude".into()]).await;
     let at = o.task("brain").await.unwrap().unwrap().dispatched_at;
     tasks::retry_due_now(o, "brain");
     tasks::retry_stuck_builtins(o).await;
-    wait_for("the new command fails too", || failed_after(at)).await;
-    wait_for("the failed fix is told", || async {
+    if try_wait_for(Duration::from_secs(20), || failed_after(at))
+        .await
+        .is_none()
+    {
+        panic!(
+            "the retry after the settings change did not fail on the node\n{}",
+            builtin_trail(db, chat, "brain").await
+        );
+    }
+    if try_wait_for(Duration::from_secs(10), || async {
         (could_not() == told_before + 3).then_some(())
     })
-    .await;
+    .await
+    .is_none()
+    {
+        panic!(
+            "the failed fix was not told ({} \"Could not start\" posts, expected {})\n{}",
+            could_not(),
+            told_before + 3,
+            builtin_trail(db, chat, "brain").await
+        );
+    }
     set_brain_command(brain_command.0.clone()).await;
     tasks::retry_due_now(o, "brain");
     tasks::retry_stuck_builtins(o).await;

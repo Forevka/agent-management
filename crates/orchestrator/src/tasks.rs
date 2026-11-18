@@ -505,9 +505,18 @@ async fn dispatch_locked(
     } else {
         Origin::Other
     };
-    crate::secretary::run_started(o, &task.id, &run_id, first.clone());
+    crate::secretary::run_started(o, &task.id, &run_id, first);
     if crate::model::is_builtin_task(&task.id) {
-        o.builtin_runs.lock().unwrap().insert(run_id.clone(), first);
+        // Who must hear if this run fails on its node: the owner, when their own text is in it,
+        // even with other texts that waited before it (the secretary's turn bookkeeping above
+        // treats such a turn as nobody's; telling the owner is a different question).
+        let tell = if prompt.is_some() {
+            origin.clone()
+        } else {
+            Origin::Other
+        };
+        tracing::debug!(task = %task.id, run = %run_id, origin = ?tell, "builtin run dispatched");
+        o.builtin_runs.lock().unwrap().insert(run_id.clone(), tell);
         // Any start, by a retry or by a new text, counts for the minimum gap between retries.
         if let Some(r) = o.builtin_retry.lock().unwrap().get_mut(&task.id) {
             r.last = Some(std::time::Instant::now());
@@ -591,6 +600,7 @@ async fn try_notice(
         .fetch_one(&o.db)
         .await?;
         if told {
+            tracing::debug!(task = %task.id, key, "notice already told this episode");
             return Ok(());
         }
     }
@@ -1012,6 +1022,14 @@ pub async fn deliver_as(
         // under the task's lock, so in the order the run receives them.
         o.working.message_sent(&task.id, run_id);
         crate::secretary::turn_sent(o, &task.id, run_id, origin.clone());
+        // The owner's text sent into a run of the fleet's own sessions that has not started yet
+        // (a retry in flight): if that run fails on its node, the owner must hear why.
+        if crate::model::is_builtin_task(&task.id)
+            && matches!(origin, Origin::Owner(_))
+            && let Some(tell) = o.builtin_runs.lock().unwrap().get_mut(run_id)
+        {
+            *tell = origin.clone();
+        }
         Ok(true)
     };
     if send(&task, text.clone())? {
