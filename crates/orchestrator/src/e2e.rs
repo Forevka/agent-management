@@ -842,6 +842,128 @@ async fn secretary_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeCha
         .await
         .unwrap();
     assert_eq!(cursor, json!({"upto": "r1"}));
+    // A secretary that cannot start (here: its node's Claude command would widen what it may do)
+    // holds the next batches back, tells the owner once (and the owner every time they write),
+    // and starts by itself once the cause is fixed, with what waited.
+    let sec = o.task(SECRETARY_TASK).await.unwrap().unwrap();
+    let node_id = sec.node_id.clone().unwrap();
+    let command: sqlx::types::Json<Vec<String>> =
+        sqlx::query_scalar("select claude_command from nodes where id = $1")
+            .bind(&node_id)
+            .fetch_one(db)
+            .await
+            .unwrap();
+    tasks::stop(o, &sec, false).await.unwrap();
+    wait_for("the secretary stopped", || async {
+        o.task(SECRETARY_TASK).await.unwrap().filter(|t| !t.running)
+    })
+    .await;
+    let mut widened = command.0.clone();
+    widened.extend(["--add-dir".to_owned(), "/".to_owned()]);
+    sqlx::query("update nodes set claude_command = $2 where id = $1")
+        .bind(&node_id)
+        .bind(sqlx::types::Json(&widened))
+        .execute(db)
+        .await
+        .unwrap();
+    let cannot = || {
+        chat.sent()
+            .iter()
+            .filter(|(_, _, h, _)| {
+                h.contains("Could not prepare the agent's run") && h.contains("--add-dir")
+            })
+            .count()
+    };
+    deliver_feed(
+        o,
+        vec![FeedEvent::Message(incoming(
+            "C-st",
+            "ops",
+            ConvKind::Channel,
+            "s1",
+            "Bob",
+            "RULE: mute everything from the ops channel",
+        ))],
+    )
+    .await;
+    assert_eq!(secretary::flush(o, true).await.unwrap(), 1, "kept for it");
+    assert_eq!(cannot(), 1, "the owner is told");
+    assert_eq!(
+        o.task(SECRETARY_TASK).await.unwrap().unwrap().status,
+        "failed"
+    );
+    deliver_feed(
+        o,
+        vec![FeedEvent::Message(incoming(
+            "C-st",
+            "ops",
+            ConvKind::Channel,
+            "s2",
+            "Bob",
+            "still there?",
+        ))],
+    )
+    .await;
+    assert_eq!(
+        secretary::flush(o, true).await.unwrap(),
+        0,
+        "no batch behind a waiting one"
+    );
+    // Not retried at once (the first wait is minutes), then retried: nobody is told again.
+    tasks::retry_stuck_builtins(o).await.unwrap();
+    tasks::retry_builtins_now(o);
+    tasks::retry_stuck_builtins(o).await.unwrap();
+    assert_eq!(cannot(), 1, "a retry does not tell the owner again");
+    // The owner's own message is always told why it cannot be handled now.
+    let stuck: fleet_telegram::Message = serde_json::from_value(json!({
+        "message_id": 9300,
+        "date": 1_700_000_000,
+        "chat": { "id": -100, "type": "supergroup", "is_forum": true },
+        "from": { "id": 42, "is_bot": false, "first_name": "Owner" },
+        "message_thread_id": inbox,
+        "is_topic_message": true,
+        "text": "mute everything from the ops channel",
+    }))
+    .unwrap();
+    crate::tg::owner_message(o, &stuck).await.unwrap();
+    assert_eq!(cannot(), 2, "the owner's message gets the reason");
+    // Fixed on the web: the next round starts it, with the batch and the owner's message as one
+    // first turn. That turn is nobody's in particular, so a rule added in it (even quoting the
+    // owner) is posted loudly, as one not asked for.
+    sqlx::query("update nodes set claude_command = $2 where id = $1")
+        .bind(&node_id)
+        .bind(&command)
+        .execute(db)
+        .await
+        .unwrap();
+    o.push_node_settings(&node_id).await.unwrap();
+    tasks::retry_stuck_builtins(o).await.unwrap();
+    let muted: crate::model::RuleRow = wait_for("the secretary is back and handles what waited", || async {
+        sqlx::query_as(
+            "select * from secretary_rules where text = 'mute everything from the ops channel' and tg_msg is not null",
+        )
+        .fetch_optional(db)
+        .await
+        .unwrap()
+    })
+    .await;
+    assert_eq!(notify_of_msg(chat, muted.tg_msg), Some(Notify::Sound));
+    // The batch held back goes now.
+    wait_for("the held batch goes out", || async {
+        (secretary::flush(o, true).await.unwrap() == 1).then_some(())
+    })
+    .await;
+    wait_for("the held message is triaged", || async {
+        sqlx::query_scalar::<_, i64>(
+            "select count(*) from secretary_triage where 'memchat:C-st:s2' = any(refs)",
+        )
+        .fetch_one(db)
+        .await
+        .unwrap()
+        .eq(&1)
+        .then_some(())
+    })
+    .await;
     // The daily digest is asked for once per day, at its hour; the day is recorded after.
     let hour = o.cfg.secretary.digest_hour;
     assert!(

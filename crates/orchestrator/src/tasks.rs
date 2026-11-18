@@ -235,7 +235,7 @@ pub async fn dispatch(
     if task.running {
         return Ok(Dispatched::Lost);
     }
-    dispatch_locked(o, &task, prompt, resume).await
+    dispatch_locked(o, &task, prompt, resume, &Origin::Other).await
 }
 
 /// Starts a queued task (resuming its session), unless it stopped being queued in the meantime:
@@ -248,7 +248,7 @@ async fn dispatch_if_queued(o: &Arc<Orchestrator>, task: &TaskRow) -> Result<Dis
         return Ok(Dispatched::Lost);
     }
     let resume = task.session_id.clone();
-    dispatch_locked(o, &task, None, resume).await
+    dispatch_locked(o, &task, None, resume, &Origin::Other).await
 }
 
 /// What [`dispatch`] did.
@@ -268,6 +268,7 @@ async fn dispatch_locked(
     task: &TaskRow,
     prompt: Option<String>,
     resume: Option<String>,
+    origin: &Origin,
 ) -> Result<Dispatched> {
     let agent = match &task.agent_id {
         Some(a) => {
@@ -297,6 +298,7 @@ async fn dispatch_locked(
             task,
             &agent.id,
             prompt.as_deref(),
+            origin,
             Some(format!(
                 "⏳ Queued: {} is busy with <b>{}</b>.",
                 esc(&agent.name),
@@ -321,7 +323,8 @@ async fn dispatch_locked(
         .bind(task.dispatched_at.unwrap_or(task.created_at))
         .fetch_one(&o.db)
         .await?;
-        let note = if told {
+        // The owner's own message is always told why it waits.
+        let note = if told && !matches!(origin, Origin::Owner(_)) {
             None
         } else {
             sqlx::query("insert into task_events (task_id, kind, data) values ($1, 'waiting', $2)")
@@ -335,7 +338,7 @@ async fn dispatch_locked(
                 esc(&task.project)
             ))
         };
-        return queue(o, task, &agent.id, prompt.as_deref(), note).await;
+        return queue(o, task, &agent.id, prompt.as_deref(), origin, note).await;
     }
     // A resumed session only exists on the node that ran it. Once that node is gone (revoked),
     // the session is gone with it: the task starts afresh elsewhere.
@@ -375,6 +378,7 @@ async fn dispatch_locked(
             task,
             &agent.id,
             prompt.as_deref(),
+            origin,
             Some(format!(
                 "⏳ Queued: waiting for {} (offline or at capacity).",
                 esc(&waiting_for)
@@ -427,6 +431,7 @@ async fn dispatch_locked(
             task,
             &agent.id,
             prompt.as_deref(),
+            origin,
             Some("⏳ Queued: the chosen node just left the fleet.".into()),
         )
         .await;
@@ -434,14 +439,15 @@ async fn dispatch_locked(
     // The run takes the task's waiting messages and the new one. They stay in the queue, tagged
     // with the run, until the node reports it started (then they go); a run that never starts
     // gives them back (`release_run_messages`), so the next one gets them.
-    sqlx::query(
+    let waited = sqlx::query(
         "update messages set run_id = $3 where task_id = $1 and to_agent = $2 and from_agent is null and run_id is null",
     )
     .bind(&task.id)
     .bind(&agent.id)
     .bind(&run_id)
     .execute(&o.db)
-    .await?;
+    .await?
+    .rows_affected();
     if let Some(p) = &prompt {
         sqlx::query(
             "insert into messages (task_id, to_agent, text, run_id) values ($1, $2, $3, $4)",
@@ -469,26 +475,32 @@ async fn dispatch_locked(
             .await?;
             release_run_messages(o, &run_id).await?;
             tracing::warn!("preparing a run of {} failed: {e:#}", task.id);
-            // The fleet's own sessions are retried by every message they get: the owner hears
-            // about it when it starts failing, not on every retry.
-            if !(crate::model::is_builtin_task(&task.id) && task.status == status::FAILED) {
-                o.post_task(
-                    task,
-                    &format!(
-                        "⚠️ Could not prepare the agent's run: {}",
-                        esc(&format!("{e:#}"))
-                    ),
-                    Notify::Sound,
-                )
-                .await;
-            }
+            notice(
+                o,
+                task,
+                origin,
+                &format!(
+                    "⚠️ Could not prepare the agent's run: {}",
+                    esc(&format!("{e:#}"))
+                ),
+                Notify::Sound,
+            )
+            .await?;
             return Ok(Dispatched::Waiting);
         }
     };
     o.server
         .send(node.id.parse()?, Body::SpawnAgent(Box::new(spawn)));
-    // A new run takes its first message as one turn (see `working`).
+    // A new run takes its first message as one turn (see `working`): the new text alone, or,
+    // with texts that waited before it, several at once.
     o.working.message_sent(&task.id, &run_id);
+    let first = if prompt.is_some() && waited == 0 {
+        origin.clone()
+    } else {
+        Origin::Other
+    };
+    crate::secretary::run_started(o, &task.id, &run_id, first);
+    o.builtin_retry.lock().unwrap().remove(&task.id);
     Ok(Dispatched::Started)
 }
 
@@ -504,6 +516,7 @@ async fn queue(
     task: &TaskRow,
     agent_id: &str,
     prompt: Option<&str>,
+    origin: &Origin,
     note: Option<String>,
 ) -> Result<Dispatched> {
     // Nobody works on a queued task, whichever path queued it (a new message, a redelivery).
@@ -521,14 +534,43 @@ async fn queue(
             .execute(&o.db)
             .await?;
     }
-    // Queue notes are progress, not a call for the owner; for the fleet's own sessions only
-    // when they become queued, not again for every message that waits.
-    if let Some(note) = note
-        && !(crate::model::is_builtin_task(&task.id) && task.status == status::QUEUED)
-    {
-        o.post_task(task, &note, Notify::Silent).await;
+    // Queue notes are progress, not a call for the owner.
+    if let Some(note) = note {
+        notice(o, task, origin, &note, Notify::Silent).await?;
     }
     Ok(Dispatched::Waiting)
+}
+
+/// Tells the owner why a task cannot run now. For the fleet's own sessions, which are retried by
+/// every text they get (batches, reports), each reason is told once per episode (since the
+/// session last produced output); the owner's own message is always told the current reason.
+async fn notice(
+    o: &Orchestrator,
+    task: &TaskRow,
+    origin: &Origin,
+    html: &str,
+    notify: Notify,
+) -> Result<()> {
+    if crate::model::is_builtin_task(&task.id) && !matches!(origin, Origin::Owner(_)) {
+        let told: bool = sqlx::query_scalar(
+            "select exists(select 1 from task_events where task_id = $1 and kind = 'notice' and data = $2
+               and at > coalesce((select max(at) from task_events where task_id = $1 and kind = 'out'), '-infinity'))",
+        )
+        .bind(&task.id)
+        .bind(html)
+        .fetch_one(&o.db)
+        .await?;
+        if told {
+            return Ok(());
+        }
+    }
+    sqlx::query("insert into task_events (task_id, kind, data) values ($1, 'notice', $2)")
+        .bind(&task.id)
+        .bind(html)
+        .execute(&o.db)
+        .await?;
+    o.post_task(task, html, notify).await;
+    Ok(())
 }
 
 /// Every node with the number of agent runs it is assigned (from our own bookkeeping, which is
@@ -679,40 +721,42 @@ async fn build_spawn(
         run_id,
     })
 }
-/// The most of the secretary's queued texts its first turn takes.
+/// About the most (in bytes) of the secretary's waiting texts its first turn takes.
 const SECRETARY_FIRST_TURN_BYTES: usize = 60_000;
 
-/// The newest `texts` (in order) that fit in `max` bytes; when some are left out, a note says
-/// how many first.
+/// The secretary's waiting texts, as its first turn takes them: every text from the owner, the
+/// brain or the orchestrator, and as many batches, newest first, as fit in `max` bytes with
+/// them (the newest batch always, whole: `flush` bounds a batch's size). Older batches that do
+/// not fit are left out, with a note saying how many; nothing is cut in the middle.
 fn newest_within(texts: Vec<String>, max: usize) -> Vec<String> {
-    let mut used = 0;
-    let keep = texts
-        .iter()
-        .rev()
-        .take_while(|t| {
+    let batch = |t: &str| t.starts_with(crate::secretary::BATCH_PREFIX);
+    let mut used: usize = texts.iter().filter(|t| !batch(t)).map(String::len).sum();
+    let mut keep = vec![true; texts.len()];
+    let mut newest = true;
+    for (i, t) in texts.iter().enumerate().rev().filter(|(_, t)| batch(t)) {
+        if newest || used + t.len() <= max {
             used += t.len();
-            used <= max
-        })
-        .count()
-        .max(1);
-    let dropped = texts.len().saturating_sub(keep);
-    let mut out: Vec<String> = texts.into_iter().skip(dropped).collect();
-    if let Some(last) = out.first_mut()
-        && last.len() > max
-    {
-        *last = crate::chat::clip(last, max);
+        } else {
+            keep[i] = false;
+        }
+        newest = false;
     }
+    let dropped = keep.iter().filter(|k| !**k).count();
+    let mut out: Vec<String> = texts
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(t, k)| k.then_some(t))
+        .collect();
     if dropped > 0 {
         out.insert(
             0,
             format!(
-                "[{dropped} earlier queued messages were left out (too much at once). Read what you missed with `fleet agent feed read --hours N`.]"
+                "[{dropped} earlier batches were left out (too much at once). Read what you missed with `fleet agent feed read --hours N`.]"
             ),
         );
     }
     out
 }
-
 /// Flags in a node's Claude command that would widen what the secretary may do. Its session is
 /// refused on such a node rather than run with them (the owner set them for their own agents).
 const WIDENING_FLAGS: [&str; 12] = [
@@ -869,6 +913,33 @@ async fn project_secret_values(o: &Orchestrator, project: &str) -> Result<Vec<St
 /// the run the first one started. The lock also keeps that run's spawn ahead of the message on
 /// the link, so the node never sees a message for a run it does not have yet.
 pub async fn deliver(o: &Arc<Orchestrator>, task: &TaskRow, text: String) -> Result<Delivered> {
+    deliver_as(o, task, text, Origin::Other).await
+}
+
+/// Where a text handed to a task comes from: the owner's own words are always told why they
+/// cannot be delivered now, and the secretary counts the owner's turns (see
+/// `secretary::Turns`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Origin {
+    /// The owner wrote it (the text is what they wrote).
+    Owner(String),
+    /// The brain's note for the secretary.
+    Note,
+    /// A batch of third parties' messages.
+    Batch,
+    /// The daily digest request.
+    Digest,
+    /// Anything else, or several texts at once.
+    Other,
+}
+
+/// [`deliver`], saying where the text comes from.
+pub async fn deliver_as(
+    o: &Arc<Orchestrator>,
+    task: &TaskRow,
+    text: String,
+    origin: Origin,
+) -> Result<Delivered> {
     let lock = o.task_lock(&task.id);
     let _held = lock.lock().await;
     let task = o.task(&task.id).await?.context("task vanished")?;
@@ -888,8 +959,10 @@ pub async fn deliver(o: &Arc<Orchestrator>, task: &TaskRow, text: String) -> Res
                 text,
             },
         );
-        // One more message the run will answer with a turn of its own (see working).
+        // One more message the run will answer with a turn of its own (see working); recorded
+        // under the task's lock, so in the order the run receives them.
         o.working.message_sent(&task.id, run_id);
+        crate::secretary::turn_sent(o, &task.id, run_id, origin.clone());
         Ok(true)
     };
     if send(&task, text.clone())? {
@@ -902,7 +975,15 @@ pub async fn deliver(o: &Arc<Orchestrator>, task: &TaskRow, text: String) -> Res
     {
         let _ = o.chat.reopen_topic(topic).await;
     }
-    match dispatch_locked(o, &task, Some(text.clone()), task.session_id.clone()).await? {
+    match dispatch_locked(
+        o,
+        &task,
+        Some(text.clone()),
+        task.session_id.clone(),
+        &origin,
+    )
+    .await?
+    {
         Dispatched::Started => Ok(Delivered::ToRun),
         Dispatched::Waiting => Ok(Delivered::Queued),
         // Claimed by something that did not take the lock: hand the text to that run.
@@ -1010,10 +1091,90 @@ pub async fn dispatch_queued(o: &Arc<Orchestrator>) {
     }
 }
 
+/// How long the fleet's own sessions wait before a stuck one is tried again: at first, and at
+/// most (the wait doubles in between).
+const BUILTIN_RETRY_FIRST: std::time::Duration = std::time::Duration::from_secs(300);
+const BUILTIN_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(1800);
+
+/// Starts the fleet's own sessions (brain, secretary) that are stuck: not running, failed to
+/// start or queued for a node, with texts waiting for them. Nothing else would: ordinary tasks
+/// are started by the owner's messages and by `dispatch_queued`, but these get their texts from
+/// the fleet (reports, batches the secretary holds back while one waits). Tried every
+/// [`BUILTIN_RETRY_FIRST`], backing off to [`BUILTIN_RETRY_MAX`], and at once after a node
+/// connects or a node's settings change ([`retry_builtins_now`]).
+pub async fn retry_stuck_builtins(o: &Arc<Orchestrator>) -> Result<()> {
+    for id in [BRAIN_TASK, crate::model::SECRETARY_TASK] {
+        let Some(task) = o.task(id).await? else {
+            continue;
+        };
+        let waiting: bool = sqlx::query_scalar(
+            "select exists(select 1 from messages where task_id = $1 and from_agent is null and run_id is null)",
+        )
+        .bind(id)
+        .fetch_one(&o.db)
+        .await?;
+        let stuck = !task.running
+            && matches!(task.status.as_str(), status::FAILED | status::QUEUED)
+            && waiting;
+        let due = {
+            let mut retry = o.builtin_retry.lock().unwrap();
+            let now = std::time::Instant::now();
+            match retry.get_mut(id) {
+                _ if !stuck => {
+                    retry.remove(id);
+                    false
+                }
+                None => {
+                    retry.insert(
+                        id.to_owned(),
+                        (now + BUILTIN_RETRY_FIRST, BUILTIN_RETRY_FIRST),
+                    );
+                    false
+                }
+                Some((at, wait)) if now >= *at => {
+                    *wait = (*wait * 2).min(BUILTIN_RETRY_MAX);
+                    *at = now + *wait;
+                    true
+                }
+                Some(_) => false,
+            }
+        };
+        if !due {
+            continue;
+        }
+        let lock = o.task_lock(id);
+        let _held = lock.lock().await;
+        let task = o.task(id).await?.context("task vanished")?;
+        if task.running {
+            continue;
+        }
+        tracing::info!("trying {id} again: it is stuck with texts waiting");
+        let resume = task.session_id.clone();
+        dispatch_locked(o, &task, None, resume, &Origin::Other).await?;
+    }
+    Ok(())
+}
+
+/// The fleet's own stuck sessions are tried at the next round (a node connected, a node's
+/// settings changed: what kept them from starting may be fixed).
+pub fn retry_builtins_now(o: &Orchestrator) {
+    let mut retry = o.builtin_retry.lock().unwrap();
+    let now = std::time::Instant::now();
+    for id in [BRAIN_TASK, crate::model::SECRETARY_TASK] {
+        let wait = retry.get(id).map_or(BUILTIN_RETRY_FIRST, |(_, w)| *w);
+        retry.insert(id.to_owned(), (now, wait));
+    }
+}
 pub async fn to_brain(o: &Arc<Orchestrator>, text: String) -> Result<Delivered> {
+    to_brain_as(o, text, Origin::Other).await
+}
+
+/// [`to_brain`], saying where the text comes from (the owner's own messages are always told
+/// why the brain cannot take them now).
+pub async fn to_brain_as(o: &Arc<Orchestrator>, text: String, origin: Origin) -> Result<Delivered> {
     ensure_brain(o).await?;
     let task = o.task(BRAIN_TASK).await?.context("brain task missing")?;
-    deliver(o, &task, text).await
+    deliver_as(o, &task, text, origin).await
 }
 
 /// Text written by an agent (or reported by a node), framed for the brain: JSON-quoted, so it
@@ -1106,18 +1267,23 @@ mod tests {
 
     #[test]
     fn the_secretarys_first_turn_keeps_the_newest_texts() {
-        let t = |n: usize| "x".repeat(n);
-        assert_eq!(newest_within(vec![t(10), t(20)], 100), vec![t(10), t(20)]);
-        let out = newest_within(vec![t(50), t(40), t(30)], 75);
-        assert_eq!(out.len(), 3);
-        assert!(out[0].contains("1 earlier queued messages were left out"));
-        assert_eq!(out[1], t(40));
-        assert_eq!(out[2], t(30));
-        // One text bigger than everything is kept, clipped.
-        let out = newest_within(vec![t(500)], 100);
-        assert!(out.len() == 1 && out[0].len() <= 104);
+        let b = |n: usize| format!("[Inbox batch: {}", "x".repeat(n));
+        let owner = "[Message from the owner in the Inbox] hi".to_owned();
+        // Everything fits: all kept.
+        assert_eq!(
+            newest_within(vec![b(10), owner.clone(), b(20)], 1000),
+            vec![b(10), owner.clone(), b(20)]
+        );
+        // Too much: older batches go, the owner's text and the newest batch stay, whole.
+        let out = newest_within(vec![b(500), b(400), owner.clone(), b(300)], 400);
+        assert!(
+            out[0].contains("2 earlier batches were left out"),
+            "{out:?}"
+        );
+        assert_eq!(&out[1..], &[owner.clone(), b(300)][..]);
+        let out = newest_within(vec![b(500), owner.clone(), b(900)], 100);
+        assert_eq!(&out[1..], &[owner, b(900)][..], "never clipped");
     }
-
     #[test]
     fn widening_flags_keep_the_secretary_off_a_node() {
         let cmd = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();

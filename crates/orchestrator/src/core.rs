@@ -43,6 +43,9 @@ pub struct Orchestrator {
     loud_posts: std::sync::Mutex<HashMap<String, tokio::time::Instant>>,
     /// What the secretary's current run is answering, turn by turn (see `secretary::Turns`).
     pub secretary_turns: std::sync::Mutex<crate::secretary::Turns>,
+    /// The fleet's own sessions that are stuck: when each is tried next, and the wait after that
+    /// (see `tasks::retry_stuck_builtins`).
+    pub builtin_retry: std::sync::Mutex<HashMap<String, (std::time::Instant, std::time::Duration)>>,
 }
 
 /// How often one task may post with a sound (`fleet agent post --notify`).
@@ -79,6 +82,7 @@ impl Orchestrator {
             working: crate::working::Working::new(chat_for_working),
             loud_posts: Default::default(),
             secretary_turns: Default::default(),
+            builtin_retry: Default::default(),
         });
         // Weak, so the consumer does not keep the orchestrator alive; the channel closes with it.
         let weak = Arc::downgrade(&o);
@@ -305,6 +309,8 @@ impl Orchestrator {
 
     /// Sends a node how to start Claude. Called on connect and after edits in the web UI.
     pub async fn push_node_settings(&self, node_id: &str) -> Result<()> {
+        // New settings (a fixed Claude command, say) may let a stuck session of the fleet start.
+        crate::tasks::retry_builtins_now(self);
         let node = self.node(node_id).await?.context("unknown node")?;
         let auth = match (node.auth_mode.as_str(), &node.auth_secret) {
             ("oauth_token", Some(s)) => ClaudeAuth::OAuthToken(self.vault.decrypt(s)?),
@@ -342,8 +348,10 @@ impl Orchestrator {
         .fetch_all(&self.db)
         .await?;
         self.runs_lost(&ended, "its node no longer runs it").await;
-        // Capacity or projects may have changed: try queued work.
+        // Capacity or projects may have changed: try queued work, and the fleet's own sessions
+        // if they are stuck (what kept them from starting may be fixed now).
         crate::tasks::dispatch_queued(self).await;
+        crate::tasks::retry_builtins_now(self);
         Ok(())
     }
 
@@ -374,7 +382,9 @@ impl Orchestrator {
             }
             AgentEventKind::Session { session_id } => {
                 if current {
-                    sqlx::query("update tasks set session_id = $2 where id = $1")
+                    // Not for one of the fleet's own sessions stopped on purpose (a reset): its
+                    // next run starts fresh, even when the stopped run reports its session late.
+                    sqlx::query("update tasks set session_id = $2 where id = $1 and not (id in ('brain', 'secretary') and status = 'stopped')")
                         .bind(&task_id)
                         .bind(&session_id)
                         .execute(&self.db)

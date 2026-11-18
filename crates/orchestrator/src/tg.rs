@@ -453,7 +453,12 @@ pub(crate) async fn owner_message(o: &Arc<Orchestrator>, msg: &Message) -> Resul
             o.show_working(msg.message_id, From::Orchestrator, None, BRAIN_TASK);
             (
                 BRAIN_TASK.to_owned(),
-                tasks::to_brain(o, format!("[Message from the owner] {text}")).await,
+                tasks::to_brain_as(
+                    o,
+                    format!("[Message from the owner] {text}"),
+                    tasks::Origin::Owner(text.to_owned()),
+                )
+                .await,
             )
         }
         // The Inbox topic is the secretary's.
@@ -469,8 +474,13 @@ pub(crate) async fn owner_message(o: &Arc<Orchestrator>, msg: &Message) -> Resul
                 Some(task) => {
                     let from = o.task_sender(&task).await;
                     o.show_working(msg.message_id, from, Some(t), &task.id);
-                    let r =
-                        tasks::deliver(o, &task, format!("[Message from the human] {text}")).await;
+                    let r = tasks::deliver_as(
+                        o,
+                        &task,
+                        format!("[Message from the human] {text}"),
+                        tasks::Origin::Owner(text.to_owned()),
+                    )
+                    .await;
                     (task.id, r)
                 }
                 // Human and feed topics only take replies to specific items.
