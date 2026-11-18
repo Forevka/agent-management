@@ -269,6 +269,16 @@ async fn node_restart_resets_the_stream() {
     for i in 0..5 {
         assert_eq!(next_message(&mut node_rx).await, text(i));
     }
+    // The node acks asynchronously, after handing a message on. Wait for the acks, so m0-m4
+    // count as handled by the old process: anything still unacked when a node restarts is
+    // rightly replayed to the new process, which would come before m5 here.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while server.pending(key.public()) > 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the node acks what it received");
     run.abort();
     ep.close().await;
     // Queued while the node process is gone.
