@@ -1308,8 +1308,10 @@ async fn secretary_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeCha
     let dave_msg = dave_todo.tg_msg.expect("the todo is posted");
 
     // Outside the owner's turn, a draft is refused outright: a third-party message, or the
-    // brain, or a retry, can never start one.
-    let refused = call_as(
+    // brain, or a retry, can never start one. Called this way (direct, bypassing the node's
+    // IPC), a failed tool call is a genuine `Err`, not an `Ok(ToolResult{ok:false,..})`: that
+    // wrapping belongs to the IPC layer, which `call_as` does not go through.
+    let err = call_as(
         o,
         SECRETARY_AGENT,
         SECRETARY_TASK,
@@ -1317,13 +1319,10 @@ async fn secretary_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeCha
         json!({"ref": dave_todo.refs[0], "text": "x"}),
     )
     .await
-    .unwrap()
-    .unwrap();
-    assert!(!refused.ok, "{refused:?}");
+    .unwrap_err();
     assert!(
-        refused.result.contains("only when the owner asks for one"),
-        "{}",
-        refused.result
+        err.to_string().contains("only when the owner asks for one"),
+        "{err:#}"
     );
 
     // The owner replies to the todo about shipping: the secretary drafts, but nothing can post
