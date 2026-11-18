@@ -196,8 +196,16 @@ if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
 Stop-FleetNode
 
 New-Item -ItemType Directory -Force -Path $InstallDir, $DataDir, $LogDir | Out-Null
-Copy-Item -Force $FleetExe $ExePath
-if ($TrayExe) { Copy-Item -Force $TrayExe $TrayPath }
+# Re-running the installer with the installed files as the source (to re-register the
+# task, say) must not fail on copying a file onto itself.
+function Copy-IfOther($From, $To) {
+    $src = (Resolve-Path -LiteralPath $From).ProviderPath
+    if (-not ((Test-Path -LiteralPath $To) -and ($src -ieq (Resolve-Path -LiteralPath $To).ProviderPath))) {
+        Copy-Item -Force -LiteralPath $src $To
+    }
+}
+Copy-IfOther $FleetExe $ExePath
+if ($TrayExe) { Copy-IfOther $TrayExe $TrayPath }
 
 [Environment]::SetEnvironmentVariable('FLEET_DATA_DIR', $DataDir, 'User')
 if ($Relay) { [Environment]::SetEnvironmentVariable('FLEET_RELAY', $Relay, 'User') }
