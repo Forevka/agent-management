@@ -18,6 +18,7 @@ use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use serde_json::{Value, json};
 
 use crate::{
+    admin::{self, Actor, AdminAction, Ref},
     chat::{clip, esc},
     core::Orchestrator,
     human::{self, Answer},
@@ -342,11 +343,12 @@ async fn dashboard(State(o): State<O>, h: HeaderMap) -> Response {
     }
 }
 
-fn item_summary(i: &HumanItemRow) -> String {
+pub(crate) fn item_summary(i: &HumanItemRow) -> String {
     let p = &i.payload.0;
     p["question"]
         .as_str()
         .or(p["title"].as_str())
+        .or(p["summary"].as_str())
         .or(p["text"].as_str())
         .or(p["tool_name"].as_str())
         .map(str::to_owned)
@@ -495,6 +497,17 @@ async fn render_item(o: &Orchestrator, id: i64) -> Result<(String, String)> {
                     esc(p["context"].as_str().unwrap_or_default())
                 ));
             }
+            "admin_change" => {
+                s.push_str(&format!(
+                    "<div class=card>The orchestrator asks to change the fleet:<p><b>{}</b></p>{}<details><summary class=muted>Exact change</summary><pre>{}</pre></details></div><div class=row><button class=primary name=action value=accept>Approve</button><button name=action value=dismiss>Reject</button></div>",
+                    esc(p["summary"].as_str().unwrap_or_default()),
+                    p["note"]
+                        .as_str()
+                        .map(|n| format!("<p class=muted>Orchestrator's note (its own words): {}</p>", esc(n)))
+                        .unwrap_or_default(),
+                    esc(&serde_json::to_string_pretty(&p["action"])?)
+                ));
+            }
             _ => {}
         }
     }
@@ -571,8 +584,16 @@ async fn item_post(
             }
             ("permission", "allow") => Some((item.id, Answer::Allow)),
             ("permission", _) => Some((item.id, Answer::Deny)),
-            ("task_proposal" | "slack_reply", "accept") => Some((item.id, Answer::Accept)),
-            ("task_proposal" | "slack_reply", _) => Some((item.id, Answer::Dismiss)),
+            ("task_proposal" | "slack_reply" | "admin_change", "accept") => {
+                Some((item.id, Answer::Accept))
+            }
+            ("task_proposal" | "slack_reply" | "admin_change", "dismiss") => {
+                Some((item.id, Answer::Dismiss))
+            }
+            // A decision is only ever taken on the button that says it.
+            ("task_proposal" | "slack_reply" | "admin_change", other) => {
+                anyhow::bail!("unknown action {other:?}")
+            }
             // Questions were handled above.
             _ => None,
         };
@@ -736,21 +757,12 @@ async fn projects_post(State(o): State<O>, h: HeaderMap, RawForm(body): RawForm)
     let f = form(&body);
     let r: Result<String> = async {
         let slug = field(&f, "slug").unwrap_or_default().trim().to_owned();
-        if slug.is_empty()
-            || slug.len() > 40
-            || !slug
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-        {
-            anyhow::bail!("invalid slug");
-        }
-        sqlx::query("insert into projects (slug, name, description) values ($1, $2, $3)")
-            .bind(&slug)
-            .bind(field(&f, "name").unwrap_or(&slug))
-            .bind(field(&f, "description").unwrap_or_default())
-            .execute(&o.db)
-            .await
-            .context("a project with this slug exists")?;
+        let action = AdminAction::ProjectCreate {
+            slug: slug.clone(),
+            name: field(&f, "name").map(str::to_owned),
+            description: field(&f, "description").unwrap_or_default().to_owned(),
+        };
+        admin::execute(&o, Actor::Owner, &action).await?;
         Ok(slug)
     }
     .await;
@@ -827,42 +839,30 @@ async fn project_post(
     require!(o, h);
     let f = form(&body);
     let r: Result<()> = async {
-        match field(&f, "op").unwrap_or_default() {
-            "edit" => {
-                sqlx::query("update projects set name = $2, description = $3 where slug = $1")
-                    .bind(&slug)
-                    .bind(field(&f, "name").unwrap_or(&slug))
-                    .bind(field(&f, "description").unwrap_or_default())
-                    .execute(&o.db)
-                    .await?;
-                sqlx::query("delete from project_secrets where project = $1").bind(&slug).execute(&o.db).await?;
-                for id in fields(&f, "folder") {
-                    sqlx::query("insert into project_secrets (project, folder_id) values ($1, $2)").bind(&slug).bind(id.parse::<i64>()?).execute(&o.db).await?;
-                }
-            }
-            "channel" => {
-                let ch = field(&f, "channel").unwrap_or_default().trim().to_owned();
-                anyhow::ensure!(!ch.is_empty(), "channel id required");
-                sqlx::query(
-                    "insert into feed_channels (source, channel_id, project, triage) values ('slack', $1, $2, $3)
-                     on conflict (source, channel_id) do update set project = $2, triage = $3",
-                )
-                .bind(&ch)
-                .bind(&slug)
-                .bind(field(&f, "triage").is_some())
-                .execute(&o.db)
-                .await?;
-            }
-            "unchannel" => {
-                sqlx::query("delete from feed_channels where source = 'slack' and channel_id = $1 and project = $2")
-                    .bind(field(&f, "channel").unwrap_or_default())
-                    .bind(&slug)
-                    .execute(&o.db)
-                    .await?;
-            }
+        let action = match field(&f, "op").unwrap_or_default() {
+            "edit" => AdminAction::ProjectEdit {
+                slug: slug.clone(),
+                name: Some(field(&f, "name").unwrap_or(&slug).to_owned()),
+                description: Some(field(&f, "description").unwrap_or_default().to_owned()),
+                folders: Some(
+                    fields(&f, "folder")
+                        .into_iter()
+                        .map(str::parse)
+                        .collect::<Result<_, _>>()?,
+                ),
+            },
+            "channel" => AdminAction::ChannelAdd {
+                project: slug.clone(),
+                channel: field(&f, "channel").unwrap_or_default().to_owned(),
+                triage: field(&f, "triage").is_some(),
+            },
+            "unchannel" => AdminAction::ChannelRemove {
+                project: slug.clone(),
+                channel: field(&f, "channel").unwrap_or_default().to_owned(),
+            },
             _ => anyhow::bail!("unknown operation"),
-        }
-        o.audit("owner", "project.edit", json!({"project": slug})).await;
+        };
+        admin::execute(&o, Actor::Owner, &action).await?;
         Ok(())
     }
     .await;
@@ -873,16 +873,6 @@ async fn project_post(
 }
 
 // ---------------------------------------------------------------- secrets
-
-/// Field presets; any folder can still hold any keys.
-const PRESETS: &[(&str, &[&str])] = &[
-    ("custom", &[]),
-    ("jira", &["JIRA_URL", "JIRA_EMAIL", "JIRA_API_TOKEN"]),
-    ("github", &["GITHUB_TOKEN"]),
-    ("gitlab", &["GITLAB_URL", "GITLAB_TOKEN"]),
-    ("slack", &["SLACK_USER_TOKEN"]),
-    ("ssh", &["SSH_HOST", "SSH_USER", "SSH_PRIVATE_KEY"]),
-];
 
 async fn secrets_page(State(o): State<O>, h: HeaderMap) -> Response {
     require!(o, h);
@@ -901,7 +891,7 @@ async fn secrets_page(State(o): State<O>, h: HeaderMap) -> Response {
             esc(&preset)
         ));
     }
-    let opts: String = PRESETS
+    let opts: String = admin::PRESETS
         .iter()
         .map(|(p, _)| format!("<option>{p}</option>"))
         .collect();
@@ -914,22 +904,12 @@ async fn secrets_page(State(o): State<O>, h: HeaderMap) -> Response {
 async fn secrets_post(State(o): State<O>, h: HeaderMap, RawForm(body): RawForm) -> Response {
     require!(o, h);
     let f = form(&body);
-    let r: Result<i64> = async {
-        let name = field(&f, "name").unwrap_or_default().trim();
-        anyhow::ensure!(!name.is_empty(), "name required");
-        let preset = field(&f, "preset").unwrap_or("custom");
-        let id: i64 = sqlx::query_scalar(
-            "insert into secret_folders (name, preset) values ($1, $2) returning id",
-        )
-        .bind(name)
-        .bind(preset)
-        .fetch_one(&o.db)
-        .await
-        .context("a folder with this name exists")?;
-        o.audit("owner", "secrets.folder.create", json!({"folder": name}))
-            .await;
-        Ok(id)
-    }
+    let r: Result<i64> = admin::create_folder(
+        &o,
+        Actor::Owner,
+        field(&f, "name").unwrap_or_default(),
+        field(&f, "preset").unwrap_or("custom"),
+    )
     .await;
     match r {
         Ok(id) => Redirect::to(&format!("/secrets/{id}")).into_response(),
@@ -950,7 +930,7 @@ async fn secret_page(State(o): State<O>, h: HeaderMap, Path(id): Path<i64>) -> R
             ));
         }
         s.push_str("</table><h2>Set a value</h2>");
-        let suggested: Vec<&str> = PRESETS.iter().find(|(p, _)| *p == preset).map(|(_, k)| k.to_vec()).unwrap_or_default();
+        let suggested: Vec<&str> = admin::PRESETS.iter().find(|(p, _)| *p == preset).map(|(_, k)| k.to_vec()).unwrap_or_default();
         let missing: Vec<&&str> = suggested.iter().filter(|k| !keys.iter().any(|x| x == **k)).collect();
         if !missing.is_empty() {
             s.push_str(&format!("<p class=muted>Preset keys not set yet: {}</p>", missing.iter().map(|k| format!("<code>{k}</code>")).collect::<Vec<_>>().join(", ")));
@@ -981,25 +961,30 @@ async fn secret_post(
         let key = field(&f, "key").unwrap_or_default().trim().to_owned();
         match field(&f, "op").unwrap_or_default() {
             "set" => {
-                anyhow::ensure!(!key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'), "invalid key");
-                let value = field(&f, "value").unwrap_or_default().replace("\r\n", "\n");
-                sqlx::query("insert into secret_items (folder_id, key, value) values ($1, $2, $3) on conflict (folder_id, key) do update set value = $3")
-                    .bind(id)
-                    .bind(&key)
-                    .bind(o.vault.encrypt(value.trim_end_matches('\n')))
-                    .execute(&o.db)
-                    .await?;
-                o.audit("owner", "secrets.set", json!({"folder": id, "key": key})).await;
+                admin::set_secret(&o, id, &key, field(&f, "value").unwrap_or_default()).await?;
                 Ok(false)
             }
             "unset" => {
-                sqlx::query("delete from secret_items where folder_id = $1 and key = $2").bind(id).bind(&key).execute(&o.db).await?;
-                o.audit("owner", "secrets.unset", json!({"folder": id, "key": key})).await;
+                admin::execute(
+                    &o,
+                    Actor::Owner,
+                    &AdminAction::SecretUnset {
+                        folder: Ref::Id(id),
+                        key,
+                    },
+                )
+                .await?;
                 Ok(false)
             }
             "delete" => {
-                sqlx::query("delete from secret_folders where id = $1").bind(id).execute(&o.db).await?;
-                o.audit("owner", "secrets.folder.delete", json!({"folder": id})).await;
+                admin::execute(
+                    &o,
+                    Actor::Owner,
+                    &AdminAction::FolderDelete {
+                        folder: Ref::Id(id),
+                    },
+                )
+                .await?;
                 Ok(true)
             }
             _ => anyhow::bail!("unknown operation"),
@@ -1098,43 +1083,59 @@ async fn node_post(
 ) -> Response {
     require!(o, h);
     let f = form(&body);
-    let r: Result<bool> = async {
+    // (revoked, push error)
+    let r: Result<(bool, Option<String>)> = async {
         match field(&f, "op").unwrap_or_default() {
             "save" => {
-                let command: Vec<String> = field(&f, "command").unwrap_or("claude").lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned).collect();
-                anyhow::ensure!(!command.is_empty(), "the command needs at least the program");
-                let mode = field(&f, "auth_mode").unwrap_or("default");
-                anyhow::ensure!(matches!(mode, "default" | "oauth_token" | "api_key"), "bad auth mode");
-                let max: i32 = field(&f, "max_agents").unwrap_or("4").parse().context("max agents must be a number")?;
-                sqlx::query("update nodes set claude_command = $2, auth_mode = $3, max_agents = $4 where id = $1")
-                    .bind(&id)
-                    .bind(sqlx::types::Json(&command))
-                    .bind(mode)
-                    .bind(max.clamp(1, 64))
-                    .execute(&o.db)
-                    .await?;
-                if let Some(secret) = field(&f, "auth_secret").map(str::trim).filter(|s| !s.is_empty()) {
-                    sqlx::query("update nodes set auth_secret = $2 where id = $1").bind(&id).bind(o.vault.encrypt(secret)).execute(&o.db).await?;
-                }
-                o.audit("owner", "node.settings", json!({"node": id, "auth_mode": mode})).await;
-                o.push_node_settings(&id).await?;
-                Ok(false)
+                let max: i32 = field(&f, "max_agents")
+                    .unwrap_or("4")
+                    .parse()
+                    .context("max agents must be a number")?;
+                let command: Vec<String> = field(&f, "command")
+                    .unwrap_or("claude")
+                    .lines()
+                    .map(str::to_owned)
+                    .collect();
+                // The token or key is web-only, so it is not part of the shared action; it is
+                // saved together with the settings, which are validated first.
+                let saved = admin::save_node_settings(
+                    &o,
+                    Actor::Owner,
+                    &id,
+                    Some(&command),
+                    Some(field(&f, "auth_mode").unwrap_or("default")),
+                    Some(max),
+                    field(&f, "auth_secret")
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty()),
+                )
+                .await?;
+                Ok((false, saved.push_error))
             }
             "revoke" => {
-                if let Ok(node) = id.parse() {
-                    o.server.disconnect(node);
-                }
-                sqlx::query("delete from nodes where id = $1").bind(&id).execute(&o.db).await?;
-                o.audit("owner", "node.revoke", json!({"node": id})).await;
-                Ok(true)
+                admin::execute(
+                    &o,
+                    Actor::Owner,
+                    &AdminAction::NodeRevoke { node: id.clone() },
+                )
+                .await?;
+                Ok((true, None))
             }
             _ => anyhow::bail!("unknown operation"),
         }
     }
     .await;
     match r {
-        Ok(true) => Redirect::to("/nodes").into_response(),
-        Ok(false) => Redirect::to(&format!("/nodes/{id}")).into_response(),
+        Ok((true, _)) => Redirect::to("/nodes").into_response(),
+        Ok((false, None)) => Redirect::to(&format!("/nodes/{id}")).into_response(),
+        Ok((false, Some(e))) => page(
+            "Saved, not pushed",
+            &format!(
+                "<div class=card>The settings are saved, but sending them to the node failed:<pre>{}</pre>The node gets them when it next connects.</div><p><a href=\"/nodes/{}\">Back to the node</a></p>",
+                esc(&e),
+                esc(&id)
+            ),
+        ),
         Err(e) => err_page(e),
     }
 }
@@ -1194,27 +1195,15 @@ async fn agents_post(State(o): State<O>, h: HeaderMap, RawForm(body): RawForm) -
     let f = form(&body);
     let r: Result<()> = async {
         match field(&f, "op").unwrap_or_default() {
-            "add" => {
-                let token = field(&f, "token").unwrap_or_default().trim().to_owned();
-                let (tg_id, username) = o.chat.inspect_bot(&token).await?;
-                let id: i64 = sqlx::query_scalar(
-                    "insert into bots (token, tg_user_id, username) values ($1, $2, $3)
-                     on conflict (tg_user_id) do update set token = $1, username = $3 returning id",
-                )
-                .bind(o.vault.encrypt(&token))
-                .bind(tg_id)
-                .bind(&username)
-                .fetch_one(&o.db)
-                .await?;
-                o.chat.add_bot(id, &token).await?;
-                o.audit("owner", "bot.add", json!({"bot": username})).await;
-            }
+            "add" => admin::add_bot(&o, field(&f, "token").unwrap_or_default()).await?,
             "delete" => {
                 let id: i64 = field(&f, "id").unwrap_or_default().parse()?;
-                sqlx::query("delete from bots where id = $1 and agent_id is null")
-                    .bind(id)
-                    .execute(&o.db)
-                    .await?;
+                admin::execute(
+                    &o,
+                    Actor::Owner,
+                    &AdminAction::BotRemove { bot: Ref::Id(id) },
+                )
+                .await?;
             }
             _ => anyhow::bail!("unknown operation"),
         }

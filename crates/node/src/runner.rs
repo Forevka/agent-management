@@ -18,7 +18,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use fleet_proto::{AgentEventKind, ClaudeAuth, SpawnAgent};
+use fleet_proto::{AgentEventKind, ClaudeAuth, SpawnAgent, redact::redact_secrets};
 use serde_json::json;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -36,8 +36,6 @@ const MAX_LINE: usize = 512 * 1024;
 const MCP_TOOL_TIMEOUT_MS: &str = "604800000";
 /// After a graceful stop, how long Claude may take to finish its turn before it is killed.
 const GRACEFUL_STOP_LIMIT: Duration = Duration::from_secs(600);
-/// Secret values shorter than this are not redacted from output: they would match too much.
-const MIN_REDACT_LEN: usize = 6;
 
 /// How long a session may sit idle after finishing a turn before the node closes it.
 fn idle_exit() -> Duration {
@@ -120,9 +118,11 @@ impl AgentHandle {
     }
 }
 
-/// The full command line for a spawn, separated out so it can be tested without a process.
+/// The fleet's arguments for a spawn, which follow the node's own `base_args` (the rest of its
+/// configured Claude command); separated out so it can be tested without a process.
 pub fn build_args(
     spawn: &SpawnAgent,
+    base_args: &[String],
     mcp_config: &Path,
     plugin_dir: &Path,
     system_prompt: Option<&Path>,
@@ -146,7 +146,12 @@ pub fn build_args(
     .iter()
     .map(|s| s.to_string())
     .collect();
-    if let Some(model) = &spawn.model {
+    // A model set in the node's command wins over the fleet's default: the last `--model` would
+    // otherwise be ours, and the node's setting would do nothing.
+    let node_sets_model = base_args
+        .iter()
+        .any(|a| a == "--model" || a.starts_with("--model="));
+    if let Some(model) = spawn.model.as_ref().filter(|_| !node_sets_model) {
         args.extend(["--model".into(), model.clone()]);
     }
     // A file rather than an argument: multi-line arguments do not survive Windows batch
@@ -220,7 +225,6 @@ pub fn start(
             .secret_files
             .iter()
             .flat_map(|f| secrets::parse_env(&f.content).into_values())
-            .filter(|v| v.len() >= MIN_REDACT_LEN)
             .collect(),
     );
     let plugin_dir = crate::skill::write_plugin(data_dir, &role)?;
@@ -236,6 +240,7 @@ pub fn start(
     cmd.args(base_args)
         .args(build_args(
             &spawn,
+            base_args,
             &mcp_path,
             &plugin_dir,
             system_path.as_deref(),
@@ -545,22 +550,6 @@ fn is_noise(line: &str) -> bool {
     }
 }
 
-/// Keeps secret values the session read (e.g. through `fleet secret get`) out of the
-/// transcript stored on the orchestrator.
-fn redact_secrets(line: &mut String, values: &[String]) {
-    for v in values {
-        if line.contains(v.as_str()) {
-            *line = line.replace(v.as_str(), "[secret]");
-        }
-        // The value as it appears inside a JSON string (escaped quotes, backslashes, newlines).
-        let escaped = serde_json::to_string(v).unwrap_or_default();
-        let escaped = escaped.trim_matches('"');
-        if escaped != v && line.contains(escaped) {
-            *line = line.replace(escaped, "[secret]");
-        }
-    }
-}
-
 fn truncate(line: &mut String) {
     if line.len() > MAX_LINE {
         let mut cut = MAX_LINE;
@@ -625,6 +614,7 @@ mod tests {
     fn args_cover_headless_contract() {
         let args = build_args(
             &spawn(),
+            &[],
             Path::new("/tmp/m.json"),
             Path::new("/tmp/plugin"),
             Some(Path::new("/tmp/sys.md")),
@@ -648,6 +638,29 @@ mod tests {
             !args.iter().any(|a| a.contains('\n')),
             "no multi-line arguments"
         );
+    }
+
+    #[test]
+    fn a_model_in_the_node_command_wins() {
+        for base in [
+            vec!["--model".to_owned(), "sonnet".to_owned()],
+            vec!["--model=sonnet".to_owned()],
+        ] {
+            let args = build_args(&spawn(), &base, Path::new("/m"), Path::new("/p"), None);
+            assert!(
+                !args.iter().any(|a| a == "--model"),
+                "fleet default skipped: {args:?}"
+            );
+        }
+        // Without one, the fleet's default model is passed.
+        let args = build_args(
+            &spawn(),
+            &["--add-dir".into(), "x".into()],
+            Path::new("/m"),
+            Path::new("/p"),
+            None,
+        );
+        assert!(args.join(" ").contains("--model opus"));
     }
 
     #[test]
@@ -687,16 +700,5 @@ mod tests {
         assert!(is_turn_result(
             r#"{"type": "result", "subtype": "success"}"#
         ));
-    }
-
-    #[test]
-    fn secrets_are_redacted_raw_and_json_escaped() {
-        let values = vec!["hunter22".to_owned(), "line1\nline2\"q".to_owned()];
-        let mut a = "token is hunter22!".to_owned();
-        redact_secrets(&mut a, &values);
-        assert_eq!(a, "token is [secret]!");
-        let mut b = serde_json::json!({"out": "key: line1\nline2\"q"}).to_string();
-        redact_secrets(&mut b, &values);
-        assert!(!b.contains("line1"), "{b}");
     }
 }

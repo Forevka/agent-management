@@ -93,6 +93,104 @@ pub enum AgentCmd {
     },
     /// Reply to the human in Telegram's General topic.
     Reply { text: String },
+    /// Administer the fleet: reads run at once, every change waits for the owner's approval.
+    Admin(AdminArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct AdminArgs {
+    #[command(subcommand)]
+    pub cmd: AdminCmd,
+    /// Why you propose the change; shown to the owner as your note ("-" reads it from stdin).
+    #[arg(long, global = true)]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AdminCmd {
+    /// Read the fleet's setup: projects, project <slug>, agents [project], bots, nodes,
+    /// node <id|name>, secrets, secret <folder>, status, items. Never shows secret values.
+    Show {
+        what: String,
+        target: Option<String>,
+    },
+    /// Propose a new project.
+    ProjectCreate {
+        slug: String,
+        #[arg(long)]
+        name: Option<String>,
+        /// What the project is ("-" reads it from stdin).
+        #[arg(long, default_value = "")]
+        description: String,
+    },
+    /// Propose a new name or description for a project.
+    ProjectEdit {
+        slug: String,
+        #[arg(long)]
+        name: Option<String>,
+        /// "-" reads it from stdin.
+        #[arg(long)]
+        description: Option<String>,
+    },
+    /// Propose giving a project's agents a secret folder (by name or id).
+    ProjectBind { project: String, folder: String },
+    /// Propose taking a secret folder away from a project.
+    ProjectUnbind { project: String, folder: String },
+    /// Propose mirroring a Slack channel (its id, e.g. C0123ABCD) into a project.
+    ChannelAdd {
+        project: String,
+        channel: String,
+        /// Show new messages to the orchestrator, which may propose tasks or replies.
+        #[arg(long)]
+        triage: bool,
+    },
+    /// Propose removing a Slack channel from a project.
+    ChannelRemove { project: String, channel: String },
+    /// Propose renaming an agent (its bot's Telegram name follows).
+    AgentRename { agent: String, name: String },
+    /// Propose giving an agent's bot back to the pool.
+    AgentUnbind { agent: String },
+    /// Propose removing an agent that has no active tasks.
+    AgentRemove { agent: String },
+    /// Propose removing a free bot from the pool.
+    BotRemove { bot: String },
+    /// Propose new settings for a node. Tokens and API keys are set on the web only.
+    /// The rest of the Claude command (program, other arguments) is set on the web only.
+    NodeSet {
+        node: String,
+        /// Set Claude's --model ("" removes it).
+        #[arg(long)]
+        model: Option<String>,
+        /// Set Claude's --fallback-model ("" removes it).
+        #[arg(long)]
+        fallback_model: Option<String>,
+        /// default (Claude's own login), oauth_token or api_key.
+        #[arg(long)]
+        auth: Option<String>,
+        #[arg(long)]
+        max_agents: Option<i32>,
+    },
+    /// Propose revoking a node (it must be invited again to rejoin).
+    NodeRevoke { node: String },
+    /// Propose an empty secret folder; the owner sets its values on the web.
+    FolderCreate {
+        name: String,
+        /// custom, jira, github, gitlab, slack or ssh.
+        #[arg(long)]
+        preset: Option<String>,
+    },
+    /// Propose deleting a secret folder and its values.
+    FolderDelete { folder: String },
+    /// Propose deleting one key's value from a secret folder.
+    SecretUnset { folder: String, key: String },
+    /// Send the owner a login link to a web page, e.g. to enter a token or secret value there
+    /// (/agents, /secrets/<id>, /nodes/<id>, /projects/<slug>). You do not get the link.
+    Link {
+        page: String,
+        /// One line telling the owner what to do there.
+        #[arg(long)]
+        text: Option<String>,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -283,7 +381,103 @@ pub fn to_call(cmd: AgentCmd) -> Result<(&'static str, Value)> {
             json!({"channel_id": channel, "thread_id": thread, "text": stdin_if_dash(text)?, "context": context}),
         ),
         AgentCmd::Reply { text } => ("reply_owner", json!({"text": stdin_if_dash(text)?})),
+        AgentCmd::Admin(a) => admin_call(a)?,
     })
+}
+
+/// `fleet agent admin ...`: reads become `admin_read`, the link `web_link`, and every change an
+/// `admin_propose` with the action name and its parameters, which the orchestrator validates.
+fn admin_call(a: AdminArgs) -> Result<(&'static str, Value)> {
+    // stdin can be read once: only one of the texts can come from it.
+    let description_from_stdin = matches!(
+        &a.cmd,
+        AdminCmd::ProjectCreate { description, .. } if description == "-"
+    ) || matches!(
+        &a.cmd,
+        AdminCmd::ProjectEdit { description: Some(d), .. } if d == "-"
+    );
+    if description_from_stdin && a.note.as_deref() == Some("-") {
+        bail!("only one of --note and --description can be \"-\" (read from stdin)");
+    }
+    let propose = |action: &str, params: Value| -> Result<(&'static str, Value)> {
+        let note = a.note.clone().map(stdin_if_dash).transpose()?;
+        Ok((
+            "admin_propose",
+            json!({"action": action, "params": params, "note": note}),
+        ))
+    };
+    match a.cmd {
+        AdminCmd::Show { what, target } => {
+            Ok(("admin_read", json!({"what": what, "target": target})))
+        }
+        AdminCmd::Link { page, text } => Ok(("web_link", json!({"page": page, "text": text}))),
+        AdminCmd::ProjectCreate {
+            slug,
+            name,
+            description,
+        } => propose(
+            "project_create",
+            json!({"slug": slug, "name": name, "description": stdin_if_dash(description)?}),
+        ),
+        AdminCmd::ProjectEdit {
+            slug,
+            name,
+            description,
+        } => propose(
+            "project_edit",
+            json!({"slug": slug, "name": name, "description": description.map(stdin_if_dash).transpose()?}),
+        ),
+        AdminCmd::ProjectBind { project, folder } => propose(
+            "project_bind_folder",
+            json!({"project": project, "folder": folder}),
+        ),
+        AdminCmd::ProjectUnbind { project, folder } => propose(
+            "project_unbind_folder",
+            json!({"project": project, "folder": folder}),
+        ),
+        AdminCmd::ChannelAdd {
+            project,
+            channel,
+            triage,
+        } => propose(
+            "channel_add",
+            json!({"project": project, "channel": channel, "triage": triage}),
+        ),
+        AdminCmd::ChannelRemove { project, channel } => propose(
+            "channel_remove",
+            json!({"project": project, "channel": channel}),
+        ),
+        AdminCmd::AgentRename { agent, name } => {
+            propose("agent_rename", json!({"agent": agent, "name": name}))
+        }
+        AdminCmd::AgentUnbind { agent } => propose("agent_unbind", json!({"agent": agent})),
+        AdminCmd::AgentRemove { agent } => propose("agent_remove", json!({"agent": agent})),
+        AdminCmd::BotRemove { bot } => propose("bot_remove", json!({"bot": bot})),
+        AdminCmd::NodeSet {
+            node,
+            model,
+            fallback_model,
+            auth,
+            max_agents,
+        } => propose(
+            "node_settings",
+            json!({
+                "node": node,
+                "model": model,
+                "fallback_model": fallback_model,
+                "auth_mode": auth,
+                "max_agents": max_agents,
+            }),
+        ),
+        AdminCmd::NodeRevoke { node } => propose("node_revoke", json!({"node": node})),
+        AdminCmd::FolderCreate { name, preset } => {
+            propose("folder_create", json!({"name": name, "preset": preset}))
+        }
+        AdminCmd::FolderDelete { folder } => propose("folder_delete", json!({"folder": folder})),
+        AdminCmd::SecretUnset { folder, key } => {
+            propose("secret_unset", json!({"folder": folder, "key": key}))
+        }
+    }
 }
 
 /// Long texts (briefs, summaries) are easiest to pass through a heredoc on stdin.
@@ -380,6 +574,61 @@ mod tests {
             ("create_task", json!("tester"))
         );
         assert_eq!(call(&["feed", "search", "bug"]).0, "feed_search");
+        assert_eq!(
+            call(&["admin", "show", "project", "demo"]),
+            ("admin_read", json!({"what": "project", "target": "demo"}))
+        );
+        assert_eq!(
+            call(&[
+                "admin",
+                "channel-add",
+                "demo",
+                "C01",
+                "--triage",
+                "--note",
+                "asked"
+            ]),
+            (
+                "admin_propose",
+                json!({"action": "channel_add", "params": {"project": "demo", "channel": "C01", "triage": true}, "note": "asked"})
+            )
+        );
+        let (t, a) = call(&[
+            "admin",
+            "node-set",
+            "pc",
+            "--model",
+            "opus",
+            "--max-agents",
+            "2",
+        ]);
+        assert_eq!(
+            (t, a["params"].clone()),
+            (
+                "admin_propose",
+                json!({"node": "pc", "model": "opus", "fallback_model": null, "auth_mode": null, "max_agents": 2})
+            )
+        );
+        // The whole command is not the brain's to set, nor --verbose (the node always passes it).
+        assert!(T::try_parse_from(["t", "admin", "node-set", "pc", "--command", "sh"]).is_err());
+        assert!(T::try_parse_from(["t", "admin", "node-set", "pc", "--verbose", "false"]).is_err());
+        // stdin is read once.
+        let both = T::try_parse_from([
+            "t",
+            "admin",
+            "project-create",
+            "web",
+            "--description",
+            "-",
+            "--note",
+            "-",
+        ])
+        .unwrap();
+        assert!(to_call(both.cmd).is_err());
+        assert_eq!(
+            call(&["admin", "link", "/secrets/3"]),
+            ("web_link", json!({"page": "/secrets/3", "text": null}))
+        );
         assert!(
             T::try_parse_from([
                 "t",

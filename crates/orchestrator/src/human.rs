@@ -7,6 +7,8 @@
 //!   AskUserQuestion, other tools). The agent's tool call is blocked until answered; the
 //!   answer is sent back to the node as the tool result.
 //! - `task_proposal`, `slack_reply`: suggestions from the brain, applied only on approval.
+//! - `admin_change`: a change to the fleet's configuration proposed by the brain (see
+//!   `admin.rs`). It runs only when the owner approves, and the outcome goes back to the brain.
 
 use std::sync::Arc;
 
@@ -189,6 +191,25 @@ async fn announce(o: &Orchestrator, row: &HumanItemRow, task: Option<&TaskRow>) 
             vec![vec![
                 Button::callback("Send", format!("x|{}|y", row.id)),
                 Button::callback("Dismiss", format!("x|{}|n", row.id)),
+            ]],
+        ),
+        "admin_change" => (
+            format!(
+                "🛠 <b>Q-{}</b> The orchestrator asks to change the fleet:\n<b>{}</b>{}\n<i>Tap a button, or reply yes / no. Any other reply rejects it, with your words as the reason.</i>",
+                row.id,
+                esc(p["summary"].as_str().unwrap_or_default()),
+                // The summary is ours; the note is the brain's own words, so it is labelled.
+                p["note"]
+                    .as_str()
+                    .map(|n| format!(
+                        "\n<i>Orchestrator's note (its own words):</i> {}",
+                        esc(&clip(n, 500))
+                    ))
+                    .unwrap_or_default()
+            ),
+            vec![vec![
+                Button::callback("Approve", format!("x|{}|y", row.id)),
+                Button::callback("Reject", format!("x|{}|n", row.id)),
             ]],
         ),
         other => bail!("unknown item kind {other}"),
@@ -488,8 +509,60 @@ async fn apply(o: &Arc<Orchestrator>, row: &HumanItemRow, ans: Answer) -> Result
         ("task_proposal" | "slack_reply", Answer::Dismiss) => {
             Ok(("dismissed".into(), json!({"dismissed": true})))
         }
+        // The item was claimed before this runs, so an approved change runs at most once. From
+        // here on nothing may fail: an error would re-open the item and allow a second run.
+        ("admin_change", ans) => {
+            // Too old to run whatever the answer: the fleet has likely moved on since.
+            if Utc::now() - row.created_at
+                > chrono::Duration::hours(crate::admin::PROPOSAL_TTL_HOURS)
+            {
+                let summary = format!(
+                    "expired: proposals are only good for {}h; ask again if it is still needed",
+                    crate::admin::PROPOSAL_TTL_HOURS
+                );
+                tell_brain(o, row.id, &summary);
+                return Ok((summary, json!({"expired": true})));
+            }
+            // A typed reply: a plain yes or no decides, anything else rejects with the owner's
+            // words as the reason (the announcement says so).
+            let (approve, reason) = match ans {
+                Answer::Accept | Answer::Approve => (true, None),
+                Answer::Dismiss | Answer::Deny => (false, None),
+                Answer::Text(t) | Answer::Revise(t) => {
+                    match t
+                        .trim()
+                        .trim_end_matches(['.', '!'])
+                        .to_lowercase()
+                        .as_str()
+                    {
+                        "yes" | "y" | "ok" | "okay" | "approve" | "approved" => (true, None),
+                        "no" | "n" | "reject" | "rejected" => (false, None),
+                        _ => (false, Some(t)),
+                    }
+                }
+                _ => bail!("approve or reject Q-{}", row.id),
+            };
+            if approve {
+                let (summary, stored) = crate::admin::run_approved(o, row).await?;
+                tell_brain(o, row.id, &summary);
+                return Ok((summary, stored));
+            }
+            let summary = match &reason {
+                Some(r) => format!("rejected: {r}"),
+                None => "rejected by the owner".into(),
+            };
+            tell_brain(o, row.id, &summary);
+            Ok((summary, json!({"approved": false, "note": reason})))
+        }
         (kind, _) => bail!("that answer does not fit a {kind} item"),
     }
+}
+
+/// Reports an admin change's outcome to the brain. Queued, in order with the brain's other
+/// reports: the change already happened, and the owner's button press is answered without
+/// waiting for the brain's session to start.
+fn tell_brain(o: &Orchestrator, id: i64, outcome: &str) {
+    o.tell_brain(format!("[Admin change Q-{id}] {outcome}"));
 }
 
 async fn pick_implementor(o: &Orchestrator, project: &str) -> Result<Option<String>> {
@@ -537,9 +610,12 @@ fn reply_permission(o: &Orchestrator, row: &HumanItemRow, decision: Value) -> Re
 pub async fn remind(o: &Orchestrator) -> Result<()> {
     let due: Vec<HumanItemRow> = sqlx::query_as(
         "select * from human_items where state = 'open' and blocking
-         and coalesce(reminded_at, created_at) < now() - make_interval(mins => $1::int)",
+         and coalesce(reminded_at, created_at) < now() - make_interval(mins => $1::int)
+         and not (kind = 'admin_change' and created_at < now() - make_interval(hours => $2::int))",
     )
     .bind(o.cfg.remind_after_minutes as i32)
+    // Expired proposals are not worth a reminder; answering one only says it expired.
+    .bind(crate::admin::PROPOSAL_TTL_HOURS as i32)
     .fetch_all(&o.db)
     .await?;
     for row in due {

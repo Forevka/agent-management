@@ -10,7 +10,10 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped on any incompatible change to [`Body`] or [`Envelope`]. Peers with different
 /// versions refuse each other during the handshake rather than misreading frames.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// 2: [`Body::SendToRun`]; the orchestrator no longer sends [`Body::SendToAgent`], which an
+/// older node could not tell apart from a message for its current run.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// ALPN for the control protocol. The version is part of it so a future protocol can be
 /// served next to this one during a rolling upgrade.
@@ -22,6 +25,7 @@ pub const MAX_FRAME_LEN: usize = 4 * 1024 * 1024;
 
 pub mod agent;
 pub mod node;
+pub mod redact;
 
 pub use agent::{
     AgentEvent, AgentEventKind, SecretFile, SpawnAgent, StopAgent, ToolCall, ToolResult,
@@ -98,6 +102,18 @@ pub enum Body {
     ToolResult(ToolResult),
     /// Orchestrator -> node: how this node starts Claude Code. Sent on every connect.
     NodeSettings(NodeSettings),
+
+    // Appended in protocol version 2.
+    /// Orchestrator -> node: text for one specific run of an agent. The node delivers it only if
+    /// that run is the agent's current one; otherwise it hands the text back as
+    /// [`AgentEventKind::Undelivered`], tagged with this `run_id`, so the orchestrator
+    /// can tell a run that is gone from one it has already replaced.
+    SendToRun {
+        agent_id: String,
+        task_id: String,
+        run_id: String,
+        text: String,
+    },
 }
 
 impl Body {
@@ -213,6 +229,16 @@ mod tests {
                 task_id: "t".into(),
                 graceful: true,
             }),
+        });
+        roundtrip(Envelope {
+            seq: 6,
+            ack: 2,
+            body: Body::SendToRun {
+                agent_id: "a1".into(),
+                task_id: "t".into(),
+                run_id: "r1".into(),
+                text: "hi".into(),
+            },
         });
         roundtrip(Envelope {
             seq: 5,

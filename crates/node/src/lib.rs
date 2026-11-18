@@ -103,7 +103,14 @@ impl Node {
         match body {
             Body::SpawnAgent(spawn) => self.spawn_agent(*spawn),
             Body::StopAgent(stop) => {
-                if let Some(h) = self.agents.lock().unwrap().get(&stop.agent_id) {
+                // Only the run of that task: the agent may have moved on to another task.
+                if let Some(h) = self
+                    .agents
+                    .lock()
+                    .unwrap()
+                    .get(&stop.agent_id)
+                    .filter(|h| h.task_id == stop.task_id)
+                {
                     h.stop(stop.graceful);
                 }
             }
@@ -125,6 +132,30 @@ impl Node {
                         &agent_id,
                         &task_id,
                         "",
+                        AgentEventKind::Undelivered { text },
+                    );
+                }
+            }
+            Body::SendToRun {
+                agent_id,
+                task_id,
+                run_id,
+                text,
+            } => {
+                // Only the run it was meant for may take it: a newer run of the same agent is a
+                // different session, and a message for a replaced run must go back.
+                let delivered = self
+                    .agents
+                    .lock()
+                    .unwrap()
+                    .get(&agent_id)
+                    .filter(|h| h.task_id == task_id && h.run_id == run_id)
+                    .is_some_and(|h| h.send_user_message(&text));
+                if !delivered {
+                    self.event(
+                        &agent_id,
+                        &task_id,
+                        &run_id,
                         AgentEventKind::Undelivered { text },
                     );
                 }

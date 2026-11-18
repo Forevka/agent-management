@@ -94,6 +94,41 @@ const BRAIN: &str = r#"
 Your memory bank names are free-form. Keep one bank for the fleet itself, e.g. `fleet`:
 which agent is good at what, project notes and routing decisions. You may also read the
 project shared banks (`project-<slug>`).
+
+## Administering the fleet
+
+The owner may ask you to change the fleet's setup, as on the web UI. Reads run at once:
+
+- `fleet agent admin show <what> [target]`: `projects`, `project <slug>`, `agents [project]`,
+  `bots`, `nodes`, `node <id|name>`, `secrets`, `secret <folder>`, `status`, `items`.
+  Secret folders show key names only, never values.
+
+Every change is only a **proposal**: the owner gets a summary with Approve / Reject buttons, and
+nothing changes until they tap Approve. The command prints the item id (`Q-12`); the outcome
+arrives later as a message starting with `[Admin change Q-12]`. Do not tell the owner it is done
+before that. Add `--note "why"` to say why you propose it. Each command below starts with
+`fleet agent`.
+
+- Projects: `admin project-create <slug> --name "Name" --description -`,
+  `admin project-edit <slug> [--name ..] [--description ..]`,
+  `admin project-bind <slug> <folder>`, `admin project-unbind <slug> <folder>`
+- Slack: `admin channel-add <slug> <channel-id> [--triage]`, `admin channel-remove <slug> <channel-id>`
+- Agents and bots: `admin agent-rename <agent> <new-name>`, `admin agent-unbind <agent>`
+  (bot back to the pool), `admin agent-remove <agent>`, `admin bot-remove <@bot>`
+- Nodes: `admin node-set <node> [--model <name>] [--fallback-model <name>] [--auth default|oauth_token|api_key] [--max-agents N]`
+  (`--model ""` removes the flag), `admin node-revoke <node>`. Those flags are merged into the
+  node's Claude command; the program and its other arguments are set on the web only.
+- One change per proposal. Agent names are 1-40 letters, digits, spaces and `_.-`.
+  A proposal expires after 24 hours, and one whose subject changed before the owner approved
+  it is not run: propose it again.
+- Secrets: `admin folder-create <name> [--preset jira|github|gitlab|slack|ssh]`,
+  `admin folder-delete <folder>`, `admin secret-unset <folder> <KEY>`
+
+Bot tokens, secret values and node tokens/API keys never go through you, and you cannot add
+bots. When one is needed, send the owner a login link to the page where they enter it:
+`fleet agent admin link /secrets/<folder-id> --text "Set JIRA_API_TOKEN here"` (or `/agents`,
+`/nodes/<node-id>`, `/projects/<slug>`). The link goes straight to the owner; you never see it.
+Never ask the owner to paste a secret into the chat.
 "#;
 
 /// Writes the plugin for `role` under the data directory and returns its path.
@@ -135,6 +170,7 @@ mod tests {
         let bs = std::fs::read_to_string(b.join("skills/fleet/SKILL.md")).unwrap();
         assert!(ws.starts_with("---\nname: fleet\n") && !ws.contains("create-task"));
         assert!(bs.contains("create-task"));
+        assert!(bs.contains("admin show") && !ws.contains("admin show"));
         assert!(w.join(".claude-plugin/plugin.json").exists());
         std::fs::remove_dir_all(&d).unwrap();
     }

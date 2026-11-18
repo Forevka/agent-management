@@ -72,13 +72,18 @@ pub trait Chat: Send + Sync + 'static {
     async fn add_bot(&self, bot_id: i64, token: &str) -> Result<()>;
     /// Renames a pool bot to the agent it now represents.
     async fn set_bot_profile(&self, bot_id: i64, name: &str, description: &str) -> Result<()>;
+    /// Forgets a bot removed from the pool: nothing is sent as it or polled for it any more.
+    async fn remove_bot(&self, bot_id: i64);
 }
 
-/// Escapes text for Telegram HTML.
+/// Escapes text for HTML, in Telegram messages and on the web UI. Quotes are escaped too, so the
+/// result is also safe inside a quoted attribute (Telegram accepts these entities).
 pub fn esc(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 /// Shortens text to `max` characters (not bytes), marking the cut.
@@ -121,6 +126,7 @@ pub mod fake {
             name: String,
         },
         BotProfile(i64, String),
+        RemoveBot(i64),
     }
 
     #[derive(Default)]
@@ -232,6 +238,9 @@ pub mod fake {
                 .unwrap()
                 .push(Op::BotProfile(bot_id, name.into()));
             Ok(())
+        }
+        async fn remove_bot(&self, bot_id: i64) {
+            self.ops.lock().unwrap().push(Op::RemoveBot(bot_id));
         }
     }
 }

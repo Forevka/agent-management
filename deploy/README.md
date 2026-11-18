@@ -187,6 +187,23 @@ sudo -u "$U" mkdir -p /home/$U/fleet-brain
 sudo -u "$U" env FLEET_DATA_DIR=/home/$U/.local/share/fleet fleet project map fleet /home/$U/fleet-brain
 ```
 
+> **Where the brain runs matters.** The brain's changes wait for your Approve
+> tap, but that gate only holds inside the orchestrator. On the machine itself
+> the brain is a Claude session with a shell, running as the node's user:
+>
+> - The node's user must **not** be able to read `/opt/fleet/deploy/.env`
+>   (it holds `FLEET_MASTER_KEY`, the orchestrator bot's token and the database
+>   passwords), and must **not** be in
+>   the `docker` group (that is root on the host, with the database and the
+>   orchestrator's data). Keep `.env` owned by another user, mode `0600`.
+> - Every run on a node shares that one OS user, so the brain can read other
+>   runs' `.env` files and the node's `node.json` while they exist. Map only the
+>   `fleet` project on the brain's node, or at least no project that has secret
+>   folders bound, so there is nothing of value to read there.
+> - Secret values are redacted from what agents send on (summaries, questions,
+>   posts). That guards against carelessness, not against a brain or agent that
+>   is trying to leak them.
+
 Memory needs no setup on nodes: agents call `fleet agent memory ...` (taught by
 the `fleet` skill the node loads into every session), and the orchestrator
 forwards those calls to Hindsight. Each agent owns the banks under its prefix
@@ -228,6 +245,12 @@ the node's key and state).
 6. **Secrets** page: a folder named `slack` with `SLACK_USER_TOKEN` turns on
    the Slack feed.
 7. Write a request in the General topic.
+
+Steps 3, 5 and 6 can also be done by asking the orchestrator in General (for
+example "create project web and bind the Jira folder to it"). It proposes each
+change in `fleet · needs you` and applies it only when you tap Approve. Bot
+tokens, secret values and node tokens are still entered on the web pages: the
+orchestrator sends you a login link to the right one.
 
 ## 7. Backups
 

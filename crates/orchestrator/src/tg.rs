@@ -207,6 +207,9 @@ impl Chat for TelegramChat {
             .await?;
         Ok(())
     }
+    async fn remove_bot(&self, bot_id: i64) {
+        self.bots.write().await.remove(&bot_id);
+    }
 }
 
 /// Long-polls the orchestrator bot forever.
@@ -251,7 +254,16 @@ pub async fn run_updates(o: Arc<Orchestrator>, bot: Bot, chat_id: i64) {
 pub async fn run_agent_bot_callbacks(o: Arc<Orchestrator>, chat: Arc<TelegramChat>, chat_id: i64) {
     let mut running: HashMap<i64, tokio::task::JoinHandle<()>> = HashMap::new();
     loop {
-        for (id, bot) in chat.agent_bots().await {
+        let bots = chat.agent_bots().await;
+        // Bots removed from the pool stop being polled with their (deleted) token.
+        running.retain(|id, h| {
+            let keep = bots.iter().any(|(b, _)| b == id);
+            if !keep {
+                h.abort();
+            }
+            keep
+        });
+        for (id, bot) in bots {
             if running.get(&id).is_some_and(|h| !h.is_finished()) {
                 continue;
             }

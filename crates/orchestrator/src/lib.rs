@@ -8,6 +8,7 @@
 // that are used exactly once.
 #![allow(clippy::type_complexity)]
 
+pub mod admin;
 pub mod auth;
 pub mod chat;
 pub mod config;
