@@ -206,9 +206,98 @@ pub fn visible(agent: &AgentRow, project: &str, bank: &str) -> bool {
         || bank.starts_with(&format!("{}--", agent_prefix(agent)))
 }
 
+/// How a task ended, for the memory saved about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    Done,
+    Failed,
+}
+
+/// Most of a summary (or failure reason) saved with a task's outcome.
+const OUTCOME_TEXT_MAX: usize = 4000;
+
+/// The memory saved when a task ends: which task, by whom, and what it says it did (or what went
+/// wrong), clipped.
+pub fn outcome_memory(
+    task_id: &str,
+    title: &str,
+    agent: &str,
+    outcome: Outcome,
+    text: &str,
+) -> String {
+    let text = crate::chat::clip(text.trim(), OUTCOME_TEXT_MAX);
+    match outcome {
+        Outcome::Done => {
+            format!("Task {task_id} \"{title}\" (agent {agent}) was completed.\nSummary: {text}")
+        }
+        Outcome::Failed => {
+            format!("Task {task_id} \"{title}\" (agent {agent}) failed.\nWhat happened: {text}")
+        }
+    }
+}
+
+/// Saves how a task ended to its project's shared bank (the one `memory --shared` uses), so the
+/// project's memory builds up even when no agent thought to retain anything. Not for the
+/// fleet's own sessions, and only with memory configured. In the background and best effort:
+/// the caller never waits on Hindsight or fails because of it. Everything is passed through the
+/// project's secret redaction first (the title and names too, not only the summary).
+pub fn remember_outcome(
+    o: &std::sync::Arc<crate::core::Orchestrator>,
+    task: &crate::model::TaskRow,
+    agent: &str,
+    outcome: Outcome,
+    text: &str,
+) {
+    if crate::model::is_builtin_task(&task.id) {
+        return;
+    }
+    let Some(mem) = o.memory.clone() else {
+        return;
+    };
+    let content = outcome_memory(&task.id, &task.title, agent, outcome, text);
+    let (o, project, task_id) = (o.clone(), task.project.clone(), task.id.clone());
+    tokio::spawn(async move {
+        let content = match crate::tasks::redact_project_secrets(&o, &project, &content).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("not saving how {task_id} ended: redacting it failed: {e:#}");
+                return;
+            }
+        };
+        let context = match outcome {
+            Outcome::Done => "task completion",
+            Outcome::Failed => "task failure",
+        };
+        if let Err(e) = mem
+            .retain(&project_bank(&project), &content, Some(context))
+            .await
+        {
+            tracing::warn!("saving how {task_id} ended to memory failed: {e:#}");
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outcome_memories_say_which_task_and_stay_compact() {
+        let m = outcome_memory(
+            "demo-1",
+            "Paint it",
+            "Alice",
+            Outcome::Done,
+            "Blue, two coats.",
+        );
+        assert_eq!(
+            m,
+            "Task demo-1 \"Paint it\" (agent Alice) was completed.\nSummary: Blue, two coats."
+        );
+        let long = "x".repeat(10_000);
+        let m = outcome_memory("demo-1", "Paint it", "Alice", Outcome::Failed, &long);
+        assert!(m.contains("failed.\nWhat happened: ") && m.chars().count() < 4200);
+    }
 
     fn agent(id: &str) -> AgentRow {
         AgentRow {

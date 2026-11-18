@@ -77,8 +77,10 @@ Your memory banks live under your own prefix. The project also has one shared ba
 What to do with it:
 
 - **When you start:** recall what is relevant (`--shared` too).
-- **When you finish:** retain durable facts: decisions, conventions, gotchas, what you shipped.
-  Put project knowledge in `--shared`, your personal working notes in your own bank.
+- **When you finish:** your `complete` summary is saved to the project's shared bank
+  automatically. Retain what goes beyond it: decisions and why, conventions, gotchas, what the
+  next agent should know. Put project knowledge in `--shared`, your personal working notes in
+  your own bank.
 "#;
 
 const BRAIN: &str = r#"

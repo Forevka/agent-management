@@ -264,6 +264,15 @@ pub async fn handle(
                         tasks::untrusted(&summary, 1500)
                     ),
                 );
+                // The project remembers what was done, whether or not the agent retained
+                // anything (once per finish, in the background).
+                crate::memory::remember_outcome(
+                    o,
+                    &task,
+                    &agent.name,
+                    crate::memory::Outcome::Done,
+                    &summary,
+                );
             }
             // The task is done whatever happens next: what follows is shown on a best-effort
             // basis, so a Telegram or database hiccup cannot leave it half-finished.

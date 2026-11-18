@@ -514,15 +514,53 @@ impl Orchestrator {
                         Notify::Sound
                     };
                     self.post_task(&task, &note, notify).await;
+                    let agent_name = self.agent_name(&task).await;
                     crate::tasks::notify_brain(
                         self,
                         &task,
                         format!(
                             "[Task {} {new_status}, agent {}] The agent session ended ({how}).",
-                            task.id,
-                            self.agent_name(&task).await
+                            task.id, agent_name
                         ),
                     );
+                    // A failure is worth remembering too: how far the work got (a stopped task
+                    // is not; someone chose to end it).
+                    if new_status == status::FAILED {
+                        let steps: Vec<(String, bool, bool)> = sqlx::query_as(
+                            "select title, done, skipped from milestones where task_id = $1 order by idx",
+                        )
+                        .bind(&task.id)
+                        .fetch_all(&self.db)
+                        .await
+                        .unwrap_or_default();
+                        let progress = if steps.is_empty() {
+                            "no checklist yet".to_owned()
+                        } else {
+                            steps
+                                .iter()
+                                .map(|(t, done, skipped)| {
+                                    let state = if *done {
+                                        "done"
+                                    } else if *skipped {
+                                        "skipped"
+                                    } else {
+                                        "open"
+                                    };
+                                    format!("{t} ({state})")
+                                })
+                                .collect::<Vec<_>>()
+                                .join("; ")
+                        };
+                        crate::memory::remember_outcome(
+                            self,
+                            &task,
+                            &agent_name,
+                            crate::memory::Outcome::Failed,
+                            &format!(
+                                "The agent session ended ({how}) before the task was completed. Checklist: {progress}."
+                            ),
+                        );
+                    }
                 }
                 crate::tasks::dispatch_queued(self).await;
             }

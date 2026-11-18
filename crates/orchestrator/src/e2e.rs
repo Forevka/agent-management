@@ -1710,6 +1710,48 @@ async fn task_lifecycle_through_a_real_node() {
             .any(|op| matches!(op, Op::Send { html, .. } if html.contains("Painted and shipped"))),
         "summary"
     );
+    // The project remembers what was done, without the agent asking: one memory in its shared
+    // bank, with the title and the redacted summary.
+    let outcome_saves = || {
+        hindsight_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(path, _)| path == "project-demo/memories")
+            .map(|(_, body)| body.clone())
+            .collect::<Vec<_>>()
+    };
+    let saved = wait_for(
+        "the completion is saved to the project's memory",
+        || async {
+            let s = outcome_saves();
+            (!s.is_empty()).then_some(s)
+        },
+    )
+    .await;
+    assert_eq!(saved.len(), 1, "{saved:#?}");
+    let item = &saved[0]["items"][0];
+    let content = item["content"].as_str().unwrap();
+    assert!(
+        content.starts_with("Task demo-BS-1 \"Paint the bikeshed\" (agent Alice) was completed.")
+            && content.contains("Painted and shipped with token [secret]")
+            && !content.contains("t0k-jira-secret"),
+        "{content}"
+    );
+    assert_eq!(item["context"], "task completion");
+    // A complete sent again (a retry) changes nothing and saves nothing.
+    let again = call_as(
+        &o,
+        task.agent_id.as_deref().unwrap(),
+        &task.id,
+        "complete",
+        json!({"summary": "again"}),
+    )
+    .await
+    .unwrap();
+    assert!(again.is_some());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(outcome_saves().len(), 1, "saved once per finish");
 
     // 5. `complete` ends the session (it frees the node); a follow-up resumes it, as a new run
     //    on the same node, in the same Claude session.

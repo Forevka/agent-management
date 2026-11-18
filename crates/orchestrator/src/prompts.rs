@@ -50,7 +50,7 @@ pub fn agent_system_prompt(
     if memory {
         s.push_str(
             "\n## Memory\nThe fleet has long-term memory (`fleet agent memory ...`): banks under your own prefix plus your project's shared bank (`--shared`). \
-             Recall what is relevant before planning; when you complete the task, retain durable facts (decisions, conventions, gotchas, what you shipped).\n",
+             Recall what is relevant before planning. Your completion summary is saved to the project's shared bank automatically when you complete; retain what goes beyond it (decisions and why, conventions, gotchas, things the next agent should know).\n",
         );
     }
     s
