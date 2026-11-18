@@ -815,6 +815,9 @@ impl Orchestrator {
             if let Err(e) = crate::human::remind(&self).await {
                 tracing::warn!("reminders failed: {e:#}");
             }
+            if let Err(e) = crate::workflows::run_due(&self).await {
+                tracing::warn!("ticking due workflows failed: {e:#}");
+            }
             if let Err(e) = self.prune().await {
                 tracing::warn!("retention pruning failed: {e:#}");
             }

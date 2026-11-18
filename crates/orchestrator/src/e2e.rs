@@ -21,7 +21,7 @@ use crate::{
         fake::{FakeChat, Op},
     },
     human::{self, Answer},
-    model::{HumanItemRow, NewAgent, TaskRow},
+    model::{HumanItemRow, NewAgent, TaskRow, WorkflowRow},
     tasks::{self, CreateTask},
 };
 
@@ -1635,6 +1635,198 @@ async fn model_effort_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &Fake
         .unwrap();
     assert_eq!(effort.as_deref(), Some("high"), "the owner's edit stands");
 }
+
+/// Workflows (CLAUDE.md: new task/tool flows need e2e coverage): `workflow_finish` keeps a
+/// task's topic open (unlike `complete`) and posts a control card; its buttons change the
+/// schedule and can delete it; a due periodic tick, and the owner writing into the topic,
+/// both resume the task through the ordinary (pre-existing) follow-up machinery.
+async fn workflow_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) {
+    let task = tasks::create_task(
+        o,
+        CreateTask {
+            project: "demo".into(),
+            title: "Watch for code review pings".into(),
+            brief: "Set up a workflow.".into(),
+            ticket: Some("WF-1".into()),
+            agent: Some("Alice".into()),
+            new_agent: None,
+            model: None,
+            effort: None,
+        },
+    )
+    .await
+    .unwrap();
+    wait_for(&format!("{} starts", task.id), || async {
+        events(db, &task.id)
+            .await
+            .into_iter()
+            .find(|e| e["subtype"] == "init")
+    })
+    .await;
+    let topic = o.task(&task.id).await.unwrap().unwrap().topic_id.unwrap();
+
+    call_as(
+        o,
+        "Alice",
+        &task.id,
+        "workflow_finish",
+        json!({"summary": "Watches #code-review and drafts replies.", "schedule": "every:1h"}),
+    )
+    .await
+    .unwrap();
+    wait_for(&format!("{} is done", task.id), || async {
+        o.task(&task.id)
+            .await
+            .unwrap()
+            .filter(|t| t.status == "done")
+    })
+    .await;
+    assert!(
+        !chat
+            .ops
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|op| matches!(op, Op::Close(t) if *t == topic)),
+        "a workflow's topic is never closed"
+    );
+    let row: WorkflowRow = sqlx::query_as("select * from workflows where task_id = $1")
+        .bind(&task.id)
+        .fetch_one(db)
+        .await
+        .unwrap();
+    assert_eq!(row.schedule.as_deref(), Some("every:1h"));
+    assert!(row.enabled);
+    let card_msg = row.tg_msg.expect("the control card was posted");
+    assert!(
+        chat.sent()
+            .into_iter()
+            .any(|(_, _, h, _)| h.contains("Workflow settings") && h.contains("Runs Every hour")),
+        "the card shows the schedule"
+    );
+
+    // Pause from the card's buttons: the row and the card both update.
+    let reply = crate::workflows::button(o, &format!("wf|{}|pause", task.id))
+        .await
+        .unwrap();
+    assert!(reply.contains("Paused"), "{reply}");
+    let paused: bool = sqlx::query_scalar("select not enabled from workflows where task_id = $1")
+        .bind(&task.id)
+        .fetch_one(db)
+        .await
+        .unwrap();
+    assert!(paused);
+    wait_for("the card shows paused", || async {
+        chat.ops
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|op| {
+                matches!(op, Op::Edit { id, html, .. } if *id == card_msg && html.contains("Paused"))
+            })
+            .then_some(())
+    })
+    .await;
+
+    // On-demand: writing into the (still open) topic resumes the finished task, even paused.
+    let nudge: fleet_telegram::Message = serde_json::from_value(json!({
+        "message_id": 9400,
+        "date": 1_700_000_000,
+        "chat": { "id": -100, "type": "supergroup", "is_forum": true },
+        "from": { "id": 42, "is_bot": false, "first_name": "Owner" },
+        "message_thread_id": topic,
+        "is_topic_message": true,
+        "text": "run it now",
+    }))
+    .unwrap();
+    crate::tg::owner_message(o, &nudge).await.unwrap();
+    wait_for(&format!("{} resumes on demand", task.id), || async {
+        events(db, &task.id).await.into_iter().find(|e| {
+            e["type"] == "assistant"
+                && e["message"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("run it now")
+        })
+    })
+    .await;
+    let resumed = o.task(&task.id).await.unwrap().unwrap();
+    tasks::stop(o, &resumed, false).await.unwrap();
+    wait_for(&format!("{} stops again", task.id), || async {
+        o.task(&task.id).await.unwrap().filter(|t| !t.running)
+    })
+    .await;
+
+    // Periodic: resume, then a due tick (not a not-yet-due one) delivers and advances
+    // last_run_at; paused, the same due tick is skipped.
+    sqlx::query("update workflows set last_run_at = now() where task_id = $1")
+        .bind(&task.id)
+        .execute(db)
+        .await
+        .unwrap();
+    crate::workflows::run_due(o).await.unwrap();
+    let still_paused_and_unticked: (bool, chrono::DateTime<chrono::Utc>) =
+        sqlx::query_as("select not enabled, last_run_at from workflows where task_id = $1")
+            .bind(&task.id)
+            .fetch_one(db)
+            .await
+            .unwrap();
+    assert!(still_paused_and_unticked.0, "still paused");
+    assert!(
+        chrono::Utc::now() - still_paused_and_unticked.1 < chrono::Duration::seconds(30),
+        "unchanged from the `now()` set above, not a new tick"
+    );
+
+    crate::workflows::button(o, &format!("wf|{}|resume", task.id))
+        .await
+        .unwrap();
+    sqlx::query("update workflows set last_run_at = now() - interval '2 hours' where task_id = $1")
+        .bind(&task.id)
+        .execute(db)
+        .await
+        .unwrap();
+    crate::workflows::run_due(o).await.unwrap();
+    wait_for(&format!("{}'s due tick is delivered", task.id), || async {
+        events(db, &task.id).await.into_iter().find(|e| {
+            e["type"] == "assistant"
+                && e["message"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("Workflow tick")
+        })
+    })
+    .await;
+    let last_run_at: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("select last_run_at from workflows where task_id = $1")
+            .bind(&task.id)
+            .fetch_one(db)
+            .await
+            .unwrap();
+    assert!(
+        chrono::Utc::now() - last_run_at < chrono::Duration::seconds(30),
+        "a due tick advances last_run_at"
+    );
+    let resumed = o.task(&task.id).await.unwrap().unwrap();
+    tasks::stop(o, &resumed, false).await.unwrap();
+    wait_for(&format!("{} stops once more", task.id), || async {
+        o.task(&task.id).await.unwrap().filter(|t| !t.running)
+    })
+    .await;
+
+    // Delete: the row is gone, the card says so with no buttons, the task and topic stay.
+    let reply = crate::workflows::button(o, &format!("wf|{}|del", task.id))
+        .await
+        .unwrap();
+    assert!(reply.contains("deleted"), "{reply}");
+    let gone: Option<WorkflowRow> = sqlx::query_as("select * from workflows where task_id = $1")
+        .bind(&task.id)
+        .fetch_optional(db)
+        .await
+        .unwrap();
+    assert!(gone.is_none());
+    wait_retired(chat, &[card_msg], "deleted").await;
+}
+
 /// Whether the message `id` sounded when it was sent.
 fn notify_of_msg(chat: &FakeChat, id: Option<i64>) -> Option<Notify> {
     chat.ops.lock().unwrap().iter().find_map(|op| match op {
@@ -3211,6 +3403,9 @@ async fn task_lifecycle_through_a_real_node() {
 
     // 18. Model and effort: a task's own, an agent's defaults, and the owner's allow-list.
     model_effort_flow(&o, &db, &chat).await;
+
+    // 19. Workflows: `workflow_finish` keeps the topic open and posts a control card.
+    workflow_flow(&o, &db, &chat).await;
 
     stop_brain().await;
     let _ = std::fs::remove_dir_all(&data_dir);

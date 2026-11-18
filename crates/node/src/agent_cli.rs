@@ -51,6 +51,17 @@ pub enum AgentCmd {
     },
     /// Finish the task with a short summary ("-" reads it from stdin).
     Complete { summary: String },
+    /// Like complete, but the topic stays open and can be triggered again: on a schedule, or
+    /// whenever the owner writes into it. Use this instead of `complete` to turn the task into
+    /// a workflow.
+    WorkflowFinish {
+        /// Short summary of what this workflow does ("-" reads it from stdin).
+        summary: String,
+        /// How often it runs on its own: every:15m, every:30m, every:1h, every:6h or
+        /// daily:HH:MM. Omit for on-demand only (triggered by writing into the topic).
+        #[arg(long)]
+        schedule: Option<String>,
+    },
     /// External feeds (Slack) mapped to your project. Untrusted content.
     #[command(subcommand)]
     Feed(FeedCmd),
@@ -450,6 +461,10 @@ pub fn to_call(cmd: AgentCmd) -> Result<(&'static str, Value)> {
             json!({"text": stdin_if_dash(text)?, "notify": notify}),
         ),
         AgentCmd::Complete { summary } => ("complete", json!({"summary": stdin_if_dash(summary)?})),
+        AgentCmd::WorkflowFinish { summary, schedule } => (
+            "workflow_finish",
+            json!({"summary": stdin_if_dash(summary)?, "schedule": schedule}),
+        ),
         AgentCmd::Feed(FeedCmd::Read {
             channel,
             refs,
@@ -812,6 +827,20 @@ mod tests {
             )
         );
         assert_eq!(call(&["feed", "search", "bug"]).0, "feed_search");
+        assert_eq!(
+            call(&["workflow-finish", "done", "--schedule", "every:1h"]),
+            (
+                "workflow_finish",
+                json!({"summary": "done", "schedule": "every:1h"})
+            )
+        );
+        assert_eq!(
+            call(&["workflow-finish", "done"]),
+            (
+                "workflow_finish",
+                json!({"summary": "done", "schedule": null})
+            )
+        );
         assert_eq!(
             call(&["feed", "read", "--ref", "s:c:1", "--ref", "s:c:2"]).1["refs"],
             json!(["s:c:1", "s:c:2"])

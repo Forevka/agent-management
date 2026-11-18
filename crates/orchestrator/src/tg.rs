@@ -342,13 +342,27 @@ async fn handle_update(o: &Arc<Orchestrator>, bot: &Bot, chat_id: i64, u: Update
                 .await;
             return;
         }
-        // Todo and rule buttons in the Inbox are the secretary's; the rest answer human items.
+        // Todo and rule buttons in the Inbox are the secretary's; a workflow's control card is
+        // its own; the rest answer human items.
         if let Some(data) = cb
             .data
             .as_deref()
             .filter(|d| crate::secretary::is_button(d))
         {
             let reply = crate::secretary::button(o, data)
+                .await
+                .unwrap_or_else(|e| format!("Failed: {e:#}"));
+            let _ = bot
+                .answer_callback_query(&cb.id, Some(&clip(&reply, 190)))
+                .await;
+            return;
+        }
+        if let Some(data) = cb
+            .data
+            .as_deref()
+            .filter(|d| crate::workflows::is_button(d))
+        {
+            let reply = crate::workflows::button(o, data)
                 .await
                 .unwrap_or_else(|e| format!("Failed: {e:#}"));
             let _ = bot

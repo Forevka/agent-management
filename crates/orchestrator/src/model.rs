@@ -189,6 +189,19 @@ pub struct RuleRow {
     pub tg_msg: Option<i64>,
 }
 
+/// A task that was turned into a workflow (see `workflows.rs`): its topic stays open, and this
+/// row says whether and when it triggers again on its own.
+#[derive(Debug, Clone, FromRow)]
+pub struct WorkflowRow {
+    pub task_id: String,
+    /// `None`: on-demand only. Otherwise `every:<N>m`/`every:<N>h` or `daily:HH:MM`.
+    pub schedule: Option<String>,
+    pub enabled: bool,
+    pub tg_msg: Option<i64>,
+    pub last_run_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewAgent {
     pub name: String,

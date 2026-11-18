@@ -47,6 +47,12 @@ exits non-zero and prints an error. For long text, pass `-` and pipe the text in
 - `fleet agent complete - <<'EOF'` then the summary, then `EOF`: finish with what changed,
   where (branch/PR) and how it was tested. This closes the topic. Your session stays
   resumable for follow-ups.
+- `fleet agent workflow-finish - [--schedule every:15m|every:30m|every:1h|every:6h|daily:HH:MM] <<'EOF'`
+  then a short summary of what this does, then `EOF`: use this **instead of** `complete` when
+  your brief asked you to set up a workflow (a standing automation), or the owner asked you to
+  turn what you just did into one. Unlike `complete`, the topic stays open: write into it later
+  to run it again on demand, or give `--schedule` to also have it run on its own. Omit
+  `--schedule` for on-demand only.
 
 Never post tool output, logs or your reasoning to Telegram.
 
@@ -103,6 +109,18 @@ const BRAIN: &str = r#"
   owner decides.
 - `fleet agent propose-reply --channel C123 [--thread 1700000000.0001] --text "..."`: posted
   as the owner only after they approve.
+
+### Workflows (standing automations)
+
+When the owner asks for a repeatable automation ("react on code-review pings in Slack", "do
+the nightly build"), or to turn what was just done into one, create a task as usual
+(`create-task`), with the brief ending by telling the agent to call `fleet agent
+workflow-finish` instead of `fleet agent complete` once it is set up, with a suggested
+`--schedule` when the owner's request implied timing (e.g. "watch for X" → on-demand or a
+short interval; "every morning" → `daily:HH:MM`). If the owner says this while talking in an
+**existing** task's topic (e.g. right after it finished some work), do not create a new task:
+tell that task's own agent to call `workflow-finish` on itself (`send-to-task <id> "Turn this
+into a workflow: ..."`) so it keeps the context of what it just did.
 
 ## The secretary
 
@@ -278,6 +296,7 @@ mod tests {
             !ss.contains("create-task") && !ss.contains("milestones") && !ss.contains("complete")
         );
         assert!(bs.contains("secretary-note") && !ws.contains("todo add"));
+        assert!(ws.contains("workflow-finish") && !ss.contains("workflow-finish"));
         std::fs::remove_dir_all(&d).unwrap();
     }
 }
