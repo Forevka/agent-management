@@ -54,8 +54,11 @@ impl ReplyPoster for SourceReplier {
 }
 
 async fn secret(o: &Orchestrator, folder: &str, key: &str) -> Result<Option<String>> {
+    // The folder name is matched without case: owners name it "Slack" as often as "slack",
+    // and a feed that silently never starts over a capital letter is worse than either.
     let enc: Option<Vec<u8>> = sqlx::query_scalar(
-        "select i.value from secret_items i join secret_folders f on f.id = i.folder_id where f.name = $1 and i.key = $2",
+        "select i.value from secret_items i join secret_folders f on f.id = i.folder_id
+         where lower(f.name) = lower($1) and i.key = $2 order by (f.name = $1) desc, f.id limit 1",
     )
     .bind(folder)
     .bind(key)
