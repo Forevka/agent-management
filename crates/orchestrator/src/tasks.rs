@@ -499,6 +499,8 @@ async fn queue(
     prompt: Option<&str>,
     note: Option<String>,
 ) -> Result<Dispatched> {
+    // Nobody works on a queued task, whichever path queued it (a new message, a redelivery).
+    o.stop_working(&task.id);
     sqlx::query("update tasks set status = 'queued', updated_at = now() where id = $1")
         .bind(&task.id)
         .execute(&o.db)

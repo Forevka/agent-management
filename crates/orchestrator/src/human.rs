@@ -482,9 +482,26 @@ async fn apply(o: &Arc<Orchestrator>, row: &HumanItemRow, ans: Answer) -> Result
                 row,
                 json!({"behavior": "allow", "updatedInput": updated}),
             )?;
+            // Claude gets the answers keyed by its own words; people see the redacted copy: each
+            // question, and each chosen option, as `shown` has it (the owner's own text as is).
+            let shown_qs = &shown(p)["questions"];
             let summary = answers
                 .iter()
-                .map(|(k, v)| format!("{}: {}", clip(k, 60), v.as_str().unwrap_or_default()))
+                .map(|(k, v)| {
+                    let v = v.as_str().unwrap_or_default();
+                    let i = qs.iter().position(|q| q["question"] == k.as_str());
+                    let question = i
+                        .and_then(|i| shown_qs[i]["question"].as_str())
+                        .unwrap_or("?");
+                    let answer = i
+                        .and_then(|i| {
+                            let options = qs[i]["options"].as_array()?;
+                            let j = options.iter().position(|o| o["label"] == v)?;
+                            shown_qs[i]["options"][j]["label"].as_str()
+                        })
+                        .unwrap_or(v);
+                    format!("{}: {}", clip(question, 60), answer)
+                })
                 .collect::<Vec<_>>()
                 .join("; ");
             Ok((summary, Value::Object(answers)))

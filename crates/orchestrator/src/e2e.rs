@@ -399,6 +399,32 @@ async fn task_lifecycle_through_a_real_node() {
     );
     assert_eq!(sent(card).1, Notify::Sound);
     assert_eq!(sent(pointer).1, Notify::Silent);
+    // A plain message in the task topic while the plan waits: it reaches the session (which
+    // answers it after the plan), gets its 👀, but no "typing…": the agent waits on the owner.
+    let topic = o.task(&task.id).await.unwrap().unwrap().topic_id.unwrap();
+    let meanwhile: fleet_telegram::Message = serde_json::from_value(json!({
+        "message_id": 9050,
+        "date": 1_700_000_000,
+        "chat": { "id": -100, "type": "supergroup", "is_forum": true },
+        "from": { "id": 42, "is_bot": false, "first_name": "Owner" },
+        "message_thread_id": topic,
+        "is_topic_message": true,
+        "text": "take your time",
+    }))
+    .unwrap();
+    crate::tg::owner_message(&o, &meanwhile).await.unwrap();
+    assert!(
+        !o.working.is_showing(&task.id),
+        "no typing while the plan waits on the owner"
+    );
+    wait_for("👀 on the message", || async {
+        chat.ops
+            .lock()
+            .unwrap()
+            .contains(&Op::React(9050, "👀".into()))
+            .then_some(())
+    })
+    .await;
     human::answer(&o, plan.id, Answer::Approve).await.unwrap();
     // Answered once (here as if on the card), every copy shows it, without buttons.
     wait_retired(&chat, &[card, pointer], "answered").await;
@@ -1507,15 +1533,13 @@ async fn task_lifecycle_through_a_real_node() {
         (brain_heard(&db, "[Message from the owner] how is it going?").await == 1).then_some(())
     })
     .await;
-    // The first "typing…" always follows the reaction, even if the turn ended meanwhile.
-    wait_for("👀, then typing in General as the orchestrator", || async {
-        let ops = chat.ops.lock().unwrap();
-        let react = ops
-            .iter()
-            .position(|o| *o == Op::React(9001, "👀".into()))?;
-        // After the reaction: earlier steps showed typing in General as the orchestrator too.
-        ops[react..]
-            .contains(&Op::Typing(From::Orchestrator, None))
+    // "typing…" itself is not asserted: a turn this quick may end before its first tick, and
+    // then none is sent (the unit tests in `working` cover the ticks).
+    wait_for("👀 on the owner's message", || async {
+        chat.ops
+            .lock()
+            .unwrap()
+            .contains(&Op::React(9001, "👀".into()))
             .then_some(())
     })
     .await;

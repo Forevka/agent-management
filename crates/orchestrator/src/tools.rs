@@ -259,16 +259,19 @@ pub async fn handle(
                 Ok(_) => {}
                 Err(e) => tracing::warn!("skipping {}'s open steps failed: {e:#}", task.id),
             }
-            o.post_task(
-                &task,
-                &format!("✅ <b>Done.</b>\n{}", esc(&clip(&summary, 3000))),
-                Notify::Sound,
-            )
-            .await;
-            if let Some(topic) = task.topic_id
-                && let Err(e) = o.chat.close_topic(topic).await
-            {
-                tracing::warn!("closing {}'s topic failed: {e:#}", task.id);
+            // Like the brain's report, posted and closed once: a retry adds no second "Done".
+            if finished {
+                o.post_task(
+                    &task,
+                    &format!("✅ <b>Done.</b>\n{}", esc(&clip(&summary, 3000))),
+                    Notify::Sound,
+                )
+                .await;
+                if let Some(topic) = task.topic_id
+                    && let Err(e) = o.chat.close_topic(topic).await
+                {
+                    tracing::warn!("closing {}'s topic failed: {e:#}", task.id);
+                }
             }
             // The session ends after this turn, freeing the node; follow-ups resume it.
             if let Err(e) = tasks::stop(o, &task, true).await {

@@ -51,8 +51,8 @@ impl Working {
     }
 
     /// Reacts to the owner's `message` (if any) and shows "typing…" in `topic`, sent as `from`,
-    /// until [`Self::stop`] or [`TYPING_CAP`]. The first "typing…" goes out right after the
-    /// reaction, whatever happens meanwhile, so the owner always sees both.
+    /// until [`Self::stop`] or [`TYPING_CAP`]. The reaction always goes out; "typing…" only
+    /// while the task is still being worked on.
     pub fn show(
         self: &Arc<Self>,
         message: Option<i64>,
@@ -75,14 +75,13 @@ impl Working {
                 tracing::debug!("reacting to the owner's message failed: {e:#}");
             }
             let deadline = tokio::time::Instant::now() + TYPING_CAP;
-            loop {
+            // Checked before every tick, the first included: a message that was only queued, or
+            // a turn that ended while reacting, shows no "typing…" at all.
+            while this.current(&task_id, generation) && tokio::time::Instant::now() < deadline {
                 if let Err(e) = this.chat.typing(from, topic).await {
                     tracing::debug!("showing typing failed: {e:#}");
                 }
                 tokio::time::sleep(TYPING_EVERY).await;
-                if !this.current(&task_id, generation) || tokio::time::Instant::now() >= deadline {
-                    break;
-                }
             }
             let mut st = this.state.lock().unwrap();
             if st.typing.get(&task_id) == Some(&generation) {
@@ -131,9 +130,17 @@ impl Working {
         }
     }
 
-    /// The task's run is gone (exited, lost, failed to start): nothing more will be answered.
-    pub fn run_ended(&self, task_id: &str) {
+    /// The task's run `run_id` is gone (exited, lost, failed to start): nothing more will be
+    /// answered from it. A late report about an older run leaves a newer run's count alone.
+    pub fn run_ended(&self, task_id: &str, run_id: &str) {
         let mut st = self.state.lock().unwrap();
+        if st
+            .in_flight
+            .get(task_id)
+            .is_some_and(|(run, _)| run != run_id)
+        {
+            return;
+        }
         st.in_flight.remove(task_id);
         st.typing.remove(task_id);
     }
@@ -223,6 +230,36 @@ mod tests {
         // A result for a run it never counted ends it too (nothing to wait for).
         w.show(None, From::Orchestrator, None, "u");
         w.turn_ended("u", "other-run");
+        assert!(!w.is_showing("u"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stopped_before_the_first_tick_only_reacts() {
+        let chat = Arc::new(FakeChat::default());
+        let w = Working::new(chat.clone());
+        // Queued, say: stopped before the loop ever ran.
+        w.show(Some(3), From::Orchestrator, None, "t");
+        w.stop("t");
+        settle().await;
+        tokio::time::advance(TYPING_EVERY * 2).await;
+        settle().await;
+        assert_eq!(*chat.ops.lock().unwrap(), [Op::React(3, RECEIVED.into())]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn only_the_counted_run_ending_stops_typing() {
+        let chat = Arc::new(FakeChat::default());
+        let w = Working::new(chat.clone());
+        w.message_sent("t", "r2");
+        w.show(None, From::Orchestrator, None, "t");
+        // A late exit of the run before: the message is with r2, still being answered.
+        w.run_ended("t", "r1");
+        assert!(w.is_showing("t"));
+        w.run_ended("t", "r2");
+        assert!(!w.is_showing("t"));
+        // No count at all (nothing was sent this process): any run's end stops it.
+        w.show(None, From::Orchestrator, None, "u");
+        w.run_ended("u", "r9");
         assert!(!w.is_showing("u"));
     }
 

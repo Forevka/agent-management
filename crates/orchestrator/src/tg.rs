@@ -145,9 +145,8 @@ impl Chat for TelegramChat {
         }
         Ok(self.sender(from).await.send_message(&msg).await?.message_id)
     }
-    // Feedback, not content: straight to the API rather than through the send queue, so it never
-    // waits behind (or holds up) real messages. The caller only logs a failure.
-    // Through the orchestrator bot's rate limiter like any call to the group, waiting for room.
+    // Through the orchestrator bot's rate limiter like any call to the group: it waits for room
+    // and retries on 429s. The caller runs it in the background and only logs a failure.
     async fn react(&self, message_id: i64, emoji: &str) -> Result<()> {
         let bot = self.orchestrator.bot().clone();
         Ok(self
@@ -461,8 +460,18 @@ pub(crate) async fn owner_message(o: &Arc<Orchestrator>, msg: &Message) -> Resul
             }
         }
     };
-    // Kept for later (no node can take it now) or not delivered: nobody is working on it.
-    if !matches!(delivered, Ok(tasks::Delivered::ToRun)) {
+    // Kept for later (no node can take it now) or not delivered: nobody is working on it. Nor
+    // while the agent waits on the owner (a plan, a question, a permission, a blocking ask): the
+    // message waits in its session until the owner answers, so only the 👀 stays.
+    let blocked = matches!(delivered, Ok(tasks::Delivered::ToRun))
+        && sqlx::query_scalar::<_, bool>(
+            "select exists(select 1 from human_items where task_id = $1 and state = 'open' and blocking)",
+        )
+        .bind(&task_id)
+        .fetch_one(&o.db)
+        .await
+        .unwrap_or(false);
+    if blocked || !matches!(delivered, Ok(tasks::Delivered::ToRun)) {
         o.stop_working(&task_id);
     }
     delivered.map(drop)

@@ -393,7 +393,7 @@ impl Orchestrator {
             AgentEventKind::Exited { code } => {
                 self.record(&task_id, "exit", &format!("{code:?}")).await?;
                 if current {
-                    self.working.run_ended(&task_id);
+                    self.working.run_ended(&task_id, &run_id);
                 }
                 // A run that ended before it started gives back what it took.
                 crate::tasks::release_run_messages(self, &run_id).await?;
@@ -480,7 +480,7 @@ impl Orchestrator {
             AgentEventKind::SpawnFailed { reason } => {
                 self.record(&task_id, "spawn_failed", &reason).await?;
                 if current {
-                    self.working.run_ended(&task_id);
+                    self.working.run_ended(&task_id, &run_id);
                 }
                 crate::tasks::release_run_messages(self, &run_id).await?;
                 let Some(task) = task.filter(|_| current) else {
@@ -611,8 +611,8 @@ impl Orchestrator {
         // and its task waits for the next node, which `dispatch_queued` finds. Nothing will
         // answer the owner from a lost run, so "typing…" ends too.
         for task in ended {
-            self.working.run_ended(&task.id);
             let Some(run) = &task.run_id else { continue };
+            self.working.run_ended(&task.id, run);
             match crate::tasks::release_run_messages(self, run).await {
                 Ok(0) => {}
                 Ok(_) => {
