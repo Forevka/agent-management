@@ -1889,7 +1889,7 @@ async fn channel_by_name_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool) {
     assert_eq!(last.payload.0["action"]["channel"], "C0123ABCD");
     let e = propose("#no-such-channel").await.unwrap_err();
     assert!(
-        e.to_string().contains("not known yet"),
+        e.to_string().contains("is known yet"),
         "{e}: a clear error, not a request to guess"
     );
     let e = propose("#dup-channel").await.unwrap_err();
