@@ -317,7 +317,12 @@ pub enum RuleCmd {
     /// List the active rules.
     List,
     /// Remove a rule (R-3 or 3).
-    Remove { id: String },
+    Remove {
+        id: String,
+        /// The owner's words that asked for it.
+        #[arg(long)]
+        because: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -523,7 +528,9 @@ pub fn to_call(cmd: AgentCmd) -> Result<(&'static str, Value)> {
             ("rule_add", json!({"text": text, "because": because}))
         }
         AgentCmd::Rule(RuleCmd::List) => ("rule_list", json!({})),
-        AgentCmd::Rule(RuleCmd::Remove { id }) => ("rule_remove", json!({"id": id})),
+        AgentCmd::Rule(RuleCmd::Remove { id, because }) => {
+            ("rule_remove", json!({"id": id, "because": because}))
+        }
         AgentCmd::Triage {
             decision,
             refs,

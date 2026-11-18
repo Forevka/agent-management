@@ -10,7 +10,7 @@ use crate::{
     chat::{From, Notify, clip, esc},
     core::Orchestrator,
     model::{
-        AgentRow, BRAIN_AGENT, BRAIN_TASK, NewAgent, NodeRow, ProjectRow, SECRETARY_TASK, TaskRow,
+        AgentRow, BRAIN_AGENT, BRAIN_TASK, NewAgent, NodeRow, ProjectRow, SECRETARY_AGENT, TaskRow,
         status,
     },
     prompts,
@@ -469,15 +469,19 @@ async fn dispatch_locked(
             .await?;
             release_run_messages(o, &run_id).await?;
             tracing::warn!("preparing a run of {} failed: {e:#}", task.id);
-            o.post_task(
-                task,
-                &format!(
-                    "⚠️ Could not prepare the agent's run: {}",
-                    esc(&format!("{e:#}"))
-                ),
-                Notify::Sound,
-            )
-            .await;
+            // The fleet's own sessions are retried by every message they get: the owner hears
+            // about it when it starts failing, not on every retry.
+            if !(crate::model::is_builtin_task(&task.id) && task.status == status::FAILED) {
+                o.post_task(
+                    task,
+                    &format!(
+                        "⚠️ Could not prepare the agent's run: {}",
+                        esc(&format!("{e:#}"))
+                    ),
+                    Notify::Sound,
+                )
+                .await;
+            }
             return Ok(Dispatched::Waiting);
         }
     };
@@ -517,8 +521,11 @@ async fn queue(
             .execute(&o.db)
             .await?;
     }
-    if let Some(note) = note {
-        // Queue notes are progress, not a call for the owner.
+    // Queue notes are progress, not a call for the owner; for the fleet's own sessions only
+    // when they become queued, not again for every message that waits.
+    if let Some(note) = note
+        && !(crate::model::is_builtin_task(&task.id) && task.status == status::QUEUED)
+    {
         o.post_task(task, &note, Notify::Silent).await;
     }
     Ok(Dispatched::Waiting)
@@ -575,7 +582,9 @@ async fn build_spawn(
     run_id: String,
 ) -> Result<SpawnAgent> {
     let is_brain = task.id == BRAIN_TASK;
-    let is_secretary = task.id == SECRETARY_TASK;
+    // By the agent, not the task: whatever task the secretary's agent were ever given, its
+    // restrictions come with it.
+    let is_secretary = agent.id == SECRETARY_AGENT;
     // The secretary reads third parties' messages all day: it gets no secrets at all, so a
     // message that talks it into something has nothing to leak.
     let secret_files = if is_secretary {
@@ -610,6 +619,13 @@ async fn build_spawn(
     if (fresh || texts.is_empty()) && !is_secretary {
         parts.push(prompts::task_prompt(task));
     }
+    // The secretary's queued texts (batches, notes) could pile up while it cannot run: its first
+    // turn keeps the newest that fit and says what was left out.
+    let texts = if is_secretary {
+        newest_within(texts, SECRETARY_FIRST_TURN_BYTES)
+    } else {
+        texts
+    };
     parts.extend(texts);
     let first = parts.join("\n\n");
     // The secretary runs on its own cheap model, whatever the node's command sets (the last
@@ -663,6 +679,40 @@ async fn build_spawn(
         run_id,
     })
 }
+/// The most of the secretary's queued texts its first turn takes.
+const SECRETARY_FIRST_TURN_BYTES: usize = 60_000;
+
+/// The newest `texts` (in order) that fit in `max` bytes; when some are left out, a note says
+/// how many first.
+fn newest_within(texts: Vec<String>, max: usize) -> Vec<String> {
+    let mut used = 0;
+    let keep = texts
+        .iter()
+        .rev()
+        .take_while(|t| {
+            used += t.len();
+            used <= max
+        })
+        .count()
+        .max(1);
+    let dropped = texts.len().saturating_sub(keep);
+    let mut out: Vec<String> = texts.into_iter().skip(dropped).collect();
+    if let Some(last) = out.first_mut()
+        && last.len() > max
+    {
+        *last = crate::chat::clip(last, max);
+    }
+    if dropped > 0 {
+        out.insert(
+            0,
+            format!(
+                "[{dropped} earlier queued messages were left out (too much at once). Read what you missed with `fleet agent feed read --hours N`.]"
+            ),
+        );
+    }
+    out
+}
+
 /// Flags in a node's Claude command that would widen what the secretary may do. Its session is
 /// refused on such a node rather than run with them (the owner set them for their own agents).
 const WIDENING_FLAGS: [&str; 12] = [
@@ -1053,6 +1103,20 @@ fn env_quote(v: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_secretarys_first_turn_keeps_the_newest_texts() {
+        let t = |n: usize| "x".repeat(n);
+        assert_eq!(newest_within(vec![t(10), t(20)], 100), vec![t(10), t(20)]);
+        let out = newest_within(vec![t(50), t(40), t(30)], 75);
+        assert_eq!(out.len(), 3);
+        assert!(out[0].contains("1 earlier queued messages were left out"));
+        assert_eq!(out[1], t(40));
+        assert_eq!(out[2], t(30));
+        // One text bigger than everything is kept, clipped.
+        let out = newest_within(vec![t(500)], 100);
+        assert!(out.len() == 1 && out[0].len() <= 104);
+    }
 
     #[test]
     fn widening_flags_keep_the_secretary_off_a_node() {

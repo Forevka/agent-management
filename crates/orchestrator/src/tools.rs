@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use fleet_net::EndpointId;
 use fleet_proto::{ToolCall, ToolResult};
 use serde_json::{Value, json};
@@ -362,6 +362,13 @@ pub async fn handle(
             ok(serde_json::to_string_pretty(&out)?)
         }
         "create_task" => {
+            // Only ordinary agents take tasks: not the brain's, not the secretary's.
+            if let Some(name) = args["agent"].as_str()
+                && let Some(a) = tasks::find_agent(o, name).await?
+                && crate::model::is_builtin_agent(&a.id)
+            {
+                bail!("{name} cannot take tasks; choose or create an agent of the project");
+            }
             let new_agent: Option<NewAgent> = args
                 .get("new_agent")
                 .filter(|v| !v.is_null())
@@ -384,12 +391,22 @@ pub async fn handle(
         "send_to_task" => {
             let id = args["task_id"].as_str().context("task_id required")?;
             let text = args["text"].as_str().context("text required")?;
+            // The fleet's own sessions are not tasks to direct: the secretary takes notes
+            // (secretary-note), the brain is you.
+            ensure!(
+                !crate::model::is_builtin_task(id),
+                "{id} is not a task; use secretary-note for the secretary"
+            );
             let t = o.task(id).await?.with_context(|| format!("no task {id}"))?;
             tasks::deliver(o, &t, format!("[Follow-up from the orchestrator] {text}")).await?;
             ok(format!("Sent to {id}."))
         }
         "stop_task" => {
             let id = args["task_id"].as_str().context("task_id required")?;
+            ensure!(
+                !crate::model::is_builtin_task(id),
+                "{id} is not a task you can stop"
+            );
             let t = o.task(id).await?.with_context(|| format!("no task {id}"))?;
             tasks::stop(o, &t, false).await?;
             ok(format!("Stopping {id}."))

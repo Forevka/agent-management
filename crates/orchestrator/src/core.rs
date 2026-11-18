@@ -41,6 +41,8 @@ pub struct Orchestrator {
     pub working: Arc<crate::working::Working>,
     /// Task -> when it last posted with a sound (see [`Orchestrator::allow_loud_post`]).
     loud_posts: std::sync::Mutex<HashMap<String, tokio::time::Instant>>,
+    /// What the secretary's current run is answering, turn by turn (see `secretary::Turns`).
+    pub secretary_turns: std::sync::Mutex<crate::secretary::Turns>,
 }
 
 /// How often one task may post with a sound (`fleet agent post --notify`).
@@ -76,6 +78,7 @@ impl Orchestrator {
             brain_tx,
             working: crate::working::Working::new(chat_for_working),
             loud_posts: Default::default(),
+            secretary_turns: Default::default(),
         });
         // Weak, so the consumer does not keep the orchestrator alive; the channel closes with it.
         let weak = Arc::downgrade(&o);
@@ -386,6 +389,9 @@ impl Orchestrator {
                         .is_ok_and(|v| v["type"] == "result")
                 {
                     self.working.turn_ended(&task_id, &run_id);
+                    if task_id == crate::model::SECRETARY_TASK {
+                        crate::secretary::turn_ended(self, &run_id);
+                    }
                 }
                 self.record(&task_id, "out", &json).await?
             }
@@ -394,6 +400,7 @@ impl Orchestrator {
                 self.record(&task_id, "exit", &format!("{code:?}")).await?;
                 if current {
                     self.working.run_ended(&task_id, &run_id);
+                    crate::secretary::run_ended(self, &run_id);
                 }
                 // A run that ended before it started gives back what it took.
                 crate::tasks::release_run_messages(self, &run_id).await?;
@@ -483,6 +490,7 @@ impl Orchestrator {
                 self.record(&task_id, "spawn_failed", &reason).await?;
                 if current {
                     self.working.run_ended(&task_id, &run_id);
+                    crate::secretary::run_ended(self, &run_id);
                 }
                 crate::tasks::release_run_messages(self, &run_id).await?;
                 let Some(task) = task.filter(|_| current) else {
@@ -551,7 +559,14 @@ impl Orchestrator {
                         self.tell_brain(text);
                         return Ok(());
                     }
-                    if let Err(e) = crate::tasks::deliver(self, &task, text.clone()).await {
+                    // The secretary's next run takes it as a turn of nobody's in particular.
+                    let redelivered = if task.id == crate::model::SECRETARY_TASK {
+                        crate::secretary::run_ended(self, &run_id);
+                        crate::secretary::redeliver(self, text.clone()).await
+                    } else {
+                        crate::tasks::deliver(self, &task, text.clone()).await
+                    };
+                    if let Err(e) = redelivered {
                         // Kept rather than lost (say, its agent was removed meanwhile): it is
                         // in the task's queue for whoever picks the task up.
                         tracing::warn!("redelivering to {} failed, text kept: {e:#}", task.id);
@@ -615,6 +630,7 @@ impl Orchestrator {
         for task in ended {
             let Some(run) = &task.run_id else { continue };
             self.working.run_ended(&task.id, run);
+            crate::secretary::run_ended(self, run);
             match crate::tasks::release_run_messages(self, run).await {
                 Ok(0) => {}
                 Ok(_) => {
@@ -709,6 +725,13 @@ impl Orchestrator {
             .execute(&self.db)
             .await?;
         }
+        // Settled todos (done, dismissed, sent for a task) go with the rest of the history.
+        sqlx::query(
+            "delete from todos where status <> 'open' and updated_at < now() - make_interval(days => $1::int)",
+        )
+        .bind(days as i32)
+        .execute(&self.db)
+        .await?;
         // Channels mapped to a project keep the general retention; everything else the owner
         // receives (every conversation, for the secretary) has its own.
         sqlx::query(

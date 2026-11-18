@@ -415,6 +415,26 @@ async fn secretary_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeCha
             .to_string()
             .contains("only available to the secretary")
     );
+    // Nor can the brain direct the fleet's own sessions as tasks.
+    for (tool, args, why) in [
+        (
+            "send_to_task",
+            json!({"task_id": "secretary", "text": "x"}),
+            "secretary-note",
+        ),
+        ("stop_task", json!({"task_id": "secretary"}), "not a task"),
+        ("stop_task", json!({"task_id": "brain"}), "not a task"),
+        (
+            "create_task",
+            json!({"project": "demo", "title": "x", "brief": "x", "agent": "Secretary"}),
+            "cannot take tasks",
+        ),
+    ] {
+        let e = call_as(o, "orchestrator", "brain", tool, args)
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains(why), "{tool}: {e}");
+    }
     let worker = o.task("demo-BS-1").await.unwrap().unwrap();
     let agent = worker.agent_id.clone().unwrap();
     for (tool, args, why) in [
@@ -625,7 +645,7 @@ async fn secretary_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeCha
         "the undone rule is gone"
     );
     let replanted: crate::model::RuleRow = wait_for("the replanted rule", || async {
-        sqlx::query_as("select * from secretary_rules where text = 'ignore #random from now on'")
+        sqlx::query_as("select * from secretary_rules where text = 'ignore #random from now on' and tg_msg is not null")
             .fetch_optional(db)
             .await
             .unwrap()
@@ -637,7 +657,7 @@ async fn secretary_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeCha
     .await;
     // The secretary settling a todo on its own shows as its doing, with Reopen for the owner.
     let budget: i64 = wait_for("the budget todo", || async {
-        sqlx::query_scalar("select id from todos where status = 'open' order by id desc limit 1")
+        sqlx::query_scalar("select id from todos where status = 'open' and tg_msg is not null order by id desc limit 1")
             .fetch_optional(db)
             .await
             .unwrap()

@@ -563,7 +563,17 @@ async fn command(
             }
             "The orchestrator brain will start a fresh session on your next message.".into()
         }
-        "/help" | "/start" => "Write in General to talk to the orchestrator. Reply in a task topic to talk to its agent; reply to a question to answer it.\n/status /queue /tasks /stop [task] /web /invite /brain_reset".into(),
+        "/secretary_reset" => {
+            sqlx::query("update tasks set session_id = null where id = $1")
+                .bind(crate::model::SECRETARY_TASK)
+                .execute(&o.db)
+                .await?;
+            if let Some(t) = o.task(crate::model::SECRETARY_TASK).await? {
+                tasks::stop(o, &t, false).await?;
+            }
+            "The secretary will start a fresh session with its next batch or your next message in the Inbox (its todos and rules stay).".into()
+        }
+        "/help" | "/start" => "Write in General to talk to the orchestrator, or in 📋 Inbox to talk to the secretary. Reply in a task topic to talk to its agent; reply to a question to answer it.\n/status /queue /tasks /stop [task] /web /invite /brain_reset /secretary_reset".into(),
         _ => format!("Unknown command {}. Try /help.", esc(cmd)),
     };
     o.chat

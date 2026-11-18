@@ -23,7 +23,7 @@ Run a fleet of [Claude Code](https://claude.com/claude-code) agents across your 
 
 ## Telegram commands
 
-`/status` · `/queue` · `/tasks` · `/stop [task]` · `/web` · `/invite` · `/brain_reset`
+`/status` · `/queue` · `/tasks` · `/stop [task]` · `/web` · `/invite` · `/brain_reset` · `/secretary_reset`
 
 ## Develop
 
