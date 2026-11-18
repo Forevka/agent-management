@@ -9,7 +9,8 @@
 //!
 //! - **Polling.** The source is asked for what is new ([`Source::poll`]) on a schedule, and keeps
 //!   an opaque JSON cursor the orchestrator stores, so that a restart resumes exactly where the
-//!   last returned batch ended. [`SlackSource`] polls the Slack Web API with the user's own token.
+//!   last returned batch ended. [`SlackSource`] polls the Slack Web API with the user's own token;
+//!   [`GChatSource`] polls Google Chat as the owner.
 //! - **Push.** The source holds a connection and hands over [`FeedEvent`]s as they happen.
 //!   Pushed events are not replayed after an outage, so a push source also fills gaps itself
 //!   ([`Source::backfill`]). [`SlackSocket`] uses Slack Socket Mode.
@@ -17,6 +18,7 @@
 //! Message text is untrusted data from other people. Sources convert markup to plain text and
 //! nothing more; they never act on what a message says.
 
+mod gchat;
 mod slack;
 
 use std::fmt;
@@ -26,6 +28,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+pub use gchat::{
+    DEFAULT_BASE_URL as GCHAT_DEFAULT_BASE_URL, DEFAULT_TOKENINFO_URL as GOOGLE_TOKENINFO_URL,
+    GChatSource, GoogleCredentials,
+};
 pub use slack::{DEFAULT_BASE_URL as SLACK_DEFAULT_BASE_URL, SlackSocket, SlackSource};
 
 /// What kind of conversation a message was posted in. Upper layers use it to weigh messages (a
@@ -281,6 +287,13 @@ pub trait Replier: Send + Sync {
         thread_id: Option<&str>,
         text: &str,
     ) -> Result<String, FeedError>;
+
+    /// A link to a message (such as one [`post_reply`](Replier::post_reply) just posted), when
+    /// the source can give one. Never fails: no link is `None`.
+    async fn permalink(&self, conversation_id: &str, message_id: &str) -> Option<String> {
+        let _ = (conversation_id, message_id);
+        None
+    }
 }
 
 /// Fetches missed messages on demand. Shared, so it can be used while the source runs.

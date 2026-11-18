@@ -7,6 +7,9 @@
 //!   AskUserQuestion, other tools). The agent's tool call is blocked until answered; the
 //!   answer is sent back to the node as the tool result.
 //! - `task_proposal`, `slack_reply`: suggestions from the brain, applied only on approval.
+//! - `reply`: a reply the secretary drafted when the owner asked for one, shown in the Inbox.
+//!   Send posts it through its source (once), a reply to the card replaces the text, Cancel
+//!   drops it. Nothing is posted without Send.
 //! - `admin_change`: a change to the fleet's configuration proposed by the brain (see
 //!   `admin.rs`). It runs only when the owner approves, and the outcome goes back to the brain.
 
@@ -210,6 +213,7 @@ async fn announce(o: &Orchestrator, row: &HumanItemRow, task: Option<&TaskRow>) 
                 Button::callback("Dismiss", format!("x|{}|n", row.id)),
             ]],
         ),
+        "reply" => reply_card(row),
         "admin_change" => (
             format!(
                 "🛠 <b>Q-{}</b> The orchestrator asks to change the fleet:\n<b>{}</b>{}\n<i>Tap a button, or reply yes / no. Any other reply rejects it, with your words as the reason.</i>",
@@ -233,12 +237,15 @@ async fn announce(o: &Orchestrator, row: &HumanItemRow, task: Option<&TaskRow>) 
     };
     // Plan and question pages need a magic link; replace the placeholder now that we have the id.
     let keyboard = with_links(o, row.id, keyboard).await?;
+    // A reply draft answers the owner in the Inbox, where they asked for it.
     let topic = match &row.project {
+        _ if row.kind == "reply" => Some(crate::secretary::inbox_topic(o).await?),
         Some(p) => Some(tasks::human_topic(o, p, row.blocking).await?),
         None => None,
     };
-    // What needs the owner sounds ("needs you"); an FYI item does not.
-    let notify = if row.blocking {
+    // What needs the owner sounds ("needs you"), and so does the draft they are waiting for;
+    // an FYI item does not.
+    let notify = if row.blocking || row.kind == "reply" {
         Notify::Sound
     } else {
         Notify::Silent
@@ -284,6 +291,62 @@ async fn announce(o: &Orchestrator, row: &HumanItemRow, task: Option<&TaskRow>) 
         }
     }
     Ok(())
+}
+
+/// A reply draft's card: where it goes (sent as the owner), what it answers, the text, and Send /
+/// Edit / Cancel. Everything in it but the text the owner approves is third-party or the
+/// secretary's, and all of it is escaped.
+fn reply_card(row: &HumanItemRow) -> (String, Keyboard) {
+    let p = &row.payload.0;
+    // Escaped first, then clipped: a clip of raw text can expand past Telegram's 4096-character
+    // limit after escaping (`'` and `&` both grow 5x), but clipping the already-escaped string
+    // cannot, whatever the source text contains. The stored payload (sent on Send, and shown in
+    // full on the web page) is never touched here, only what the card displays.
+    let s = |k: &str, max: usize| clip(&esc(p[k].as_str().unwrap_or_default()), max);
+    let place = if p["thread_id"].is_string() {
+        "in the thread of"
+    } else {
+        "answering"
+    };
+    (
+        format!(
+            "✉️ <b>Q-{}</b> Reply draft, sent <b>as you</b> to <b>{}</b>\n<i>{place} {}:</i> {}\n<blockquote>{}</blockquote>\n<i>Reply to this message with new text to replace the draft.</i>",
+            row.id,
+            s("destination", 150),
+            s("in_reply_to", 150),
+            s("quote", 400),
+            s("text", 3000),
+        ),
+        vec![vec![
+            Button::callback("📤 Send", format!("x|{}|y", row.id)),
+            Button::callback("✏️ Edit", format!("e|{}|", row.id)),
+            Button::callback("✖️ Cancel", format!("x|{}|n", row.id)),
+        ]],
+    )
+}
+
+/// The owner replied to an open reply draft's card with new text: it replaces the draft as
+/// written, and the card shows it. The draft stays open for Send.
+async fn edit_reply(o: &Orchestrator, id: i64, text: &str) -> Result<String> {
+    let text = text.trim();
+    anyhow::ensure!(!text.is_empty(), "the new text is empty");
+    let row: Option<HumanItemRow> = sqlx::query_as(
+        "update human_items set payload = jsonb_set(payload, '{text}', to_jsonb($2::text))
+         where id = $1 and kind = 'reply' and state = 'open' returning *",
+    )
+    .bind(id)
+    .bind(text)
+    .fetch_optional(&o.db)
+    .await?;
+    let Some(row) = row else {
+        return Ok(format!("Q-{id} is no longer open"));
+    };
+    let (html, kb) = reply_card(&row);
+    if let Some(msg) = row.tg_msg {
+        o.chat.edit(From::Orchestrator, msg, &html, kb).await?;
+    }
+    o.audit("owner", "reply.edit", json!({"item": id})).await;
+    Ok(format!("Q-{id}: draft replaced; tap Send to post it"))
 }
 
 /// A copy recorded after its item was already answered or cancelled (the owner was quick, or
@@ -346,6 +409,12 @@ pub enum Answer {
 
 /// Applies an answer. Returns a short confirmation for the UI.
 pub async fn answer(o: &Arc<Orchestrator>, id: i64, ans: Answer) -> Result<String> {
+    // Text for a reply draft is its new wording, not a decision: the draft stays open.
+    if let Answer::Text(t) = &ans
+        && item(o, id).await?.kind == "reply"
+    {
+        return edit_reply(o, id, t).await;
+    }
     // Claim the item atomically so a double click or a web+Telegram race answers once.
     let claimed: Option<HumanItemRow> =
         sqlx::query_as("update human_items set state = 'answered', answered_at = now() where id = $1 and state = 'open' returning *")
@@ -555,13 +624,40 @@ async fn apply(o: &Arc<Orchestrator>, row: &HumanItemRow, ans: Answer) -> Result
             .await?;
             Ok((format!("created {}", task.id), json!({"task": task.id})))
         }
+        // Claimed before this runs, so a draft is posted at most once; a failed post re-opens
+        // it for another try.
+        ("reply", Answer::Accept) => {
+            let source = p["source"].as_str().unwrap_or_default();
+            let poster = crate::feeds::poster(o, source).await.with_context(|| {
+                format!(
+                    "{} is not running, or cannot post; try again later",
+                    crate::feeds::source_name(source)
+                )
+            })?;
+            let text = p["text"].as_str().unwrap_or_default();
+            let id = poster
+                .post_reply(
+                    p["conversation_id"].as_str().unwrap_or_default(),
+                    p["thread_id"].as_str(),
+                    text,
+                )
+                .await?;
+            let link = poster
+                .permalink(p["conversation_id"].as_str().unwrap_or_default(), &id)
+                .await;
+            let mut summary = format!("sent to {}", p["destination"].as_str().unwrap_or_default());
+            if let Some(l) = &link {
+                summary.push_str(&format!(": {l}"));
+            }
+            Ok((summary, json!({"sent": id, "text": text, "link": link})))
+        }
+        ("reply", Answer::Dismiss) => Ok(("cancelled".into(), json!({"cancelled": true}))),
         ("slack_reply", Answer::Accept) => {
-            let poster = o
-                .feed_poster
-                .read()
-                .await
-                .clone()
-                .context("no Slack source is configured")?;
+            // The brain proposes Slack replies by channel; other sources go through `reply`.
+            let source = p["source"].as_str().unwrap_or("slack");
+            let poster = crate::feeds::poster(o, source).await.with_context(|| {
+                format!("no {} source is running", crate::feeds::source_name(source))
+            })?;
             let ts = poster
                 .post_reply(
                     p["channel_id"].as_str().unwrap_or_default(),

@@ -1016,6 +1016,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-websockets",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]

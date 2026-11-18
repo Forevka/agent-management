@@ -1,4 +1,4 @@
-//! External feeds (Slack today; any source behind `fleet_feeds::Source`): running the sources,
+//! External feeds (Slack, Google Chat; any source behind `fleet_feeds::Source`): running the sources,
 //! storage, mirroring into Telegram, the secretary's queue, and the feed tools.
 //!
 //! Feed content is written by third parties. It is stored and shown as data, and only reaches
@@ -11,8 +11,8 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use fleet_feeds::{
-    ConversationKind, FeedError, FeedEvent, FeedMessage, Replier, SlackSocket, SlackSource, Source,
-    SourceStatus,
+    ConversationKind, FeedError, FeedEvent, FeedMessage, GChatSource, GoogleCredentials, Replier,
+    SlackSocket, SlackSource, Source, SourceStatus,
 };
 use serde_json::{Value, json};
 
@@ -27,6 +27,13 @@ pub const SLACK_FOLDER: &str = "slack";
 pub const SLACK_TOKEN_KEY: &str = "SLACK_USER_TOKEN";
 pub const SLACK_APP_TOKEN_KEY: &str = "SLACK_APP_TOKEN";
 
+/// The secrets-manager folder and keys of the Google Chat source: the owner's "authorized user"
+/// OAuth credential (an OAuth client of their Google Cloud project, and a refresh token).
+pub const GCHAT_FOLDER: &str = "gchat";
+pub const GCHAT_CLIENT_ID_KEY: &str = "GOOGLE_CLIENT_ID";
+pub const GCHAT_CLIENT_SECRET_KEY: &str = "GOOGLE_CLIENT_SECRET";
+pub const GCHAT_REFRESH_TOKEN_KEY: &str = "GOOGLE_REFRESH_TOKEN";
+
 /// Posts approved replies back to the source.
 #[async_trait]
 pub trait ReplyPoster: Send + Sync {
@@ -36,10 +43,23 @@ pub trait ReplyPoster: Send + Sync {
         thread_id: Option<&str>,
         text: &str,
     ) -> Result<String>;
+
+    /// Whether a reply can go into a thread (else only to the conversation).
+    fn in_thread(&self) -> bool {
+        true
+    }
+
+    /// A link to a message this posted, when the source can give one.
+    async fn permalink(&self, _conversation_id: &str, _msg_id: &str) -> Option<String> {
+        None
+    }
 }
 
 /// A running source's reply handle (usable while the source runs).
-struct SourceReplier(Arc<dyn Replier>);
+struct SourceReplier {
+    replier: Arc<dyn Replier>,
+    in_thread: bool,
+}
 
 #[async_trait]
 impl ReplyPoster for SourceReplier {
@@ -49,10 +69,58 @@ impl ReplyPoster for SourceReplier {
         thread_id: Option<&str>,
         text: &str,
     ) -> Result<String> {
-        Ok(self.0.post_reply(channel_id, thread_id, text).await?)
+        Ok(self.replier.post_reply(channel_id, thread_id, text).await?)
+    }
+
+    fn in_thread(&self) -> bool {
+        self.in_thread
     }
 }
 
+/// The reply handle of the running source `source` (its kind: "slack", "gchat"), if it can reply.
+pub async fn poster(o: &Orchestrator, source: &str) -> Option<Arc<dyn ReplyPoster>> {
+    o.feed_posters.read().await.get(source).cloned()
+}
+
+/// Offers a running source's replier for approved replies (until the source stops).
+pub(crate) async fn offer_replier(
+    o: &Orchestrator,
+    kind: &str,
+    replier: Arc<dyn Replier>,
+    in_thread: bool,
+) {
+    o.feed_posters.write().await.insert(
+        kind.to_owned(),
+        Arc::new(SourceReplier { replier, in_thread }) as Arc<dyn ReplyPoster>,
+    );
+}
+
+/// A source's name as the owner reads it.
+pub fn source_name(source: &str) -> String {
+    match source {
+        "slack" => "Slack".into(),
+        "gchat" => "Google Chat".into(),
+        other => other.to_owned(),
+    }
+}
+
+/// Where a message came from, as the owner reads it: "Slack · #ops · Bob", "Google Chat ·
+/// Project X · Olya". Plain text built from third-party names: escape it to show it.
+pub fn label(source: &str, kind: &str, conversation: &str, author: Option<&str>) -> String {
+    // Slack writes channel names with a '#'; other sources name their spaces plainly.
+    let conversation = match (source, ConvKind::parse(kind)) {
+        ("slack", ConvKind::Channel | ConvKind::Private) => {
+            format!("#{}", conversation.trim_start_matches('#'))
+        }
+        _ => conversation.to_owned(),
+    };
+    let mut parts = vec![source_name(source), conversation];
+    // A direct message is named after the other person already.
+    if let Some(a) = author.filter(|a| !a.is_empty() && *a != parts[1]) {
+        parts.push(a.to_owned());
+    }
+    parts.join(" · ")
+}
 async fn secret(o: &Orchestrator, folder: &str, key: &str) -> Result<Option<String>> {
     // The folder name is matched without case: owners name it "Slack" as often as "slack",
     // and a feed that silently never starts over a capital letter is worse than either.
@@ -78,6 +146,12 @@ enum SourceConfig {
     SlackSocket { user: String, app: String },
     /// Only the user token: the channels mapped to projects, polled (as before Socket Mode).
     SlackPoll { user: String, channels: Vec<String> },
+    /// Google Chat, polled as the owner with their OAuth credential.
+    GoogleChat {
+        client_id: String,
+        client_secret: String,
+        refresh_token: String,
+    },
 }
 
 impl SourceConfig {
@@ -86,18 +160,37 @@ impl SourceConfig {
         match self {
             Self::SlackSocket { .. } => "feed_cursor_slack_socket",
             Self::SlackPoll { .. } => "feed_cursor_slack",
+            Self::GoogleChat { .. } => "feed_cursor_gchat",
         }
     }
 
-    fn build(&self) -> Box<dyn Source> {
-        match self {
+    fn build(&self) -> Result<Box<dyn Source>, FeedError> {
+        Ok(match self {
             Self::SlackSocket { user, app } => {
                 Box::new(SlackSocket::new(user.clone(), app.clone()))
             }
             Self::SlackPoll { user, channels } => {
                 Box::new(SlackSource::new(user.clone(), channels.clone()))
             }
-        }
+            Self::GoogleChat {
+                client_id,
+                client_secret,
+                refresh_token,
+            } => {
+                // Read the way Google's own credential files are, so the token endpoint stays
+                // the adapter's default.
+                let creds = GoogleCredentials::from_json(
+                    &json!({
+                        "type": "authorized_user",
+                        "client_id": client_id,
+                        "client_secret": client_secret,
+                        "refresh_token": refresh_token,
+                    })
+                    .to_string(),
+                )?;
+                Box::new(GChatSource::new(creds))
+            }
+        })
     }
 }
 
@@ -116,60 +209,114 @@ async fn slack_config(o: &Orchestrator) -> Result<Option<SourceConfig>> {
     Ok((!channels.is_empty()).then_some(SourceConfig::SlackPoll { user, channels }))
 }
 
-/// Runs the configured sources forever (Slack today), restarting one when its configuration
-/// changes. Each source runs in push or poll mode, as it does itself, and retries what it can
-/// by itself; one that stops with an error (a revoked or wrong token) is reported to the owner
-/// and stays stopped until its settings change.
+/// Google Chat runs once all three parts of the owner's OAuth credential are in its folder.
+async fn gchat_config(o: &Orchestrator) -> Result<Option<SourceConfig>> {
+    let (Some(client_id), Some(client_secret), Some(refresh_token)) = (
+        secret(o, GCHAT_FOLDER, GCHAT_CLIENT_ID_KEY).await?,
+        secret(o, GCHAT_FOLDER, GCHAT_CLIENT_SECRET_KEY).await?,
+        secret(o, GCHAT_FOLDER, GCHAT_REFRESH_TOKEN_KEY).await?,
+    ) else {
+        return Ok(None);
+    };
+    Ok(Some(SourceConfig::GoogleChat {
+        client_id,
+        client_secret,
+        refresh_token,
+    }))
+}
+
+/// The sources that should run now, each under the name it runs as (its kind). Each source's
+/// configuration is read on its own: a decrypt or database error reading one source's secrets
+/// (a corrupted value, a `FLEET_MASTER_KEY` that no longer matches after a partial restore)
+/// must not stop the orchestrator from reconciling every other source, which it would if this
+/// read one `Result` for all of them with `?`.
+async fn wanted(o: &Orchestrator) -> Vec<(&'static str, SourceConfig)> {
+    let mut v = Vec::new();
+    match slack_config(o).await {
+        Ok(Some(c)) => v.push(("slack", c)),
+        Ok(None) => {}
+        Err(e) => tracing::warn!("reading the slack feed's settings failed: {e:#}"),
+    }
+    match gchat_config(o).await {
+        Ok(Some(c)) => v.push(("gchat", c)),
+        Ok(None) => {}
+        Err(e) => tracing::warn!("reading the google chat feed's settings failed: {e:#}"),
+    }
+    v
+}
+
+/// Runs every configured source forever (Slack, Google Chat), each in its own task with its own
+/// cursor, restarting one when its configuration changes. Each source runs in push or poll mode,
+/// as it does itself, and retries what it can by itself; one that stops with an error (a revoked
+/// or wrong token) is reported to the owner and stays stopped until its settings change.
 pub async fn run_feeds(o: Arc<Orchestrator>) {
-    let mut running: Option<(SourceConfig, tokio::task::JoinHandle<()>)> = None;
-    let mut stopped: Option<SourceConfig> = None;
+    let mut running: std::collections::HashMap<
+        &'static str,
+        (SourceConfig, tokio::task::JoinHandle<()>),
+    > = Default::default();
+    let mut stopped: std::collections::HashMap<&'static str, SourceConfig> = Default::default();
     loop {
-        match slack_config(&o).await {
-            Ok(want) => {
-                // A source that ended by itself stays down until its settings change.
-                if let Some((cfg, h)) = &running
-                    && h.is_finished()
-                {
-                    stopped = Some(cfg.clone());
-                    running = None;
-                }
-                let current = running
-                    .as_ref()
-                    .is_some_and(|(cfg, _)| Some(cfg) == want.as_ref());
-                if !current {
-                    if let Some((_, h)) = running.take() {
-                        h.abort();
-                    }
-                    *o.feed_poster.write().await = None;
-                    if let Some(cfg) = want.filter(|w| stopped.as_ref() != Some(w)) {
-                        stopped = None;
-                        let o = o.clone();
-                        let c = cfg.clone();
-                        running = Some((
-                            cfg,
-                            tokio::spawn(async move {
-                                let mut src = c.build();
-                                if let Err(e) = drive(&o, src.as_mut(), c.cursor_key()).await {
-                                    source_stopped(&o, src.kind(), &e).await;
-                                }
-                            }),
-                        ));
-                    }
-                }
+        let want = wanted(&o).await;
+        // A source that ended by itself stays down until its settings change.
+        running.retain(|name, (cfg, h)| {
+            if h.is_finished() {
+                stopped.insert(name, cfg.clone());
+                false
+            } else {
+                true
             }
-            Err(e) => tracing::warn!("reading the feed settings failed: {e:#}"),
+        });
+        // Sources no longer configured stop.
+        let names: Vec<&'static str> = want.iter().map(|(n, _)| *n).collect();
+        for (name, (_, h)) in running.iter().filter(|(n, _)| !names.contains(n)) {
+            tracing::info!("feed source {name} is no longer configured; stopping it");
+            h.abort();
+        }
+        running.retain(|n, _| names.contains(n));
+        stopped.retain(|n, _| names.contains(n));
+        let mut posters = o.feed_posters.write().await;
+        posters.retain(|n, _| running.contains_key(n.as_str()));
+        drop(posters);
+        for (name, cfg) in want {
+            if running.get(name).is_some_and(|(c, _)| *c == cfg) {
+                continue;
+            }
+            if let Some((_, h)) = running.remove(name) {
+                h.abort();
+                o.feed_posters.write().await.remove(name);
+            }
+            if stopped.get(name) == Some(&cfg) {
+                continue;
+            }
+            stopped.remove(name);
+            let o = o.clone();
+            let c = cfg.clone();
+            running.insert(
+                name,
+                (
+                    cfg,
+                    tokio::spawn(async move {
+                        let mut src = match c.build() {
+                            Ok(s) => s,
+                            Err(e) => return source_stopped(&o, name, &e).await,
+                        };
+                        if let Err(e) = drive(&o, src.as_mut(), c.cursor_key()).await {
+                            source_stopped(&o, src.kind(), &e).await;
+                        }
+                    }),
+                ),
+            );
         }
         tokio::time::sleep(Duration::from_secs(30)).await;
     }
 }
-
 /// A source that cannot go on (the source said so: a revoked or wrong token, say). The owner
 /// hears it once, with a sound: messages stop arriving until they fix its settings.
 async fn source_stopped(o: &Orchestrator, kind: &str, e: &FeedError) {
     tracing::error!("feed source {kind} stopped: {e}");
     let html = format!(
         "⚠️ The {} feed stopped: {}\nNo messages arrive from it until its settings change (web UI → Secrets → its folder).",
-        esc(kind),
+        esc(&source_name(kind)),
         esc(&clip(&e.to_string(), 500))
     );
     if let Err(e) = o
@@ -242,10 +389,11 @@ where
         }
         None => {}
     }
-    *o.feed_poster.write().await = src
-        .replier()
-        .map(|r| Arc::new(SourceReplier(r)) as Arc<dyn ReplyPoster>);
     let kind = src.kind();
+    // Approved replies to this source go through it while it runs.
+    if let Some(replier) = src.replier() {
+        offer_replier(o, kind, replier, src.capabilities().can_reply_in_thread).await;
+    }
     let (tx, mut rx) = tokio::sync::mpsc::channel::<FeedEvent>(256);
     let consume = async move {
         // Messages not stored yet, oldest first, and the newest checkpoint not saved yet.
@@ -315,7 +463,7 @@ where
         }
     };
     let (result, ()) = tokio::join!(src.run(tx), consume);
-    *o.feed_poster.write().await = None;
+    o.feed_posters.write().await.remove(kind);
     result
 }
 

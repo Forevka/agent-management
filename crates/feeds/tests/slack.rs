@@ -173,6 +173,15 @@ impl Mock {
                     None => Json(json!({"ok": false, "error": "channel_not_found"})),
                 }
             }
+            "chat.getPermalink" => {
+                let channel = q.get("channel").cloned().unwrap_or_default();
+                let ts = q.get("message_ts").cloned().unwrap_or_default();
+                Json(json!({
+                    "ok": true,
+                    "channel": channel,
+                    "permalink": format!("https://acme.slack.com/archives/{channel}/p{}", ts.replace('.', ""))
+                }))
+            }
             "chat.postMessage" => {
                 let Ok(v) = serde_json::from_slice::<Value>(body) else {
                     return Json(json!({"ok": false, "error": "invalid_json"}));
@@ -774,6 +783,15 @@ async fn post_reply_sends_channel_thread_and_text_as_the_user() {
         assert_eq!(m.posts[1], json!({"channel": "C1", "text": "top level"}));
     }
     s.assert_token_handled();
+    // The posted reply's link, from Slack itself.
+    let replier = src.replier().unwrap();
+    assert_eq!(
+        replier
+            .permalink("C1", "1800000000.000001")
+            .await
+            .as_deref(),
+        Some("https://acme.slack.com/archives/C1/p1800000000000001")
+    );
 
     assert_eq!(
         src.post_reply("C404", None, "x").await,

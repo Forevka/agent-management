@@ -114,6 +114,8 @@ for line in sys.stdin:
                 tool("todo_add", {"title": "Review Dave's doc", "refs": [r]})
             elif "outage" in t:
                 tool("escalate", {"summary": "Bob reports an outage on the website", "refs": [r]})
+            elif "ship" in t:
+                tool("todo_add", {"title": "Reply to Dave about shipping", "refs": [r]})
             elif t.startswith("RULE:"):
                 # A message talking the secretary into a rule (prompt injection, obeyed here so
                 # the safety net shows: the owner is alerted and can undo it).
@@ -138,6 +140,11 @@ for line in sys.stdin:
         said = text.split("] ", 1)[1].split("\n")[0]
         if "ignore" in said:
             tool("rule_add", {"text": "Messages in #random are noise", "because": said})
+        if '"ref":"' in text:
+            # A reply to a post about a source message: draft an answer to it. Nothing is sent
+            # until the owner taps Send on the card this creates.
+            ref = text.split('"ref":"', 1)[1].split('"', 1)[0]
+            tool("reply_draft", {"ref": ref, "text": "Yes, Friday works for the ship date."})
         tool("digest_post", {"text": "Since you asked: one todo is open."})
         out({"type": "result", "subtype": "success", "total_cost_usd": 0.0})
     elif text.startswith("[Daily digest"):

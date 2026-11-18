@@ -276,7 +276,9 @@ a restart.
    `claude.exe`) and authentication (the host's own login, a
    `claude setup-token` token, or an API key).
 6. **Secrets** page: a folder named `slack` with `SLACK_USER_TOKEN` turns on
-   the Slack feed (see "Slack" below for the secretary, which needs a Slack app).
+   the Slack feed (see "Slack and the secretary" below for the app that lets
+   it see everything). A folder named `gchat` turns on Google Chat (see
+   "Google Chat" below).
 7. Write a request in the General topic.
 
 Steps 3, 5 and 6 can also be done by asking the orchestrator in General (for
@@ -337,6 +339,45 @@ flags to Claude's command (`--dangerously-skip-permissions`, `--add-dir`,
 `--permission-mode`, `--allowedTools`, `--settings`, `--tools`,
 `--mcp-config`, `--plugin-dir`): the secretary is refused on such a node. Its settings
 (digest hour, time zone, batching, retention) are in `deploy/.env.example`.
+
+Every message the secretary cites (in a todo, an escalation note, a digest or
+a reply draft) is labelled with where it came from, e.g. "Slack ·
+#gitlab-notifications · Serdar" or "Google Chat · Project X · Olya", the same
+way in Telegram and on `/inbox`.
+
+### Replying from Telegram
+
+Reply in the Inbox to one of the secretary's posts that cites a source
+message (a todo, a note) with what you want said ("tell him Friday works").
+The secretary drafts the actual message and posts a card with **Send**,
+**Edit** and **Cancel**: nothing reaches Slack or Google Chat until you tap
+Send. Reply to the card itself with new wording to replace the draft before
+sending, word for word.
+
+### Google Chat
+
+Google Chat has no equivalent of Slack's Socket Mode, so this is a polling
+feed (about every 30 seconds): the secretary sees new messages in every space
+you are a member of, direct messages included, from the moment it starts (no
+history import). Muted/notification settings are not exposed by this API, so
+use an owner rule in the Inbox instead if you want a space treated as low
+priority.
+
+You need an OAuth **"authorized user" credential** (not a service account)
+with these scopes: `chat.spaces.readonly`, `chat.messages.readonly` and
+`chat.messages.create` (the last one only if you want to send replies). How
+you obtain one is up to you (a Google Cloud OAuth client plus a one-time
+consent flow, e.g. with `google-auth-oauthlib`, or any tool that writes the
+standard "authorized_user" JSON). Fleet web UI → **Secrets** → folder
+`gchat` → set:
+
+- `GOOGLE_CLIENT_ID`
+- `GOOGLE_CLIENT_SECRET`
+- `GOOGLE_REFRESH_TOKEN`
+
+If the refresh token is revoked, or its scopes no longer cover what the
+secretary needs, the orchestrator says so in General and the feed stays off
+until the `gchat` folder changes.
 
 ## 7. Backups
 

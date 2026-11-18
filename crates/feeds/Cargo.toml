@@ -3,14 +3,14 @@ name = "fleet-feeds"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Read-only feeds from external chat channels (Slack first): polled with the user's own token, or pushed through Slack Socket Mode."
+description = "Feeds from external chat sources behind one source-agnostic model: Slack (polled, or pushed through Socket Mode) and Google Chat (polled)."
 
 [dependencies]
 async-trait = "0.1.92"
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 # `rustls-no-provider` keeps TLS on ring (which iroh already uses) instead of compiling aws-lc;
 # `Api::new` installs ring as the process default. `query` is opt-in since reqwest 0.13.
-reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls-no-provider", "query"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["form", "json", "rustls-no-provider", "query"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 # The same verifier reqwest uses, so the Socket Mode WebSocket trusts exactly what the Web API
 # calls trust.
@@ -30,3 +30,4 @@ tracing = "0.1.41"
 axum = "0.8.9"
 tokio = { version = "1.48.0", features = ["full", "test-util"] }
 tokio-websockets = { version = "0.13.3", default-features = false, features = ["server", "sha1_smol"] }
+wiremock = "0.6.5"

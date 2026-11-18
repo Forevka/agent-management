@@ -28,7 +28,7 @@
 mod api;
 mod directory;
 mod mrkdwn;
-mod pace;
+pub(crate) mod pace;
 mod socket;
 mod state;
 
@@ -982,6 +982,28 @@ impl Replier for SlackReplier {
         text: &str,
     ) -> Result<String, FeedError> {
         post_message(&self.0, conversation_id, thread_id, text).await
+    }
+
+    /// Slack's own link for the message (`chat.getPermalink`, which needs no scope).
+    async fn permalink(&self, conversation_id: &str, message_id: &str) -> Option<String> {
+        #[derive(serde::Deserialize)]
+        struct Link {
+            permalink: Option<String>,
+        }
+        match self
+            .0
+            .get::<Link>(
+                "chat.getPermalink",
+                &[("channel", conversation_id), ("message_ts", message_id)],
+            )
+            .await
+        {
+            Ok(l) => l.permalink,
+            Err(e) => {
+                tracing::debug!(error = %e, "slack chat.getPermalink failed");
+                None
+            }
+        }
     }
 }
 

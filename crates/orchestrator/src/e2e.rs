@@ -149,6 +149,33 @@ fn incoming(
 struct MemSource {
     events: Vec<fleet_feeds::FeedEvent>,
     restored: Option<Value>,
+    /// `None` everywhere except the one reply-draft test that needs a working poster: every
+    /// other use of this source proves the rest of the fleet works with nothing able to post
+    /// back, which `reply_draft` must itself refuse.
+    posts: Option<Arc<std::sync::Mutex<Vec<(String, Option<String>, String)>>>>,
+}
+
+/// Records what [`MemSource`] was asked to post, as the owner, once `reply_draft`'s Send is
+/// actually exercised.
+struct MemReplier(Arc<std::sync::Mutex<Vec<(String, Option<String>, String)>>>);
+
+#[async_trait::async_trait]
+impl fleet_feeds::Replier for MemReplier {
+    async fn post_reply(
+        &self,
+        conversation_id: &str,
+        thread_id: Option<&str>,
+        text: &str,
+    ) -> Result<String, fleet_feeds::FeedError> {
+        let mut posts = self.0.lock().unwrap();
+        let id = format!("memchat-sent-{}", posts.len() + 1);
+        posts.push((
+            conversation_id.to_owned(),
+            thread_id.map(str::to_owned),
+            text.to_owned(),
+        ));
+        Ok(id)
+    }
 }
 
 #[async_trait::async_trait]
@@ -173,6 +200,19 @@ impl fleet_feeds::Source for MemSource {
     ) -> Result<String, fleet_feeds::FeedError> {
         Err(fleet_feeds::FeedError::Unsupported("reply"))
     }
+    fn capabilities(&self) -> fleet_feeds::Capabilities {
+        fleet_feeds::Capabilities {
+            push: true,
+            can_reply: self.posts.is_some(),
+            can_reply_in_thread: true,
+            ..Default::default()
+        }
+    }
+    fn replier(&self) -> Option<Arc<dyn fleet_feeds::Replier>> {
+        self.posts
+            .clone()
+            .map(|p| Arc::new(MemReplier(p)) as Arc<dyn fleet_feeds::Replier>)
+    }
     async fn run(&mut self, sink: fleet_feeds::FeedSink) -> Result<(), fleet_feeds::FeedError> {
         for e in self.events.drain(..) {
             if sink.send(e).await.is_err() {
@@ -188,6 +228,7 @@ async fn deliver_feed(o: &Arc<Orchestrator>, events: Vec<fleet_feeds::FeedEvent>
     let mut src = MemSource {
         events,
         restored: None,
+        posts: None,
     };
     crate::feeds::drive(o, &mut src, "feed_cursor_memchat")
         .await
@@ -861,6 +902,7 @@ async fn secretary_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeCha
             FeedEvent::Checkpoint(json!({"upto": "r1"})),
         ],
         restored: None,
+        posts: None,
     };
     crate::feeds::drive_with(o, &mut src, "feed_cursor_retry", |m| {
         let first = tries.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
@@ -1242,6 +1284,164 @@ async fn secretary_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeCha
             .map(|n| assert_eq!(n, Notify::Silent))
     })
     .await;
+
+    // --- Reply drafts: refused outside the owner's turn, refused while nothing can post, then
+    // the whole Send / Edit / Cancel cycle once something can (CLAUDE.md: new human/tool flows
+    // need e2e coverage). ---
+    let ship = incoming(
+        "D-dave",
+        "Dave",
+        ConvKind::Direct,
+        "r-ship-1",
+        "Dave",
+        "can you ship Friday?",
+    );
+    deliver_feed(o, vec![FeedEvent::Message(ship)]).await;
+    assert_eq!(secretary::flush(o, true).await.unwrap(), 1);
+    let dave_todo: crate::model::TodoRow = wait_for("the ship todo", || async {
+        sqlx::query_as("select * from todos where title = 'Reply to Dave about shipping'")
+            .fetch_optional(db)
+            .await
+            .unwrap()
+    })
+    .await;
+    let dave_msg = dave_todo.tg_msg.expect("the todo is posted");
+
+    // Outside the owner's turn, a draft is refused outright: a third-party message, or the
+    // brain, or a retry, can never start one.
+    let refused = call_as(
+        o,
+        SECRETARY_AGENT,
+        SECRETARY_TASK,
+        "reply_draft",
+        json!({"ref": dave_todo.refs[0], "text": "x"}),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(!refused.ok, "{refused:?}");
+    assert!(
+        refused.result.contains("only when the owner asks for one"),
+        "{}",
+        refused.result
+    );
+
+    // The owner replies to the todo about shipping: the secretary drafts, but nothing can post
+    // to "memchat" yet (no real source has registered a reply handle), so the attempt is
+    // refused rather than silently creating a card nobody could ever send.
+    let ask_dave = |message_id: i64| -> fleet_telegram::Message {
+        serde_json::from_value(json!({
+            "message_id": message_id,
+            "date": 1_700_000_000,
+            "chat": { "id": -100, "type": "supergroup", "is_forum": true },
+            "from": { "id": 42, "is_bot": false, "first_name": "Owner" },
+            "message_thread_id": inbox,
+            "is_topic_message": true,
+            "reply_to_message": { "message_id": dave_msg },
+            "text": "tell him Friday works",
+        }))
+        .unwrap()
+    };
+    crate::tg::owner_message(o, &ask_dave(9300)).await.unwrap();
+    wait_for("told there is nothing to post with yet", || async {
+        secretary_results(db)
+            .await
+            .iter()
+            .any(|(t, ok, r)| t == "reply_draft" && !ok && r.contains("cannot be sent to memchat"))
+            .then_some(())
+    })
+    .await;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("select count(*) from human_items where kind = 'reply'")
+            .fetch_one(db)
+            .await
+            .unwrap(),
+        0,
+        "no card without something able to post"
+    );
+
+    // Give "memchat" a working reply handle, as a real source would once the owner configures
+    // one, then ask again: now a card appears, with Send / Edit / Cancel, nothing posted yet.
+    let posts: Arc<std::sync::Mutex<Vec<(String, Option<String>, String)>>> = Default::default();
+    let mut enable = MemSource {
+        events: vec![],
+        restored: None,
+        posts: Some(posts.clone()),
+    };
+    crate::feeds::drive(o, &mut enable, "feed_cursor_memchat_replies")
+        .await
+        .unwrap();
+    crate::tg::owner_message(o, &ask_dave(9301)).await.unwrap();
+    let draft: HumanItemRow = wait_for("the reply draft", || async {
+        sqlx::query_as("select * from human_items where kind = 'reply' order by id desc limit 1")
+            .fetch_optional(db)
+            .await
+            .unwrap()
+    })
+    .await;
+    assert_eq!(draft.state, "open");
+    let card = wait_for("the draft card", || async {
+        chat.sent()
+            .into_iter()
+            .find(|(_, _, h, _)| h.contains("Reply draft"))
+    })
+    .await;
+    assert!(card.2.contains("memchat · Dave"), "{}", card.2);
+    assert!(card.2.contains("Yes, Friday works"), "{}", card.2);
+    assert_eq!(card.3[0].len(), 3, "Send, Edit, Cancel");
+    assert_eq!(
+        card.3[0][0].data.as_deref(),
+        Some(format!("x|{}|y", draft.id).as_str())
+    );
+    assert_eq!(
+        card.3[0][1].data.as_deref(),
+        Some(format!("e|{}|", draft.id).as_str())
+    );
+    assert_eq!(
+        card.3[0][2].data.as_deref(),
+        Some(format!("x|{}|n", draft.id).as_str())
+    );
+
+    // A reply to the card replaces the draft, word for word, and it stays open.
+    human::answer(
+        o,
+        draft.id,
+        Answer::Text("Actually, Monday instead.".into()),
+    )
+    .await
+    .unwrap();
+    wait_for("the edited card", || async {
+        chat.ops
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|op| {
+                matches!(
+                    op,
+                    Op::Edit { id, html, keyboard, .. }
+                        if Some(*id) == draft.tg_msg
+                            && html.contains("Actually, Monday instead.")
+                            && !keyboard.is_empty()
+                )
+            })
+            .then_some(())
+    })
+    .await;
+    assert!(posts.lock().unwrap().is_empty(), "nothing sent yet");
+
+    // Send posts exactly the edited draft, as the owner, and retires the card with no buttons.
+    let sent = human::answer(o, draft.id, Answer::Accept).await.unwrap();
+    assert!(sent.contains("sent to memchat"), "{sent}");
+    let (conv, thread, posted_text) = posts.lock().unwrap()[0].clone();
+    assert_eq!(conv, "D-dave");
+    assert_eq!(thread, None, "a direct message has no thread");
+    assert_eq!(posted_text, "Actually, Monday instead.");
+    wait_retired(chat, &[draft.tg_msg.unwrap()], "answered").await;
+
+    // A second tap posts nothing twice.
+    let again = human::answer(o, draft.id, Answer::Accept).await.unwrap();
+    assert!(again.contains("is already answered"), "{again}");
+    assert_eq!(posts.lock().unwrap().len(), 1, "sent once");
 }
 
 async fn model_effort_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) {

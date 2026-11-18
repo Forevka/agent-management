@@ -405,6 +405,10 @@ fn callback(data: &str) -> Result<(i64, Answer)> {
         ("a", "y") => Answer::Allow,
         ("a", _) => Answer::Deny,
         ("x", "y") => Answer::Accept,
+        // A reply draft is edited by replying to its card; the button says how.
+        ("e", _) => anyhow::bail!(
+            "Reply to the draft with the new text: it replaces the draft as you write it."
+        ),
         ("x", _) => Answer::Dismiss,
         _ => anyhow::bail!("unknown button"),
     };
@@ -463,7 +467,13 @@ pub(crate) async fn owner_message(o: &Arc<Orchestrator>, msg: &Message) -> Resul
         }
         // The Inbox topic is the secretary's.
         Some(t) if crate::secretary::inbox_topic_if_any(o).await? == Some(t) => {
-            return crate::secretary::owner_message(o, msg.message_id, text).await;
+            return crate::secretary::owner_message(
+                o,
+                msg.message_id,
+                text,
+                msg.reply_to_message.as_ref().map(|r| r.message_id),
+            )
+            .await;
         }
         Some(t) => {
             let task: Option<TaskRow> = sqlx::query_as("select * from tasks where topic_id = $1")

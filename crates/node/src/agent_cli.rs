@@ -123,6 +123,16 @@ pub enum AgentCmd {
     /// Post to the owner's Inbox topic.
     #[command(subcommand)]
     Digest(DigestCmd),
+    /// Draft a reply to a message, sent as the owner only once they tap Send. Only when the owner
+    /// asks for one, in answer to their own message.
+    ReplyDraft {
+        /// The message to answer (its ref).
+        #[arg(long = "ref")]
+        reference: String,
+        /// The reply ("-" reads it from stdin).
+        #[arg(long)]
+        text: String,
+    },
     /// The owner's triage rules.
     #[command(subcommand)]
     Rule(RuleCmd),
@@ -316,6 +326,10 @@ pub enum DigestCmd {
         /// The text ("-" reads it from stdin).
         #[arg(long)]
         text: String,
+        /// A message ref it is about (repeat for more): shown with where it came from, and the
+        /// owner can reply to the post about it.
+        #[arg(long = "source")]
+        sources: Vec<String>,
     },
 }
 
@@ -536,9 +550,14 @@ pub fn to_call(cmd: AgentCmd) -> Result<(&'static str, Value)> {
             "escalate",
             json!({"summary": stdin_if_dash(summary)?, "refs": sources}),
         ),
-        AgentCmd::Digest(DigestCmd::Post { text }) => {
-            ("digest_post", json!({"text": stdin_if_dash(text)?}))
-        }
+        AgentCmd::Digest(DigestCmd::Post { text, sources }) => (
+            "digest_post",
+            json!({"text": stdin_if_dash(text)?, "refs": sources}),
+        ),
+        AgentCmd::ReplyDraft { reference, text } => (
+            "reply_draft",
+            json!({"ref": reference, "text": stdin_if_dash(text)?}),
+        ),
         AgentCmd::Rule(RuleCmd::Add { text, because }) => {
             ("rule_add", json!({"text": text, "because": because}))
         }
@@ -851,7 +870,15 @@ mod tests {
         assert!(T::try_parse_from(["t", "triage", "todo", "s:c:1"]).is_err());
         assert_eq!(
             call(&["digest", "post", "--text", "All quiet"]),
-            ("digest_post", json!({"text": "All quiet"}))
+            ("digest_post", json!({"text": "All quiet", "refs": []}))
+        );
+        assert_eq!(
+            call(&["digest", "post", "--text", "See", "--source", "s:c:1"]),
+            ("digest_post", json!({"text": "See", "refs": ["s:c:1"]}))
+        );
+        assert_eq!(
+            call(&["reply-draft", "--ref", "s:c:1", "--text", "On it"]),
+            ("reply_draft", json!({"ref": "s:c:1", "text": "On it"}))
         );
         assert_eq!(
             call(&["secretary-note", "Alice is VIP"]).0,

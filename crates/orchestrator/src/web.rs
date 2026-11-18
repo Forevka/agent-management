@@ -507,6 +507,15 @@ async fn render_item(o: &Orchestrator, id: i64) -> Result<(String, String)> {
                     esc(p["context"].as_str().unwrap_or_default())
                 ));
             }
+            "reply" => {
+                s.push_str(&format!(
+                    "<div class=card>Reply to <b>{}</b>, posted <b>as you</b>, answering {}: <span class=muted>{}</span><pre>{}</pre><span class=muted>To change the text, reply to the draft in Telegram.</span></div><div class=row><button class=primary name=action value=accept>Send</button><button name=action value=dismiss>Cancel</button></div>",
+                    esc(p["destination"].as_str().unwrap_or_default()),
+                    esc(p["in_reply_to"].as_str().unwrap_or_default()),
+                    esc(p["quote"].as_str().unwrap_or_default()),
+                    esc(p["text"].as_str().unwrap_or_default())
+                ));
+            }
             "admin_change" => {
                 s.push_str(&format!(
                     "<div class=card>The orchestrator asks to change the fleet:<p><b>{}</b></p>{}<details><summary class=muted>Exact change</summary><pre>{}</pre></details></div><div class=row><button class=primary name=action value=accept>Approve</button><button name=action value=dismiss>Reject</button></div>",
@@ -594,14 +603,14 @@ async fn item_post(
             }
             ("permission", "allow") => Some((item.id, Answer::Allow)),
             ("permission", _) => Some((item.id, Answer::Deny)),
-            ("task_proposal" | "slack_reply" | "admin_change", "accept") => {
+            ("task_proposal" | "slack_reply" | "reply" | "admin_change", "accept") => {
                 Some((item.id, Answer::Accept))
             }
-            ("task_proposal" | "slack_reply" | "admin_change", "dismiss") => {
+            ("task_proposal" | "slack_reply" | "reply" | "admin_change", "dismiss") => {
                 Some((item.id, Answer::Dismiss))
             }
             // A decision is only ever taken on the button that says it.
-            ("task_proposal" | "slack_reply" | "admin_change", other) => {
+            ("task_proposal" | "slack_reply" | "reply" | "admin_change", other) => {
                 anyhow::bail!("unknown action {other:?}")
             }
             // Questions were handled above.
@@ -1365,21 +1374,19 @@ pub(crate) async fn render_inbox(o: &Orchestrator) -> Result<String> {
     refs.extend(triage.iter().flat_map(|t| t.1.clone()));
     let msgs = secretary::messages_by_ref(o, &refs).await?;
     let source = |r: &str| match msgs.get(r) {
-        Some((conv, author, text, link, attention)) => {
-            let who = format!("{} · {}", esc(conv), esc(author.as_deref().unwrap_or("?")));
-            let who = match link {
-                Some(l) if l.starts_with("https://") => {
-                    format!("<a href=\"{}\" rel=noopener>{who}</a>", esc(l))
-                }
-                _ => who,
+        Some(m) => {
+            let who = esc(&m.label());
+            let who = match m.web_link() {
+                Some(l) => format!("<a href=\"{}\" rel=noopener>{who}</a>", esc(l)),
+                None => who,
             };
             // A conversation the owner turned down in its source, as the secretary sees it.
-            let badge = match attention.as_deref() {
+            let badge = match m.attention.as_deref() {
                 Some("muted") => " <span class=pill>muted</span>",
                 Some("mentions_only") => " <span class=pill>mentions only</span>",
                 _ => "",
             };
-            format!("{who}{badge}: {}", esc(&clip(text, 200)))
+            format!("{who}{badge}: {}", esc(&clip(&m.text, 200)))
         }
         None => format!("<span class=muted>{} (no longer kept)</span>", esc(r)),
     };

@@ -24,8 +24,8 @@ pub struct Orchestrator {
     pub server: Server,
     pub chat: Arc<dyn Chat>,
     pub cfg: Config,
-    /// Posts approved Slack replies; set once the feed source is configured.
-    pub feed_poster: tokio::sync::RwLock<Option<Arc<dyn crate::feeds::ReplyPoster>>>,
+    /// Posts approved replies, per running source that can (keyed by its kind: "slack", ...).
+    pub feed_posters: tokio::sync::RwLock<HashMap<String, Arc<dyn crate::feeds::ReplyPoster>>>,
     pub auth: crate::auth::DbAuth,
     /// The fleet's shared memory, when Hindsight is configured.
     pub memory: Option<crate::memory::Hindsight>,
@@ -77,7 +77,7 @@ impl Orchestrator {
             chat,
             cfg,
             memory,
-            feed_poster: Default::default(),
+            feed_posters: Default::default(),
             auth,
             invite_addr: Default::default(),
             locks: Default::default(),
