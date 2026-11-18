@@ -890,10 +890,19 @@ pub fn notify_brain(o: &Orchestrator, task: &TaskRow, text: String) {
 
 async fn ensure_brain(o: &Orchestrator) -> Result<()> {
     let slug = &o.cfg.brain_project;
-    sqlx::query("insert into projects (slug, name, description) values ($1, 'Fleet', 'The orchestrator brain''s workspace') on conflict do nothing")
+    let created = sqlx::query("insert into projects (slug, name, description) values ($1, 'Fleet', 'The orchestrator brain''s workspace') on conflict do nothing")
         .bind(slug)
         .execute(&o.db)
-        .await?;
+        .await?
+        .rows_affected()
+        == 1;
+    if created {
+        // The only project not created through `admin`; nodes list it for mapping too. The
+        // brain does not depend on it, so a failure is only logged.
+        if let Err(e) = o.push_project_list(None).await {
+            tracing::warn!("sending the project list to nodes failed: {e:#}");
+        }
+    }
     sqlx::query("insert into agents (id, name, role, project) values ($1, 'Orchestrator', 'orchestrator', $2) on conflict do nothing")
         .bind(BRAIN_AGENT)
         .bind(slug)

@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 fleet-proto.workspace = true
 fleet-net.workspace = true
+fleet-node-config.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

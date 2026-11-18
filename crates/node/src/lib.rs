@@ -5,7 +5,9 @@
 //! `fleet mcp` shim inside each agent uses to reach the orchestrator.
 
 pub mod agent_cli;
-pub mod config;
+/// `node.json` and `status.json` live in their own crate so the tray app can use them without
+/// compiling the network stack; re-exported here so `fleet_node::config` keeps working.
+pub use fleet_node_config as config;
 pub mod ipc;
 pub mod mcp;
 pub mod runner;
@@ -15,7 +17,7 @@ pub mod tools;
 
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -25,10 +27,16 @@ use std::{
 
 use anyhow::Result;
 use fleet_net::{Client, Inbound};
-use fleet_proto::{AgentEvent, AgentEventKind, Body, NodeInfo, SpawnAgent, ToolCall, ToolResult};
+use fleet_proto::{
+    AgentEvent, AgentEventKind, Body, NodeInfo, NodeSettings, ProjectSummary, SpawnAgent, ToolCall,
+    ToolResult,
+};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::{config::NodeConfig, runner::AgentHandle};
+use crate::{
+    config::{NodeConfig, status::Status},
+    runner::AgentHandle,
+};
 
 /// Ordinary tool calls answer within seconds; one that does not is reported as failed so the
 /// agent's command returns instead of hanging. Permission prompts wait for the human instead.
@@ -46,11 +54,25 @@ struct PendingCall {
     resend: Option<ToolCall>,
 }
 
+/// What `status.json` reports besides the node's identity.
+#[derive(Default)]
+struct LinkStatus {
+    connected: bool,
+    /// The orchestrator's projects, once it has sent them.
+    projects: Option<Vec<ProjectSummary>>,
+}
+
 pub struct Node {
     data_dir: PathBuf,
     /// This executable; agents start it as their MCP server (`fleet mcp`).
     exe: PathBuf,
     client: Client,
+    /// The name this node joined with, shown by the tray app.
+    node_name: String,
+    /// This process's start stamp, written next to its pid so a reused pid is not taken for it.
+    started: Option<u64>,
+    /// Held while `status.json` is written, so writes land in the order of the events.
+    status: Mutex<LinkStatus>,
     config: Mutex<NodeConfig>,
     agents: Mutex<HashMap<String, AgentHandle>>,
     pending: Mutex<HashMap<String, PendingCall>>,
@@ -61,19 +83,60 @@ pub struct Node {
 }
 
 impl Node {
-    pub fn new(data_dir: PathBuf, exe: PathBuf, client: Client) -> Result<Arc<Self>> {
+    pub fn new(
+        data_dir: PathBuf,
+        exe: PathBuf,
+        client: Client,
+        node_name: String,
+    ) -> Result<Arc<Self>> {
         let config = NodeConfig::load(&data_dir)?;
-        Ok(Arc::new(Self {
+        let node = Arc::new(Self {
             data_dir,
             exe,
             client,
+            node_name,
+            started: config::process::start_time(std::process::id()),
+            status: Mutex::new(LinkStatus::default()),
             config: Mutex::new(config),
             agents: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             next_call: AtomicU64::new(1),
             call_prefix: runner::random_token()[..8].to_owned(),
             ipc_addr: Mutex::new(None),
-        }))
+        });
+        // Replaces whatever a previous node process left, so the tray sees this pid at once.
+        node.update_status(|_| {});
+        Ok(node)
+    }
+
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    /// Changes the reported link state and rewrites `status.json`.
+    fn update_status(&self, change: impl FnOnce(&mut LinkStatus)) {
+        let mut s = self.status.lock().unwrap();
+        change(&mut s);
+        let status = Status {
+            connected: s.connected,
+            node_name: self.node_name.clone(),
+            pid: Some(std::process::id()),
+            pid_started: self.started,
+            updated_at: config::status::now_utc(),
+            projects: s.projects.clone(),
+        };
+        if let Err(e) = status.write(&self.data_dir) {
+            tracing::warn!("could not write the status file: {e:#}");
+        }
+    }
+
+    /// Marks this node disconnected in `status.json` on a clean exit. Left alone if a newer node
+    /// process has already taken the file over.
+    pub fn mark_stopped(&self) {
+        let ours = Status::read(&self.data_dir).and_then(|s| s.pid) == Some(std::process::id());
+        if ours {
+            self.update_status(|s| s.connected = false);
+        }
     }
 
     pub fn client(&self) -> &Client {
@@ -89,10 +152,11 @@ impl Node {
         while let Some(ev) = events.recv().await {
             match ev {
                 Inbound::Connected { .. } => {
+                    self.update_status(|s| s.connected = true);
                     self.send_info();
                     self.resend_pending_permissions();
                 }
-                Inbound::Disconnected { .. } => {}
+                Inbound::Disconnected { .. } => self.update_status(|s| s.connected = false),
                 Inbound::Message { body, .. } => self.handle(body),
             }
         }
@@ -164,12 +228,24 @@ impl Node {
             }
             Body::ToolResult(result) => self.resolve(result),
             Body::NodeSettings(settings) => {
-                let mut cfg = self.config.lock().unwrap();
-                cfg.settings = Some(settings);
-                if let Err(e) = cfg.save(&self.data_dir) {
-                    tracing::warn!("could not save node settings: {e:#}");
+                let projects_changed = {
+                    let mut cfg = self.config.lock().unwrap();
+                    match apply_settings(&mut cfg, &self.data_dir, &settings) {
+                        Ok(changed) => changed,
+                        Err(e) => {
+                            // Still use them for this run; node.json is left as it is rather
+                            // than overwritten from memory.
+                            tracing::warn!("could not save node settings: {e:#}");
+                            cfg.settings = Some(settings);
+                            false
+                        }
+                    }
+                };
+                if projects_changed {
+                    self.send_info();
                 }
             }
+            Body::ProjectList(projects) => self.update_status(|s| s.projects = Some(projects)),
             other => tracing::warn!("unexpected message for a node: {other:?}"),
         }
     }
@@ -406,11 +482,13 @@ impl Node {
     async fn watch_config(self: Arc<Self>) {
         loop {
             tokio::time::sleep(Duration::from_secs(5)).await;
-            let Ok(fresh) = NodeConfig::load(&self.data_dir) else {
-                continue;
-            };
             let changed = {
+                // Loaded under the lock, so a settings push in between cannot be overwritten
+                // with an older copy of the file.
                 let mut cfg = self.config.lock().unwrap();
+                let Ok(fresh) = NodeConfig::load(&self.data_dir) else {
+                    continue;
+                };
                 let changed = cfg.projects != fresh.projects;
                 cfg.projects = fresh.projects;
                 if fresh.settings.is_some() {
@@ -425,6 +503,23 @@ impl Node {
     }
 }
 
+/// Saves settings pushed by the orchestrator into `node.json` and returns whether the mapped
+/// projects in memory changed.
+///
+/// It starts from the file, not from memory: memory only catches up with `fleet project map`
+/// or the tray app every few seconds, and saving it would undo a mapping made in between. The
+/// file is changed under `node.json.lock`, which those writers hold too, and the fresh projects
+/// are adopted into memory under the caller's config lock.
+fn apply_settings(cfg: &mut NodeConfig, data_dir: &Path, settings: &NodeSettings) -> Result<bool> {
+    let (fresh, ()) = NodeConfig::update(data_dir, |c| {
+        c.settings = Some(settings.clone());
+        Ok(())
+    })?;
+    let changed = cfg.projects != fresh.projects;
+    *cfg = fresh;
+    Ok(changed)
+}
+
 fn is_allow(decision: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(decision)
         .ok()
@@ -434,4 +529,98 @@ fn is_allow(decision: &str) -> bool {
                 .map(|b| b == "allow")
         })
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use fleet_proto::ClaudeAuth;
+
+    use super::*;
+
+    fn settings(max_agents: u32) -> NodeSettings {
+        NodeSettings {
+            claude_command: vec!["claude".into()],
+            auth: ClaudeAuth::Default,
+            max_agents,
+        }
+    }
+
+    #[test]
+    fn settings_keep_projects_mapped_on_disk_since_the_last_poll() {
+        let dir = std::env::temp_dir().join(format!("fleet-node-settings-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let project = dir.join("repo");
+        std::fs::create_dir_all(&project).unwrap();
+
+        // In memory: nothing mapped yet. On disk: `fleet project map` (or the tray) just
+        // mapped a project, and the 5 s poll has not picked it up.
+        let mut memory = NodeConfig::default();
+        let mut on_disk = NodeConfig::default();
+        on_disk.map_project("demo", &project).unwrap();
+        on_disk.save(&dir).unwrap();
+
+        let changed = apply_settings(&mut memory, &dir, &settings(3)).unwrap();
+        assert!(changed, "the fresh projects are reported");
+        let saved = NodeConfig::load(&dir).unwrap();
+        assert_eq!(saved.projects, on_disk.projects, "the mapping survives");
+        assert_eq!(saved.settings, Some(settings(3)));
+        assert_eq!(memory, saved, "memory adopts what was saved");
+
+        // Nothing changed on disk this time: the projects are unchanged.
+        assert!(!apply_settings(&mut memory, &dir, &settings(5)).unwrap());
+        assert_eq!(NodeConfig::load(&dir).unwrap().settings, Some(settings(5)));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn status_file_tracks_the_link_and_a_clean_exit_leaves_a_newer_node_alone() {
+        let dir = std::env::temp_dir().join(format!("fleet-node-status-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let orchestrator = fleet_net::EndpointAddr::new(fleet_net::SecretKey::generate().public());
+        let (client, _events) = Client::new(orchestrator);
+        let node = Node::new(dir.clone(), PathBuf::from("fleet"), client, "pc".into()).unwrap();
+
+        // Written at once, with this process's pid and start stamp.
+        let status = Status::read(&dir).unwrap();
+        assert!(!status.connected);
+        assert_eq!(status.node_name, "pc");
+        assert_eq!(status.pid, Some(std::process::id()));
+        assert_eq!(
+            status.pid_started,
+            config::process::start_time(std::process::id())
+        );
+        node.update_status(|s| s.connected = true);
+        assert!(Status::read(&dir).unwrap().connected);
+
+        // Our own file: a clean exit marks it disconnected.
+        node.mark_stopped();
+        assert!(!Status::read(&dir).unwrap().connected);
+
+        // A newer node process has taken the file over: it is left as that node wrote it.
+        let foreign = r#"{"connected":true,"node_name":"pc","pid":4000000001}"#;
+        std::fs::write(Status::path(&dir), foreign).unwrap();
+        node.mark_stopped();
+        assert_eq!(
+            std::fs::read_to_string(Status::path(&dir)).unwrap(),
+            foreign
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn settings_leave_an_unreadable_node_json_alone() {
+        let dir = std::env::temp_dir().join(format!("fleet-node-broken-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(NodeConfig::path(&dir), "{broken").unwrap();
+        let mut memory = NodeConfig::default();
+        assert!(apply_settings(&mut memory, &dir, &settings(3)).is_err());
+        assert_eq!(
+            std::fs::read_to_string(NodeConfig::path(&dir)).unwrap(),
+            "{broken"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

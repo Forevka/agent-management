@@ -1,8 +1,9 @@
 name: Release
 
 # Push a tag like v0.1.0 (or v0.2.0-rc.1, published as a prerelease) to build
-# the `fleet` binaries, attach them to a GitHub release with SHA-256 sums, and
-# push the orchestrator image to ghcr.io/<owner>/fleet.
+# the `fleet` binaries (and the Windows tray app, fleet-tray), attach them to a
+# GitHub release with SHA-256 sums, and push the orchestrator image to
+# ghcr.io/<owner>/fleet.
 
 on:
   push:
@@ -60,15 +61,41 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-windows
+          # The tray app is a Cargo workspace of its own, with its own target dir.
+          workspaces: |
+            . -> target
+            apps/tray/src-tauri -> target
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/tray/package-lock.json
       - name: Build
         run: cargo build --release --locked --package fleet --bin fleet --target x86_64-pc-windows-msvc
-      - name: Stage asset
+      - name: Tray version matches the workspace
+        # The tray takes its version from its Cargo.toml (tauri.conf.json has none), which must
+        # follow the workspace's, as fleet.exe's does.
+        shell: bash
+        run: |
+          ws=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          tray=$(sed -n 's/^version = "\(.*\)"/\1/p' apps/tray/src-tauri/Cargo.toml | head -n1)
+          echo "workspace $ws, tray $tray"
+          test "$ws" = "$tray"
+      - name: Build tray
+        working-directory: apps/tray
+        # bash: PowerShell's npm wrapper drops the `--` separators.
+        shell: bash
+        run: |
+          npm ci
+          npm run tauri build -- --no-bundle --target x86_64-pc-windows-msvc -- --locked
+      - name: Stage assets
         shell: bash
         env:
           TAG: ${{ github.ref_name }}
         run: |
           mkdir -p dist
           cp target/x86_64-pc-windows-msvc/release/fleet.exe "dist/fleet-${TAG#v}-x86_64-pc-windows-msvc.exe"
+          cp apps/tray/src-tauri/target/x86_64-pc-windows-msvc/release/fleet-tray.exe "dist/fleet-tray-${TAG#v}-x86_64-pc-windows-msvc.exe"
       - uses: actions/upload-artifact@v7
         with:
           name: fleet-x86_64-pc-windows-msvc

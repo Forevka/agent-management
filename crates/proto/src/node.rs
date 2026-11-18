@@ -56,6 +56,13 @@ pub struct ProjectMapping {
     pub path: String,
 }
 
+/// A project the orchestrator knows, as listed to nodes for their local mapping UI.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectSummary {
+    pub slug: String,
+    pub name: String,
+}
+
 /// How a node runs Claude Code, configured per node in the orchestrator's web UI.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NodeSettings {

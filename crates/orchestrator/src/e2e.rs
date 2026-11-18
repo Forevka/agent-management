@@ -71,6 +71,10 @@ where
     }
 }
 
+fn node_status(data_dir: &std::path::Path) -> Option<fleet_node::config::status::Status> {
+    fleet_node::config::status::Status::read(data_dir)
+}
+
 async fn open_item(db: &sqlx::PgPool, task: &str, kind: &str) -> Option<HumanItemRow> {
     sqlx::query_as("select * from human_items where task_id = $1 and kind = $2 and state = 'open'")
         .bind(task)
@@ -235,6 +239,7 @@ async fn task_lifecycle_through_a_real_node() {
         data_dir.clone(),
         PathBuf::from("/nonexistent/fleet"),
         client.clone(),
+        "e2e-node".into(),
     )
     .unwrap();
     tokio::spawn(node.clone().run(link_events));
@@ -259,6 +264,18 @@ async fn task_lifecycle_through_a_real_node() {
         .filter(|b| *b)
     })
     .await;
+    // The node tells its tray app about the link and the orchestrator's projects.
+    let status = wait_for("status.json with the project list", || async {
+        node_status(&data_dir).filter(|s| {
+            s.connected
+                && s.projects
+                    .as_ref()
+                    .is_some_and(|p| p.iter().any(|p| p.slug == "demo" && p.name == "Demo"))
+        })
+    })
+    .await;
+    assert_eq!(status.node_name, "e2e-node");
+    assert_eq!(status.pid, Some(std::process::id()));
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fake_claude.py");
     sqlx::query("update nodes set claude_command = $2 where id = $1")
         .bind(&node_id)
@@ -695,6 +712,36 @@ async fn task_lifecycle_through_a_real_node() {
     let done = human::answer(&o, create.id, Answer::Accept).await.unwrap();
     assert!(done.contains("created project web"), "{done}");
     assert!(project_exists().await);
+    // Every connected node hears about the new project, for its tray app.
+    wait_for("the new project in status.json", || async {
+        node_status(&data_dir).filter(|s| {
+            s.projects
+                .as_ref()
+                .is_some_and(|p| p.iter().any(|p| p.slug == "web" && p.name == "Web"))
+        })
+    })
+    .await;
+    // And about a rename, made the way the web UI makes it.
+    crate::admin::execute(
+        &o,
+        crate::admin::Actor::Owner,
+        &crate::admin::AdminAction::ProjectEdit {
+            slug: "web".into(),
+            name: Some("Website".into()),
+            description: None,
+            folders: None,
+        },
+    )
+    .await
+    .unwrap();
+    wait_for("the renamed project in status.json", || async {
+        node_status(&data_dir).filter(|s| {
+            s.projects
+                .as_ref()
+                .is_some_and(|p| p.iter().any(|p| p.slug == "web" && p.name == "Website"))
+        })
+    })
+    .await;
     let again = human::answer(&o, create.id, Answer::Accept).await.unwrap();
     assert!(again.contains("already answered"), "{again}");
     let runs: i64 = sqlx::query_scalar(
@@ -1012,6 +1059,7 @@ async fn task_lifecycle_through_a_real_node() {
         data_dir2.clone(),
         PathBuf::from("/nonexistent/fleet"),
         client2.clone(),
+        "e2e-node-2".into(),
     )
     .unwrap();
     tokio::spawn(node2.run(link_events2));
@@ -1148,6 +1196,7 @@ async fn task_lifecycle_through_a_real_node() {
         data_dir3.clone(),
         PathBuf::from("/nonexistent/fleet"),
         client3.clone(),
+        "e2e-node-3".into(),
     )
     .unwrap();
     tokio::spawn(node3.run(link_events3));

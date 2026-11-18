@@ -217,6 +217,7 @@ In a normal (not elevated) PowerShell, as the user logged into Claude Code:
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\deploy\windows\install-node.ps1 `
   -FleetExe .\fleet-<version>-x86_64-pc-windows-msvc.exe `
+  -TrayExe .\fleet-tray-<version>-x86_64-pc-windows-msvc.exe `
   -Relay https://relay.<domain> -Ticket <ticket>
 ```
 
@@ -230,6 +231,32 @@ locking the screen is fine.
 Remove it with `install-node.ps1 -Uninstall` (add `-RemoveData` to also delete
 the node's key and state).
 
+#### The tray app
+
+`-TrayExe` (optional) installs `fleet-tray.exe` next to `fleet.exe`. While the
+node runs it shows a tray icon; click it to map projects to folders on this PC
+instead of running `fleet project map`. The project dropdown lists the
+orchestrator's projects, kept current by the node, and mappings the
+orchestrator does not know are flagged. Changes apply within 5 seconds, without
+a restart.
+
+- `fleet node` starts the tray once at startup if `fleet-tray.exe` sits next
+  to it. The tray exits when the node stops. **Quit tray** in its menu closes it
+  until the node next starts; set `FLEET_NO_TRAY=1` (user environment) to never
+  start it. The node reads the variable when it starts, so restart the node
+  (or log off and on) after changing it. `fleet join` never starts the tray.
+- The node writes `status.json` (link state, the orchestrator's projects, its
+  pid and start time) in its data directory for the tray. The tray edits only
+  the `projects` key of `node.json`, under the same `node.json.lock` the node
+  and `fleet project map` take; the node's settings in it are left as they are.
+- The tray logs problems it cannot show in its window to
+  `<data dir>\logs\tray.log` (the data dir is `%LOCALAPPDATA%\fleet\data` for
+  an installed node).
+- Without `-TrayExe`, the script picks up `fleet-tray.exe` or a release asset
+  `fleet-tray-<version>-x86_64-pc-windows-msvc.exe` sitting next to `-FleetExe`
+  (the newest, if there are several). Building it yourself: see
+  `apps/tray/README.md`.
+
 
 ### After the first node: projects, bots, Claude
 
@@ -238,7 +265,8 @@ the node's key and state).
    member of the group).
 3. **Projects** page: create each project (its slug is what nodes map), bind
    secret folders, add Slack channels.
-4. On each host, map the project: `fleet project map <slug> <directory>`.
+4. On each host, map the project: `fleet project map <slug> <directory>`, or
+   on Windows, from the tray app.
 5. **Nodes** page: per node, set the Claude command (e.g. a full path to
    `claude.exe`) and authentication (the host's own login, a
    `claude setup-token` token, or an API key).
@@ -312,9 +340,13 @@ docker image prune -f
 implemented. Until then, by hand:
 
 - Linux: replace `/usr/local/bin/fleet`, then `sudo systemctl restart fleet-node`.
-- Windows: rerun `install-node.ps1 -FleetExe <new exe>` (no `-Ticket`). It
-  stops the node, replaces the binary and restarts the task; the node's key is
-  kept.
+- Windows: rerun `install-node.ps1 -FleetExe <new exe> -TrayExe <new tray exe>`
+  (no `-Ticket`). It stops the node and the tray, replaces the binaries and
+  restarts the task; the node's key is kept.
+- A release that raises the protocol version (`PROTOCOL_VERSION` in
+  `crates/proto`) refuses nodes on the old version with "protocol version N is
+  not supported": update the orchestrator and every node together. Version 3
+  added the project list for the tray app.
 
 ## Troubleshooting
 

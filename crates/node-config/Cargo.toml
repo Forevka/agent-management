@@ -1,0 +1,16 @@
+[package]
+name = "fleet-node-config"
+description = "A node's local files (node.json, status.json), shared by the node and the tray app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Kept free of the network stack: the tray app (apps/tray) depends on it.
+[dependencies]
+fleet-proto.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }

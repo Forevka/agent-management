@@ -11,6 +11,7 @@ repository = "https://github.com/Forevka/agent-management"
 [workspace.dependencies]
 fleet-proto = { path = "crates/proto" }
 fleet-net = { path = "crates/net" }
+fleet-node-config = { path = "crates/node-config" }
 anyhow = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }

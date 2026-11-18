@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 ///
 /// 2: [`Body::SendToRun`]; the orchestrator no longer sends [`Body::SendToAgent`], which an
 /// older node could not tell apart from a message for its current run.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// 3: [`Body::ProjectList`]. A version 2 node cannot decode it, and an undecodable frame drops
+/// the link, so it must be refused at the handshake instead.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// ALPN for the control protocol. The version is part of it so a future protocol can be
 /// served next to this one during a rolling upgrade.
@@ -30,7 +32,9 @@ pub mod redact;
 pub use agent::{
     AgentEvent, AgentEventKind, SecretFile, SpawnAgent, StopAgent, ToolCall, ToolResult,
 };
-pub use node::{ClaudeAuth, Hello, NodeInfo, NodeSettings, ProjectMapping, Rejected, Welcome};
+pub use node::{
+    ClaudeAuth, Hello, NodeInfo, NodeSettings, ProjectMapping, ProjectSummary, Rejected, Welcome,
+};
 
 /// One frame on the wire.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -114,6 +118,11 @@ pub enum Body {
         run_id: String,
         text: String,
     },
+
+    // Appended in protocol version 3.
+    /// Orchestrator -> node: every project, so the node's tray app can offer them for mapping.
+    /// Sent on every connect (after [`Body::NodeSettings`]) and after any project change.
+    ProjectList(Vec<ProjectSummary>),
 }
 
 impl Body {
@@ -282,6 +291,25 @@ mod tests {
                 auth: ClaudeAuth::OAuthToken("t".into()),
                 max_agents: 4,
             }),
+        });
+        roundtrip(Envelope {
+            seq: 9,
+            ack: 0,
+            body: Body::ProjectList(vec![
+                ProjectSummary {
+                    slug: "demo".into(),
+                    name: "Demo".into(),
+                },
+                ProjectSummary {
+                    slug: "fleet".into(),
+                    name: String::new(),
+                },
+            ]),
+        });
+        roundtrip(Envelope {
+            seq: 10,
+            ack: 0,
+            body: Body::ProjectList(vec![]),
         });
     }
 

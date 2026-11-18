@@ -164,6 +164,9 @@ async fn run(cli: Cli) -> Result<()> {
                 ticket.orchestrator,
                 name,
                 Some(ticket.secret),
+                // `fleet join` only runs until the node is admitted (the installer stops it
+                // then); the `fleet node` that follows starts the tray.
+                false,
             )
             .await
         }
@@ -175,7 +178,15 @@ async fn run(cli: Cli) -> Result<()> {
                     path.display()
                 )
             })?;
-            node(&data_dir, cli.relay.as_deref(), unhex(&text)?, name, None).await
+            node(
+                &data_dir,
+                cli.relay.as_deref(),
+                unhex(&text)?,
+                name,
+                None,
+                true,
+            )
+            .await
         }
     }
 }
@@ -294,6 +305,7 @@ async fn node(
     orchestrator: EndpointAddr,
     name: Option<String>,
     join_secret: Option<String>,
+    with_tray: bool,
 ) -> Result<()> {
     std::fs::create_dir_all(data_dir)?;
     let key = load_or_create_key(data_dir)?;
@@ -319,12 +331,21 @@ async fn node(
         join_secret,
     };
     let exe = std::env::current_exe()?;
-    let node = fleet_node::Node::new(data_dir.to_path_buf(), exe, client.clone())?;
+    let node = fleet_node::Node::new(
+        data_dir.to_path_buf(),
+        exe.clone(),
+        client.clone(),
+        cfg.node_name.clone(),
+    )?;
     tracing::info!(id = %ep.id(), name = %cfg.node_name, "node starting");
+    // After `Node::new`, which writes this process's pid into status.json for the tray to find.
+    if with_tray {
+        launch_tray(&exe, data_dir);
+    }
     let link = tokio::spawn(async move { client.run(&ep, cfg).await });
     let agents = node.clone();
-    tokio::select! {
-        r = node.run(events) => r,
+    let result = tokio::select! {
+        r = node.clone().run(events) => r,
         r = link => {
             let r = r?;
             // The link only ends in an error when the orchestrator refuses this node (revoked).
@@ -335,29 +356,72 @@ async fn node(
             r
         }
         _ = tokio::signal::ctrl_c() => Ok(()),
+    };
+    node.mark_stopped();
+    result
+}
+
+/// Starts the tray app (`fleet-tray.exe` next to this executable) for managing project
+/// mappings. Once per node start: a tray the owner quit stays quit. Optional in every way: a
+/// missing tray, `FLEET_NO_TRAY=1` or a failed start only means no tray.
+#[cfg(windows)]
+fn launch_tray(exe: &Path, data_dir: &Path) {
+    use std::os::windows::process::CommandExt;
+    // Detached, so it has no console and is not tied to ours; it exits when this pid does.
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+
+    if std::env::var_os("FLEET_NO_TRAY").is_some_and(|v| !v.is_empty() && v != "0") {
+        return;
+    }
+    let tray = exe.with_file_name("fleet-tray.exe");
+    if !tray.is_file() {
+        return;
+    }
+    // Only the null stdio handles below are passed on: std and tokio open files and sockets
+    // non-inheritable, so the tray holds none of the node's handles.
+    let started = std::process::Command::new(&tray)
+        // Not the node's working directory, which the tray would otherwise keep in use.
+        .current_dir(tray.parent().unwrap_or(Path::new(".")))
+        .arg("--data-dir")
+        .arg(std::path::absolute(data_dir).unwrap_or_else(|_| data_dir.to_path_buf()))
+        .arg("--node-pid")
+        .arg(std::process::id().to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+        .spawn();
+    match started {
+        Ok(_) => tracing::info!(tray = %tray.display(), "tray app started"),
+        Err(e) => tracing::warn!(tray = %tray.display(), "could not start the tray app: {e}"),
     }
 }
 
+#[cfg(not(windows))]
+fn launch_tray(_exe: &Path, _data_dir: &Path) {}
+
 fn project(data_dir: &Path, cmd: ProjectCmd) -> Result<()> {
     std::fs::create_dir_all(data_dir)?;
-    let mut cfg = NodeConfig::load(data_dir)?;
+    // Changes go through `NodeConfig::update`, under the lock the node and the tray app hold.
     match cmd {
         ProjectCmd::Map { slug, dir } => {
-            cfg.map_project(&slug, &dir)?;
-            cfg.save(data_dir)?;
+            let (cfg, ()) = NodeConfig::update(data_dir, |cfg| cfg.map_project(&slug, &dir))?;
             println!(
                 "mapped {slug} -> {}",
                 cfg.project_dir(&slug).unwrap_or_default().display()
             );
         }
         ProjectCmd::Unmap { slug } => {
-            if !cfg.unmap_project(&slug) {
-                bail!("{slug} is not mapped");
-            }
-            cfg.save(data_dir)?;
+            NodeConfig::update(data_dir, |cfg| {
+                if !cfg.unmap_project(&slug) {
+                    bail!("{slug} is not mapped");
+                }
+                Ok(())
+            })?;
         }
         ProjectCmd::List => {
-            for p in &cfg.projects {
+            for p in &NodeConfig::load(data_dir)?.projects {
                 println!("{}\t{}", p.project, p.path);
             }
         }

@@ -73,6 +73,51 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+        with:
+          # The tray app is a Cargo workspace of its own, with its own target dir.
+          workspaces: |
+            . -> target
+            apps/tray/src-tauri -> target
       - run: cargo build --workspace --locked
+      # Windows-only code (the tray launch, job objects) is linted only here.
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
+
+      # The tray app (apps/tray): Windows only, shipped next to fleet.exe.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/tray/package-lock.json
+      - name: Tray frontend deps
+        working-directory: apps/tray
+        run: npm ci
+      - name: Tray checks
+        working-directory: apps/tray
+        run: npm run check
+      - name: Tray version matches the workspace
+        # The tray ships with fleet.exe and takes its version (tauri.conf.json has none).
+        shell: bash
+        run: |
+          set -euo pipefail
+          ws=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          tray=$(sed -n 's/^version = "\(.*\)"/\1/p' apps/tray/src-tauri/Cargo.toml | head -n1)
+          echo "workspace $ws, tray $tray"
+          test "$ws" = "$tray"
+      - name: Tray fmt
+        working-directory: apps/tray/src-tauri
+        run: cargo fmt --check
+      - name: Tray clippy
+        working-directory: apps/tray/src-tauri
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Tray test
+        working-directory: apps/tray/src-tauri
+        run: cargo test --locked
+      - name: Tray release build
+        working-directory: apps/tray
+        # bash: PowerShell's npm wrapper drops the `--` separators.
+        shell: bash
+        run: npm run tauri build -- --no-bundle -- --locked

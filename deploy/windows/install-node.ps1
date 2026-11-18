@@ -32,6 +32,13 @@
     Path to fleet.exe from the release (fleet-<version>-x86_64-pc-windows-msvc.exe
     renamed, or as is). Default: .\fleet.exe next to this script.
 
+.PARAMETER TrayExe
+    Path to fleet-tray.exe, the tray app for mapping projects to folders
+    (fleet-tray-<version>-x86_64-pc-windows-msvc.exe from the release, renamed or
+    as is). Optional. Default: the newest of fleet-tray.exe and
+    fleet-tray-*-x86_64-pc-windows-msvc.exe next to -FleetExe, if there is one.
+    Installed next to fleet.exe, where `fleet node` looks for it and starts it.
+
 .PARAMETER InstallDir
     Where fleet.exe and the launcher are copied. Added to the user's PATH so
     agents can run `fleet secret get` and `fleet mcp`.
@@ -55,7 +62,7 @@
 .EXAMPLE
     # From an ordinary (non-elevated) PowerShell, as the user logged into Claude Code:
     powershell -ExecutionPolicy Bypass -File .\install-node.ps1 -FleetExe .\fleet.exe `
-        -Relay https://relay.example.com -Ticket <ticket from `fleet invite`>
+        -TrayExe .\fleet-tray.exe -Relay https://relay.example.com -Ticket <ticket from `fleet invite`>
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\install-node.ps1 -Uninstall
@@ -64,6 +71,9 @@
 param(
     [Parameter(ParameterSetName = 'Install')]
     [string]$FleetExe = (Join-Path $PSScriptRoot 'fleet.exe'),
+
+    [Parameter(ParameterSetName = 'Install')]
+    [string]$TrayExe,
 
     [Parameter(ParameterSetName = 'Install')]
     [Parameter(ParameterSetName = 'Uninstall')]
@@ -91,6 +101,7 @@ $TaskPath = '\'
 $DataDir = if ($env:FLEET_DATA_DIR) { $env:FLEET_DATA_DIR } else { Join-Path $env:LOCALAPPDATA 'fleet\data' }
 $LogDir = Join-Path $env:LOCALAPPDATA 'fleet\logs'
 $ExePath = Join-Path $InstallDir 'fleet.exe'
+$TrayPath = Join-Path $InstallDir 'fleet-tray.exe'
 $Launcher = Join-Path $InstallDir 'fleet-node-launcher.ps1'
 $UserId = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 
@@ -116,10 +127,14 @@ function Stop-FleetNode {
         # Ends the launcher; the node is its child and is stopped below.
         Stop-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction SilentlyContinue
     }
-    # Stop node processes started from our install dir (not other fleet.exe copies).
-    Get-Process -Name 'fleet' -ErrorAction SilentlyContinue |
-        Where-Object { $_.Path -and ($_.Path -ieq $ExePath) } |
-        Stop-Process -Force -ErrorAction SilentlyContinue
+    # Stop node processes started from our install dir (not other fleet.exe copies). The tray
+    # exits by itself once the node is gone, but only after a poll; stop it now too so
+    # fleet-tray.exe can be replaced or removed.
+    $procs = @(Get-Process -Name 'fleet', 'fleet-tray' -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -and (($_.Path -ieq $ExePath) -or ($_.Path -ieq $TrayPath)) })
+    $procs | Stop-Process -Force -ErrorAction SilentlyContinue
+    # Stop-Process returns before the processes are gone, and their exes stay locked until then.
+    $procs | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
 }
 
 if ($Uninstall) {
@@ -148,6 +163,18 @@ if ($Uninstall) {
 if (-not (Test-Path $FleetExe)) {
     throw "fleet.exe not found at '$FleetExe'. Pass -FleetExe <path to the release binary>."
 }
+if ($TrayExe) {
+    if (-not (Test-Path $TrayExe)) { throw "fleet-tray.exe not found at '$TrayExe'." }
+} else {
+    # Optional: without it the node simply runs without a tray icon. Next to -FleetExe, take
+    # fleet-tray.exe or a release asset (fleet-tray-<version>-x86_64-pc-windows-msvc.exe), the
+    # newest if there are several.
+    $candidate = Get-ChildItem -LiteralPath (Split-Path -Parent (Resolve-Path $FleetExe)) -File |
+        Where-Object { $_.Name -ieq 'fleet-tray.exe' -or $_.Name -like 'fleet-tray-*-x86_64-pc-windows-msvc.exe' } |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -First 1
+    if ($candidate) { $TrayExe = $candidate.FullName }
+}
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).
     IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if ($isAdmin) {
@@ -165,6 +192,7 @@ Stop-FleetNode
 
 New-Item -ItemType Directory -Force -Path $InstallDir, $DataDir, $LogDir | Out-Null
 Copy-Item -Force $FleetExe $ExePath
+if ($TrayExe) { Copy-Item -Force $TrayExe $TrayPath }
 
 [Environment]::SetEnvironmentVariable('FLEET_DATA_DIR', $DataDir, 'User')
 if ($Relay) { [Environment]::SetEnvironmentVariable('FLEET_RELAY', $Relay, 'User') }
@@ -253,6 +281,9 @@ Start-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath
 
 Write-Host ''
 Write-Host "Installed: $ExePath"
+if (Test-Path $TrayPath) {
+    Write-Host "Tray app:  $TrayPath (started by the node; set FLEET_NO_TRAY=1 to turn it off)"
+}
 Write-Host "Task:      Task Scheduler > $TaskPath$TaskName (at logon of $UserId)"
 Write-Host "Data:      $DataDir"
 Write-Host "Logs:      $(Join-Path $LogDir 'node.log')"

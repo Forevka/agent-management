@@ -5,7 +5,8 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use anyhow::{Context, Result};
 use fleet_net::{EndpointId, Inbound, Server};
 use fleet_proto::{
-    AgentEvent, AgentEventKind, Body, ClaudeAuth, Hello, NodeInfo, NodeSettings, ToolResult,
+    AgentEvent, AgentEventKind, Body, ClaudeAuth, Hello, NodeInfo, NodeSettings, ProjectSummary,
+    ToolResult,
 };
 use sqlx::PgPool;
 use tokio::sync::mpsc;
@@ -232,6 +233,35 @@ impl Orchestrator {
         .execute(&self.db)
         .await?;
         self.push_node_settings(&id).await?;
+        self.push_project_list(Some(peer)).await?;
+        Ok(())
+    }
+
+    /// Sends the project list (for the node's tray app) to one node, or with `None` to every
+    /// connected node. Called on connect and after every project change.
+    pub async fn push_project_list(&self, node: Option<EndpointId>) -> Result<()> {
+        let projects: Vec<ProjectSummary> =
+            sqlx::query_as::<_, (String, String)>("select slug, name from projects order by slug")
+                .fetch_all(&self.db)
+                .await?
+                .into_iter()
+                .map(|(slug, name)| ProjectSummary { slug, name })
+                .collect();
+        let targets = match node {
+            Some(n) => vec![n],
+            // Only live links: a node that is offline gets a fresh list when it reconnects, so
+            // queueing a stale one for it would add nothing.
+            None => sqlx::query_scalar::<_, String>("select id from nodes where online")
+                .fetch_all(&self.db)
+                .await?
+                .iter()
+                .filter_map(|id| id.parse::<EndpointId>().ok())
+                .filter(|n| self.server.is_connected(*n))
+                .collect(),
+        };
+        for n in targets {
+            self.server.send(n, Body::ProjectList(projects.clone()));
+        }
         Ok(())
     }
 

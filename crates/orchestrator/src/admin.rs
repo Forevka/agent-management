@@ -156,12 +156,9 @@ pub enum AdminAction {
     },
 }
 
+/// The node's rule, so every project created here can be mapped on a node.
 pub fn valid_slug(slug: &str) -> bool {
-    !slug.is_empty()
-        && slug.len() <= 40
-        && slug
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    fleet_node_config::validate_slug(slug).is_ok()
 }
 
 fn valid_key(key: &str) -> bool {
@@ -381,6 +378,14 @@ async fn active_tasks(o: &Orchestrator, agent_id: &str) -> Result<i64> {
     .await?)
 }
 
+/// Nodes show the project list in their tray app; refresh it after a project is created or
+/// renamed. The change itself has already succeeded, so a failure here is only logged.
+async fn projects_changed(o: &Orchestrator) {
+    if let Err(e) = o.push_project_list(None).await {
+        tracing::warn!("sending the project list to nodes failed: {e:#}");
+    }
+}
+
 // ---------------------------------------------------------------- execute
 
 /// Applies a change for `actor` (who the audit log names, and what is allowed). Returns a short
@@ -411,6 +416,7 @@ pub async fn execute(o: &Arc<Orchestrator>, actor: Actor, action: &AdminAction) 
                 json!({"project": slug}),
             )
             .await;
+            projects_changed(o).await;
             Ok(format!("created project {slug}"))
         }
         A::ProjectEdit {
@@ -451,6 +457,7 @@ pub async fn execute(o: &Arc<Orchestrator>, actor: Actor, action: &AdminAction) 
             tx.commit().await?;
             o.audit(actor.audit_name(), "project.edit", json!({"project": slug}))
                 .await;
+            projects_changed(o).await;
             Ok(format!("updated project {slug}"))
         }
         A::ProjectBindFolder { project, folder: f } => {
@@ -2065,5 +2072,6 @@ mod tests {
     fn slugs() {
         assert!(valid_slug("web-2"));
         assert!(!valid_slug("Web") && !valid_slug("") && !valid_slug("a b"));
+        assert!(!valid_slug("-web"), "nodes refuse a leading '-'");
     }
 }

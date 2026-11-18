@@ -110,6 +110,10 @@ This is a new project, unrelated to `stoneshard-mod`. It goes in **`Forevka/agen
    - Run `fleet join <ticket>` on the PC. Its key is added to the allowlist, and it installs and starts itself as a service.
    - The node's Claude command and auth are then set in the web UI.
 2. **Mapping a project:** create the project once in the web UI (tracker preset, secret bindings, Slack channels). On a node, run `fleet project map <slug> <path>` or use the web UI.
+   - On Windows, the tray app (`apps/tray`, Tauri + Svelte) does the same from a window. The node starts it (`fleet-tray.exe` next to `fleet.exe`, unless `FLEET_NO_TRAY=1`) and it exits with the node; one tray per user, serving one data directory.
+   - The orchestrator sends every node the project list (`Body::ProjectList`, protocol 3) on connect and after each project create or edit. The node writes it, its link state and its pid to `status.json`; the tray offers those slugs in a dropdown and flags mappings the orchestrator does not know.
+   - The tray edits only `projects` in `node.json`. Every writer of `node.json` (the node saving pushed settings, `fleet project map`, the tray) loads, changes and saves it while holding `node.json.lock`, an OS file lock, so one writer's change is not saved over by another's. The lock is advisory: a hand edit or an older binary that does not take it can still race. Saves are atomic renames from a per-writer temp file, so readers never see a half-written file. The node picks up mapping changes within 5 s.
+   - `status.json` carries the node's pid and that process's start time, so the tray does not take a later process that reused the pid for the node.
 3. **"do X" in Telegram (General, or a project topic):**
    - The orchestrator bot receives it and passes it to the **brain** session. The brain:
      - looks up memory in Hindsight;
