@@ -15,7 +15,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
-use fleet_feeds::{FeedError, FeedMessage, SlackSource, Source};
+use fleet_feeds::{ConversationKind, FeedError, FeedEvent, FeedMessage, SlackSource, Source};
 use serde_json::{Value, json};
 
 const TOKEN: &str = "xoxp-test-token";
@@ -27,6 +27,8 @@ enum FaultKind {
     TooMany(u64),
     /// HTTP 200 with `{"ok":false,"error":"ratelimited"}` and `Retry-After`.
     RatelimitedBody(u64),
+    /// HTTP 200 with `{"ok":false,"error":…}`.
+    ApiError(&'static str),
 }
 
 struct Fault {
@@ -163,7 +165,9 @@ impl Mock {
             "conversations.info" => {
                 let id = q.get("channel").cloned().unwrap_or_default();
                 match self.channel_names.get(&id) {
-                    Some(name) => Json(json!({"ok": true, "channel": {"id": id, "name": name}})),
+                    Some(name) => Json(
+                        json!({"ok": true, "channel": {"id": id, "name": name, "is_channel": true}}),
+                    ),
                     None => Json(json!({"ok": false, "error": "channel_not_found"})),
                 }
             }
@@ -227,6 +231,7 @@ async fn route(
                 axum::Json(json!({"ok": false, "error": "ratelimited"})),
             )
                 .into_response(),
+            FaultKind::ApiError(code) => Json(json!({"ok": false, "error": code})),
         };
         if m.faults[i].times == 0 {
             m.faults.remove(i);
@@ -364,8 +369,8 @@ async fn first_poll_returns_history_oldest_first() {
     assert_eq!(texts(&msgs), ["one", "two", "three"]);
     let first = &msgs[0];
     assert_eq!(first.source, "slack");
-    assert_eq!(first.channel_id, "C1");
-    assert_eq!(first.channel_name.as_deref(), Some("general"));
+    assert_eq!(first.conversation_id, "C1");
+    assert_eq!(first.conversation_name.as_deref(), Some("general"));
     assert_eq!(first.id, s.ts(1));
     assert_eq!(first.thread_id, None);
     assert_eq!(first.author_id.as_deref(), Some("U1"));
@@ -829,6 +834,91 @@ async fn suggested_interval_backs_off_when_idle() {
     s.post("C1", 2, "U1", "again");
     src.poll().await.unwrap();
     assert_eq!(src.suggested_interval(), Duration::from_secs(15));
+}
+
+#[tokio::test]
+async fn polled_messages_carry_kind_and_owner_flags() {
+    let s = Slack::start().await;
+    s.post("C1", 1, "U1", "ping <@UME>");
+    s.post("C1", 2, "UME", "pong <@UME>");
+    s.post("C1", 3, "U2", "<@UMEX> is someone else");
+    let mut src = s.source(&["C1"]);
+    let msgs = src.poll().await.unwrap();
+    assert!(
+        msgs.iter()
+            .all(|m| m.conversation_kind == ConversationKind::Channel)
+    );
+    let flags: Vec<(bool, bool)> = msgs
+        .iter()
+        .map(|m| (m.mentions_owner, m.from_owner))
+        .collect();
+    assert_eq!(flags, [(true, false), (false, true), (false, false)]);
+    let caps = src.capabilities();
+    assert!(caps.poll && caps.can_reply && !caps.push);
+    assert!(src.replier().is_some());
+    // The polling run stops only when the token is unusable; everything else is retried.
+    assert!(src.is_fatal(&FeedError::Api("token_revoked".into())));
+    assert!(!src.is_fatal(&FeedError::Api("internal_error".into())));
+    assert!(!src.is_fatal(&FeedError::Api("channel_not_found".into())));
+    assert!(!src.is_fatal(&FeedError::Http("timeout".into())));
+}
+
+#[tokio::test]
+async fn the_default_run_polls_into_the_sink_with_checkpoints() {
+    let s = Slack::start().await;
+    s.post("C1", 1, "U1", "one");
+    let mut src = s
+        .source(&["C1"])
+        .with_poll_interval(Duration::from_millis(20), Duration::from_millis(20));
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    let run = tokio::spawn(async move { src.run(tx).await });
+    async fn next(rx: &mut tokio::sync::mpsc::Receiver<FeedEvent>) -> FeedEvent {
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+    match next(&mut rx).await {
+        FeedEvent::Message(m) => assert_eq!(m.text, "one"),
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(next(&mut rx).await, FeedEvent::Checkpoint(_)));
+    s.post("C1", 2, "U1", "two");
+    loop {
+        match next(&mut rx).await {
+            FeedEvent::Message(m) => {
+                assert_eq!(m.text, "two");
+                break;
+            }
+            FeedEvent::Checkpoint(_) => continue,
+            other => panic!("{other:?}"),
+        }
+    }
+    // A recoverable error is retried, not the end of the run.
+    s.fault(
+        "conversations.history",
+        Box::new(|_| true),
+        FaultKind::ApiError("internal_error"),
+    );
+    s.post("C1", 3, "U1", "three");
+    loop {
+        match next(&mut rx).await {
+            FeedEvent::Message(m) => {
+                assert_eq!(m.text, "three");
+                break;
+            }
+            FeedEvent::Checkpoint(_) => continue,
+            other => panic!("{other:?}"),
+        }
+    }
+    assert!(!run.is_finished());
+    // Closing the sink stops the run cleanly.
+    drop(rx);
+    let res = tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(res, Ok(()));
 }
 
 #[tokio::test]

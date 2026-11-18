@@ -22,7 +22,8 @@ use crate::{
     chat::{clip, esc},
     core::Orchestrator,
     human::{self, Answer},
-    model::{HumanItemRow, NodeRow, TaskRow},
+    model::{HumanItemRow, NodeRow, RuleRow, TaskRow, TodoRow},
+    secretary,
 };
 
 type O = Arc<Orchestrator>;
@@ -42,6 +43,7 @@ pub fn router(o: O) -> Router {
         .route("/nodes", get(nodes_page).post(nodes_post))
         .route("/nodes/{id}", get(node_page).post(node_post))
         .route("/agents", get(agents_page).post(agents_post))
+        .route("/inbox", get(inbox_page).post(inbox_post))
         .layer(axum::middleware::map_response(security_headers))
         .with_state(o)
 }
@@ -184,7 +186,7 @@ button{{padding:8px 14px;border-radius:6px;border:1px solid var(--line);backgrou
 button.primary{{background:var(--accent);border-color:var(--accent);color:#fff}}button.danger{{color:var(--bad)}}
 .pill{{display:inline-block;padding:1px 8px;border-radius:99px;border:1px solid var(--line);font-size:12px}}
 .on{{color:var(--ok)}}.off{{color:var(--muted)}}.plan h1,.plan h2,.plan h3{{font-size:16px}}
-</style></head><body><header><b>Fleet</b><a href="/">Dashboard</a><a href="/projects">Projects</a><a href="/secrets">Secrets</a><a href="/nodes">Nodes</a><a href="/agents">Agents</a></header>
+</style></head><body><header><b>Fleet</b><a href="/">Dashboard</a><a href="/projects">Projects</a><a href="/secrets">Secrets</a><a href="/nodes">Nodes</a><a href="/agents">Agents</a><a href="/inbox">Inbox</a></header>
 <main><h1>{t}</h1>{body}</main></body></html>"#,
         t = esc(title)
     );
@@ -294,7 +296,7 @@ async fn dashboard(State(o): State<O>, h: HeaderMap) -> Response {
     let r: Result<String> = async {
         let items = human::open_items(&o).await?;
         let tasks: Vec<TaskRow> =
-            sqlx::query_as("select * from tasks where id <> 'brain' and status <> 'done' order by updated_at desc limit 50").fetch_all(&o.db).await?;
+            sqlx::query_as("select * from tasks where id not in ('brain', 'secretary') and status <> 'done' order by updated_at desc limit 50").fetch_all(&o.db).await?;
         let nodes: Vec<NodeRow> = sqlx::query_as("select * from nodes order by name").fetch_all(&o.db).await?;
         let mut s = String::from("<h2>Waiting on you</h2>");
         if items.is_empty() {
@@ -1159,7 +1161,7 @@ async fn node_post(
 async fn agents_page(State(o): State<O>, h: HeaderMap) -> Response {
     require!(o, h);
     let agents: Vec<(String, String, String, Option<String>, Option<String>)> = sqlx::query_as(
-        "select a.id, a.name, a.role, a.project, b.username from agents a left join bots b on b.id = a.bot_id where a.id <> 'orchestrator' order by a.project, a.name",
+        "select a.id, a.name, a.role, a.project, b.username from agents a left join bots b on b.id = a.bot_id where a.id not in ('orchestrator', 'secretary') order by a.project, a.name",
     )
     .fetch_all(&o.db)
     .await
@@ -1226,6 +1228,193 @@ async fn agents_post(State(o): State<O>, h: HeaderMap, RawForm(body): RawForm) -
     .await;
     match r {
         Ok(()) => Redirect::to("/agents").into_response(),
+        Err(e) => err_page(e),
+    }
+}
+
+// ---------------------------------------------------------------- inbox (the secretary)
+
+async fn inbox_page(State(o): State<O>, h: HeaderMap) -> Response {
+    require!(o, h);
+    match render_inbox(&o).await {
+        Ok(body) => page("Inbox", &body),
+        Err(e) => err_page(e),
+    }
+}
+
+/// The secretary's work: open todos (with the same actions as in Telegram), the rules, and
+/// what it decided about recent messages. Everything from messages is escaped.
+pub(crate) async fn render_inbox(o: &Orchestrator) -> Result<String> {
+    let todos: Vec<TodoRow> = sqlx::query_as(
+        "(select * from todos where status = 'open' order by id desc limit 200)
+         union all (select * from todos where status <> 'open' order by updated_at desc limit 20)",
+    )
+    .fetch_all(&o.db)
+    .await?;
+    let rules: Vec<RuleRow> = sqlx::query_as(
+        "select * from secretary_rules where active or created_at > now() - interval '30 days' order by active desc, id desc limit 100",
+    )
+    .fetch_all(&o.db)
+    .await?;
+    let triage: Vec<(chrono::DateTime<chrono::Utc>, Vec<String>, String, String)> = sqlx::query_as(
+        "select at, refs, decision, note from secretary_triage order by id desc limit 50",
+    )
+    .fetch_all(&o.db)
+    .await?;
+    let (pending, batches_today, messages_today): (i64, i64, i64) = sqlx::query_as(
+        "select (select count(*) from feed_messages where secretary = 'pending'),
+                (select count(*) from secretary_batches where at > now() - interval '1 day'),
+                (select coalesce(sum(messages), 0) from secretary_batches where at > now() - interval '1 day')",
+    )
+    .fetch_one(&o.db)
+    .await?;
+    let mut refs: Vec<String> = todos.iter().flat_map(|t| t.refs.clone()).collect();
+    refs.extend(triage.iter().flat_map(|t| t.1.clone()));
+    let msgs = secretary::messages_by_ref(o, &refs).await?;
+    let source = |r: &str| match msgs.get(r) {
+        Some((conv, author, text, link)) => {
+            let who = format!("{} · {}", esc(conv), esc(author.as_deref().unwrap_or("?")));
+            let who = match link {
+                Some(l) if l.starts_with("https://") => {
+                    format!("<a href=\"{}\" rel=noopener>{who}</a>", esc(l))
+                }
+                _ => who,
+            };
+            format!("{who}: {}", esc(&clip(text, 200)))
+        }
+        None => format!("<span class=muted>{} (no longer kept)</span>", esc(r)),
+    };
+
+    let mut s = format!(
+        "<p class=muted>{messages_today} messages in {batches_today} batches in the last day · {pending} waiting for the next batch.</p><h2>Todos</h2>"
+    );
+    let open: Vec<&TodoRow> = todos.iter().filter(|t| t.status == "open").collect();
+    if open.is_empty() {
+        s.push_str("<p class=muted>Nothing open.</p>");
+    }
+    for t in &open {
+        let due = t
+            .due
+            .map(|d| format!(" <span class=pill>due {}</span>", d.format("%Y-%m-%d")))
+            .unwrap_or_default();
+        let sources: String = t
+            .refs
+            .iter()
+            .map(|r| format!("<li>{}</li>", source(r)))
+            .collect();
+        s.push_str(&format!(
+            "<div class=card><b>T-{id}</b> {title}{due}<br>{detail}<ul class=muted>{sources}</ul>\
+             <form method=post class=row><input type=hidden name=op value=todo><input type=hidden name=id value={id}>\
+             <button name=action value=d>✅ Done</button><button name=action value=x>🗑 Dismiss</button><button name=action value=m>🛠 Make task</button></form></div>",
+            id = t.id,
+            title = esc(&t.title),
+            detail = esc(&t.detail),
+        ));
+    }
+    let settled: Vec<&TodoRow> = todos.iter().filter(|t| t.status != "open").collect();
+    if !settled.is_empty() {
+        s.push_str("<h2>Recently settled</h2><table>");
+        for t in settled {
+            // What the secretary settled on its own can be reopened, as in Telegram; a todo
+            // sent for a task stays as it is.
+            let by = t.updated_by.as_deref().unwrap_or("owner");
+            let reopen = if t.status != "tasked" {
+                format!(
+                    "<form method=post><input type=hidden name=op value=todo><input type=hidden name=id value={}><button name=action value=o>↩️ Reopen</button></form>",
+                    t.id
+                )
+            } else {
+                String::new()
+            };
+            s.push_str(&format!(
+                "<tr><td>T-{}</td><td>{}</td><td class=muted>{} by the {}</td><td>{reopen}</td></tr>",
+                t.id,
+                esc(&t.title),
+                esc(if t.status == "tasked" { "task requested" } else { &t.status }),
+                esc(if by == "secretary" { "secretary" } else { "owner" })
+            ));
+        }
+        s.push_str("</table>");
+    }
+
+    s.push_str("<h2>Rules</h2><p class=muted>How the secretary triages, as you taught it. Every change is also posted to the Inbox topic.</p><table>");
+    for r in &rules {
+        let action = if r.active {
+            format!(
+                "<form method=post><input type=hidden name=op value=rule_remove><input type=hidden name=id value={}><button class=danger>Remove</button></form>",
+                r.id
+            )
+        } else {
+            "<span class=muted>removed</span>".into()
+        };
+        let why = r
+            .cited
+            .as_deref()
+            .map(|c| format!("<br><span class=muted>asked: “{}”</span>", esc(c)))
+            .unwrap_or_default();
+        s.push_str(&format!(
+            "<tr><td>R-{}</td><td>{}{why}</td><td class=muted>{}</td><td>{action}</td></tr>",
+            r.id,
+            esc(&r.text),
+            esc(&r.source)
+        ));
+    }
+    s.push_str(
+        "</table><form method=post class=card><input type=hidden name=op value=rule_add>\
+         <label>New rule<input type=text name=text required maxlength=500 placeholder=\"Messages in #random are noise\"></label><button class=primary>Add rule</button></form>",
+    );
+
+    s.push_str(
+        "<h2>Recent triage</h2><table><tr><th>When</th><th>Decision</th><th>Messages</th></tr>",
+    );
+    for (at, refs, decision, note) in &triage {
+        let items: String = refs
+            .iter()
+            .take(10)
+            .map(|r| format!("<li>{}</li>", source(r)))
+            .collect();
+        let more = if refs.len() > 10 {
+            format!("<li class=muted>and {} more</li>", refs.len() - 10)
+        } else {
+            String::new()
+        };
+        s.push_str(&format!(
+            "<tr><td class=muted>{}</td><td><span class=pill>{}</span><br>{}</td><td><ul>{items}{more}</ul></td></tr>",
+            at.format("%m-%d %H:%M"),
+            esc(decision),
+            esc(note)
+        ));
+    }
+    s.push_str("</table>");
+    Ok(s)
+}
+
+async fn inbox_post(State(o): State<O>, h: HeaderMap, RawForm(body): RawForm) -> Response {
+    require!(o, h);
+    let f = form(&body);
+    let r: Result<()> = async {
+        match field(&f, "op").unwrap_or_default() {
+            // The same actions as the Inbox buttons in Telegram.
+            "todo" => {
+                let id: i64 = field(&f, "id").unwrap_or_default().parse()?;
+                let action = field(&f, "action").unwrap_or_default();
+                anyhow::ensure!(matches!(action, "d" | "x" | "m" | "o"), "unknown action");
+                secretary::button(&o, &format!("t|{id}|{action}")).await?;
+            }
+            "rule_remove" => {
+                let id: i64 = field(&f, "id").unwrap_or_default().parse()?;
+                secretary::button(&o, &format!("r|{id}|u")).await?;
+            }
+            "rule_add" => {
+                secretary::owner_rule(&o, field(&f, "text").unwrap_or_default()).await?;
+            }
+            other => anyhow::bail!("unknown action {other:?}"),
+        }
+        Ok(())
+    }
+    .await;
+    match r {
+        Ok(()) => Redirect::to("/inbox").into_response(),
         Err(e) => err_page(e),
     }
 }

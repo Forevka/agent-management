@@ -12,8 +12,8 @@ use crate::{
     chat::{From, Notify, clip, esc},
     core::Orchestrator,
     human::{self, NewItem},
-    model::{AgentRow, BRAIN_AGENT, NewAgent, TaskRow},
-    tasks,
+    model::{AgentRow, BRAIN_AGENT, NewAgent, SECRETARY_AGENT, TaskRow},
+    secretary, tasks,
 };
 
 /// Agent-to-agent messages allowed per sender and recipient in ten minutes. Two agents stuck
@@ -47,6 +47,24 @@ pub async fn handle(
         .fetch_one(&o.db)
         .await?;
     let is_brain = agent.id == BRAIN_AGENT;
+    let is_secretary = agent.id == SECRETARY_AGENT;
+    // The secretary reads third parties' messages all day: it gets its own tools, the read-only
+    // feed and memory tools and nothing else (no tasks, replies, messages to agents, admin).
+    if is_secretary
+        && !secretary::TOOLS.contains(&call.tool.as_str())
+        && !matches!(
+            call.tool.as_str(),
+            "permission"
+                | "feed_read"
+                | "feed_search"
+                | "memory_retain"
+                | "memory_recall"
+                | "memory_reflect"
+                | "memory_banks"
+        )
+    {
+        bail!("{} is not available to the secretary", call.tool);
+    }
     // Everything an agent sends on (questions, posts, milestones, summaries, messages to other
     // agents, memories, proposals) loses the values of its project's secrets first, whichever
     // tool carries it. Not permission prompts: their input goes back to Claude as the call it
@@ -153,8 +171,14 @@ pub async fn handle(
             if target.id == agent.id {
                 bail!("you cannot message yourself");
             }
-            // Agents talk within their project; the orchestrator is reached by the owner only.
-            if target.id == BRAIN_AGENT || (!is_brain && target.project != agent.project) {
+            // Agents talk within their project; the orchestrator is reached by the owner only, and
+            // the secretary through the brain's `secretary-note`.
+            if target.id == SECRETARY_AGENT {
+                bail!("the secretary takes notes only from the orchestrator (secretary-note)");
+            }
+            if crate::model::is_builtin_agent(&target.id)
+                || (!is_brain && target.project != agent.project)
+            {
                 bail!("{} is not an agent of your project", target.name);
             }
             let recent: i64 = sqlx::query_scalar(
@@ -282,11 +306,22 @@ pub async fn handle(
         "memory_retain" | "memory_recall" | "memory_reflect" | "memory_banks" => {
             ok(memory(o, &agent, &task.project, &call.tool, &args).await?)
         }
-        "feed_read" => ok(crate::feeds::read(o, &task.project, is_brain, &args).await?),
-        "feed_search" => ok(crate::feeds::search(o, &task.project, is_brain, &args).await?),
+        // The brain and the secretary see every conversation; other agents their project's.
+        "feed_read" => {
+            ok(crate::feeds::read(o, &task.project, is_brain || is_secretary, &args).await?)
+        }
+        "feed_search" => {
+            ok(crate::feeds::search(o, &task.project, is_brain || is_secretary, &args).await?)
+        }
+        name if secretary::TOOLS.contains(&name) => {
+            if !is_secretary {
+                bail!("{name} is only available to the secretary");
+            }
+            ok(secretary::tool(o, name, &args).await?)
+        }
         // Orchestration tools: the brain only. Administration is refused by name, so an agent
         // that learned of it gets a clear answer instead of "unknown tool".
-        "admin_read" | "admin_propose" | "web_link" if !is_brain => {
+        "admin_read" | "admin_propose" | "web_link" | "secretary_note" if !is_brain => {
             bail!("{} is only available to the orchestrator", call.tool)
         }
         _ if !is_brain => bail!("unknown tool {}", call.tool),
@@ -312,7 +347,7 @@ pub async fn handle(
         .await?),
         "list_tasks" => {
             let rows: Vec<TaskRow> = sqlx::query_as(
-                "select * from tasks where id <> 'brain' and ($1::text is null or project = $1) and ($2::text is null or status = $2)
+                "select * from tasks where id not in ('brain', 'secretary') and ($1::text is null or project = $1) and ($2::text is null or status = $2)
                  order by updated_at desc limit $3",
             )
             .bind(args["project"].as_str())
@@ -391,6 +426,12 @@ pub async fn handle(
             .await?;
             ok(format!("Proposed as Q-{}; the human decides.", row.id))
         }
+        // The owner's wishes for the secretary, relayed (trusted, unlike what it reads).
+        "secretary_note" => {
+            let text = args["text"].as_str().context("text required")?;
+            secretary::note_from_brain(o, text).await?;
+            ok("Passed to the secretary.".into())
+        }
         "reply_owner" => {
             let text = args["text"].as_str().context("text required")?;
             // The answer the owner is waiting for: it sounds, and ends "typing…".
@@ -428,6 +469,13 @@ async fn permission(
             .bind(&call.call_id)
             .fetch_optional(&o.db)
             .await?;
+    if agent.id == SECRETARY_AGENT {
+        return Ok(Some(ToolResult {
+            call_id: call.call_id.clone(),
+            ok: true,
+            result: secretary::permission_denial().to_string(),
+        }));
+    }
     match existing {
         Some((state, _)) if state == "open" => return Ok(None),
         Some((_, Some(answer))) if answer.0.get("decision").is_some() => {
@@ -590,7 +638,11 @@ async fn memory(
                 crate::memory::agent_prefix(agent),
                 crate::memory::project_bank(project),
             ] {
-                if agent.id != BRAIN_AGENT && !banks.contains(&default) {
+                // The secretary is not offered its project's shared bank (see memory).
+                if agent.id != BRAIN_AGENT
+                    && !banks.contains(&default)
+                    && crate::memory::visible(agent, project, &default)
+                {
                     banks.push(default);
                 }
             }

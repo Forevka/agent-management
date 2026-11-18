@@ -52,6 +52,16 @@ pub fn ts_unix(ts: &str) -> Option<f64> {
     Some(secs as f64 + micros as f64 / 1_000_000.0)
 }
 
+/// The timestamp one microsecond before `ts`, so that an exclusive `oldest` includes `ts`
+/// itself. A malformed timestamp is returned unchanged.
+pub fn ts_before(ts: &str) -> String {
+    match ts_key(ts) {
+        Some((0, 0)) | None => ts.to_owned(),
+        Some((secs, 0)) => format!("{}.999999", secs - 1),
+        Some((secs, micros)) => format!("{secs}.{:06}", micros - 1),
+    }
+}
+
 /// Formats Unix seconds as a Slack timestamp, for the `oldest` of a time window.
 pub fn ts_from_unix(secs: f64) -> String {
     let secs = secs.max(0.0);
@@ -183,6 +193,9 @@ mod tests {
         assert_eq!(ts_key("1.1234567"), None);
         assert_eq!(ts_unix("1700000000.500000"), Some(1_700_000_000.5));
         assert_eq!(ts_from_unix(12.25), "12.250000");
+        assert_eq!(ts_before("1700000000.000100"), "1700000000.000099");
+        assert_eq!(ts_before("1700000000.000000"), "1699999999.999999");
+        assert_eq!(ts_before("x"), "x");
     }
 
     #[test]

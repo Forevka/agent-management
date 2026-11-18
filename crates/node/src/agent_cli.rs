@@ -105,6 +105,39 @@ pub enum AgentCmd {
     },
     /// Reply to the human in Telegram's General topic.
     Reply { text: String },
+    /// Pass the owner's wishes on to the secretary (e.g. what to ignore, what is a todo).
+    SecretaryNote { text: String },
+    // Secretary only.
+    /// The owner's todo list.
+    #[command(subcommand)]
+    Todo(TodoCmd),
+    /// Hand messages to the orchestrator: work for an agent, or a reply worth drafting.
+    Escalate {
+        /// What it is about and why it needs the orchestrator ("-" reads it from stdin).
+        #[arg(long)]
+        summary: String,
+        /// A message ref from the batch (repeat for more).
+        #[arg(long = "source", required = true)]
+        sources: Vec<String>,
+    },
+    /// Post to the owner's Inbox topic.
+    #[command(subcommand)]
+    Digest(DigestCmd),
+    /// The owner's triage rules.
+    #[command(subcommand)]
+    Rule(RuleCmd),
+    /// Record messages you ignore or note (todos and escalations are recorded by their commands).
+    Triage {
+        /// ignore or note.
+        #[arg(value_parser = ["ignore", "note"])]
+        decision: String,
+        /// Message refs.
+        #[arg(required = true)]
+        refs: Vec<String>,
+        /// Why, in a few words.
+        #[arg(long)]
+        why: Option<String>,
+    },
     /// Administer the fleet: reads run at once, every change waits for the owner's approval.
     Admin(AdminArgs),
 }
@@ -229,11 +262,74 @@ pub struct CreateTaskArgs {
 }
 
 #[derive(Debug, Subcommand)]
-pub enum FeedCmd {
-    /// Recent messages.
-    Read {
+pub enum TodoCmd {
+    /// Add a todo for the owner.
+    Add {
+        /// Short and actionable: who, what, by when.
         #[arg(long)]
+        title: String,
+        /// Context ("-" reads it from stdin).
+        #[arg(long)]
+        detail: Option<String>,
+        /// A message ref it came from (repeat for more).
+        #[arg(long = "source")]
+        sources: Vec<String>,
+        /// YYYY-MM-DD.
+        #[arg(long)]
+        due: Option<String>,
+    },
+    /// List todos (open by default).
+    List {
+        /// open, done, dismissed or all.
+        #[arg(long, default_value = "open")]
+        status: String,
+    },
+    /// Change a todo's status.
+    Update {
+        /// T-12 or 12.
+        id: String,
+        /// open, done or dismissed.
+        #[arg(long, value_parser = ["open", "done", "dismissed"])]
+        status: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DigestCmd {
+    /// Post a summary or an answer to the owner.
+    Post {
+        /// The text ("-" reads it from stdin).
+        #[arg(long)]
+        text: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RuleCmd {
+    /// Add a rule the owner asked for.
+    Add {
+        #[arg(long)]
+        text: String,
+        /// The owner's words that asked for it.
+        #[arg(long)]
+        because: String,
+    },
+    /// List the active rules.
+    List,
+    /// Remove a rule (R-3 or 3).
+    Remove { id: String },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum FeedCmd {
+    /// Recent messages, or the messages given with --ref.
+    Read {
+        /// A conversation's name or id.
+        #[arg(long, visible_alias = "conversation")]
         channel: Option<String>,
+        /// A message ref (repeat for more); reads exactly those messages.
+        #[arg(long = "ref")]
+        refs: Vec<String>,
         #[arg(long, default_value_t = 24.0)]
         hours: f64,
         #[arg(long, default_value_t = 50)]
@@ -322,11 +418,12 @@ pub fn to_call(cmd: AgentCmd) -> Result<(&'static str, Value)> {
         AgentCmd::Complete { summary } => ("complete", json!({"summary": stdin_if_dash(summary)?})),
         AgentCmd::Feed(FeedCmd::Read {
             channel,
+            refs,
             hours,
             limit,
         }) => (
             "feed_read",
-            json!({"channel": channel, "since_hours": hours, "limit": limit}),
+            json!({"channel": channel, "refs": refs, "since_hours": hours, "limit": limit}),
         ),
         AgentCmd::Feed(FeedCmd::Search { query, limit }) => {
             ("feed_search", json!({"query": query, "limit": limit}))
@@ -399,6 +496,42 @@ pub fn to_call(cmd: AgentCmd) -> Result<(&'static str, Value)> {
             json!({"channel_id": channel, "thread_id": thread, "text": stdin_if_dash(text)?, "context": context}),
         ),
         AgentCmd::Reply { text } => ("reply_owner", json!({"text": stdin_if_dash(text)?})),
+        AgentCmd::SecretaryNote { text } => {
+            ("secretary_note", json!({"text": stdin_if_dash(text)?}))
+        }
+        AgentCmd::Todo(TodoCmd::Add {
+            title,
+            detail,
+            sources,
+            due,
+        }) => (
+            "todo_add",
+            json!({"title": title, "detail": detail.map(stdin_if_dash).transpose()?, "refs": sources, "due": due}),
+        ),
+        AgentCmd::Todo(TodoCmd::List { status }) => ("todo_list", json!({"status": status})),
+        AgentCmd::Todo(TodoCmd::Update { id, status }) => {
+            ("todo_update", json!({"id": id, "status": status}))
+        }
+        AgentCmd::Escalate { summary, sources } => (
+            "escalate",
+            json!({"summary": stdin_if_dash(summary)?, "refs": sources}),
+        ),
+        AgentCmd::Digest(DigestCmd::Post { text }) => {
+            ("digest_post", json!({"text": stdin_if_dash(text)?}))
+        }
+        AgentCmd::Rule(RuleCmd::Add { text, because }) => {
+            ("rule_add", json!({"text": text, "because": because}))
+        }
+        AgentCmd::Rule(RuleCmd::List) => ("rule_list", json!({})),
+        AgentCmd::Rule(RuleCmd::Remove { id }) => ("rule_remove", json!({"id": id})),
+        AgentCmd::Triage {
+            decision,
+            refs,
+            why,
+        } => (
+            "triage",
+            json!({"decision": decision, "refs": refs, "why": why}),
+        ),
         AgentCmd::Admin(a) => admin_call(a)?,
     })
 }
@@ -604,6 +737,70 @@ mod tests {
             ("create_task", json!("tester"))
         );
         assert_eq!(call(&["feed", "search", "bug"]).0, "feed_search");
+        assert_eq!(
+            call(&["feed", "read", "--ref", "s:c:1", "--ref", "s:c:2"]).1["refs"],
+            json!(["s:c:1", "s:c:2"])
+        );
+        assert_eq!(
+            call(&["feed", "read", "--conversation", "general"]).1["channel"],
+            json!("general")
+        );
+        assert_eq!(
+            call(&[
+                "todo",
+                "add",
+                "--title",
+                "Reply to Al",
+                "--source",
+                "s:c:1",
+                "--due",
+                "2026-11-20"
+            ]),
+            (
+                "todo_add",
+                json!({"title": "Reply to Al", "detail": null, "refs": ["s:c:1"], "due": "2026-11-20"})
+            )
+        );
+        assert_eq!(
+            call(&["todo", "update", "T-3", "--status", "done"]),
+            ("todo_update", json!({"id": "T-3", "status": "done"}))
+        );
+        assert!(T::try_parse_from(["t", "todo", "update", "3", "--status", "gone"]).is_err());
+        assert_eq!(
+            call(&["escalate", "--summary", "Outage", "--source", "s:c:1"]),
+            ("escalate", json!({"summary": "Outage", "refs": ["s:c:1"]}))
+        );
+        assert!(T::try_parse_from(["t", "escalate", "--summary", "x"]).is_err());
+        assert_eq!(
+            call(&[
+                "rule",
+                "add",
+                "--text",
+                "#random is noise",
+                "--because",
+                "ignore random"
+            ]),
+            (
+                "rule_add",
+                json!({"text": "#random is noise", "because": "ignore random"})
+            )
+        );
+        assert_eq!(
+            call(&["triage", "ignore", "s:c:1", "s:c:2", "--why", "bots"]),
+            (
+                "triage",
+                json!({"decision": "ignore", "refs": ["s:c:1", "s:c:2"], "why": "bots"})
+            )
+        );
+        assert!(T::try_parse_from(["t", "triage", "todo", "s:c:1"]).is_err());
+        assert_eq!(
+            call(&["digest", "post", "--text", "All quiet"]),
+            ("digest_post", json!({"text": "All quiet"}))
+        );
+        assert_eq!(
+            call(&["secretary-note", "Alice is VIP"]).0,
+            "secretary_note"
+        );
         assert_eq!(
             call(&["admin", "show", "project", "demo"]),
             ("admin_read", json!({"what": "project", "target": "demo"}))

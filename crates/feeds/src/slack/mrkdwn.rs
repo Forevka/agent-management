@@ -50,6 +50,21 @@ pub fn mentioned_users(text: &str) -> Vec<String> {
     ids
 }
 
+/// Whether the raw text mentions `user` as `<@U…>` or `<@U…|label>`. Group mentions such as
+/// `<!here>` do not count: they are not addressed to the owner in particular.
+pub fn mentions_user(text: &str, user: &str) -> bool {
+    let mut rest = text;
+    while let Some(start) = rest.find("<@") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('>') else { break };
+        if split_label(&after[..end]).0 == user {
+            return true;
+        }
+        rest = &after[end + 1..];
+    }
+    false
+}
+
 fn token(
     inner: &str,
     user: &impl Fn(&str) -> Option<String>,
@@ -136,6 +151,14 @@ mod tests {
         assert_eq!(conv("dangling < bracket"), "dangling < bracket");
         assert_eq!(conv("<>"), "");
         assert_eq!(conv("émoji 🚀 <@U1>"), "émoji 🚀 @alice");
+    }
+
+    #[test]
+    fn detects_mentions_of_one_user() {
+        assert!(mentions_user("hey <@UME> look", "UME"));
+        assert!(mentions_user("<@UME|me> look", "UME"));
+        assert!(!mentions_user("hey <@UMEX> and <!here>", "UME"));
+        assert!(!mentions_user("UME <@UME", "UME"));
     }
 
     #[test]

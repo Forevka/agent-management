@@ -14,14 +14,14 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use crate::FeedError;
+use crate::{ConversationKind, FeedError};
 
 /// What to wait when Slack rate limits without saying for how long.
 const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(30);
 /// Caps a single request, so one hung connection cannot stall the orchestrator's poll loop.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The user token. Its `Debug` is redacted so that it cannot leak through a log line or panic
+/// A Slack token (the user's `xoxp-`, or the app-level `xapp-`). Its `Debug` is redacted so that it cannot leak through a log line or panic
 /// message that prints the source.
 #[derive(Clone)]
 pub struct Token(String);
@@ -200,6 +200,14 @@ pub struct RawMessage {
     pub files: Vec<RawFile>,
     /// The new version of the message, for a `message_changed` event.
     pub message: Option<Box<RawMessage>>,
+    // The fields below only appear on pushed events, never in history.
+    /// The conversation, and its kind (`channel`, `group`, `im` or `mpim`).
+    pub channel: Option<String>,
+    pub channel_type: Option<String>,
+    /// The version before an edit (`message_changed`) or deletion (`message_deleted`).
+    pub previous_message: Option<Box<RawMessage>>,
+    /// The deleted message's ts, for a `message_deleted` event.
+    pub deleted_ts: Option<String>,
 }
 
 impl RawMessage {
@@ -273,10 +281,64 @@ pub struct ConversationInfo {
     pub channel: Option<Conversation>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default)]
 pub struct Conversation {
+    pub id: Option<String>,
     pub name: Option<String>,
+    pub is_channel: bool,
+    pub is_group: bool,
+    pub is_im: bool,
+    pub is_mpim: bool,
+    pub is_private: bool,
+    /// For a direct message, the other person.
+    pub user: Option<String>,
+}
+
+impl Conversation {
+    pub fn kind(&self) -> ConversationKind {
+        if self.is_im {
+            ConversationKind::Direct
+        } else if self.is_mpim {
+            ConversationKind::Group
+        } else if self.is_private || self.is_group {
+            ConversationKind::Private
+        } else if self.is_channel {
+            ConversationKind::Channel
+        } else {
+            ConversationKind::Other
+        }
+    }
+}
+
+/// The kind of a conversation from the `channel_type` of a pushed message event.
+pub fn kind_from_channel_type(t: &str) -> ConversationKind {
+    match t {
+        "im" => ConversationKind::Direct,
+        "mpim" => ConversationKind::Group,
+        // Slack's historical name for private channels.
+        "group" => ConversationKind::Private,
+        "channel" => ConversationKind::Channel,
+        _ => ConversationKind::Other,
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct ConversationList {
+    /// Kept raw, like history pages, so that one odd entry cannot fail the whole page.
+    pub channels: Vec<Value>,
+    pub response_metadata: Option<ResponseMetadata>,
+}
+
+impl ConversationList {
+    pub fn next_cursor(&self) -> Option<String> {
+        self.response_metadata
+            .as_ref()
+            .and_then(|m| m.next_cursor.as_deref())
+            .filter(|c| !c.is_empty())
+            .map(str::to_owned)
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -284,6 +346,12 @@ pub struct Conversation {
 pub struct AuthTest {
     pub url: Option<String>,
     pub user_id: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct ConnectionsOpen {
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]

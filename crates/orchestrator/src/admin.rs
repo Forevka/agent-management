@@ -340,8 +340,8 @@ async fn agent(o: &Orchestrator, r: &str) -> Result<AgentRow> {
         .await?
         .with_context(|| format!("no agent {r:?}"))?;
     ensure!(
-        a.id != BRAIN_AGENT,
-        "the orchestrator agent cannot be changed"
+        !crate::model::is_builtin_agent(&a.id),
+        "the orchestrator's and the secretary's agents cannot be changed"
     );
     Ok(a)
 }
@@ -1858,10 +1858,10 @@ pub async fn agents_json(o: &Orchestrator, project: Option<&str>) -> Result<Valu
         "select a.id, a.name, a.role, a.project, b.username,
                 (select count(*) from tasks t where t.agent_id = a.id and t.running) as running
          from agents a left join bots b on b.id = a.bot_id
-         where a.id <> $2 and ($1::text is null or a.project = $1) order by a.project, a.name",
+         where a.id <> all($2) and ($1::text is null or a.project = $1) order by a.project, a.name",
     )
     .bind(project)
-    .bind(BRAIN_AGENT)
+    .bind([BRAIN_AGENT, crate::model::SECRETARY_AGENT])
     .fetch_all(&o.db)
     .await?;
     let mut out = Vec::new();
@@ -1918,7 +1918,7 @@ async fn status_json(o: &Orchestrator) -> Result<Value> {
         .fetch_all(&o.db)
         .await?;
     let (active, queued): (i64, i64) = sqlx::query_as(
-        "select count(*) filter (where status in ('planning','running','waiting')), count(*) filter (where status = 'queued') from tasks where id <> 'brain'",
+        "select count(*) filter (where status in ('planning','running','waiting')), count(*) filter (where status = 'queued') from tasks where id not in ('brain', 'secretary')",
     )
     .fetch_one(&o.db)
     .await?;

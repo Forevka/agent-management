@@ -7,14 +7,16 @@
 //! - every agent owns the banks under its prefix `agent-<agent-id>` (its main bank is the
 //!   prefix itself, others are `agent-<agent-id>--<name>`);
 //! - the agents of a project share `project-<slug>`;
-//! - the brain may use any bank.
+//! - the brain may use any bank;
+//! - the secretary only its own: what it remembers comes from third parties' messages, so it
+//!   never writes where other agents read.
 
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use crate::model::{AgentRow, BRAIN_AGENT};
+use crate::model::{AgentRow, BRAIN_AGENT, SECRETARY_AGENT};
 
 #[derive(Clone)]
 pub struct Hindsight {
@@ -163,6 +165,13 @@ pub fn resolve_bank(
     bank: Option<&str>,
     shared: bool,
 ) -> Result<String> {
+    if agent.id == SECRETARY_AGENT
+        && (shared || bank.is_some_and(|b| b.trim() == project_bank(project)))
+    {
+        bail!(
+            "the secretary keeps its memory in its own banks (agent-secretary, agent-secretary--<name>)"
+        );
+    }
     if shared {
         return Ok(project_bank(project));
     }
@@ -192,7 +201,7 @@ pub fn resolve_bank(
 /// Whether the caller may see a bank in `memory banks`.
 pub fn visible(agent: &AgentRow, project: &str, bank: &str) -> bool {
     agent.id == BRAIN_AGENT
-        || bank == project_bank(project)
+        || (bank == project_bank(project) && agent.id != SECRETARY_AGENT)
         || bank == agent_prefix(agent)
         || bank.starts_with(&format!("{}--", agent_prefix(agent)))
 }

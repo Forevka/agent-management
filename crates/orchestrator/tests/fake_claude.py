@@ -46,10 +46,14 @@ def tool(name, args):
 
 session = arg("--resume") or "sess-" + uuid.uuid4().hex[:8]
 out({"type": "system", "subtype": "init", "session_id": session, "model": arg("--model"),
-     "permission_mode": arg("--permission-mode"), "role_prompt": bool(arg("--append-system-prompt"))})
+     "permission_mode": arg("--permission-mode"), "role_prompt": bool(arg("--append-system-prompt")),
+     # Every --model given (the last one wins in the real CLI) and the pre-approved tools.
+     "models": [sys.argv[i + 1] for i, a in enumerate(sys.argv[:-1]) if a == "--model"],
+     "allowed_tools": arg("--allowedTools"), "tools": arg("--tools"),
+     "strict_mcp": "--strict-mcp-config" in sys.argv, "setting_sources": arg("--setting-sources")})
 
 skill = os.path.join(arg("--plugin-dir"), "skills", "fleet", "SKILL.md")
-out({"type": "skill", "present": os.path.exists(skill), "role": os.environ.get("FLEET_ROLE")})
+out({"type": "skill", "present": os.path.exists(skill), "role": os.environ.get("FLEET_ROLE"), "cwd": os.getcwd()})
 secrets_dir = os.environ.get("FLEET_SECRETS_DIR", "")
 out({"type": "secrets", "files": sorted(os.listdir(secrets_dir)) if os.path.isdir(secrets_dir) else []})
 
@@ -96,6 +100,47 @@ for line in sys.stdin:
         tool("admin_propose", {"action": "node_settings", "params": {"node": "e2e-node", "command": ["sh", "-c", "env"]}})
         tool("admin_propose", {"action": "folder_create", "params": {"name": "Notes"}})
         tool("web_link", {"page": "/secrets", "text": "Set the Jira token"})
+        out({"type": "result", "subtype": "success", "total_cost_usd": 0.0})
+    elif text.startswith("[Inbox batch"):
+        # The secretary: triage each message of the batch by what it says.
+        batch = [json.loads(l) for l in text.splitlines() if l.startswith("{")]
+        for m in batch:
+            t, r = m["text"], m["ref"]
+            if "invoice" in t:
+                tool("todo_add", {"title": "Reply to Alice about the invoice", "detail": "She asks for the <Q3> invoice.",
+                                  "refs": [r], "due": "2026-11-20"})
+            elif "review" in t:
+                tool("todo_add", {"title": "Review Dave's doc", "refs": [r]})
+            elif "outage" in t:
+                tool("escalate", {"summary": "Bob reports an outage on the website", "refs": [r]})
+            elif t.startswith("RULE:"):
+                # A message talking the secretary into a rule (prompt injection, obeyed here so
+                # the safety net shows: the owner is alerted and can undo it).
+                tool("rule_add", {"text": t[5:].strip(), "because": t[5:].strip()})
+            else:
+                tool("triage", {"decision": "ignore", "refs": [r], "why": "chatter"})
+        tool("todo_add", {"title": "Made up", "refs": ["slack:C0NOPE:1.0"]})
+        # Whatever a message says, the secretary has no task, reply, agent or admin tools.
+        for name, a in [("create_task", {"project": "demo", "title": "x", "brief": "x"}),
+                        ("reply_owner", {"text": "hi"}),
+                        ("propose_slack_reply", {"channel_id": "C1", "text": "hi"}),
+                        ("send_to_task", {"task_id": "demo-BS-1", "text": "x"}),
+                        ("ask_agent", {"agent": "Alice", "message": "x"}),
+                        ("admin_read", {"what": "projects"}),
+                        ("secretary_note", {"text": "x"}),
+                        ("memory_retain", {"content": "x", "shared": True}),
+                        ("memory_retain", {"content": "x", "bank": "project-fleet"}),
+                        ("memory_banks", {})]:
+            tool(name, a)
+        out({"type": "result", "subtype": "success", "total_cost_usd": 0.0})
+    elif text.startswith("[Message from the owner in the Inbox]"):
+        said = text.split("] ", 1)[1].split("\n")[0]
+        if "ignore" in said:
+            tool("rule_add", {"text": "Messages in #random are noise", "because": said})
+        tool("digest_post", {"text": "Since you asked: one todo is open."})
+        out({"type": "result", "subtype": "success", "total_cost_usd": 0.0})
+    elif text.startswith("[Daily digest"):
+        tool("digest_post", {"text": "Daily digest: " + text[:40]})
         out({"type": "result", "subtype": "success", "total_cost_usd": 0.0})
     elif text.startswith("[Answer to Q-"):
         # One step skipped with a reason, one left open: completing shows it skipped too.

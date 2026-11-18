@@ -342,6 +342,20 @@ async fn handle_update(o: &Arc<Orchestrator>, bot: &Bot, chat_id: i64, u: Update
                 .await;
             return;
         }
+        // Todo and rule buttons in the Inbox are the secretary's; the rest answer human items.
+        if let Some(data) = cb
+            .data
+            .as_deref()
+            .filter(|d| crate::secretary::is_button(d))
+        {
+            let reply = crate::secretary::button(o, data)
+                .await
+                .unwrap_or_else(|e| format!("Failed: {e:#}"));
+            let _ = bot
+                .answer_callback_query(&cb.id, Some(&clip(&reply, 190)))
+                .await;
+            return;
+        }
         let reply = match cb.data.as_deref().map(callback) {
             Some(f) => match f {
                 Ok((id, ans)) => human::answer(o, id, ans)
@@ -442,6 +456,10 @@ pub(crate) async fn owner_message(o: &Arc<Orchestrator>, msg: &Message) -> Resul
                 tasks::to_brain(o, format!("[Message from the owner] {text}")).await,
             )
         }
+        // The Inbox topic is the secretary's.
+        Some(t) if crate::secretary::inbox_topic_if_any(o).await? == Some(t) => {
+            return crate::secretary::owner_message(o, msg.message_id, text).await;
+        }
         Some(t) => {
             let task: Option<TaskRow> = sqlx::query_as("select * from tasks where topic_id = $1")
                 .bind(t)
@@ -510,7 +528,7 @@ async fn command(
         }
         "/tasks" => {
             let rows: Vec<(String, String, String)> =
-                sqlx::query_as("select id, title, status from tasks where id <> 'brain' and status not in ('done') order by updated_at desc limit 30")
+                sqlx::query_as("select id, title, status from tasks where id not in ('brain', 'secretary') and status not in ('done') order by updated_at desc limit 30")
                     .fetch_all(&o.db)
                     .await?;
             if rows.is_empty() {
@@ -581,7 +599,7 @@ async fn status(o: &Orchestrator) -> Result<String> {
         s.push_str("none yet (/invite)\n");
     }
     let (active, waiting): (i64, i64) = sqlx::query_as(
-        "select count(*) filter (where status in ('planning','running','waiting')), count(*) filter (where status = 'queued') from tasks where id <> 'brain'",
+        "select count(*) filter (where status in ('planning','running','waiting')), count(*) filter (where status = 'queued') from tasks where id not in ('brain', 'secretary')",
     )
     .fetch_one(&o.db)
     .await?;

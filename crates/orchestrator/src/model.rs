@@ -100,6 +100,45 @@ pub mod status {
 /// The brain's pseudo task and agent ids.
 pub const BRAIN_TASK: &str = "brain";
 pub const BRAIN_AGENT: &str = "orchestrator";
+/// The secretary's (see `secretary`).
+pub const SECRETARY_TASK: &str = "secretary";
+pub const SECRETARY_AGENT: &str = "secretary";
+
+/// The fleet's own long-lived sessions (the brain, the secretary): never planned, never
+/// "finished", not listed or administered as ordinary tasks and agents.
+pub fn is_builtin_task(id: &str) -> bool {
+    id == BRAIN_TASK || id == SECRETARY_TASK
+}
+pub fn is_builtin_agent(id: &str) -> bool {
+    id == BRAIN_AGENT || id == SECRETARY_AGENT
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct TodoRow {
+    pub id: i64,
+    pub title: String,
+    pub detail: String,
+    pub refs: Vec<String>,
+    pub status: String,
+    pub created_by: String,
+    /// Who last changed its status: `secretary` or `owner`.
+    pub updated_by: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub due: Option<DateTime<Utc>>,
+    pub tg_msg: Option<i64>,
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct RuleRow {
+    pub id: i64,
+    pub text: String,
+    pub source: String,
+    pub cited: Option<String>,
+    pub active: bool,
+    pub created_at: DateTime<Utc>,
+    pub tg_msg: Option<i64>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewAgent {

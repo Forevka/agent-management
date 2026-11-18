@@ -9,7 +9,10 @@ use serde_json::{Value, json};
 use crate::{
     chat::{From, Notify, clip, esc},
     core::Orchestrator,
-    model::{AgentRow, BRAIN_AGENT, BRAIN_TASK, NewAgent, NodeRow, ProjectRow, TaskRow, status},
+    model::{
+        AgentRow, BRAIN_AGENT, BRAIN_TASK, NewAgent, NodeRow, ProjectRow, SECRETARY_TASK, TaskRow,
+        status,
+    },
     prompts,
 };
 
@@ -450,7 +453,7 @@ async fn dispatch_locked(
         .execute(&o.db)
         .await?;
     }
-    let spawn = match build_spawn(o, task, &agent, resume, run_id.clone()).await {
+    let spawn = match build_spawn(o, task, &agent, node, resume, run_id.clone()).await {
         Ok(s) => s,
         Err(e) => {
             // Release the claim (back to the node it had), give the messages back for the next
@@ -486,9 +489,9 @@ async fn dispatch_locked(
 }
 
 /// New work starts in plan mode so the human approves the plan; follow-ups to a running or
-/// approved task continue in auto mode. The brain never plans.
+/// approved task continue in auto mode. The brain and the secretary never plan.
 fn plan_first(task: &TaskRow, resume: Option<&str>) -> bool {
-    task.id != BRAIN_TASK && (resume.is_none() || task.status == status::DONE)
+    !crate::model::is_builtin_task(&task.id) && (resume.is_none() || task.status == status::DONE)
 }
 
 /// Leaves a task queued (keeping a follow-up message for when it starts) and says why.
@@ -530,7 +533,8 @@ async fn node_load(o: &Orchestrator) -> Result<Vec<(NodeRow, i64)>> {
     let mut out = Vec::with_capacity(nodes.len());
     for n in nodes {
         let load: i64 =
-            sqlx::query_scalar("select count(*) from tasks where node_id = $1 and running")
+            // The fleet's own sessions (brain, secretary) mostly wait; they take no slot.
+            sqlx::query_scalar("select count(*) from tasks where node_id = $1 and running and id not in ('brain', 'secretary')")
                 .bind(&n.id)
                 .fetch_one(&o.db)
                 .await?;
@@ -566,17 +570,27 @@ async fn build_spawn(
     o: &Orchestrator,
     task: &TaskRow,
     agent: &AgentRow,
+    node: &NodeRow,
     resume: Option<String>,
     run_id: String,
 ) -> Result<SpawnAgent> {
-    let secret_files = secret_files(o, &task.project).await?;
+    let is_brain = task.id == BRAIN_TASK;
+    let is_secretary = task.id == SECRETARY_TASK;
+    // The secretary reads third parties' messages all day: it gets no secrets at all, so a
+    // message that talks it into something has nothing to leak.
+    let secret_files = if is_secretary {
+        vec![]
+    } else {
+        secret_files(o, &task.project).await?
+    };
     let names: Vec<String> = secret_files
         .iter()
         .map(|f| format!("{}.env", f.name))
         .collect();
-    let is_brain = task.id == BRAIN_TASK;
     let system = if is_brain {
         prompts::brain_system_prompt(o.memory.is_some())
+    } else if is_secretary {
+        prompts::secretary_system_prompt(o.memory.is_some())
     } else {
         prompts::agent_system_prompt(agent, task, &names, o.memory.is_some())
     };
@@ -590,14 +604,44 @@ async fn build_spawn(
     // A fresh session (nothing to resume: a new task, or its old session's node is gone) knows
     // nothing yet, so it starts with the task's brief, then the messages. The brain has no brief
     // beyond its system prompt. A resumed session already has it; it only gets the brief when
-    // there is nothing else to say (a queued task starting).
+    // there is nothing else to say (a queued task starting). The secretary has no brief at all.
     let fresh = resume.is_none() && !is_brain;
     let mut parts = Vec::new();
-    if fresh || texts.is_empty() {
+    if (fresh || texts.is_empty()) && !is_secretary {
         parts.push(prompts::task_prompt(task));
     }
     parts.extend(texts);
     let first = parts.join("\n\n");
+    // The secretary runs on its own cheap model, whatever the node's command sets (the last
+    // `--model` wins), with only Bash (and Skill, to load its skill) among Claude's tools, no
+    // settings files and no MCP servers but the fleet's, in `dontAsk` mode with only
+    // `fleet agent` pre-approved: anything else is refused without asking anyone, so
+    // third-party text can never get it to run other commands (checked against the real CLI;
+    // see `docs/plan.md`). It runs in an empty directory of its own (the node sees its role).
+    let (permission_mode, model, extra_args) = if is_secretary {
+        refuse_widening(&node.claude_command.0)?;
+        (
+            "dontAsk".to_owned(),
+            None,
+            [
+                "--model",
+                &o.cfg.secretary.model,
+                "--tools",
+                "Bash,Skill",
+                "--allowedTools",
+                "Bash(fleet agent:*)",
+                "--strict-mcp-config",
+                "--setting-sources",
+                "",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+        )
+    } else if plan_first {
+        ("plan".to_owned(), Some(o.cfg.model.clone()), vec![])
+    } else {
+        ("auto".to_owned(), Some(o.cfg.model.clone()), vec![])
+    };
     Ok(SpawnAgent {
         agent_id: agent.id.clone(),
         task_id: task.id.clone(),
@@ -610,18 +654,42 @@ async fn build_spawn(
         prompt: first,
         append_system_prompt: Some(system),
         resume_session_id: resume,
-        permission_mode: if plan_first {
-            "plan".into()
-        } else {
-            "auto".into()
-        },
+        permission_mode,
         after_plan_mode: Some("auto".into()),
-        model: Some(o.cfg.model.clone()),
-        extra_args: vec![],
+        model,
+        extra_args,
         extra_mcp_servers: None,
         secret_files,
         run_id,
     })
+}
+/// Flags in a node's Claude command that would widen what the secretary may do. Its session is
+/// refused on such a node rather than run with them (the owner set them for their own agents).
+const WIDENING_FLAGS: [&str; 12] = [
+    "--dangerously-skip-permissions",
+    "--allow-dangerously-skip-permissions",
+    "--add-dir",
+    "--permission-mode",
+    "--allowedTools",
+    "--allowed-tools",
+    "--settings",
+    "--setting-sources",
+    "--tools",
+    "--mcp-config",
+    "--plugin-dir",
+    "--agents",
+];
+
+fn refuse_widening(command: &[String]) -> Result<()> {
+    for arg in command.iter().skip(1) {
+        let flag = arg.split('=').next().unwrap_or(arg);
+        if WIDENING_FLAGS.contains(&flag) {
+            bail!(
+                "the node's Claude command has {flag}, which would widen what the secretary may do; run the secretary on a node without it"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// The project's bound secret folders as `.env` files.
@@ -909,12 +977,12 @@ pub fn untrusted(text: &str, max: usize) -> String {
 /// work is done and must not wait for the brain. Never for the brain's own task, which would
 /// make it talk to itself.
 pub fn notify_brain(o: &Orchestrator, task: &TaskRow, text: String) {
-    if task.id != BRAIN_TASK {
+    if !crate::model::is_builtin_task(&task.id) {
         o.tell_brain(text);
     }
 }
 
-async fn ensure_brain(o: &Orchestrator) -> Result<()> {
+pub(crate) async fn ensure_brain(o: &Orchestrator) -> Result<()> {
     let slug = &o.cfg.brain_project;
     let created = sqlx::query("insert into projects (slug, name, description) values ($1, 'Fleet', 'The orchestrator brain''s workspace') on conflict do nothing")
         .bind(slug)
@@ -985,6 +1053,23 @@ fn env_quote(v: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn widening_flags_keep_the_secretary_off_a_node() {
+        let cmd = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(refuse_widening(&cmd(&["claude", "--model", "opus"])).is_ok());
+        for bad in [
+            "--dangerously-skip-permissions",
+            "--add-dir=/",
+            "--allowed-tools",
+            "--settings",
+            "--permission-mode=bypassPermissions",
+        ] {
+            assert!(refuse_widening(&cmd(&["claude", bad])).is_err(), "{bad}");
+        }
+        // The program itself is not a flag, whatever its name.
+        assert!(refuse_widening(&cmd(&["--add-dir"])).is_ok());
+    }
 
     #[test]
     fn only_free_text_is_redacted() {

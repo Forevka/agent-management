@@ -23,6 +23,71 @@ pub struct Config {
     pub retention_days: i64,
     /// Remind about unanswered blocking items after this many minutes.
     pub remind_after_minutes: i64,
+    /// The secretary's settings (see `secretary`).
+    pub secretary: SecretaryConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct SecretaryConfig {
+    /// Claude model of the secretary session: a cheap one, as it reads every message.
+    pub model: String,
+    /// Messages to the owner personally (direct, group, a mention) wait this long for more to
+    /// arrive before the secretary sees them.
+    pub debounce_secs: i64,
+    /// Other traffic waits at most this long...
+    pub batch_secs: i64,
+    /// ...or until this many messages are waiting.
+    pub batch_size: i64,
+    /// At most this many messages are shown in one batch; the rest are counted per conversation.
+    pub max_batch: i64,
+    /// Batches per hour at most; more messages wait for the next hour.
+    pub turns_per_hour: i64,
+    /// Escalations to the brain per hour at most; more are refused (the secretary adds a todo).
+    pub escalations_per_hour: i64,
+    /// The daily digest's hour (0-23) in `timezone`; a negative one turns the digest off.
+    pub digest_hour: i64,
+    /// The owner's IANA time zone (`Europe/Kyiv`), for the digest and the times shown.
+    pub timezone: String,
+    /// How long messages of conversations not mapped to a project are kept.
+    pub feed_retention_days: i64,
+}
+
+impl SecretaryConfig {
+    fn from_env() -> Self {
+        let text = |name: &str, default: &str| {
+            std::env::var(name)
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| default.into())
+        };
+        Self {
+            model: text("FLEET_SECRETARY_MODEL", "haiku"),
+            debounce_secs: env_num("FLEET_SECRETARY_DEBOUNCE_SECS", 30),
+            batch_secs: env_num("FLEET_SECRETARY_BATCH_SECS", 600),
+            batch_size: env_num("FLEET_SECRETARY_BATCH_SIZE", 50),
+            max_batch: env_num("FLEET_SECRETARY_MAX_BATCH", 80),
+            turns_per_hour: env_num("FLEET_SECRETARY_TURNS_PER_HOUR", 30),
+            escalations_per_hour: env_num("FLEET_SECRETARY_ESCALATIONS_PER_HOUR", 10),
+            digest_hour: env_num("FLEET_SECRETARY_DIGEST_HOUR", 9),
+            timezone: text("FLEET_TIMEZONE", "UTC"),
+            feed_retention_days: env_num("FLEET_FEED_RETENTION_DAYS", 90),
+        }
+    }
+
+    pub fn test() -> Self {
+        Self {
+            model: "haiku".into(),
+            debounce_secs: 30,
+            batch_secs: 600,
+            batch_size: 50,
+            max_batch: 80,
+            turns_per_hour: 30,
+            escalations_per_hour: 10,
+            digest_hour: 9,
+            timezone: "UTC".into(),
+            feed_retention_days: 90,
+        }
+    }
 }
 
 impl Config {
@@ -48,6 +113,7 @@ impl Config {
             magic_link_minutes: env_num("FLEET_MAGIC_LINK_MINUTES", 60 * 24),
             retention_days: env_num("FLEET_RETENTION_DAYS", 90),
             remind_after_minutes: env_num("FLEET_REMIND_AFTER_MINUTES", 120),
+            secretary: SecretaryConfig::from_env(),
         })
     }
 
@@ -63,6 +129,7 @@ impl Config {
             magic_link_minutes: 60,
             retention_days: 90,
             remind_after_minutes: 120,
+            secretary: SecretaryConfig::test(),
         }
     }
 }

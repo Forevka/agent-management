@@ -271,7 +271,7 @@ a restart.
    `claude.exe`) and authentication (the host's own login, a
    `claude setup-token` token, or an API key).
 6. **Secrets** page: a folder named `slack` with `SLACK_USER_TOKEN` turns on
-   the Slack feed.
+   the Slack feed (see "Slack" below for the secretary, which needs a Slack app).
 7. Write a request in the General topic.
 
 Steps 3, 5 and 6 can also be done by asking the orchestrator in General (for
@@ -279,6 +279,59 @@ example "create project web and bind the Jira folder to it"). It proposes each
 change in `fleet · needs you` and applies it only when you tap Approve. Bot
 tokens, secret values and node tokens are still entered on the web pages: the
 orchestrator sends you a login link to the right one.
+
+### Slack and the secretary
+
+The secretary reads **every** conversation you are in (DMs, group DMs, private
+and public channels), in real time, through a Slack app in Socket Mode. With
+only `SLACK_USER_TOKEN` set, the fleet still polls the channels mapped to
+projects, as before, but the secretary sees nothing else.
+
+In your Slack app (api.slack.com/apps → the app):
+
+1. **Socket Mode** → turn on **Enable Socket Mode**. Create an app-level
+   token with the `connections:write` scope: turning Socket Mode on may ask for
+   one, or use **Basic Information** → **App-Level Tokens** → **Generate Token
+   and Scopes**. That `xapp-...` token is `SLACK_APP_TOKEN`.
+2. **OAuth & Permissions** → **User Token Scopes**: `channels:history`,
+   `channels:read`, `groups:history`, `groups:read`, `im:history`, `im:read`,
+   `mpim:history`, `mpim:read`, `users:read`, and `chat:write` (only for
+   replies you approve).
+3. **Event Subscriptions** → **Enable Events** → **Subscribe to events on
+   behalf of users** (Slack's docs call these "Workspace Events"):
+   `message.channels`, `message.groups`, `message.im`, `message.mpim`. Save.
+   With Socket Mode on, no request URL is needed.
+4. **Install** (or **Reinstall**) **to Workspace**, then copy the **User OAuth
+   Token** (`xoxp-...`): that is `SLACK_USER_TOKEN`. Adding scopes later means
+   reinstalling and copying the new token.
+5. Fleet web UI → **Secrets** → folder `slack` → set both keys.
+
+Slack's settings pages change now and then; if a name above differs, look for
+the same setting nearby.
+
+- **Keep the app internal** (do not distribute it). Internal apps keep the
+  Tier 3 limits on `conversations.history`/`replies` (about 50 calls a minute)
+  that catching up after an outage relies on; since 2025-05-29, apps that are
+  distributed but not in the Marketplace get 1 call a minute and 15 messages a
+  page.
+- **Run one orchestrator per `SLACK_APP_TOKEN`.** Slack spreads events across
+  all of an app's open connections, so a second process (a staging
+  orchestrator, say) silently takes a share of the messages. The orchestrator
+  logs a warning when Slack reports more than one connection.
+- If the tokens stop working (revoked, wrong type), the orchestrator says so in
+  General and stops the feed until the `slack` folder changes.
+
+The secretary runs as its own session in `FLEET_BRAIN_PROJECT` (so on the
+brain's node), on `FLEET_SECRETARY_MODEL` (Haiku by default). Its todos, rule
+changes and answers appear in the **📋 Inbox** topic, created on first use;
+write there to talk to it ("what did I miss since yesterday?", "ignore
+#random"). The web UI's **Inbox** page lists open todos, rules and recent
+triage. It gets no secrets, runs in an empty directory of its own, and may run
+only `fleet agent` commands. The node it runs on must not add permission-widening
+flags to Claude's command (`--dangerously-skip-permissions`, `--add-dir`,
+`--permission-mode`, `--allowedTools`, `--settings`, `--tools`,
+`--mcp-config`, `--plugin-dir`): the secretary is refused on such a node. Its settings
+(digest hour, time zone, batching, retention) are in `deploy/.env.example`.
 
 ## 7. Backups
 

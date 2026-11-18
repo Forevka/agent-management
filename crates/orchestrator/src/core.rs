@@ -433,7 +433,9 @@ impl Orchestrator {
                 // else that ends a run is worth telling the owner about.
                 let idle_exit = code == Some(0)
                     && matches!(task.status.as_str(), status::RUNNING | status::WAITING);
-                if task.status != status::DONE && task.id != crate::model::BRAIN_TASK && !idle_exit
+                if task.status != status::DONE
+                    && !crate::model::is_builtin_task(&task.id)
+                    && !idle_exit
                 {
                     // A task stopped on purpose stays stopped, whatever exit the kill produced.
                     let new_status = if code == Some(0) || task.status == status::STOPPED {
@@ -694,19 +696,35 @@ impl Orchestrator {
 
     async fn prune(&self) -> Result<()> {
         let days = self.cfg.retention_days as f64;
-        for table in ["task_events", "feed_messages", "audit_log"] {
-            let col = if table == "task_events" || table == "audit_log" {
-                "at"
-            } else {
-                "created_at"
-            };
+        for table in [
+            "task_events",
+            "audit_log",
+            "secretary_triage",
+            "secretary_batches",
+        ] {
             sqlx::query(&format!(
-                "delete from {table} where {col} < now() - make_interval(days => $1::int)"
+                "delete from {table} where at < now() - make_interval(days => $1::int)"
             ))
             .bind(days as i32)
             .execute(&self.db)
             .await?;
         }
+        // Channels mapped to a project keep the general retention; everything else the owner
+        // receives (every conversation, for the secretary) has its own.
+        sqlx::query(
+            "delete from feed_messages m where created_at < now() - make_interval(days => $1::int)
+             and exists (select 1 from feed_channels c where c.source = m.source and c.channel_id = m.channel_id)",
+        )
+        .bind(days as i32)
+        .execute(&self.db)
+        .await?;
+        sqlx::query(
+            "delete from feed_messages m where created_at < now() - make_interval(days => $1::int)
+             and not exists (select 1 from feed_channels c where c.source = m.source and c.channel_id = m.channel_id)",
+        )
+        .bind(self.cfg.secretary.feed_retention_days as i32)
+        .execute(&self.db)
+        .await?;
         sqlx::query("delete from magic_links where expires_at < now()")
             .execute(&self.db)
             .await?;

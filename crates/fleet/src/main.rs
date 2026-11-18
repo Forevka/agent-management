@@ -265,7 +265,8 @@ async fn orchestrator(
         chat.clone(),
         chat_id,
     ));
-    tokio::spawn(fleet_orchestrator::feeds::run_slack(o.clone()));
+    tokio::spawn(fleet_orchestrator::feeds::run_feeds(o.clone()));
+    tokio::spawn(fleet_orchestrator::secretary::run(o.clone()));
 
     tracing::info!(id = %ep.id(), %bind, %web_bind, bot = ?me.username, "orchestrator up");
     let listener = tokio::net::TcpListener::bind(web_bind).await?;

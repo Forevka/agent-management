@@ -18,6 +18,7 @@ pub mod human;
 pub mod memory;
 pub mod model;
 pub mod prompts;
+pub mod secretary;
 pub mod tasks;
 pub mod tg;
 pub mod tools;

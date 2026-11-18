@@ -1,9 +1,14 @@
-//! Slack, polled through the Web API with the user's own token.
+//! Slack, two ways.
 //!
-//! The user cannot install an app, so there are no pushed events: everything is a poll, and the
-//! request budget is the scarce resource (since 2025 Slack throttles `conversations.history` and
-//! `conversations.replies` hard for tokens that do not belong to a Marketplace app). The design
-//! follows from that:
+//! - [`SlackSocket`] (in `socket.rs`) receives every message in every conversation the owner is
+//!   in, pushed through Socket Mode by the owner's own Slack app. It needs an app-level token as
+//!   well as the user token.
+//! - [`SlackSource`] (this file) polls a fixed list of channels through the Web API with nothing
+//!   but the user's token. It is what runs when no app token is configured.
+//!
+//! For the poller the request budget is the scarce resource (since 2025 Slack throttles
+//! `conversations.history` and `conversations.replies` to one request a minute for apps that are
+//! neither internal nor in the Marketplace). The design follows from that:
 //!
 //! - A quiet channel costs exactly one `conversations.history` request per poll: everything after
 //!   the channel's cursor, which is empty when nothing happened.
@@ -21,18 +26,24 @@
 //! resumes the pagination, and only a complete run is returned.
 
 mod api;
+mod directory;
 mod mrkdwn;
+mod pace;
+mod socket;
 mod state;
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use crate::{FeedError, FeedMessage, Source};
+use crate::{Capabilities, ConversationKind, FeedError, FeedMessage, Replier, Source};
 use api::{Api, AuthTest, ConversationInfo, Page, Posted, RawMessage, UserInfo, is_fatal};
 use state::{ChannelState, Cursor, ThreadState, ts_from_unix, ts_gt, ts_max, ts_unix};
+
+pub use socket::SlackSocket;
 
 /// The public Slack Web API.
 pub const DEFAULT_BASE_URL: &str = "https://slack.com/api";
@@ -86,6 +97,8 @@ pub struct SlackSource {
     users: HashMap<String, Option<String>>,
     /// Channel id to name; `None` when the lookup failed for good.
     channel_names: HashMap<String, Option<String>>,
+    /// Channel id to its kind, learned from the same `conversations.info` call as the name.
+    channel_kinds: HashMap<String, ConversationKind>,
     auth: Option<AuthInfo>,
     last_errors: Vec<(String, FeedError)>,
 }
@@ -143,6 +156,7 @@ impl SlackSource {
             pending_history: HashMap::new(),
             users: HashMap::new(),
             channel_names: HashMap::new(),
+            channel_kinds: HashMap::new(),
             auth: None,
             last_errors: Vec::new(),
         }
@@ -583,8 +597,9 @@ impl SlackSource {
                 .await
             {
                 Ok(info) => {
-                    self.channel_names
-                        .insert(channel, info.channel.and_then(|c| c.name));
+                    let conv = info.channel.unwrap_or_default();
+                    self.channel_kinds.insert(channel.clone(), conv.kind());
+                    self.channel_names.insert(channel, conv.name);
                 }
                 Err(e @ (FeedError::RateLimited(_) | FeedError::Http(_))) => {
                     tracing::debug!(error = %e, "slack conversations.info failed; retrying later");
@@ -599,66 +614,123 @@ impl SlackSource {
     }
 
     fn to_feed_message(&self, c: Collected) -> Option<FeedMessage> {
-        let changed = c.msg.subtype.as_deref() == Some("message_changed");
-        let m = effective(&c.msg);
-        let id = m.ts.clone().or_else(|| c.msg.ts.clone())?;
-        let ts_unix = ts_unix(&id)?;
-        let author_id = m.user.clone().or_else(|| m.bot_id.clone());
-        let author_name = match &m.user {
-            Some(u) => self.users.get(u).cloned().flatten(),
-            None => m
-                .username
-                .clone()
-                .or_else(|| m.bot_profile.as_ref().and_then(|b| b.name.clone())),
-        };
-        let mut text = mrkdwn::to_plain(
-            m.text.as_deref().unwrap_or(""),
+        let auth = self.auth.as_ref();
+        shape_message(
+            &c.msg,
+            Shape {
+                channel: &c.channel,
+                channel_name: self.channel_names.get(&c.channel).cloned().flatten(),
+                kind: self
+                    .channel_kinds
+                    .get(&c.channel)
+                    .copied()
+                    .unwrap_or_default(),
+                thread_id: c.thread_id,
+                workspace_url: auth.and_then(|a| a.url.as_deref()),
+                owner: auth.and_then(|a| a.user_id.as_deref()),
+            },
             |id| self.users.get(id).cloned().flatten(),
             |id| self.channel_names.get(id).cloned().flatten(),
-        );
-        let files: Vec<&str> = m
-            .files
-            .iter()
-            .filter_map(|f| f.name.as_deref().or(f.title.as_deref()))
-            .collect();
-        if !files.is_empty() {
-            if !text.is_empty() {
-                text.push('\n');
-            }
-            text.push_str(&format!("[files: {}]", files.join(", ")));
-        }
-        let permalink = self
-            .auth
-            .as_ref()
-            .and_then(|a| a.url.as_deref())
-            .map(|base| {
-                let base = base.trim_end_matches('/');
-                let mut link = format!("{base}/archives/{}/p{}", c.channel, id.replace('.', ""));
-                if let Some(thread) = &c.thread_id {
-                    link.push_str(&format!("?thread_ts={thread}&cid={}", c.channel));
-                }
-                link
-            });
-        Some(FeedMessage {
-            source: KIND.to_owned(),
-            channel_name: self.channel_names.get(&c.channel).cloned().flatten(),
-            channel_id: c.channel,
-            id,
-            thread_id: c.thread_id,
-            author_id,
-            author_name,
-            text,
-            permalink,
-            ts_unix,
-            edited: changed || m.edited.is_some(),
-        })
+        )
     }
+}
+
+/// Where a message was seen, for [`shape_message`].
+struct Shape<'a> {
+    channel: &'a str,
+    channel_name: Option<String>,
+    kind: ConversationKind,
+    thread_id: Option<String>,
+    /// The workspace URL from `auth.test`, for permalinks.
+    workspace_url: Option<&'a str>,
+    /// The owner's Slack user id, for `mentions_owner` and `from_owner`.
+    owner: Option<&'a str>,
+}
+
+/// Turns a raw Slack message (or `message_changed` event) into a [`FeedMessage`]. Shared by the
+/// poller and the Socket Mode client, so both shape messages identically. `user_name` and
+/// `channel_name` look up cached names and never make requests.
+fn shape_message(
+    raw: &RawMessage,
+    s: Shape<'_>,
+    user_name: impl Fn(&str) -> Option<String>,
+    channel_name: impl Fn(&str) -> Option<String>,
+) -> Option<FeedMessage> {
+    let changed = raw.subtype.as_deref() == Some("message_changed");
+    let m = effective(raw);
+    let id = m.ts.clone().or_else(|| raw.ts.clone())?;
+    let ts_unix = ts_unix(&id)?;
+    let author_id = m.user.clone().or_else(|| m.bot_id.clone());
+    let author_name = match &m.user {
+        Some(u) => user_name(u),
+        None => m
+            .username
+            .clone()
+            .or_else(|| m.bot_profile.as_ref().and_then(|b| b.name.clone())),
+    };
+    let raw_text = m.text.as_deref().unwrap_or("");
+    let mut text = mrkdwn::to_plain(raw_text, &user_name, &channel_name);
+    let files: Vec<&str> = m
+        .files
+        .iter()
+        .filter_map(|f| f.name.as_deref().or(f.title.as_deref()))
+        .collect();
+    if !files.is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&format!("[files: {}]", files.join(", ")));
+    }
+    let permalink = s.workspace_url.map(|base| {
+        let base = base.trim_end_matches('/');
+        let mut link = format!("{base}/archives/{}/p{}", s.channel, id.replace('.', ""));
+        if let Some(thread) = &s.thread_id {
+            link.push_str(&format!("?thread_ts={thread}&cid={}", s.channel));
+        }
+        link
+    });
+    let from_owner = s.owner.is_some() && m.user.as_deref() == s.owner;
+    let mentions_owner = !from_owner && s.owner.is_some_and(|o| mrkdwn::mentions_user(raw_text, o));
+    Some(FeedMessage {
+        source: KIND.to_owned(),
+        conversation_name: s.channel_name,
+        conversation_id: s.channel.to_owned(),
+        id,
+        thread_id: s.thread_id,
+        author_id,
+        author_name,
+        text,
+        permalink,
+        ts_unix,
+        edited: changed || m.edited.is_some(),
+        conversation_kind: s.kind,
+        subject: None,
+        mentions_owner,
+        from_owner,
+    })
 }
 
 #[async_trait]
 impl Source for SlackSource {
     fn kind(&self) -> &'static str {
         KIND
+    }
+
+    fn poll_interval(&self) -> Duration {
+        self.suggested_interval()
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            poll: true,
+            can_reply: true,
+            can_reply_in_thread: true,
+            ..Capabilities::default()
+        }
+    }
+
+    fn is_fatal(&self, err: &FeedError) -> bool {
+        is_fatal(err) || matches!(err, FeedError::Unsupported(_) | FeedError::Internal(_))
     }
 
     async fn poll(&mut self) -> Result<Vec<FeedMessage>, FeedError> {
@@ -826,15 +898,45 @@ impl Source for SlackSource {
         thread_id: Option<&str>,
         text: &str,
     ) -> Result<String, FeedError> {
-        let mut body = json!({ "channel": channel_id, "text": text });
-        if let Some(thread) = thread_id {
-            body["thread_ts"] = Value::String(thread.to_owned());
-        }
-        let posted: Posted = self.api.post_json("chat.postMessage", &body).await?;
-        posted
-            .ts
-            .ok_or_else(|| FeedError::Decode("chat.postMessage: no ts".into()))
+        post_message(&self.api, channel_id, thread_id, text).await
     }
+
+    fn replier(&self) -> Option<Arc<dyn Replier>> {
+        Some(Arc::new(SlackReplier(self.api.clone())))
+    }
+}
+
+/// Posts replies with the user token, independently of the source it came from, so that a
+/// running source (which holds `&mut self`) does not block approved replies.
+struct SlackReplier(Api);
+
+#[async_trait]
+impl Replier for SlackReplier {
+    async fn post_reply(
+        &self,
+        conversation_id: &str,
+        thread_id: Option<&str>,
+        text: &str,
+    ) -> Result<String, FeedError> {
+        post_message(&self.0, conversation_id, thread_id, text).await
+    }
+}
+
+/// Posts as the user (`chat.postMessage` with the user token), so a reply reads as the owner's.
+async fn post_message(
+    api: &Api,
+    channel_id: &str,
+    thread_id: Option<&str>,
+    text: &str,
+) -> Result<String, FeedError> {
+    let mut body = json!({ "channel": channel_id, "text": text });
+    if let Some(thread) = thread_id {
+        body["thread_ts"] = Value::String(thread.to_owned());
+    }
+    let posted: Posted = api.post_json("chat.postMessage", &body).await?;
+    posted
+        .ts
+        .ok_or_else(|| FeedError::Decode("chat.postMessage: no ts".into()))
 }
 
 /// Starts or refreshes tracking for a thread whose root (or broadcast reply) shows activity
