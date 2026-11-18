@@ -37,14 +37,14 @@ impl Config {
         if let Some(m) = model {
             anyhow::ensure!(
                 self.allowed_models.iter().any(|a| a == m),
-                "model {m:?} is not allowed for tasks; allowed: {} (FLEET_ALLOWED_MODELS)",
+                "model {m:?} is not allowed; allowed: {} (FLEET_ALLOWED_MODELS)",
                 self.allowed_models.join(", ")
             );
         }
         if let Some(e) = effort {
             anyhow::ensure!(
                 self.allowed_efforts.iter().any(|a| a == e),
-                "effort {e:?} is not allowed for tasks; allowed: {} (FLEET_ALLOWED_EFFORTS)",
+                "effort {e:?} is not allowed; allowed: {} (FLEET_ALLOWED_EFFORTS)",
                 self.allowed_efforts.join(", ")
             );
         }
@@ -52,11 +52,11 @@ impl Config {
     }
 }
 
-/// The models the brain may choose when the owner set none: the fleet's own and the usual
-/// aliases.
+/// The models the brain may choose when the owner set none: the fleet's own and the cheaper
+/// aliases (a pricier model per task is the owner's choice: they opt in).
 fn default_allowed_models(fleet_model: &str) -> Vec<String> {
     let mut v = vec![fleet_model.to_owned()];
-    for m in ["opus", "sonnet", "haiku"] {
+    for m in ["sonnet", "haiku"] {
         if !v.iter().any(|x| x == m) {
             v.push(m.to_owned());
         }
@@ -64,15 +64,19 @@ fn default_allowed_models(fleet_model: &str) -> Vec<String> {
     v
 }
 
-/// A comma-separated list from the environment, or `default`.
+/// The effort levels the brain may choose when the owner set none: not the expensive ones.
+const DEFAULT_ALLOWED_EFFORTS: [&str; 3] = ["low", "medium", "high"];
+
+/// A comma-separated list from the environment; `default` only when the variable is unset (set
+/// but empty is an empty list: nothing allowed).
 fn env_list(name: &str, default: Vec<String>) -> Vec<String> {
     match std::env::var(name) {
-        Ok(v) if !v.trim().is_empty() => v
+        Ok(v) => v
             .split(',')
             .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty())
             .collect(),
-        _ => default,
+        Err(_) => default,
     }
 }
 
@@ -142,10 +146,14 @@ impl SecretaryConfig {
 impl Config {
     pub fn from_env() -> Result<Self> {
         let model = std::env::var("FLEET_MODEL").unwrap_or_else(|_| "opus".into());
+        crate::model::check_model_value("FLEET_MODEL", model.trim()).context(
+            "FLEET_MODEL must be a Claude model name (an alias, an id, a Vertex or Bedrock id)",
+        )?;
+        let model = model.trim().to_owned();
         let allowed_models = env_list("FLEET_ALLOWED_MODELS", default_allowed_models(&model));
         let allowed_efforts = env_list(
             "FLEET_ALLOWED_EFFORTS",
-            crate::model::EFFORTS.map(str::to_owned).to_vec(),
+            DEFAULT_ALLOWED_EFFORTS.map(str::to_owned).to_vec(),
         );
         for m in &allowed_models {
             crate::model::check_model_value("FLEET_ALLOWED_MODELS: model", m)?;
@@ -194,7 +202,7 @@ impl Config {
             remind_after_minutes: 120,
             secretary: SecretaryConfig::test(),
             allowed_models: default_allowed_models("opus"),
-            allowed_efforts: crate::model::EFFORTS.map(str::to_owned).to_vec(),
+            allowed_efforts: DEFAULT_ALLOWED_EFFORTS.map(str::to_owned).to_vec(),
         }
     }
 }
@@ -214,7 +222,10 @@ mod tests {
     fn the_brain_chooses_within_the_allow_list() {
         let cfg = Config::test();
         assert!(cfg.check_allowed(None, None).is_ok());
-        assert!(cfg.check_allowed(Some("opus"), Some("max")).is_ok());
+        assert!(cfg.check_allowed(Some("opus"), Some("high")).is_ok());
+        // The expensive efforts are the owner's to opt into.
+        assert!(cfg.check_allowed(None, Some("max")).is_err());
+        assert!(cfg.check_allowed(None, Some("xhigh")).is_err());
         assert!(cfg.check_allowed(Some("haiku"), Some("low")).is_ok());
         let e = cfg.check_allowed(Some("gpt-9"), None).unwrap_err();
         assert!(e.to_string().contains("not allowed") && e.to_string().contains("sonnet"));
@@ -228,11 +239,8 @@ mod tests {
         assert!(narrow.check_allowed(Some("haiku"), Some("medium")).is_ok());
         assert_eq!(
             default_allowed_models("claude-opus-4-1"),
-            ["claude-opus-4-1", "opus", "sonnet", "haiku"]
+            ["claude-opus-4-1", "sonnet", "haiku"]
         );
-        assert_eq!(
-            default_allowed_models("sonnet"),
-            ["sonnet", "opus", "haiku"]
-        );
+        assert_eq!(default_allowed_models("sonnet"), ["sonnet", "haiku"]);
     }
 }

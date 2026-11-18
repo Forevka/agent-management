@@ -207,7 +207,7 @@ pub async fn create_task(o: &Arc<Orchestrator>, req: CreateTask) -> Result<TaskR
         esc(&task.title),
         esc(&agent.name),
         esc(&agent.role),
-        esc(&model_effort_label(&task, &agent, &o.cfg.model)),
+        esc(&model_effort_label(&task, &agent, &o.cfg.model, None)),
         esc(&clip(&task.brief, 3000))
     );
     let _ = o
@@ -811,13 +811,25 @@ fn sets_flag(command: &[String], flag: &str) -> bool {
         .any(|a| a == flag || a.starts_with(&format!("{flag}=")))
 }
 
-/// "model X, effort Y" as a task runs (where a node's own `--model`/`--effort` do not override
-/// it), for the owner to see.
-pub fn model_effort_label(task: &TaskRow, agent: &AgentRow, fleet_model: &str) -> String {
+/// "model X, effort Y" as a task runs, for the owner to see. With the node's Claude command
+/// (once the task has a node), it says where the node's own `--model`/`--effort` take over.
+pub fn model_effort_label(
+    task: &TaskRow,
+    agent: &AgentRow,
+    fleet_model: &str,
+    node_command: Option<&[String]>,
+) -> String {
     let (model, effort) = crate::model::resolve_model_effort(task, agent, fleet_model);
-    match effort {
-        Some(e) => format!("model {model}, effort {e}"),
-        None => format!("model {model}"),
+    let by_node = |flag: &str| node_command.is_some_and(|c| sets_flag(c, flag));
+    let model = if by_node("--model") {
+        "model set by the node's command".to_owned()
+    } else {
+        format!("model {model}")
+    };
+    match (effort, by_node("--effort")) {
+        (_, true) => format!("{model}, effort set by the node's command"),
+        (Some(e), false) => format!("{model}, effort {e}"),
+        (None, false) => model,
     }
 }
 
@@ -1485,6 +1497,22 @@ mod tests {
             stable_reason("auth failed"),
             stable_reason("no such program")
         );
+    }
+
+    #[test]
+    fn a_flag_counts_alone_or_with_its_value_after_the_program() {
+        let cmd = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(sets_flag(&cmd(&["claude", "--effort", "high"]), "--effort"));
+        assert!(sets_flag(&cmd(&["claude", "--effort=max"]), "--effort"));
+        assert!(!sets_flag(
+            &cmd(&["claude", "--effort-foo", "x"]),
+            "--effort"
+        ));
+        assert!(
+            !sets_flag(&cmd(&["--effort"]), "--effort"),
+            "the program is not a flag"
+        );
+        assert!(!sets_flag(&cmd(&["claude", "--model", "opus"]), "--effort"));
     }
 
     #[test]

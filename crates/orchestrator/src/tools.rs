@@ -410,14 +410,15 @@ pub async fn handle(
                 .map(|v| serde_json::from_value(v.clone()))
                 .transpose()?;
             // The brain chooses within the owner's allow-list (FLEET_ALLOWED_MODELS / _EFFORTS).
-            let opt = |k: &str| {
-                args[k]
-                    .as_str()
-                    .map(str::trim)
-                    .filter(|v| !v.is_empty())
-                    .map(str::to_owned)
+            // Absent, null or empty: not set. Anything else must be a string.
+            let opt = |k: &str| -> Result<Option<String>> {
+                match &args[k] {
+                    Value::Null => Ok(None),
+                    Value::String(v) => Ok(Some(v.trim().to_owned()).filter(|v| !v.is_empty())),
+                    other => bail!("{k} must be a string, not {other}"),
+                }
             };
-            let (model, effort) = (opt("model"), opt("effort"));
+            let (model, effort) = (opt("model")?, opt("effort")?);
             o.cfg.check_allowed(model.as_deref(), effort.as_deref())?;
             let t = tasks::create_task(
                 o,

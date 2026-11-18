@@ -50,6 +50,7 @@ out({"type": "system", "subtype": "init", "session_id": session, "model": arg("-
      # Every --model given (the last one wins in the real CLI) and the pre-approved tools.
      "models": [sys.argv[i + 1] for i, a in enumerate(sys.argv[:-1]) if a == "--model"],
      "allowed_tools": arg("--allowedTools"), "tools": arg("--tools"), "effort": arg("--effort"),
+     "efforts": [sys.argv[i + 1] for i, a in enumerate(sys.argv[:-1]) if a == "--effort"],
      "strict_mcp": "--strict-mcp-config" in sys.argv, "setting_sources": arg("--setting-sources")})
 
 skill = os.path.join(arg("--plugin-dir"), "skills", "fleet", "SKILL.md")

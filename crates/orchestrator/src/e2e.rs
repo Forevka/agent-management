@@ -1336,12 +1336,112 @@ async fn model_effort_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &Fake
     )
     .await
     .unwrap();
-    let (_, init) = start("ME-3", None, None).await;
+    let (me3, init) = start("ME-3", None, None).await;
     assert_eq!(
         init["models"].as_array().unwrap().last().unwrap(),
         &json!(o.cfg.model)
     );
     assert_eq!(init["effort"], Value::Null);
+
+    // A node whose own command sets --effort keeps it: the task's effort is left out, so
+    // Claude gets exactly one --effort.
+    let node = o.task(&me3).await.unwrap().unwrap().node_id.unwrap();
+    let command: sqlx::types::Json<Vec<String>> =
+        sqlx::query_scalar("select claude_command from nodes where id = $1")
+            .bind(&node)
+            .fetch_one(db)
+            .await
+            .unwrap();
+    let set_command = |cmd: Vec<String>| {
+        let node = node.clone();
+        async move {
+            sqlx::query("update nodes set claude_command = $2 where id = $1")
+                .bind(&node)
+                .bind(sqlx::types::Json(cmd))
+                .execute(db)
+                .await
+                .unwrap();
+            o.node_settings_changed(&node).await.unwrap();
+        }
+    };
+    let mut with_effort = command.0.clone();
+    with_effort.extend(["--effort".to_owned(), "high".to_owned()]);
+    set_command(with_effort).await;
+    let (_, init) = start("ME-4", None, Some("low")).await;
+    assert_eq!(init["efforts"], json!(["high"]), "{init}");
+    set_command(command.0.clone()).await;
+
+    // The brain proposes an agent's defaults: within the allow-list, applied on approval, and
+    // stale when the owner changed the same field on the web meanwhile.
+    let propose = |params: Value| async move {
+        call_as(
+            o,
+            "orchestrator",
+            "brain",
+            "admin_propose",
+            json!({"action": "agent_settings", "params": params}),
+        )
+        .await
+    };
+    let last_change = || async {
+        sqlx::query_as::<_, HumanItemRow>(
+            "select * from human_items where kind = 'admin_change' order by id desc limit 1",
+        )
+        .fetch_one(db)
+        .await
+        .unwrap()
+    };
+    let e = propose(json!({"agent": "Alice", "effort": "max"}))
+        .await
+        .unwrap_err();
+    assert!(
+        e.to_string().contains("effort \"max\" is not allowed"),
+        "{e}"
+    );
+    propose(json!({"agent": "Alice", "model": "sonnet", "effort": "medium"}))
+        .await
+        .unwrap();
+    let item = last_change().await;
+    let summary = item.payload.0["summary"].as_str().unwrap();
+    assert!(
+        summary.contains(
+            "model (fleet default), effort (Claude's default) → model sonnet, effort medium"
+        ),
+        "{summary}"
+    );
+    human::answer(o, item.id, Answer::Accept).await.unwrap();
+    let alice: crate::model::AgentRow =
+        sqlx::query_as("select * from agents where lower(name) = 'alice'")
+            .fetch_one(db)
+            .await
+            .unwrap();
+    assert_eq!(
+        (alice.model.as_deref(), alice.effort.as_deref()),
+        (Some("sonnet"), Some("medium"))
+    );
+    propose(json!({"agent": "Alice", "effort": "low"}))
+        .await
+        .unwrap();
+    let stale = last_change().await;
+    crate::admin::execute(
+        o,
+        Actor::Owner,
+        &AdminAction::AgentSettings {
+            agent: alice.id.clone(),
+            model: None,
+            effort: Some("high".into()),
+        },
+    )
+    .await
+    .unwrap();
+    let r = human::answer(o, stale.id, Answer::Accept).await.unwrap();
+    assert!(r.contains("state changed since this was proposed"), "{r}");
+    let effort: Option<String> = sqlx::query_scalar("select effort from agents where id = $1")
+        .bind(&alice.id)
+        .fetch_one(db)
+        .await
+        .unwrap();
+    assert_eq!(effort.as_deref(), Some("high"), "the owner's edit stands");
 }
 /// Whether the message `id` sounded when it was sent.
 fn notify_of_msg(chat: &FakeChat, id: Option<i64>) -> Option<Notify> {

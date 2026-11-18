@@ -75,18 +75,21 @@ pub struct TaskRow {
 /// The effort levels Claude Code accepts (`claude --help`, 2.1.268).
 pub const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
-/// A model or effort value as it may be passed to Claude: a plain token, never an option.
+/// A model name as it may be passed to Claude, everywhere one is accepted (tasks, agents, a
+/// node's `--model`, the allow-list, `FLEET_MODEL`): a plain token, never an option. Aliases,
+/// full ids (`claude-sonnet-4-5[1m]`), Vertex (`claude-opus-4@20250514`) and Bedrock ids and
+/// ARNs (`us.anthropic.…:0`, `arn:aws:bedrock:…/…`) fit; whitespace, `=` and a leading `-` do
+/// not.
 pub fn check_model_value(what: &str, v: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
-        (1..=64).contains(&v.len())
+        (1..=200).contains(&v.len())
             && !v.starts_with('-')
             && v.chars()
-                .all(|c| c.is_ascii_alphanumeric() || "._:[]-".contains(c)),
-        "{what} {v:?} is not valid: 1-64 letters, digits and . _ : [ ] -"
+                .all(|c| c.is_ascii_alphanumeric() || "._:[]-@/".contains(c)),
+        "{what} {v:?} is not a model name: 1-200 letters, digits and . _ : [ ] - @ /, not starting with -"
     );
     Ok(())
 }
-
 pub fn check_effort(v: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         EFFORTS.contains(&v),
@@ -263,7 +266,12 @@ mod tests {
         assert!(check_model_value("model", "--dangerously-skip-permissions").is_err());
         assert!(check_model_value("model", "opus; rm -rf /").is_err());
         assert!(check_model_value("model", "").is_err());
-        assert!(check_model_value("model", &"x".repeat(65)).is_err());
+        assert!(check_model_value("model", "claude-opus-4@20250514").is_ok());
+        assert!(
+            check_model_value("model", "arn:aws:bedrock:us-east-1:1:inference-profile/x").is_ok()
+        );
+        assert!(check_model_value("model", "opus=1").is_err());
+        assert!(check_model_value("model", &"x".repeat(201)).is_err());
         for e in EFFORTS {
             assert!(check_effort(e).is_ok());
         }

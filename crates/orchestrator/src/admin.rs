@@ -265,16 +265,11 @@ fn merge_claude_flags(
     model: Option<&str>,
     fallback_model: Option<&str>,
 ) -> Result<Vec<String>> {
+    // An empty value clears the flag; any other is a model name, by the fleet's one rule.
     for value in [model, fallback_model].into_iter().flatten() {
-        ensure!(
-            value.is_empty()
-                || (value.len() <= 100
-                    && !value.starts_with('-')
-                    && value
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || "-._:[]".contains(c))),
-            "{value:?} is not a model name"
-        );
+        if !value.is_empty() {
+            crate::model::check_model_value("model", value)?;
+        }
     }
     ensure!(
         !command.is_empty(),
@@ -644,12 +639,16 @@ pub async fn execute(o: &Arc<Orchestrator>, actor: Actor, action: &AdminAction) 
             .bind(effort.clone().flatten())
             .execute(&o.db)
             .await?;
-            o.audit(
-                actor.audit_name(),
-                "agent.settings",
-                json!({"agent": a.id, "model": model, "effort": effort}),
-            )
-            .await;
+            // Absent: unchanged; "": cleared back to the default; else the new value.
+            let mut detail = serde_json::Map::new();
+            detail.insert("agent".into(), json!(a.id));
+            for (k, v) in [("model", &model), ("effort", &effort)] {
+                if let Some(v) = v {
+                    detail.insert(k.into(), json!(v.clone().unwrap_or_default()));
+                }
+            }
+            o.audit(actor.audit_name(), "agent.settings", Value::Object(detail))
+                .await;
             Ok(format!(
                 "{} now runs with {}; its running sessions keep theirs until they restart",
                 a.name,
@@ -1250,6 +1249,12 @@ pub async fn prepare(o: &Orchestrator, action: AdminAction) -> Result<(AdminActi
         } => {
             let a = agent(o, &r).await?;
             let (m, e) = agent_settings_values(model.as_deref(), effort.as_deref())?;
+            // The brain proposes within the owner's allow-list, as for a task (the owner's own
+            // edits on the web may use any valid value).
+            o.cfg.check_allowed(
+                m.clone().flatten().as_deref(),
+                e.clone().flatten().as_deref(),
+            )?;
             ensure!(
                 m.is_some() || e.is_some(),
                 "nothing to change: give model or effort (an empty value goes back to the default)"
@@ -1588,13 +1593,31 @@ async fn snapshot(o: &Orchestrator, action: &AdminAction) -> Result<Value> {
                     .await?;
             json!(row)
         }
-        A::AgentSettings { agent, .. } => {
+        // Only the fields being changed: the owner editing the other one on the web meanwhile
+        // does not make the proposal stale.
+        A::AgentSettings {
+            agent,
+            model,
+            effort,
+        } => {
             let row: Option<(Option<String>, Option<String>)> =
                 sqlx::query_as("select model, effort from agents where id = $1")
                     .bind(agent)
                     .fetch_optional(&o.db)
                     .await?;
-            json!(row)
+            match row {
+                None => Value::Null,
+                Some((m, e)) => {
+                    let mut v = serde_json::Map::new();
+                    if model.is_some() {
+                        v.insert("model".into(), json!(m));
+                    }
+                    if effort.is_some() {
+                        v.insert("effort".into(), json!(e));
+                    }
+                    Value::Object(v)
+                }
+            }
         }
         A::AgentRemove { agent } => {
             let row: Option<(String, Option<i64>, Option<String>, i64)> = sqlx::query_as(
@@ -1965,9 +1988,19 @@ async fn project_json(o: &Orchestrator, slug: &str) -> Result<Value> {
 }
 
 pub async fn agents_json(o: &Orchestrator, project: Option<&str>) -> Result<Value> {
-    let rows: Vec<(String, String, String, Option<String>, Option<String>, i64)> = sqlx::query_as(
+    let rows: Vec<(
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        i64,
+        Option<String>,
+        Option<String>,
+    )> = sqlx::query_as(
         "select a.id, a.name, a.role, a.project, b.username,
-                (select count(*) from tasks t where t.agent_id = a.id and t.running) as running
+                (select count(*) from tasks t where t.agent_id = a.id and t.running) as running,
+                a.model, a.effort
          from agents a left join bots b on b.id = a.bot_id
          where a.id <> all($2) and ($1::text is null or a.project = $1) order by a.project, a.name",
     )
@@ -1976,12 +2009,13 @@ pub async fn agents_json(o: &Orchestrator, project: Option<&str>) -> Result<Valu
     .fetch_all(&o.db)
     .await?;
     let mut out = Vec::new();
-    for (id, name, role, project, bot, running) in rows {
+    for (id, name, role, project, bot, running, model, effort) in rows {
         let recent: Vec<String> = sqlx::query_scalar("select id || ': ' || title || ' [' || status || ']' from tasks where agent_id = $1 order by updated_at desc limit 5")
             .bind(&id)
             .fetch_all(&o.db)
             .await?;
-        out.push(json!({"id": id, "name": name, "role": role, "project": project, "bot": bot, "running": running > 0, "recent_tasks": recent}));
+        // Its defaults (null: the fleet's model, Claude's default effort).
+        out.push(json!({"id": id, "name": name, "role": role, "project": project, "bot": bot, "running": running > 0, "model": model, "effort": effort, "recent_tasks": recent}));
     }
     Ok(Value::Array(out))
 }

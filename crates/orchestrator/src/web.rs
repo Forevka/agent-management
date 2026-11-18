@@ -680,7 +680,22 @@ async fn task_page(State(o): State<O>, h: HeaderMap, Path(id): Path<String>) -> 
                 .fetch_optional(&o.db)
                 .await?
             {
-                Some(agent) => crate::tasks::model_effort_label(&t, &agent, &o.cfg.model),
+                Some(agent) => {
+                    // Once it has a node, that node's own --model/--effort take over.
+                    let node_command = match &t.node_id {
+                        Some(n) => o.node(n).await?.map(|n| n.claude_command.0),
+                        None => None,
+                    };
+                    format!(
+                        " · {}",
+                        crate::tasks::model_effort_label(
+                            &t,
+                            &agent,
+                            &o.cfg.model,
+                            node_command.as_deref()
+                        )
+                    )
+                }
                 None => String::new(),
             },
             None => String::new(),
@@ -688,7 +703,7 @@ async fn task_page(State(o): State<O>, h: HeaderMap, Path(id): Path<String>) -> 
         let events: Vec<(String, String)> =
             sqlx::query_as("select kind, data from task_events where task_id = $1 order by id desc limit 400").bind(&id).fetch_all(&o.db).await?;
         let mut s = format!(
-            "<div class=card><b>{}</b> · {} · status <span class=pill>{}</span>{}<br><span class=muted>agent {} · {} · node {} · session {}</span><div class=plan>{}</div></div><h2>Transcript (latest first)</h2>",
+            "<div class=card><b>{}</b> · {} · status <span class=pill>{}</span>{}<br><span class=muted>agent {}{} · node {} · session {}</span><div class=plan>{}</div></div><h2>Transcript (latest first)</h2>",
             esc(&t.id),
             esc(&t.title),
             esc(&t.status),
