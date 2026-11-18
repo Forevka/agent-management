@@ -385,7 +385,10 @@ async fn permission(
         "AskUserQuestion" => "question",
         _ => "permission",
     };
-    let payload = json!({"tool_name": tool, "input": args["input"], "plan": args["input"]["plan"]});
+    // `input` goes back to Claude as the call it makes, exactly as written; what the owner is
+    // shown (`plan`, `display`) is a copy without the project's secret values.
+    let display = tasks::redact_display(o, &task.project, &args["input"]).await?;
+    let payload = json!({"tool_name": tool, "input": args["input"], "plan": display["plan"], "display": display});
     human::create(
         o,
         NewItem {

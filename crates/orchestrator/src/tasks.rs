@@ -420,11 +420,33 @@ async fn dispatch_locked(
         )
         .await;
     }
-    let spawn = match build_spawn(o, task, &agent, prompt.clone(), resume, run_id.clone()).await {
+    // The run takes the task's waiting messages and the new one. They stay in the queue, tagged
+    // with the run, until the node reports it started (then they go); a run that never starts
+    // gives them back (`release_run_messages`), so the next one gets them.
+    sqlx::query(
+        "update messages set run_id = $3 where task_id = $1 and to_agent = $2 and from_agent is null and run_id is null",
+    )
+    .bind(&task.id)
+    .bind(&agent.id)
+    .bind(&run_id)
+    .execute(&o.db)
+    .await?;
+    if let Some(p) = &prompt {
+        sqlx::query(
+            "insert into messages (task_id, to_agent, text, run_id) values ($1, $2, $3, $4)",
+        )
+        .bind(&task.id)
+        .bind(&agent.id)
+        .bind(p)
+        .bind(&run_id)
+        .execute(&o.db)
+        .await?;
+    }
+    let spawn = match build_spawn(o, task, &agent, resume, run_id.clone()).await {
         Ok(s) => s,
         Err(e) => {
-            // Release the claim (back to the node it had), keep the message for the next try,
-            // and mark the task failed: retrying on every node event would repeat the same
+            // Release the claim (back to the node it had), give the messages back for the next
+            // try, and mark the task failed: retrying on every node event would repeat the same
             // failure. A new message to the task tries again.
             sqlx::query(
                 "update tasks set running = false, node_id = $3, status = 'failed', updated_at = now() where id = $1 and run_id = $2",
@@ -434,14 +456,7 @@ async fn dispatch_locked(
             .bind(&task.node_id)
             .execute(&o.db)
             .await?;
-            if let Some(p) = &prompt {
-                sqlx::query("insert into messages (task_id, to_agent, text) values ($1, $2, $3)")
-                    .bind(&task.id)
-                    .bind(&agent.id)
-                    .bind(p)
-                    .execute(&o.db)
-                    .await?;
-            }
+            release_run_messages(o, &run_id).await?;
             tracing::warn!("preparing a run of {} failed: {e:#}", task.id);
             o.post_task(
                 task,
@@ -510,11 +525,33 @@ async fn node_load(o: &Orchestrator) -> Result<Vec<(NodeRow, i64)>> {
     Ok(out)
 }
 
+/// Gives the messages a run took back to its task's queue: for a run that ended without ever
+/// starting (once it starts they are gone already, so this is harmless for any ended run).
+///
+/// Returns how many were given back.
+pub(crate) async fn release_run_messages(o: &Orchestrator, run_id: &str) -> Result<u64> {
+    Ok(
+        sqlx::query("update messages set run_id = null where run_id = $1")
+            .bind(run_id)
+            .execute(&o.db)
+            .await?
+            .rows_affected(),
+    )
+}
+
+/// The run started: the messages it took are delivered.
+pub(crate) async fn run_started(o: &Orchestrator, run_id: &str) -> Result<()> {
+    sqlx::query("delete from messages where run_id = $1")
+        .bind(run_id)
+        .execute(&o.db)
+        .await?;
+    Ok(())
+}
+
 async fn build_spawn(
     o: &Orchestrator,
     task: &TaskRow,
     agent: &AgentRow,
-    prompt: Option<String>,
     resume: Option<String>,
     run_id: String,
 ) -> Result<SpawnAgent> {
@@ -530,24 +567,22 @@ async fn build_spawn(
         prompts::agent_system_prompt(agent, task, &names, o.memory.is_some())
     };
     let plan_first = plan_first(task, resume.as_deref());
-    // Follow-ups queued while the task waited for a node go first.
-    let queued: Vec<String> = sqlx::query_scalar(
-        "delete from messages where task_id = $1 and to_agent = $2 and from_agent is null returning text",
-    )
-    .bind(&task.id)
-    .bind(&agent.id)
-    .fetch_all(&o.db)
-    .await?;
+    // What this run took: follow-ups that waited for it, then the new message, in order.
+    let texts: Vec<String> =
+        sqlx::query_scalar("select text from messages where run_id = $1 order by id")
+            .bind(&run_id)
+            .fetch_all(&o.db)
+            .await?;
     // A fresh session (nothing to resume: a new task, or its old session's node is gone) knows
-    // nothing yet, so it starts with the task's brief, then what waited for it, then the new
-    // message. The brain has no brief beyond its system prompt.
+    // nothing yet, so it starts with the task's brief, then the messages. The brain has no brief
+    // beyond its system prompt. A resumed session already has it; it only gets the brief when
+    // there is nothing else to say (a queued task starting).
     let fresh = resume.is_none() && !is_brain;
     let mut parts = Vec::new();
-    if fresh || prompt.is_none() {
+    if fresh || texts.is_empty() {
         parts.push(prompts::task_prompt(task));
     }
-    parts.extend(queued);
-    parts.extend(prompt);
+    parts.extend(texts);
     let first = parts.join("\n\n");
     Ok(SpawnAgent {
         agent_id: agent.id.clone(),
@@ -628,7 +663,25 @@ const FREE_TEXT_FIELDS: &[&str] = &[
     "note",
     "description",
     "source",
+    "query",
+    "ticket",
 ];
+
+/// A copy of `v` to show people, with the project's secret values taken out of every string.
+/// Only for display: the original is what the agent gets back.
+pub async fn redact_display(o: &Orchestrator, project: &str, v: &Value) -> Result<Value> {
+    fn all(v: &mut Value, values: &[String]) {
+        match v {
+            Value::String(s) => fleet_proto::redact::redact_secrets(s, values),
+            Value::Array(a) => a.iter_mut().for_each(|x| all(x, values)),
+            Value::Object(m) => m.values_mut().for_each(|x| all(x, values)),
+            _ => {}
+        }
+    }
+    let mut copy = v.clone();
+    all(&mut copy, &project_secret_values(o, project).await?);
+    Ok(copy)
+}
 
 /// [`redact_project_secrets`] over the free-text fields of an agent's tool arguments.
 pub async fn redact_project_json(o: &Orchestrator, project: &str, v: &mut Value) -> Result<()> {
@@ -760,6 +813,7 @@ pub async fn stop(o: &Orchestrator, task: &TaskRow, graceful: bool) -> Result<()
                 agent_id: agent.clone(),
                 task_id: task.id.clone(),
                 graceful,
+                run_id: task.run_id.clone().unwrap_or_default(),
             }),
         );
     }

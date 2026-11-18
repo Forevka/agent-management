@@ -228,6 +228,7 @@ mod tests {
                 agent_id: "a1".into(),
                 task_id: "t".into(),
                 graceful: true,
+                run_id: "r1".into(),
             }),
         });
         roundtrip(Envelope {

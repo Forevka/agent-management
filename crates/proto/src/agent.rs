@@ -71,6 +71,9 @@ pub struct StopAgent {
     pub task_id: String,
     /// Close the session's input and let Claude finish its turn, instead of killing it.
     pub graceful: bool,
+    /// Appended in protocol version 2: the run to stop. Empty means the task's current run;
+    /// otherwise the node leaves a different (newer) run of the task alone.
+    pub run_id: String,
 }
 
 /// Something that happened in an agent session on a node.

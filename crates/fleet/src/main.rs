@@ -322,9 +322,18 @@ async fn node(
     let node = fleet_node::Node::new(data_dir.to_path_buf(), exe, client.clone())?;
     tracing::info!(id = %ep.id(), name = %cfg.node_name, "node starting");
     let link = tokio::spawn(async move { client.run(&ep, cfg).await });
+    let agents = node.clone();
     tokio::select! {
         r = node.run(events) => r,
-        r = link => r?,
+        r = link => {
+            let r = r?;
+            // The link only ends in an error when the orchestrator refuses this node (revoked).
+            // Its agent sessions must not linger on, with their secrets, once it is out.
+            if r.is_err() {
+                agents.stop_all(std::time::Duration::from_secs(15)).await;
+            }
+            r
+        }
         _ = tokio::signal::ctrl_c() => Ok(()),
     }
 }

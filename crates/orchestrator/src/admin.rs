@@ -696,9 +696,10 @@ pub async fn execute(o: &Arc<Orchestrator>, actor: Actor, action: &AdminAction) 
             .execute(&mut *tx)
             .await?;
             tx.commit().await?;
-            // Ask the node to stop those runs (best effort: it may never read this), then
-            // disconnect it. Both after the delete, so it cannot be readmitted in between.
-            if let Ok(key) = id.parse::<fleet_net::EndpointId>() {
+            // Ask the node to stop those runs, after the delete so it cannot be readmitted. (A
+            // node that comes back is refused, and then stops all its agents itself.)
+            let key = id.parse::<fleet_net::EndpointId>().ok();
+            if let Some(key) = key {
                 for t in &ended {
                     if let Some(agent) = &t.agent_id {
                         o.server.send(
@@ -707,13 +708,16 @@ pub async fn execute(o: &Arc<Orchestrator>, actor: Actor, action: &AdminAction) 
                                 agent_id: agent.clone(),
                                 task_id: t.id.clone(),
                                 graceful: false,
+                                run_id: t.run_id.clone().unwrap_or_default(),
                             }),
                         );
                     }
                 }
-                o.server.disconnect(key);
             }
             if removed == 0 && ended.is_empty() {
+                if let Some(key) = key {
+                    o.server.disconnect(key);
+                }
                 return Ok(format!("nothing to revoke: there is no node {}", q(r)));
             }
             o.audit(actor.audit_name(), "node.revoke", json!({"node": id}))
@@ -722,6 +726,15 @@ pub async fn execute(o: &Arc<Orchestrator>, actor: Actor, action: &AdminAction) 
             // follow-ups may wait on other tasks' locks.
             let (o2, n) = (o.clone(), ended.len());
             tokio::spawn(async move {
+                // Disconnect once the node has acknowledged the stops (disconnecting drops what
+                // is still queued), or after a few seconds if it does not.
+                if let Some(key) = key {
+                    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+                    while o2.server.pending(key) > 0 && tokio::time::Instant::now() < deadline {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                    o2.server.disconnect(key);
+                }
                 o2.runs_lost(&ended, "its node was revoked").await;
                 // Work waiting for a node (including a brain with messages) can go elsewhere.
                 tasks::dispatch_queued(&o2).await;

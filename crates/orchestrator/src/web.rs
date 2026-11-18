@@ -353,7 +353,7 @@ pub(crate) fn item_summary(i: &HumanItemRow) -> String {
         .or(p["tool_name"].as_str())
         .map(str::to_owned)
         .or_else(|| {
-            p["input"]["questions"][0]["question"]
+            human::shown(p)["questions"][0]["question"]
                 .as_str()
                 .map(str::to_owned)
         })
@@ -421,14 +421,16 @@ async fn render_item(o: &Orchestrator, id: i64) -> Result<(String, String)> {
                     markdown(
                         p["plan"]
                             .as_str()
-                            .or(p["input"]["plan"].as_str())
+                            .or(human::shown(p)["plan"].as_str())
                             .unwrap_or("(empty plan)")
                     )
                 ));
             }
             "question" => {
                 s.push_str(&format!("<h2>Questions · Q-{}</h2>", it.id));
-                for (qi, q) in p["input"]["questions"]
+                // The shown (redacted) wording; answers go by option index, which the server
+                // maps back to the real labels (question_answers).
+                for (qi, q) in human::shown(p)["questions"]
                     .as_array()
                     .cloned()
                     .unwrap_or_default()
@@ -441,10 +443,16 @@ async fn render_item(o: &Orchestrator, id: i64) -> Result<(String, String)> {
                         "<div class=card><b>{}</b>",
                         esc(q["question"].as_str().unwrap_or_default())
                     ));
-                    for opt in q["options"].as_array().cloned().unwrap_or_default() {
+                    for (oi, opt) in q["options"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                        .iter()
+                        .enumerate()
+                    {
                         let label = opt["label"].as_str().unwrap_or_default();
                         s.push_str(&format!(
-                            "<label><input type={ty} name=\"{name}\" value=\"{v}\"> {v}<br><span class=muted>{d}</span></label>",
+                            "<label><input type={ty} name=\"{name}\" value={oi}> {v}<br><span class=muted>{d}</span></label>",
                             ty = if multi { "checkbox" } else { "radio" },
                             v = esc(label),
                             d = esc(opt["description"].as_str().unwrap_or_default())
@@ -478,7 +486,7 @@ async fn render_item(o: &Orchestrator, id: i64) -> Result<(String, String)> {
                 s.push_str(&format!(
                     "<div class=card>The agent wants to use <code>{}</code>:<pre>{}</pre></div><div class=row><button class=primary name=action value=allow>Allow</button><button class=danger name=action value=deny>Deny</button></div>",
                     esc(p["tool_name"].as_str().unwrap_or_default()),
-                    esc(&serde_json::to_string_pretty(&p["input"])?)
+                    esc(&serde_json::to_string_pretty(human::shown(p))?)
                 ));
             }
             "task_proposal" => {
@@ -632,7 +640,13 @@ fn question_answers(
         .enumerate()
     {
         let name = format!("i{}_q{qi}", q.id);
-        let mut parts: Vec<String> = fields(f, &name).into_iter().map(str::to_owned).collect();
+        // Options come as indices (the page may show redacted labels); the answer is the real
+        // label, from the question Claude asked.
+        let mut parts: Vec<String> = fields(f, &name)
+            .into_iter()
+            .filter_map(|i| i.parse::<usize>().ok())
+            .filter_map(|i| question["options"][i]["label"].as_str().map(str::to_owned))
+            .collect();
         if let Some(other) = field(f, &format!("{name}_other"))
             .map(str::trim)
             .filter(|s| !s.is_empty())

@@ -237,7 +237,7 @@ async fn task_lifecycle_through_a_real_node() {
         client.clone(),
     )
     .unwrap();
-    tokio::spawn(node.run(link_events));
+    tokio::spawn(node.clone().run(link_events));
     let cfg = ClientConfig {
         orchestrator: orch_addr.clone(),
         node_name: "e2e-node".into(),
@@ -1057,6 +1057,7 @@ async fn task_lifecycle_through_a_real_node() {
             .filter(|t| t.running && t.node_id.as_deref() == Some(node_id.as_str()))
     })
     .await;
+    assert_eq!(node.running(), 1, "the brain runs on node 1");
     let done = crate::admin::execute(
         &o,
         crate::admin::Actor::Owner,
@@ -1069,6 +1070,11 @@ async fn task_lifecycle_through_a_real_node() {
     assert!(done.contains("1 run(s) on it ended"), "{done}");
     let brain = o.task("brain").await.unwrap().unwrap();
     assert!(!brain.running, "the brain's run on the revoked node ended");
+    // The node got the stop before it was disconnected: the process there really ends.
+    wait_for("the revoked node stops the brain's process", || async {
+        (node.running() == 0).then_some(())
+    })
+    .await;
     tasks::to_brain(&o, "[Message from the owner] after the revoke".into())
         .await
         .unwrap();
@@ -1204,6 +1210,66 @@ async fn task_lifecycle_through_a_real_node() {
     tasks::stop(&o, &restarted, false).await.unwrap();
     wait_for("brain told of the third stop", || async {
         (brain_heard(&db, "[Task demo-BS-1 stopped").await == 3).then_some(())
+    })
+    .await;
+
+    // 15. A run that never starts gives back the message it took; the next run gets it.
+    let node3_id = demo_now.node_id.clone().unwrap();
+    let set_command = |command: Vec<String>| {
+        let (o, db, node3_id) = (o.clone(), db.clone(), node3_id.clone());
+        async move {
+            sqlx::query("update nodes set claude_command = $2 where id = $1")
+                .bind(&node3_id)
+                .bind(sqlx::types::Json(command))
+                .execute(&db)
+                .await
+                .unwrap();
+            o.push_node_settings(&node3_id).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    };
+    set_command(vec!["no-such-claude-program".into()]).await;
+    let stopped = o.task(&task.id).await.unwrap().unwrap();
+    tasks::deliver(
+        &o,
+        &stopped,
+        "[Message from the human] survives a failed start".into(),
+    )
+    .await
+    .unwrap();
+    wait_for("the start fails and the message is given back", || async {
+        let t = o.task(&task.id).await.unwrap().unwrap();
+        let back: i64 = sqlx::query_scalar(
+            "select count(*) from messages where task_id = $1 and run_id is null",
+        )
+        .bind(&task.id)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        (t.status == "failed" && !t.running && back == 1).then_some(())
+    })
+    .await;
+    wait_for("brain told it could not start", || async {
+        (brain_heard(&db, "[Task demo-BS-1 could not start]").await == 1).then_some(())
+    })
+    .await;
+    set_command(vec!["python3".into(), script.display().to_string()]).await;
+    let failed = o.task(&task.id).await.unwrap().unwrap();
+    tasks::deliver(&o, &failed, "[Message from the human] and then".into())
+        .await
+        .unwrap();
+    wait_for("the next run gets both", || async {
+        events(&db, &task.id).await.into_iter().find(|e| {
+            e["message"]["content"][0]["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("survives a failed start") && t.contains("and then"))
+        })
+    })
+    .await;
+    let after = o.task(&task.id).await.unwrap().unwrap();
+    tasks::stop(&o, &after, false).await.unwrap();
+    wait_for("brain told of the fourth stop", || async {
+        (brain_heard(&db, "[Task demo-BS-1 stopped").await == 4).then_some(())
     })
     .await;
 

@@ -14,7 +14,6 @@ use tokio::sync::Mutex;
 use crate::{
     chat::{From, clip, esc},
     core::Orchestrator,
-    tasks,
 };
 
 /// The secrets-manager folder and key holding the owner's Slack user token.
@@ -209,9 +208,8 @@ pub async fn ingest(o: &Arc<Orchestrator>, messages: &[FeedMessage]) -> Result<(
                 project.as_deref().unwrap_or("none"),
                 lines.join("\n")
             );
-            if let Err(e) = tasks::to_brain(o, note).await {
-                tracing::warn!("triage to brain failed: {e:#}");
-            }
+            // Queued, in order with the brain's other reports: polling Slack never waits for it.
+            o.tell_brain(note);
         }
     }
     Ok(())

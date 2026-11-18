@@ -66,11 +66,18 @@ impl Orchestrator {
             locks: Default::default(),
             brain_tx,
         });
-        let this = o.clone();
+        // Weak, so the consumer does not keep the orchestrator alive; the channel closes with it.
+        let weak = Arc::downgrade(&o);
         tokio::spawn(async move {
             while let Some(text) = brain_rx.recv().await {
-                if let Err(e) = crate::tasks::to_brain(&this, text).await {
-                    tracing::warn!("telling the brain failed: {e:#}");
+                let Some(this) = weak.upgrade() else { break };
+                // One retry: a momentary database or link hiccup should not drop a report.
+                if let Err(e) = crate::tasks::to_brain(&this, text.clone()).await {
+                    tracing::warn!("telling the brain failed, retrying: {e:#}");
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    if let Err(e) = crate::tasks::to_brain(&this, text).await {
+                        tracing::warn!("telling the brain failed: {e:#}");
+                    }
                 }
             }
         });
@@ -287,6 +294,7 @@ impl Orchestrator {
         match kind {
             AgentEventKind::Started { .. } => {
                 if current {
+                    crate::tasks::run_started(self, &run_id).await?;
                     sqlx::query(
                         "update agents set last_active = now(), preferred_node = $2 where id = $1",
                     )
@@ -309,13 +317,17 @@ impl Orchestrator {
             AgentEventKind::Stderr { line } => self.record(&task_id, "err", &line).await?,
             AgentEventKind::Exited { code } => {
                 self.record(&task_id, "exit", &format!("{code:?}")).await?;
+                // A run that ended before it started gives back what it took.
+                crate::tasks::release_run_messages(self, &run_id).await?;
                 let Some(task) = task.filter(|_| current) else {
                     return Ok(());
                 };
-                // Only while this is still the task's run: a dispatch since the read above has
-                // made a newer run current, and this exit must not touch it.
+                // Only while this is still the task's running run: a dispatch since the read
+                // above has made a newer run current, or the run was already ended (lost,
+                // revoked, handed back) and maybe re-queued; either way this exit must not
+                // touch the task or report it again.
                 let ours = sqlx::query(
-                    "update tasks set running = false, updated_at = now() where id = $1 and run_id = $2",
+                    "update tasks set running = false, updated_at = now() where id = $1 and run_id = $2 and running",
                 )
                 .bind(&task_id)
                 .bind(&run_id)
@@ -376,6 +388,7 @@ impl Orchestrator {
             }
             AgentEventKind::SpawnFailed { reason } => {
                 self.record(&task_id, "spawn_failed", &reason).await?;
+                crate::tasks::release_run_messages(self, &run_id).await?;
                 let Some(task) = task.filter(|_| current) else {
                     return Ok(());
                 };
@@ -422,6 +435,7 @@ impl Orchestrator {
                 // marked gone; if the task has moved on to a newer run, the text simply goes
                 // there.
                 self.record(&task_id, "undelivered", &text).await?;
+                crate::tasks::release_run_messages(self, &run_id).await?;
                 if let Some(task) = task {
                     {
                         let lock = self.task_lock(&task.id);
@@ -433,6 +447,12 @@ impl Orchestrator {
                         .bind(&run_id)
                         .execute(&self.db)
                         .await?;
+                    }
+                    // The brain's own messages go through its queue, in order with the rest,
+                    // and never hold up node events while its session starts.
+                    if task.id == crate::model::BRAIN_TASK {
+                        self.tell_brain(text);
+                        return Ok(());
                     }
                     if let Err(e) = crate::tasks::deliver(self, &task, text.clone()).await {
                         // Kept rather than lost (say, its agent was removed meanwhile): it is
@@ -492,6 +512,23 @@ impl Orchestrator {
     /// Tells the brain about runs that ended without an exit event (a finished task's session
     /// ending is expected and not worth a message).
     pub(crate) async fn runs_lost(self: &Arc<Self>, ended: &[TaskRow], why: &str) {
+        // A run lost before it started (revoked mid-dispatch) gives back the messages it took,
+        // and its task waits for the next node, which `dispatch_queued` finds.
+        for task in ended {
+            let Some(run) = &task.run_id else { continue };
+            match crate::tasks::release_run_messages(self, run).await {
+                Ok(0) => {}
+                Ok(_) => {
+                    let _ = sqlx::query(
+                        "update tasks set status = 'queued' where id = $1 and not running and status not in ('done','stopped')",
+                    )
+                    .bind(&task.id)
+                    .execute(&self.db)
+                    .await;
+                }
+                Err(e) => tracing::warn!("giving back {}'s messages failed: {e:#}", task.id),
+            }
+        }
         let ended_already = [status::DONE, status::STOPPED, status::FAILED];
         for task in ended
             .iter()

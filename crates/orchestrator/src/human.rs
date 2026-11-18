@@ -35,6 +35,16 @@ pub struct NewItem<'a> {
     pub call_id: Option<String>,
 }
 
+/// What a permission item shows people: its redacted copy of the call (`display`), or the call
+/// itself for items made before there was one. Never what is sent back to Claude.
+pub(crate) fn shown(p: &Value) -> &Value {
+    if p["display"].is_null() {
+        &p["input"]
+    } else {
+        &p["display"]
+    }
+}
+
 pub async fn create(o: &Orchestrator, item: NewItem<'_>) -> Result<HumanItemRow> {
     let project = item
         .project
@@ -111,7 +121,8 @@ async fn announce(o: &Orchestrator, row: &HumanItemRow, task: Option<&TaskRow>) 
             ],
         ),
         "question" => {
-            let qs = p["input"]["questions"]
+            // Buttons answer by option index, so the shown labels may be the redacted ones.
+            let qs = shown(p)["questions"]
                 .as_array()
                 .cloned()
                 .unwrap_or_default();
@@ -146,7 +157,7 @@ async fn announce(o: &Orchestrator, row: &HumanItemRow, task: Option<&TaskRow>) 
         }
         "permission" => {
             let tool = p["tool_name"].as_str().unwrap_or("?");
-            let input = clip(&p["input"].to_string(), 600);
+            let input = clip(&shown(p).to_string(), 600);
             (
                 format!(
                     "🔐 <b>Q-{}</b>{task_ref} wants to use <code>{}</code>\n<pre>{}</pre>",

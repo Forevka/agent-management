@@ -103,13 +103,15 @@ impl Node {
         match body {
             Body::SpawnAgent(spawn) => self.spawn_agent(*spawn),
             Body::StopAgent(stop) => {
-                // Only the run of that task: the agent may have moved on to another task.
+                // Only the run of that task (and that run, when named): the agent may have
+                // moved on to another task, or the task to a newer run.
                 if let Some(h) = self
                     .agents
                     .lock()
                     .unwrap()
                     .get(&stop.agent_id)
                     .filter(|h| h.task_id == stop.task_id)
+                    .filter(|h| stop.run_id.is_empty() || h.run_id == stop.run_id)
                 {
                     h.stop(stop.graceful);
                 }
@@ -205,6 +207,23 @@ impl Node {
                     reason: format!("{e:#}"),
                 },
             ),
+        }
+    }
+
+    /// How many agent processes this node runs now.
+    pub fn running(&self) -> usize {
+        self.agents.lock().unwrap().len()
+    }
+
+    /// Stops every agent and waits (up to `limit`) for them to exit, which also removes their
+    /// secrets files. For when this node must not keep working: the orchestrator refused it.
+    pub async fn stop_all(&self, limit: std::time::Duration) {
+        for h in self.agents.lock().unwrap().values() {
+            h.stop(false);
+        }
+        let deadline = tokio::time::Instant::now() + limit;
+        while !self.agents.lock().unwrap().is_empty() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
     }
 
