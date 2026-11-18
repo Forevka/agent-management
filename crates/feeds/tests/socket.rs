@@ -1579,8 +1579,10 @@ async fn documented_mutes_work_without_the_undocumented_prefs() {
 #[tokio::test]
 async fn a_new_mute_counts_on_its_own_shorter_interval() {
     let mut s = Slack::start().await;
+    // The membership list must not come due during the test: only the settings may be re-read.
     let src = s
         .source()
+        .with_directory_refresh(Duration::from_secs(3600))
         .with_attention_refresh(Duration::from_millis(200))
         .with_keepalive(Duration::from_millis(50), Duration::from_secs(5));
     let dir = src.directory().unwrap();

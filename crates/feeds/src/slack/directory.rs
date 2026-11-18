@@ -55,6 +55,10 @@ pub struct SlackDirectory {
     /// since a mute is expected to count within minutes.
     attention_every: Duration,
     cache: Mutex<Cache>,
+    /// Held while the membership list is read, so callers that ask at the same time (the
+    /// maintenance task and a `conversations()` caller at startup, say) share one read instead
+    /// of each paging through `users.conversations`. A tokio mutex: it is held across `.await`.
+    refreshing: tokio::sync::Mutex<()>,
 }
 
 #[derive(Debug, Default)]
@@ -190,6 +194,7 @@ impl SlackDirectory {
             refresh_every,
             attention_every,
             cache: Mutex::new(Cache::default()),
+            refreshing: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -507,6 +512,19 @@ impl SlackDirectory {
     /// Lists the owner's conversations with `users.conversations` and caches them. A failure
     /// starts or lengthens the back-off [`refresh_due`](Self::refresh_due) honours.
     pub async fn refresh(&self) -> Result<Vec<Conversation>, FeedError> {
+        let asked = Instant::now();
+        let _one_at_a_time = self.refreshing.lock().await;
+        // Another caller finished a read while this one waited: that list is as new as the
+        // one this call would fetch.
+        let fresh = self
+            .cache()
+            .membership
+            .as_ref()
+            .and_then(|(at, ids)| (*at >= asked).then(|| ids.clone()));
+        if let Some(ids) = fresh {
+            self.refresh_attention(&ids).await;
+            return Ok(self.cached_list(&ids));
+        }
         let res = self.list().await;
         {
             let mut cache = self.cache();
@@ -671,8 +689,14 @@ impl Directory for SlackDirectory {
             .unwrap_or_default();
         // A refresh elsewhere may have listed the conversations but not yet read the settings.
         self.refresh_attention(&ids).await;
-        Ok(ids
-            .iter()
+        Ok(self.cached_list(&ids))
+    }
+}
+
+impl SlackDirectory {
+    /// The conversations of a membership list, from the cache, with their settings.
+    fn cached_list(&self, ids: &[String]) -> Vec<Conversation> {
+        ids.iter()
             .map(|id| {
                 let mut c = self
                     .cache()
@@ -686,11 +710,9 @@ impl Directory for SlackDirectory {
                 c.attention = self.attention(id);
                 c
             })
-            .collect())
+            .collect()
     }
-}
 
-impl SlackDirectory {
     /// One conversation's name and kind, cached after the first `conversations.info`.
     async fn lookup_conversation(&self, id: &str) -> Result<Conversation, FeedError> {
         if let Some(c) = self.cache().conversations.get(id) {
