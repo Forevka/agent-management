@@ -1172,6 +1172,49 @@ async fn a_polling_cursor_gets_its_gap_checked_after_the_switch() {
 }
 
 #[tokio::test]
+async fn a_dm_shaped_like_slacks_user_scoped_event_is_delivered() {
+    let mut s = Slack::start().await;
+    let (mut rx, _run) = s.run(s.source());
+    let mut conn = s.accept().await;
+    send(&mut conn, hello()).await;
+    let ts = s.ts(1);
+    // The full envelope Slack sends for `message.im` on a user-token subscription, with the
+    // fields a minimal event leaves out.
+    let envelope = json!({
+        "envelope_id": "8f3c5d1e-0000-4000-8000-000000000001",
+        "type": "events_api",
+        "accepts_response_payload": false,
+        "retry_attempt": 0,
+        "retry_reason": "",
+        "payload": {
+            "token": "x", "team_id": "T1", "context_team_id": "T1", "context_enterprise_id": null,
+            "api_app_id": "A1", "type": "event_callback", "event_id": "Ev0001",
+            "event_time": 1_700_000_000u64, "is_ext_shared_channel": false,
+            "event_context": "4-eyJldCI6Im1lc3NhZ2UifQ",
+            "authorizations": [{"enterprise_id": null, "team_id": "T1", "user_id": "UME",
+                                "is_bot": false, "is_enterprise_install": false}],
+            "event": {
+                "user": "U1", "type": "message", "ts": ts, "client_msg_id": "c0ffee",
+                "text": "can you look at this?", "team": "T1",
+                "blocks": [{"type": "rich_text", "block_id": "b1", "elements": [
+                    {"type": "rich_text_section", "elements": [{"type": "text", "text": "can you look at this?"}]}
+                ]}],
+                "channel": "D1", "event_ts": ts, "channel_type": "im"
+            }
+        }
+    });
+    send(&mut conn, envelope).await;
+    assert_eq!(
+        read_text(&mut conn).await["envelope_id"],
+        "8f3c5d1e-0000-4000-8000-000000000001"
+    );
+    let m = next_message(&mut rx).await;
+    assert_eq!(m.text, "can you look at this?");
+    assert_eq!(m.conversation_kind, ConversationKind::Direct);
+    assert!(!m.from_owner);
+}
+
+#[tokio::test]
 async fn a_short_outage_still_checks_every_direct_message() {
     let mut s = Slack::start().await;
     let now = SystemTime::now()

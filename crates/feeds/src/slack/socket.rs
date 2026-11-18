@@ -211,6 +211,53 @@ struct Shared {
     queued: AtomicUsize,
     /// Events dropped because the queue was full (each opened a gap instead).
     overflowed: AtomicUsize,
+    /// What the processor did with events, for the once-a-minute summary.
+    stats: Mutex<Stats>,
+}
+
+/// Counters for the processor's minute summary. They hold reasons and error codes, never
+/// message text.
+#[derive(Debug, Default)]
+struct Stats {
+    delivered: usize,
+    drops: BTreeMap<&'static str, usize>,
+    lookup_errors: BTreeMap<String, usize>,
+    /// Lookup failures already logged as a warning.
+    warned_lookups: HashSet<String>,
+}
+
+/// What may be logged about an event: its kind, never its content.
+#[derive(Debug, Default)]
+struct EventMeta {
+    event_type: Option<String>,
+    subtype: Option<String>,
+    channel_type: Option<String>,
+}
+
+impl EventMeta {
+    fn of(ev: &Value) -> Self {
+        let field = |k: &str| ev.get(k).and_then(Value::as_str).map(str::to_owned);
+        Self {
+            event_type: field("type"),
+            subtype: field("subtype"),
+            channel_type: field("channel_type"),
+        }
+    }
+}
+
+/// Frames read on one connection, by envelope type, for the reader's minute summary.
+#[derive(Debug, Default)]
+struct FrameCounts {
+    hello: usize,
+    events_api: usize,
+    disconnect: usize,
+    other: usize,
+}
+
+impl FrameCounts {
+    fn any(&self) -> bool {
+        self.hello + self.events_api + self.disconnect + self.other > 0
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -440,6 +487,7 @@ impl Shared {
             fatal_notify: Notify::new(),
             queued: AtomicUsize::new(0),
             overflowed: AtomicUsize::new(0),
+            stats: Mutex::new(Stats::default()),
         }
     }
 
@@ -771,21 +819,31 @@ impl Shared {
         hint: Option<ConversationKind>,
         raw: &RawMessage,
     ) -> Option<FeedMessage> {
-        let conv = self.dir.conversation(channel).await.ok();
+        let conv = match self.dir.conversation(channel).await {
+            Ok(c) => Some(c),
+            Err(e) => {
+                self.lookup_failed("conversations.info", &e);
+                None
+            }
+        };
         let kind = hint
             .filter(|k| *k != ConversationKind::Other)
             .or(conv.as_ref().map(|c| c.kind))
             .unwrap_or_default();
         let m = effective(raw);
-        if let Some(u) = &m.user {
-            let _ = self.dir.user_name(u).await;
+        if let Some(u) = &m.user
+            && let Err(e) = self.dir.user_name(u).await
+        {
+            self.lookup_failed("users.info", &e);
         }
         if let Some(text) = &m.text {
             for u in mrkdwn::mentioned_users(text)
                 .into_iter()
                 .take(MAX_MENTION_LOOKUPS)
             {
-                let _ = self.dir.user_name(&u).await;
+                if let Err(e) = self.dir.user_name(&u).await {
+                    self.lookup_failed("users.info", &e);
+                }
             }
         }
         let auth = self.auth();
@@ -808,13 +866,17 @@ impl Shared {
     /// are delivered.
     async fn handle_event(&self, ev: Value) -> Handled {
         let mut out = Handled::default();
-        if ev.get("type").and_then(Value::as_str) != Some("message") {
+        let meta = EventMeta::of(&ev);
+        if meta.event_type.as_deref() != Some("message") {
+            self.dropped("not a message event", &meta);
             return out;
         }
         let Some(raw) = RawMessage::parse(ev) else {
+            self.dropped("unparsable message", &meta);
             return out;
         };
         let Some(channel) = raw.channel.clone() else {
+            self.dropped("no channel", &meta);
             return out;
         };
         let hint = raw.channel_type.as_deref().map(kind_from_channel_type);
@@ -827,16 +889,18 @@ impl Shared {
                     .deleted_ts
                     .clone()
                     .or_else(|| raw.previous_message.as_ref().and_then(|p| p.ts.clone()));
-                if let Some(id) = deleted {
-                    out.events.push(FeedEvent::Deleted {
+                match deleted {
+                    Some(id) => out.events.push(FeedEvent::Deleted {
                         source: KIND.to_owned(),
                         conversation_id: channel,
                         message_id: id,
-                    });
+                    }),
+                    None => self.dropped("deletion without a message id", &meta),
                 }
             }
             Some("message_changed") => {
                 let Some(new) = raw.message.as_deref() else {
+                    self.dropped("edit without a new version", &meta);
                     return out;
                 };
                 let unchanged = raw
@@ -845,26 +909,91 @@ impl Shared {
                     .is_some_and(|old| old.text == new.text && old.files.len() == new.files.len());
                 // An unfurl or a new reply count, not an edit.
                 if unchanged {
+                    self.dropped("edit without a text change", &meta);
                     return out;
                 }
-                if let Some(m) = self.shape(&channel, hint, &raw).await {
-                    out.events.push(FeedEvent::Message(m));
+                match self.shape(&channel, hint, &raw).await {
+                    Some(m) => out.events.push(FeedEvent::Message(m)),
+                    None => self.shape_failed(&meta),
                 }
             }
             _ if keep(&raw) => {
                 let Some(ts) = raw.ts.as_deref() else {
+                    self.dropped("no ts", &meta);
                     return out;
                 };
                 if self.is_delivered(&channel, ts) {
+                    self.dropped("already delivered", &meta);
                     return out;
                 }
-                if let Some(m) = self.shape(&channel, hint, &raw).await {
-                    out.events.push(FeedEvent::Message(m));
+                match self.shape(&channel, hint, &raw).await {
+                    Some(m) => out.events.push(FeedEvent::Message(m)),
+                    None => self.shape_failed(&meta),
                 }
             }
-            _ => {}
+            _ => self.dropped("housekeeping subtype", &meta),
         }
         out
+    }
+
+    /// Records an event that is deliberately not delivered. Only its type, subtype and
+    /// conversation type are logged, never its text.
+    fn dropped(&self, reason: &'static str, meta: &EventMeta) {
+        tracing::debug!(
+            reason,
+            event_type = ?meta.event_type,
+            subtype = ?meta.subtype,
+            channel_type = ?meta.channel_type,
+            "slack event not delivered"
+        );
+        *lock(&self.stats).drops.entry(reason).or_default() += 1;
+    }
+
+    /// A message event that could not be turned into a feed message (no usable ts).
+    fn shape_failed(&self, meta: &EventMeta) {
+        tracing::warn!(
+            event_type = ?meta.event_type,
+            subtype = ?meta.subtype,
+            channel_type = ?meta.channel_type,
+            "slack message event dropped: it has no usable ts"
+        );
+        *lock(&self.stats)
+            .drops
+            .entry("could not be shaped")
+            .or_default() += 1;
+    }
+
+    /// A name lookup failed; the message is still delivered, without the name. Each distinct
+    /// failure is logged as a warning once (a missing scope would otherwise repeat for every
+    /// message), and all are counted in the minute summary.
+    fn lookup_failed(&self, method: &'static str, e: &FeedError) {
+        let key = format!("{method}: {e}");
+        let mut stats = lock(&self.stats);
+        *stats.lookup_errors.entry(key.clone()).or_default() += 1;
+        if stats.warned_lookups.insert(key) {
+            tracing::warn!(method, error = %e, "slack name lookup failed; messages go on without the name");
+        } else {
+            tracing::debug!(method, error = %e, "slack name lookup failed");
+        }
+    }
+
+    /// Logs, once a minute, what the processor did with the events it got.
+    fn log_minute_stats(&self) {
+        let mut stats = lock(&self.stats);
+        let drops = std::mem::take(&mut stats.drops);
+        let lookups = std::mem::take(&mut stats.lookup_errors);
+        let delivered = std::mem::take(&mut stats.delivered);
+        if delivered == 0 && drops.is_empty() && lookups.is_empty() {
+            return;
+        }
+        let dropped: Vec<String> = drops.iter().map(|(r, n)| format!("{r}: {n}")).collect();
+        let failed: Vec<String> = lookups.iter().map(|(k, n)| format!("{k} ({n})")).collect();
+        tracing::info!(
+            delivered,
+            dropped = %dropped.join(", "),
+            lookup_errors = %failed.join(", "),
+            "slack events processed in the last minute"
+        );
     }
 
     /// One request of a gap check, through the shared Tier 3 gate.
@@ -1407,6 +1536,13 @@ impl SlackSocket {
         ping.tick().await;
         let mut last_frame = Instant::now();
         let mut replacement: Option<Task<Result<Ready, String>>> = None;
+        // What arrives, summarised once a minute, so that "connected but nothing comes" can be
+        // told apart from "events come but are not delivered".
+        let mut counts = FrameCounts::default();
+        let mut first_event = true;
+        let mut minute = tokio::time::interval(Duration::from_secs(60));
+        minute.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        minute.tick().await;
         loop {
             tokio::select! {
                 frame = ws.next() => {
@@ -1446,10 +1582,12 @@ impl SlackSocket {
                     }
                     match v.get("type").and_then(Value::as_str) {
                         Some("hello") => {
+                            counts.hello += 1;
                             *hello = true;
                             self.hello(&v, sink, maintenance, false, true);
                         }
                         Some("disconnect") => {
+                            counts.disconnect += 1;
                             let reason = v.get("reason").and_then(Value::as_str).unwrap_or("");
                             tracing::info!(reason, "slack socket disconnect requested");
                             if reason == "link_disabled" {
@@ -1464,7 +1602,25 @@ impl SlackSocket {
                             }
                         }
                         Some("events_api") => {
+                            counts.events_api += 1;
                             let payload = v.get("payload").cloned().unwrap_or(Value::Null);
+                            let meta = EventMeta::of(payload.get("event").unwrap_or(&Value::Null));
+                            if first_event {
+                                first_event = false;
+                                tracing::info!(
+                                    event_type = ?meta.event_type,
+                                    subtype = ?meta.subtype,
+                                    channel_type = ?meta.channel_type,
+                                    "slack socket: first event since connecting"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    event_type = ?meta.event_type,
+                                    subtype = ?meta.subtype,
+                                    channel_type = ?meta.channel_type,
+                                    "slack socket: event"
+                                );
+                            }
                             let key = payload
                                 .get("event_id")
                                 .and_then(Value::as_str)
@@ -1476,7 +1632,10 @@ impl SlackSocket {
                                 tracing::debug!("slack event delivered again; dropped");
                                 continue;
                             }
-                            let Some(event) = payload.get("event").cloned() else { continue };
+                            let Some(event) = payload.get("event").cloned() else {
+                                tracing::warn!("slack events_api envelope without an event; ignored");
+                                continue;
+                            };
                             // Count before sending, so the processor never sees fewer than it
                             // has to finish.
                             self.shared.queued.fetch_add(1, Ordering::SeqCst);
@@ -1498,7 +1657,24 @@ impl SlackSocket {
                         }
                         // Slash commands and interactivity are acknowledged above and otherwise
                         // not ours to handle.
-                        _ => {}
+                        other => {
+                            counts.other += 1;
+                            tracing::debug!(frame_type = ?other, "slack socket: frame ignored");
+                        }
+                    }
+                }
+                _ = minute.tick() => {
+                    if counts.any() {
+                        tracing::info!(
+                            events_api = counts.events_api,
+                            hello = counts.hello,
+                            disconnect = counts.disconnect,
+                            other = counts.other,
+                            "slack socket: {} events_api, {} other frames in the last minute",
+                            counts.events_api,
+                            counts.hello + counts.disconnect + counts.other,
+                        );
+                        counts = FrameCounts::default();
                     }
                 }
                 ready = async { (&mut replacement.as_mut().expect("guarded").0).await },
@@ -1672,6 +1848,9 @@ async fn process(
 ) {
     let mut tick = tokio::time::interval(every);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut minute = tokio::time::interval(Duration::from_secs(60));
+    minute.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    minute.tick().await;
     loop {
         tokio::select! {
             ev = events.recv() => {
@@ -1687,6 +1866,7 @@ async fn process(
                     }
                     if let Some((c, id)) = key {
                         shared.mark_delivered(&c, &id);
+                        lock(&shared.stats).delivered += 1;
                     }
                 }
                 // Progress is recorded only once its messages are with the consumer, so a
@@ -1703,6 +1883,7 @@ async fn process(
                     return;
                 }
             }
+            _ = minute.tick() => shared.log_minute_stats(),
         }
     }
 }
