@@ -132,6 +132,11 @@ function Stop-FleetNode {
     # fleet-tray.exe can be replaced or removed.
     $procs = @(Get-Process -Name 'fleet', 'fleet-tray' -ErrorAction SilentlyContinue |
         Where-Object { $_.Path -and (($_.Path -ieq $ExePath) -or ($_.Path -ieq $TrayPath)) })
+    # The launcher loop itself, in case it outlived its console host: it would start the old
+    # node again five seconds later.
+    $launchers = @(Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -and $_.CommandLine.Contains($Launcher) })
+    $launchers | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     $procs | Stop-Process -Force -ErrorAction SilentlyContinue
     # Stop-Process returns before the processes are gone, and their exes stay locked until then.
     $procs | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
@@ -255,11 +260,19 @@ if ($Ticket) {
     Write-Host 'Joined.'
 }
 
-# -WindowStyle Hidden keeps the console out of the way (a window may flash
-# briefly at logon).
-$action = New-ScheduledTaskAction -Execute 'powershell.exe' `
-    -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$Launcher`"" `
-    -WorkingDirectory $env:USERPROFILE
+# The launcher runs under a headless console host: it has a console (the node and
+# cmd's log redirection need one) but no window. `powershell -WindowStyle Hidden`
+# alone is not enough: when Windows Terminal is the default terminal app, it opens
+# a visible Terminal window, and closing that window kills the node. Builds before
+# Windows 10 1809 have no headless conhost and keep the old (briefly flashing) way.
+$psArgs = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$Launcher`""
+if ([Environment]::OSVersion.Version.Build -ge 17763) {
+    $action = New-ScheduledTaskAction -Execute 'conhost.exe' `
+        -Argument "--headless powershell.exe $psArgs" -WorkingDirectory $env:USERPROFILE
+} else {
+    $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
+        -Argument $psArgs -WorkingDirectory $env:USERPROFILE
+}
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $UserId
 # Interactive + Limited: the user's own, non-elevated token, as in a terminal.
 $principal = New-ScheduledTaskPrincipal -UserId $UserId -LogonType Interactive -RunLevel Limited
