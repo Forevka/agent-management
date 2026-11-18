@@ -2,7 +2,8 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # Work branches too, so a pushed branch is checked before it has a pull request.
+    branches: [main, 'fix/**', 'feat/**']
   pull_request:
   workflow_dispatch:
 
@@ -11,7 +12,8 @@ permissions:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  # A newer push to a work branch supersedes the running check; main always finishes.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   CARGO_TERM_COLOR: always
