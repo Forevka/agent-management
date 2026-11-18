@@ -1244,6 +1244,105 @@ async fn secretary_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeCha
     .await;
 }
 
+async fn model_effort_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) {
+    use crate::admin::{Actor, AdminAction};
+    // The brain may only choose what the owner allows.
+    for (args, why) in [
+        (json!({"model": "gpt-9"}), "model \"gpt-9\" is not allowed"),
+        (
+            json!({"effort": "turbo"}),
+            "effort \"turbo\" is not allowed",
+        ),
+    ] {
+        let mut a = json!({"project": "demo", "title": "x", "brief": "x", "agent": "Alice"});
+        a.as_object_mut()
+            .unwrap()
+            .extend(args.as_object().unwrap().clone());
+        let e = call_as(o, "orchestrator", "brain", "create_task", a)
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains(why), "{e}");
+    }
+    let start = |ticket: &'static str, model: Option<&str>, effort: Option<&str>| {
+        let (model, effort) = (model.map(str::to_owned), effort.map(str::to_owned));
+        async move {
+            let t = tasks::create_task(
+                o,
+                CreateTask {
+                    project: "demo".into(),
+                    title: format!("Sand the shed ({ticket})"),
+                    brief: "Sand it.".into(),
+                    ticket: Some(ticket.into()),
+                    agent: Some("Alice".into()),
+                    new_agent: None,
+                    model,
+                    effort,
+                },
+            )
+            .await
+            .unwrap();
+            let id = t.id.clone();
+            let init = wait_for(&format!("{id} starts"), || async {
+                events(db, &id)
+                    .await
+                    .into_iter()
+                    .find(|e| e["subtype"] == "init")
+            })
+            .await;
+            tasks::stop(o, &t, false).await.unwrap();
+            wait_for(&format!("{id} stopped"), || async {
+                o.task(&id).await.unwrap().filter(|t| !t.running)
+            })
+            .await;
+            (id, init)
+        }
+    };
+    // A task's own model and effort.
+    let (id, init) = start("ME-1", Some("sonnet"), Some("high")).await;
+    assert_eq!(init["models"].as_array().unwrap().last().unwrap(), "sonnet");
+    assert_eq!(init["effort"], "high");
+    assert!(
+        chat.sent()
+            .iter()
+            .any(|(_, _, h, _)| h.contains(&format!("<b>{id}</b>"))
+                && h.contains("model sonnet, effort high")),
+        "the opening message says what it runs with"
+    );
+    // Nothing set on the task: the agent's defaults (set by the owner on the web).
+    let alice = tasks::find_agent(o, "Alice").await.unwrap().unwrap();
+    crate::admin::execute(
+        o,
+        Actor::Owner,
+        &AdminAction::AgentSettings {
+            agent: alice.id.clone(),
+            model: Some("haiku".into()),
+            effort: Some("low".into()),
+        },
+    )
+    .await
+    .unwrap();
+    let (_, init) = start("ME-2", None, None).await;
+    assert_eq!(init["models"].as_array().unwrap().last().unwrap(), "haiku");
+    assert_eq!(init["effort"], "low");
+    // Back to the fleet's: the fleet model, and no --effort at all.
+    crate::admin::execute(
+        o,
+        Actor::Owner,
+        &AdminAction::AgentSettings {
+            agent: alice.id,
+            model: Some(String::new()),
+            effort: Some(String::new()),
+        },
+    )
+    .await
+    .unwrap();
+    let (_, init) = start("ME-3", None, None).await;
+    assert_eq!(
+        init["models"].as_array().unwrap().last().unwrap(),
+        &json!(o.cfg.model)
+    );
+    assert_eq!(init["effort"], Value::Null);
+}
 /// Whether the message `id` sounded when it was sent.
 fn notify_of_msg(chat: &FakeChat, id: Option<i64>) -> Option<Notify> {
     chat.ops.lock().unwrap().iter().find_map(|op| match op {
@@ -1568,6 +1667,8 @@ async fn task_lifecycle_through_a_real_node() {
                 name: "Alice".into(),
                 role: "implementor".into(),
             }),
+            model: None,
+            effort: None,
         },
     )
     .await
@@ -2815,6 +2916,9 @@ async fn task_lifecycle_through_a_real_node() {
     //     ingest path): messages arrive, it gets a framed batch, adds todos, escalates, and
     //     cannot use task, reply, agent or admin tools.
     secretary_flow(&o, &db, &chat).await;
+
+    // 18. Model and effort: a task's own, an agent's defaults, and the owner's allow-list.
+    model_effort_flow(&o, &db, &chat).await;
 
     stop_brain().await;
     let _ = std::fs::remove_dir_all(&data_dir);

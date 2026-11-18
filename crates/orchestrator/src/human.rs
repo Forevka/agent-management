@@ -547,6 +547,9 @@ async fn apply(o: &Arc<Orchestrator>, row: &HumanItemRow, ans: Answer) -> Result
                         name: format!("{}-dev", tasks::slugify(&project)),
                         role: "implementor".into(),
                     }),
+                    // The agent's defaults: a proposal does not choose them.
+                    model: None,
+                    effort: None,
                 },
             )
             .await?;

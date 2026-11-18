@@ -364,9 +364,35 @@ pub async fn handle(
             .bind(args["limit"].as_i64().unwrap_or(20).clamp(1, 100))
             .fetch_all(&o.db)
             .await?;
+            // With the model and effort each runs with (its own, else its agent's defaults).
+            let defaults: std::collections::HashMap<String, (Option<String>, Option<String>)> =
+                sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+                    "select id, model, effort from agents",
+                )
+                .fetch_all(&o.db)
+                .await?
+                .into_iter()
+                .map(|(id, m, e)| (id, (m, e)))
+                .collect();
             let out: Vec<Value> = rows
                 .iter()
-                .map(|t| json!({"id": t.id, "title": t.title, "status": t.status, "agent": t.agent_id, "running": t.running, "updated": t.updated_at.to_rfc3339()}))
+                .map(|t| {
+                    let (am, ae) = t
+                        .agent_id
+                        .as_ref()
+                        .and_then(|a| defaults.get(a).cloned())
+                        .unwrap_or_default();
+                    json!({
+                        "id": t.id,
+                        "title": t.title,
+                        "status": t.status,
+                        "agent": t.agent_id,
+                        "running": t.running,
+                        "updated": t.updated_at.to_rfc3339(),
+                        "model": t.model.clone().or(am).unwrap_or_else(|| o.cfg.model.clone()),
+                        "effort": t.effort.clone().or(ae),
+                    })
+                })
                 .collect();
             ok(serde_json::to_string_pretty(&out)?)
         }
@@ -383,6 +409,16 @@ pub async fn handle(
                 .filter(|v| !v.is_null())
                 .map(|v| serde_json::from_value(v.clone()))
                 .transpose()?;
+            // The brain chooses within the owner's allow-list (FLEET_ALLOWED_MODELS / _EFFORTS).
+            let opt = |k: &str| {
+                args[k]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_owned)
+            };
+            let (model, effort) = (opt("model"), opt("effort"));
+            o.cfg.check_allowed(model.as_deref(), effort.as_deref())?;
             let t = tasks::create_task(
                 o,
                 tasks::CreateTask {
@@ -392,6 +428,8 @@ pub async fn handle(
                     ticket: args["ticket"].as_str().map(Into::into),
                     agent: args["agent"].as_str().map(Into::into),
                     new_agent,
+                    model,
+                    effort,
                 },
             )
             .await?;

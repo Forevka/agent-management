@@ -45,6 +45,9 @@ pub struct AgentRow {
     pub project: Option<String>,
     pub bot_id: Option<i64>,
     pub preferred_node: Option<String>,
+    /// Its default Claude model and effort (null: the fleet's).
+    pub model: Option<String>,
+    pub effort: Option<String>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -64,6 +67,49 @@ pub struct TaskRow {
     pub updated_at: DateTime<Utc>,
     pub run_id: Option<String>,
     pub dispatched_at: Option<DateTime<Utc>>,
+    /// This task's own Claude model and effort (null: its agent's).
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
+/// The effort levels Claude Code accepts (`claude --help`, 2.1.268).
+pub const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
+/// A model or effort value as it may be passed to Claude: a plain token, never an option.
+pub fn check_model_value(what: &str, v: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        (1..=64).contains(&v.len())
+            && !v.starts_with('-')
+            && v.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "._:[]-".contains(c)),
+        "{what} {v:?} is not valid: 1-64 letters, digits and . _ : [ ] -"
+    );
+    Ok(())
+}
+
+pub fn check_effort(v: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        EFFORTS.contains(&v),
+        "effort {v:?} is not one of {}",
+        EFFORTS.join(", ")
+    );
+    Ok(())
+}
+
+/// The model and effort a run of `task` uses: the task's own, else its agent's, else (for the
+/// model) the fleet's default. No effort means Claude's own default.
+pub fn resolve_model_effort(
+    task: &TaskRow,
+    agent: &AgentRow,
+    fleet_model: &str,
+) -> (String, Option<String>) {
+    let model = task
+        .model
+        .clone()
+        .or_else(|| agent.model.clone())
+        .unwrap_or_else(|| fleet_model.to_owned());
+    let effort = task.effort.clone().or_else(|| agent.effort.clone());
+    (model, effort)
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -144,4 +190,83 @@ pub struct RuleRow {
 pub struct NewAgent {
     pub name: String,
     pub role: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn task(model: Option<&str>, effort: Option<&str>) -> TaskRow {
+        TaskRow {
+            id: "p-1".into(),
+            project: "p".into(),
+            title: "t".into(),
+            brief: String::new(),
+            agent_id: Some("a".into()),
+            node_id: None,
+            status: "queued".into(),
+            topic_id: None,
+            checklist_msg_id: None,
+            session_id: None,
+            running: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            run_id: None,
+            dispatched_at: None,
+            model: model.map(Into::into),
+            effort: effort.map(Into::into),
+        }
+    }
+
+    fn agent(model: Option<&str>, effort: Option<&str>) -> AgentRow {
+        AgentRow {
+            id: "a".into(),
+            name: "A".into(),
+            role: "implementor".into(),
+            project: Some("p".into()),
+            bot_id: None,
+            preferred_node: None,
+            model: model.map(Into::into),
+            effort: effort.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn task_then_agent_then_fleet() {
+        let r = |t, a| resolve_model_effort(&t, &a, "opus");
+        assert_eq!(
+            r(
+                task(Some("haiku"), Some("low")),
+                agent(Some("sonnet"), Some("max"))
+            ),
+            ("haiku".into(), Some("low".into()))
+        );
+        assert_eq!(
+            r(task(None, None), agent(Some("sonnet"), Some("max"))),
+            ("sonnet".into(), Some("max".into()))
+        );
+        // Each falls back on its own.
+        assert_eq!(
+            r(task(Some("haiku"), None), agent(None, Some("high"))),
+            ("haiku".into(), Some("high".into()))
+        );
+        assert_eq!(
+            r(task(None, None), agent(None, None)),
+            ("opus".into(), None)
+        );
+    }
+
+    #[test]
+    fn values_are_plain_tokens() {
+        assert!(check_model_value("model", "claude-sonnet-4-5[1m]").is_ok());
+        assert!(check_model_value("model", "us.anthropic.claude:1").is_ok());
+        assert!(check_model_value("model", "--dangerously-skip-permissions").is_err());
+        assert!(check_model_value("model", "opus; rm -rf /").is_err());
+        assert!(check_model_value("model", "").is_err());
+        assert!(check_model_value("model", &"x".repeat(65)).is_err());
+        for e in EFFORTS {
+            assert!(check_effort(e).is_ok());
+        }
+        assert!(check_effort("turbo").is_err());
+    }
 }

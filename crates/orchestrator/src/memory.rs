@@ -307,6 +307,8 @@ mod tests {
             project: Some("p".into()),
             bot_id: None,
             preferred_node: None,
+            model: None,
+            effort: None,
         }
     }
 

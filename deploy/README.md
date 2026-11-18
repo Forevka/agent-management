@@ -263,6 +263,11 @@ a restart.
 1. In Telegram, send `/web` to get a login link for the web UI.
 2. **Agents** page: register the agent bots' tokens (each bot must already be a
    member of the group).
+   The same page sets each agent's default Claude model and effort (empty: the
+   fleet's `FLEET_MODEL` and Claude's default effort). The orchestrator may pick a
+   model and effort per task only from `FLEET_ALLOWED_MODELS` and
+   `FLEET_ALLOWED_EFFORTS` (see `deploy/.env.example`); a node whose Claude command
+   sets `--model` or `--effort` keeps its own.
 3. **Projects** page: create each project (its slug is what nodes map), bind
    secret folders, add Slack channels.
 4. On each host, map the project: `fleet project map <slug> <directory>`, or

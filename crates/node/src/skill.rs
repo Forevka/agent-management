@@ -92,6 +92,10 @@ const BRAIN: &str = r#"
 - `fleet agent create-task --project p --title "..." --brief - [--ticket ABC-1] (--agent <name> | --new-agent <Name> --role implementor|reviewer|tester) <<'EOF'`
   then the brief, then `EOF`.
   - The brief must be self-contained: goal, context, constraints, definition of done.
+  - `--model <name>` and `--effort low|medium|high|xhigh|max` choose what the task runs with
+    (else the agent's defaults, else the fleet's). A cheap model and low effort for small,
+    mechanical chores; a strong model and high effort for hard design, debugging or risky
+    changes; otherwise leave them out. Only models and efforts the owner allows are accepted.
 - `fleet agent send-to-task <task-id> "follow-up"`: continue existing work. It resumes the
   agent's session.
 - `fleet agent stop-task <task-id>`
@@ -135,7 +139,9 @@ before that. Add `--note "why"` to say why you propose it. Each command below st
   `admin project-bind <slug> <folder>`, `admin project-unbind <slug> <folder>`
 - Slack: `admin channel-add <slug> <channel-id> [--triage]`, `admin channel-remove <slug> <channel-id>`
 - Agents and bots: `admin agent-rename <agent> <new-name>`, `admin agent-unbind <agent>`
-  (bot back to the pool), `admin agent-remove <agent>`, `admin bot-remove <@bot>`
+  (bot back to the pool), `admin agent-remove <agent>`, `admin bot-remove <@bot>`,
+  `admin agent-set <agent> [--model <name>] [--effort <level>]` (an agent's defaults; `""` goes
+  back to the fleet's)
 - Nodes: `admin node-set <node> [--model <name>] [--fallback-model <name>] [--auth default|oauth_token|api_key] [--max-agents N]`
   (`--model ""` removes the flag), `admin node-revoke <node>`. Those flags are merged into the
   node's Claude command; the program and its other arguments are set on the web only.

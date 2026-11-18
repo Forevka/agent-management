@@ -197,6 +197,15 @@ pub enum AdminCmd {
     AgentUnbind { agent: String },
     /// Propose removing an agent that has no active tasks.
     AgentRemove { agent: String },
+    /// Propose an agent's default Claude model and effort ("" goes back to the default).
+    AgentSet {
+        agent: String,
+        #[arg(long)]
+        model: Option<String>,
+        /// low, medium, high, xhigh or max.
+        #[arg(long)]
+        effort: Option<String>,
+    },
     /// Propose removing a free bot from the pool.
     BotRemove { bot: String },
     /// Propose new settings for a node. Tokens and API keys are set on the web only.
@@ -259,6 +268,12 @@ pub struct CreateTaskArgs {
     /// Role of the new agent: implementor, reviewer or tester.
     #[arg(long)]
     pub role: Option<String>,
+    /// The task's own Claude model (else the agent's default); within the owner's allow-list.
+    #[arg(long)]
+    pub model: Option<String>,
+    /// The task's own effort: low, medium, high, xhigh or max (else the agent's default).
+    #[arg(long)]
+    pub effort: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -474,7 +489,7 @@ pub fn to_call(cmd: AgentCmd) -> Result<(&'static str, Value)> {
             };
             (
                 "create_task",
-                json!({"project": a.project, "title": a.title, "brief": stdin_if_dash(a.brief)?, "ticket": a.ticket, "agent": a.agent, "new_agent": new_agent}),
+                json!({"project": a.project, "title": a.title, "brief": stdin_if_dash(a.brief)?, "ticket": a.ticket, "agent": a.agent, "new_agent": new_agent, "model": a.model, "effort": a.effort}),
             )
         }
         AgentCmd::SendToTask { task, text } => (
@@ -610,6 +625,14 @@ fn admin_call(a: AdminArgs) -> Result<(&'static str, Value)> {
         }
         AdminCmd::AgentUnbind { agent } => propose("agent_unbind", json!({"agent": agent})),
         AdminCmd::AgentRemove { agent } => propose("agent_remove", json!({"agent": agent})),
+        AdminCmd::AgentSet {
+            agent,
+            model,
+            effort,
+        } => propose(
+            "agent_settings",
+            json!({"agent": agent, "model": model, "effort": effort}),
+        ),
         AdminCmd::BotRemove { bot } => propose("bot_remove", json!({"bot": bot})),
         AdminCmd::NodeSet {
             node,
@@ -742,6 +765,32 @@ mod tests {
         assert_eq!(
             (t, a["new_agent"]["role"].clone()),
             ("create_task", json!("tester"))
+        );
+        let (_, a) = call(&[
+            "create-task",
+            "--project",
+            "p",
+            "--title",
+            "t",
+            "--brief",
+            "b",
+            "--agent",
+            "Al",
+            "--model",
+            "sonnet",
+            "--effort",
+            "high",
+        ]);
+        assert_eq!(
+            (a["model"].clone(), a["effort"].clone()),
+            (json!("sonnet"), json!("high"))
+        );
+        assert_eq!(
+            call(&["admin", "agent-set", "Al", "--effort", "low"]),
+            (
+                "admin_propose",
+                json!({"action": "agent_settings", "params": {"agent": "Al", "model": null, "effort": "low"}, "note": null})
+            )
         );
         assert_eq!(call(&["feed", "search", "bug"]).0, "feed_search");
         assert_eq!(

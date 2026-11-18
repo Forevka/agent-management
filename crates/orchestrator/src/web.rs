@@ -673,15 +673,28 @@ async fn task_page(State(o): State<O>, h: HeaderMap, Path(id): Path<String>) -> 
     require!(o, h);
     let r: Result<String> = async {
         let t = o.task(&id).await?.context("no such task")?;
+        // What it runs with: its own model and effort, else its agent's, else the fleet's.
+        let runs_with = match &t.agent_id {
+            Some(a) => match sqlx::query_as::<_, crate::model::AgentRow>("select * from agents where id = $1")
+                .bind(a)
+                .fetch_optional(&o.db)
+                .await?
+            {
+                Some(agent) => crate::tasks::model_effort_label(&t, &agent, &o.cfg.model),
+                None => String::new(),
+            },
+            None => String::new(),
+        };
         let events: Vec<(String, String)> =
             sqlx::query_as("select kind, data from task_events where task_id = $1 order by id desc limit 400").bind(&id).fetch_all(&o.db).await?;
         let mut s = format!(
-            "<div class=card><b>{}</b> · {} · status <span class=pill>{}</span>{}<br><span class=muted>agent {} · node {} · session {}</span><div class=plan>{}</div></div><h2>Transcript (latest first)</h2>",
+            "<div class=card><b>{}</b> · {} · status <span class=pill>{}</span>{}<br><span class=muted>agent {} · {} · node {} · session {}</span><div class=plan>{}</div></div><h2>Transcript (latest first)</h2>",
             esc(&t.id),
             esc(&t.title),
             esc(&t.status),
             if t.running { " ▶ running" } else { "" },
             esc(t.agent_id.as_deref().unwrap_or("-")),
+            esc(&runs_with),
             esc(t.node_id.as_deref().map(|n| &n[..n.len().min(10)]).unwrap_or("-")),
             esc(t.session_id.as_deref().unwrap_or("-")),
             markdown(&t.brief)
@@ -1185,8 +1198,16 @@ async fn node_post(
 
 async fn agents_page(State(o): State<O>, h: HeaderMap) -> Response {
     require!(o, h);
-    let agents: Vec<(String, String, String, Option<String>, Option<String>)> = sqlx::query_as(
-        "select a.id, a.name, a.role, a.project, b.username from agents a left join bots b on b.id = a.bot_id where a.id not in ('orchestrator', 'secretary') order by a.project, a.name",
+    let agents: Vec<(
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = sqlx::query_as(
+        "select a.id, a.name, a.role, a.project, b.username, a.model, a.effort from agents a left join bots b on b.id = a.bot_id where a.id not in ('orchestrator', 'secretary') order by a.project, a.name",
     )
     .fetch_all(&o.db)
     .await
@@ -1197,15 +1218,34 @@ async fn agents_page(State(o): State<O>, h: HeaderMap) -> Response {
             .await
             .unwrap_or_default();
     let mut s = String::from(
-        "<h2>Agents</h2><table><tr><th>Agent</th><th>Role</th><th>Project</th><th>Bot</th></tr>",
+        "<h2>Agents</h2><p class=muted>Model and effort are each agent's defaults (empty: the fleet's model and Claude's default effort); a task may set its own. A node whose Claude command sets <code>--model</code> or <code>--effort</code> keeps its own.</p>\
+         <table><tr><th>Agent</th><th>Role</th><th>Project</th><th>Bot</th><th>Model · effort</th></tr>",
     );
-    for (_, name, role, project, bot) in agents {
+    for (id, name, role, project, bot, model, effort) in agents {
+        let options: String = std::iter::once("")
+            .chain(crate::model::EFFORTS)
+            .map(|e| {
+                let sel = if effort.as_deref().unwrap_or("") == e {
+                    " selected"
+                } else {
+                    ""
+                };
+                let label = if e.is_empty() { "(default)" } else { e };
+                format!("<option value=\"{e}\"{sel}>{label}</option>")
+            })
+            .collect();
         s.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td>@{}</td></tr>",
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>@{}</td><td><form method=post class=row>\
+             <input type=hidden name=op value=settings><input type=hidden name=agent value=\"{}\">\
+             <input type=text name=model value=\"{}\" placeholder=\"{}\" maxlength=64 style=\"width:10em\">\
+             <select name=effort style=\"width:8em\">{options}</select><button>Save</button></form></td></tr>",
             esc(&name),
             esc(&role),
             esc(project.as_deref().unwrap_or("")),
-            esc(bot.as_deref().unwrap_or("-"))
+            esc(bot.as_deref().unwrap_or("-")),
+            esc(&id),
+            esc(model.as_deref().unwrap_or("")),
+            esc(&o.cfg.model)
         ));
     }
     s.push_str("</table><h2>Bot pool</h2><table>");
@@ -1243,6 +1283,19 @@ async fn agents_post(State(o): State<O>, h: HeaderMap, RawForm(body): RawForm) -
                     &o,
                     Actor::Owner,
                     &AdminAction::BotRemove { bot: Ref::Id(id) },
+                )
+                .await?;
+            }
+            // The owner may use any valid model and effort (the allow-list is for the brain).
+            "settings" => {
+                admin::execute(
+                    &o,
+                    Actor::Owner,
+                    &AdminAction::AgentSettings {
+                        agent: field(&f, "agent").unwrap_or_default().to_owned(),
+                        model: Some(field(&f, "model").unwrap_or_default().to_owned()),
+                        effort: Some(field(&f, "effort").unwrap_or_default().to_owned()),
+                    },
                 )
                 .await?;
             }

@@ -25,6 +25,55 @@ pub struct Config {
     pub remind_after_minutes: i64,
     /// The secretary's settings (see `secretary`).
     pub secretary: SecretaryConfig,
+    /// Models and effort levels the brain may choose for a task (the owner's own settings on
+    /// the web may use any valid value).
+    pub allowed_models: Vec<String>,
+    pub allowed_efforts: Vec<String>,
+}
+
+impl Config {
+    /// Whether the brain may give a task this model and effort.
+    pub fn check_allowed(&self, model: Option<&str>, effort: Option<&str>) -> Result<()> {
+        if let Some(m) = model {
+            anyhow::ensure!(
+                self.allowed_models.iter().any(|a| a == m),
+                "model {m:?} is not allowed for tasks; allowed: {} (FLEET_ALLOWED_MODELS)",
+                self.allowed_models.join(", ")
+            );
+        }
+        if let Some(e) = effort {
+            anyhow::ensure!(
+                self.allowed_efforts.iter().any(|a| a == e),
+                "effort {e:?} is not allowed for tasks; allowed: {} (FLEET_ALLOWED_EFFORTS)",
+                self.allowed_efforts.join(", ")
+            );
+        }
+        Ok(())
+    }
+}
+
+/// The models the brain may choose when the owner set none: the fleet's own and the usual
+/// aliases.
+fn default_allowed_models(fleet_model: &str) -> Vec<String> {
+    let mut v = vec![fleet_model.to_owned()];
+    for m in ["opus", "sonnet", "haiku"] {
+        if !v.iter().any(|x| x == m) {
+            v.push(m.to_owned());
+        }
+    }
+    v
+}
+
+/// A comma-separated list from the environment, or `default`.
+fn env_list(name: &str, default: Vec<String>) -> Vec<String> {
+    match std::env::var(name) {
+        Ok(v) if !v.trim().is_empty() => v
+            .split(',')
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        _ => default,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -92,6 +141,18 @@ impl SecretaryConfig {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
+        let model = std::env::var("FLEET_MODEL").unwrap_or_else(|_| "opus".into());
+        let allowed_models = env_list("FLEET_ALLOWED_MODELS", default_allowed_models(&model));
+        let allowed_efforts = env_list(
+            "FLEET_ALLOWED_EFFORTS",
+            crate::model::EFFORTS.map(str::to_owned).to_vec(),
+        );
+        for m in &allowed_models {
+            crate::model::check_model_value("FLEET_ALLOWED_MODELS: model", m)?;
+        }
+        for e in &allowed_efforts {
+            crate::model::check_effort(e).context("FLEET_ALLOWED_EFFORTS")?;
+        }
         Ok(Self {
             public_url: std::env::var("FLEET_PUBLIC_URL")
                 .context("FLEET_PUBLIC_URL is required")?
@@ -101,7 +162,7 @@ impl Config {
                 .context("TELEGRAM_OWNER_ID is required")?
                 .parse()
                 .context("TELEGRAM_OWNER_ID must be a number")?,
-            model: std::env::var("FLEET_MODEL").unwrap_or_else(|_| "opus".into()),
+            model,
             hindsight_url: std::env::var("HINDSIGHT_URL")
                 .ok()
                 .filter(|s| !s.is_empty())
@@ -114,6 +175,8 @@ impl Config {
             retention_days: env_num("FLEET_RETENTION_DAYS", 90),
             remind_after_minutes: env_num("FLEET_REMIND_AFTER_MINUTES", 120),
             secretary: SecretaryConfig::from_env(),
+            allowed_models,
+            allowed_efforts,
         })
     }
 
@@ -130,6 +193,8 @@ impl Config {
             retention_days: 90,
             remind_after_minutes: 120,
             secretary: SecretaryConfig::test(),
+            allowed_models: default_allowed_models("opus"),
+            allowed_efforts: crate::model::EFFORTS.map(str::to_owned).to_vec(),
         }
     }
 }
@@ -139,4 +204,35 @@ fn env_num(name: &str, default: i64) -> i64 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_brain_chooses_within_the_allow_list() {
+        let cfg = Config::test();
+        assert!(cfg.check_allowed(None, None).is_ok());
+        assert!(cfg.check_allowed(Some("opus"), Some("max")).is_ok());
+        assert!(cfg.check_allowed(Some("haiku"), Some("low")).is_ok());
+        let e = cfg.check_allowed(Some("gpt-9"), None).unwrap_err();
+        assert!(e.to_string().contains("not allowed") && e.to_string().contains("sonnet"));
+        let narrow = Config {
+            allowed_models: vec!["haiku".into()],
+            allowed_efforts: vec!["low".into(), "medium".into()],
+            ..Config::test()
+        };
+        assert!(narrow.check_allowed(Some("opus"), None).is_err());
+        assert!(narrow.check_allowed(None, Some("high")).is_err());
+        assert!(narrow.check_allowed(Some("haiku"), Some("medium")).is_ok());
+        assert_eq!(
+            default_allowed_models("claude-opus-4-1"),
+            ["claude-opus-4-1", "opus", "sonnet", "haiku"]
+        );
+        assert_eq!(
+            default_allowed_models("sonnet"),
+            ["sonnet", "opus", "haiku"]
+        );
+    }
 }

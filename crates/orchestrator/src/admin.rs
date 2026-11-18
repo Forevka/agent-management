@@ -117,6 +117,15 @@ pub enum AdminAction {
     AgentRemove {
         agent: String,
     },
+    /// The agent's default Claude model and effort. Unset fields stay as they are; an empty
+    /// string clears one (back to the fleet's default).
+    AgentSettings {
+        agent: String,
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(default)]
+        effort: Option<String>,
+    },
     /// Removes a free bot (and its token) from the pool.
     BotRemove {
         bot: Ref,
@@ -154,6 +163,39 @@ pub enum AdminAction {
         folder: Ref,
         key: String,
     },
+}
+
+/// An agent setting as given (None: unchanged; empty: back to the default), checked.
+fn agent_settings_values(
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> Result<(Option<Option<String>>, Option<Option<String>>)> {
+    let model = match model.map(str::trim) {
+        None => None,
+        Some("") => Some(None),
+        Some(m) => {
+            crate::model::check_model_value("model", m)?;
+            Some(Some(m.to_owned()))
+        }
+    };
+    let effort = match effort.map(str::trim) {
+        None => None,
+        Some("") => Some(None),
+        Some(e) => {
+            crate::model::check_effort(e)?;
+            Some(Some(e.to_owned()))
+        }
+    };
+    Ok((model, effort))
+}
+
+/// "model X, effort Y" for an agent's defaults, saying where it falls back to the default.
+fn setting_label(model: &Option<String>, effort: &Option<String>) -> String {
+    format!(
+        "model {}, effort {}",
+        model.as_deref().unwrap_or("(fleet default)"),
+        effort.as_deref().unwrap_or("(Claude's default)")
+    )
 }
 
 /// The node's rule, so every project created here can be mapped on a node.
@@ -584,6 +626,35 @@ pub async fn execute(o: &Arc<Orchestrator>, actor: Actor, action: &AdminAction) 
             )
             .await;
             Ok(format!("{}'s bot is back in the pool", a.name))
+        }
+        A::AgentSettings {
+            agent: r,
+            model,
+            effort,
+        } => {
+            let a = agent(o, r).await?;
+            let (model, effort) = agent_settings_values(model.as_deref(), effort.as_deref())?;
+            sqlx::query(
+                "update agents set model = case when $2 then $3 else model end, effort = case when $4 then $5 else effort end where id = $1",
+            )
+            .bind(&a.id)
+            .bind(model.is_some())
+            .bind(model.clone().flatten())
+            .bind(effort.is_some())
+            .bind(effort.clone().flatten())
+            .execute(&o.db)
+            .await?;
+            o.audit(
+                actor.audit_name(),
+                "agent.settings",
+                json!({"agent": a.id, "model": model, "effort": effort}),
+            )
+            .await;
+            Ok(format!(
+                "{} now runs with {}; its running sessions keep theirs until they restart",
+                a.name,
+                setting_label(&model.unwrap_or(a.model), &effort.unwrap_or(a.effort))
+            ))
         }
         A::AgentRemove { agent: r } => {
             let a = agent(o, r).await?;
@@ -1172,6 +1243,38 @@ pub async fn prepare(o: &Orchestrator, action: AdminAction) -> Result<(AdminActi
             );
             (A::AgentUnbind { agent: a.id }, summary)
         }
+        A::AgentSettings {
+            agent: r,
+            model,
+            effort,
+        } => {
+            let a = agent(o, &r).await?;
+            let (m, e) = agent_settings_values(model.as_deref(), effort.as_deref())?;
+            ensure!(
+                m.is_some() || e.is_some(),
+                "nothing to change: give model or effort (an empty value goes back to the default)"
+            );
+            let before = setting_label(&a.model, &a.effort);
+            let after = setting_label(
+                &m.clone().unwrap_or(a.model.clone()),
+                &e.clone().unwrap_or(a.effort.clone()),
+            );
+            let summary = format!(
+                "Set agent {}'s defaults ({}, project {}): {before} → {after}. Its tasks use them unless a task sets its own. Agent name: {}.",
+                a.id,
+                a.role,
+                a.project.as_deref().unwrap_or("-"),
+                q(&a.name)
+            );
+            (
+                A::AgentSettings {
+                    agent: a.id,
+                    model: m.map(Option::unwrap_or_default),
+                    effort: e.map(Option::unwrap_or_default),
+                },
+                summary,
+            )
+        }
         A::AgentRemove { agent: r } => {
             let a = agent(o, &r).await?;
             let active = active_tasks(o, &a.id).await?;
@@ -1480,6 +1583,14 @@ async fn snapshot(o: &Orchestrator, action: &AdminAction) -> Result<Value> {
         A::AgentRename { agent, .. } | A::AgentUnbind { agent } => {
             let row: Option<(String, Option<i64>, Option<String>)> =
                 sqlx::query_as("select name, bot_id, project from agents where id = $1")
+                    .bind(agent)
+                    .fetch_optional(&o.db)
+                    .await?;
+            json!(row)
+        }
+        A::AgentSettings { agent, .. } => {
+            let row: Option<(Option<String>, Option<String>)> =
+                sqlx::query_as("select model, effort from agents where id = $1")
                     .bind(agent)
                     .fetch_optional(&o.db)
                     .await?;

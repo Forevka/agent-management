@@ -24,6 +24,10 @@ pub struct CreateTask {
     /// Existing agent name or id.
     pub agent: Option<String>,
     pub new_agent: Option<NewAgent>,
+    /// The task's own Claude model and effort (None: the agent's). Checked to be valid here;
+    /// whether the brain may choose them is checked where it asks (`tools`).
+    pub model: Option<String>,
+    pub effort: Option<String>,
 }
 
 pub async fn project(o: &Orchestrator, slug: &str) -> Result<ProjectRow> {
@@ -142,6 +146,12 @@ pub fn bot_profile(name: &str, role: &str, project: &str) -> (String, String) {
 }
 
 pub async fn create_task(o: &Arc<Orchestrator>, req: CreateTask) -> Result<TaskRow> {
+    if let Some(m) = &req.model {
+        crate::model::check_model_value("model", m)?;
+    }
+    if let Some(e) = &req.effort {
+        crate::model::check_effort(e)?;
+    }
     let proj = project(o, &req.project).await?;
     let agent = match (&req.agent, &req.new_agent) {
         (Some(a), _) => {
@@ -179,22 +189,25 @@ pub async fn create_task(o: &Arc<Orchestrator>, req: CreateTask) -> Result<TaskR
         .chat
         .create_topic(&clip(&format!("{id} · {}", req.title), 120))
         .await?;
-    sqlx::query("insert into tasks (id, project, title, brief, agent_id, status, topic_id) values ($1, $2, $3, $4, $5, 'queued', $6)")
+    sqlx::query("insert into tasks (id, project, title, brief, agent_id, status, topic_id, model, effort) values ($1, $2, $3, $4, $5, 'queued', $6, $7, $8)")
         .bind(&id)
         .bind(&proj.slug)
         .bind(&req.title)
         .bind(&req.brief)
         .bind(&agent.id)
         .bind(topic)
+        .bind(&req.model)
+        .bind(&req.effort)
         .execute(&o.db)
         .await?;
     let task = o.task(&id).await?.context("task vanished")?;
     let intro = format!(
-        "🆕 <b>{}</b> · {}\nAgent: <b>{}</b> ({})\n<blockquote expandable>{}</blockquote>",
+        "🆕 <b>{}</b> · {}\nAgent: <b>{}</b> ({}) · {}\n<blockquote expandable>{}</blockquote>",
         esc(&task.id),
         esc(&task.title),
         esc(&agent.name),
         esc(&agent.role),
+        esc(&model_effort_label(&task, &agent, &o.cfg.model)),
         esc(&clip(&task.brief, 3000))
     );
     let _ = o
@@ -754,10 +767,20 @@ async fn build_spawn(
             .map(str::to_owned)
             .to_vec(),
         )
-    } else if plan_first {
-        ("plan".to_owned(), Some(o.cfg.model.clone()), vec![])
     } else {
-        ("auto".to_owned(), Some(o.cfg.model.clone()), vec![])
+        // The task's own model and effort, else its agent's, else the fleet's model. The model
+        // goes as `model`, which the node leaves out when its own command sets `--model`;
+        // effort is left out here when the node's command sets `--effort` (which of two
+        // `--effort`s Claude takes cannot be relied on).
+        let (model, effort) = crate::model::resolve_model_effort(task, agent, &o.cfg.model);
+        let extra = match effort {
+            Some(e) if !sets_flag(&node.claude_command.0, "--effort") => {
+                vec!["--effort".to_owned(), e]
+            }
+            _ => vec![],
+        };
+        let mode = if plan_first { "plan" } else { "auto" };
+        (mode.to_owned(), Some(model), extra)
     };
     Ok(SpawnAgent {
         agent_id: agent.id.clone(),
@@ -780,6 +803,24 @@ async fn build_spawn(
         run_id,
     })
 }
+/// Whether a Claude command (after its program) has `flag`, alone or as `flag=value`.
+fn sets_flag(command: &[String], flag: &str) -> bool {
+    command
+        .iter()
+        .skip(1)
+        .any(|a| a == flag || a.starts_with(&format!("{flag}=")))
+}
+
+/// "model X, effort Y" as a task runs (where a node's own `--model`/`--effort` do not override
+/// it), for the owner to see.
+pub fn model_effort_label(task: &TaskRow, agent: &AgentRow, fleet_model: &str) -> String {
+    let (model, effort) = crate::model::resolve_model_effort(task, agent, fleet_model);
+    match effort {
+        Some(e) => format!("model {model}, effort {e}"),
+        None => format!("model {model}"),
+    }
+}
+
 /// About the most (in bytes) of the secretary's waiting texts its first turn takes.
 const SECRETARY_FIRST_TURN_BYTES: usize = 60_000;
 
