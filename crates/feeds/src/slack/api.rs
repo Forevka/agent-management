@@ -293,6 +293,9 @@ pub struct Conversation {
     pub is_private: bool,
     /// For a direct message, the other person.
     pub user: Option<String>,
+    /// Whether the token's user is in the conversation (`conversations.info`; never set by
+    /// `users.conversations`, which lists only conversations the user is in).
+    pub is_member: Option<bool>,
 }
 
 impl Conversation {

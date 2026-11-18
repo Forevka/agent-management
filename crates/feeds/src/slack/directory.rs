@@ -50,7 +50,17 @@ struct Cache {
     /// Consecutive failed refreshes, and when the next one may be tried.
     refresh_failures: u32,
     retry_at: Option<Instant>,
+    /// Membership decided for one conversation (from `conversations.info` or a join or leave
+    /// event), and when.
+    decided: HashMap<String, (bool, Instant)>,
 }
+
+/// How long a "not a member" answer is trusted. Short, so a channel joined without a join
+/// event starts delivering within minutes.
+const NOT_MEMBER_TTL: Duration = Duration::from_secs(10 * 60);
+/// A membership list at least this old is read again before a conversation missing from it is
+/// declared not a member.
+const LIST_RECHECK: Duration = Duration::from_secs(60);
 
 impl SlackDirectory {
     pub fn new(api: Api, gates: Arc<Gates>, refresh_every: Duration) -> Self {
@@ -154,6 +164,106 @@ impl SlackDirectory {
         cache.conversations.insert(conv.id.clone(), conv);
     }
 
+    /// Records a membership change the owner made (a join or leave event).
+    pub fn set_member(&self, id: &str, member: bool) {
+        let mut cache = self.cache();
+        if cache.decided.len() >= CACHE_CAP {
+            cache.decided.clear();
+        }
+        cache
+            .decided
+            .insert(id.to_owned(), (member, Instant::now()));
+        if !member && let Some((_, ids)) = cache.membership.as_mut() {
+            ids.retain(|c| c != id);
+        }
+    }
+
+    /// What is known about the owner's membership without a request.
+    fn known_member(&self, id: &str) -> Option<bool> {
+        let cache = self.cache();
+        if let Some((member, at)) = cache.decided.get(id) {
+            let ttl = if *member {
+                self.refresh_every
+            } else {
+                NOT_MEMBER_TTL
+            };
+            if at.elapsed() < ttl {
+                return Some(*member);
+            }
+        }
+        match &cache.membership {
+            Some((at, ids)) if at.elapsed() < self.refresh_every && ids.iter().any(|c| c == id) => {
+                Some(true)
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether the owner is a member of a conversation. Direct and group messages always are
+    /// (`kind_hint` from the event's `channel_type` says so without a request). Otherwise the
+    /// cached answer, else `conversations.info`'s `is_member`, else the membership list. An
+    /// error means the answer is unknown, and the caller must not deliver.
+    pub async fn is_member(
+        &self,
+        id: &str,
+        kind_hint: Option<ConversationKind>,
+    ) -> Result<bool, FeedError> {
+        if matches!(
+            kind_hint,
+            Some(ConversationKind::Direct | ConversationKind::Group)
+        ) {
+            return Ok(true);
+        }
+        if let Some(member) = self.known_member(id) {
+            return Ok(member);
+        }
+        let info = match pace::get::<ConversationInfo>(
+            &self.api,
+            &self.gates.tier3,
+            1,
+            "conversations.info",
+            &[("channel", id)],
+        )
+        .await
+        {
+            Ok(info) => info.channel.unwrap_or_default(),
+            // A conversation the token cannot see is not one the owner is in.
+            Err(FeedError::Api(code)) if code == "channel_not_found" => {
+                self.set_member(id, false);
+                return Ok(false);
+            }
+            Err(e) => return Err(e),
+        };
+        let kind = info.kind();
+        let stated = info.is_member;
+        let conv = self.to_conversation(id, info).await;
+        self.remember(conv);
+        let member = match (kind, stated) {
+            (ConversationKind::Direct | ConversationKind::Group, _) => true,
+            (_, Some(m)) => m,
+            // Slack did not say: decide from a fresh membership list.
+            (_, None) => {
+                let fresh = self
+                    .cache()
+                    .membership
+                    .as_ref()
+                    .is_some_and(|(at, _)| at.elapsed() < LIST_RECHECK);
+                let ids = if fresh {
+                    self.cache()
+                        .membership
+                        .as_ref()
+                        .map(|(_, ids)| ids.clone())
+                        .unwrap_or_default()
+                } else {
+                    self.refresh().await?.into_iter().map(|c| c.id).collect()
+                };
+                ids.iter().any(|c| c == id)
+            }
+        };
+        self.set_member(id, member);
+        Ok(member)
+    }
+
     /// Lists the owner's conversations with `users.conversations` and caches them. A failure
     /// starts or lengthens the back-off [`refresh_due`](Self::refresh_due) honours.
     pub async fn refresh(&self) -> Result<Vec<Conversation>, FeedError> {
@@ -232,8 +342,13 @@ impl SlackDirectory {
             self.remember(conv.clone());
             out.push(conv);
         }
-        self.cache().membership =
-            Some((Instant::now(), out.iter().map(|c| c.id.clone()).collect()));
+        let mut cache = self.cache();
+        // The list is the newer word: a conversation on it is one the owner is in now.
+        for c in &out {
+            cache.decided.remove(&c.id);
+        }
+        cache.membership = Some((Instant::now(), out.iter().map(|c| c.id.clone()).collect()));
+        drop(cache);
         Ok(out)
     }
 }

@@ -213,6 +213,8 @@ struct Shared {
     overflowed: AtomicUsize,
     /// What the processor did with events, for the once-a-minute summary.
     stats: Mutex<Stats>,
+    /// See [`Config::refill_after`].
+    refill_after: Duration,
 }
 
 /// Counters for the processor's minute summary. They hold reasons and error codes, never
@@ -488,6 +490,7 @@ impl Shared {
             queued: AtomicUsize::new(0),
             overflowed: AtomicUsize::new(0),
             stats: Mutex::new(Stats::default()),
+            refill_after: cfg.refill_after,
         }
     }
 
@@ -867,6 +870,9 @@ impl Shared {
     async fn handle_event(&self, ev: Value) -> Handled {
         let mut out = Handled::default();
         let meta = EventMeta::of(&ev);
+        if self.membership_event(&ev, meta.event_type.as_deref()) {
+            return out;
+        }
         if meta.event_type.as_deref() != Some("message") {
             self.dropped("not a message event", &meta);
             return out;
@@ -880,6 +886,30 @@ impl Shared {
             return out;
         };
         let hint = raw.channel_type.as_deref().map(kind_from_channel_type);
+        // User-scoped `message.channels` also delivers public channels the owner can read but
+        // is not in. Only conversations the owner is a member of may produce messages; when
+        // that cannot be determined, nothing is delivered (and nothing is recorded for the
+        // conversation, so no gap check starts there either).
+        match self.dir.is_member(&channel, hint).await {
+            Ok(true) => {}
+            Ok(false) => {
+                self.dropped("not a member", &meta);
+                return out;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    channel_type = ?meta.channel_type,
+                    "slack message held back: could not tell whether the owner is in its \
+                     conversation; it is checked again later"
+                );
+                self.dropped("membership unknown", &meta);
+                if let Some(ts) = &raw.ts {
+                    self.retry_later(&channel, ts);
+                }
+                return out;
+            }
+        }
         if let Some(ts) = &raw.ts {
             out.mark = Some((channel.clone(), ts.clone(), hint));
         }
@@ -934,6 +964,59 @@ impl Shared {
             _ => self.dropped("housekeeping subtype", &meta),
         }
         out
+    }
+
+    /// Handles the owner joining or leaving a conversation, when Slack sends such events (they
+    /// are not subscribed to on purpose; the membership list covers their absence). Returns
+    /// whether `ev` was one.
+    fn membership_event(&self, ev: &Value, event_type: Option<&str>) -> bool {
+        let owner = self.auth().user_id;
+        let is_owner = || ev.get("user").and_then(Value::as_str) == owner.as_deref();
+        let change = match event_type {
+            Some("member_joined_channel") if is_owner() => {
+                ev.get("channel").and_then(Value::as_str).map(|c| (c, true))
+            }
+            Some("member_left_channel") if is_owner() => ev
+                .get("channel")
+                .and_then(Value::as_str)
+                .map(|c| (c, false)),
+            Some("channel_joined" | "group_joined") => ev
+                .get("channel")
+                .and_then(|c| c.get("id"))
+                .and_then(Value::as_str)
+                .map(|c| (c, true)),
+            Some("channel_left" | "group_left") => ev
+                .get("channel")
+                .and_then(Value::as_str)
+                .map(|c| (c, false)),
+            _ => None,
+        };
+        let Some((channel, member)) = change else {
+            return false;
+        };
+        tracing::info!(
+            member,
+            "slack: the owner's membership of a conversation changed"
+        );
+        self.dir.set_member(channel, member);
+        true
+    }
+
+    /// A message whose conversation's membership could not be determined: its conversation
+    /// gets a gap from just before it, retried after `refill_after`, where membership is
+    /// checked again before anything is delivered.
+    fn retry_later(&self, channel: &str, ts: &str) {
+        {
+            let mut st = lock(&self.state);
+            let mark = st
+                .cursor
+                .conversations
+                .entry(channel.to_owned())
+                .or_default();
+            widen_gap(mark, &ts_before(ts));
+            st.dirty = true;
+        }
+        self.schedule_refill(self.refill_after);
     }
 
     /// Records an event that is deliberately not delivered. Only its type, subtype and
@@ -1434,6 +1517,7 @@ impl SlackSocket {
     /// How long until gaps a round could not finish are tried again (default 5 minutes).
     pub fn with_refill_after(mut self, after: Duration) -> Self {
         self.cfg.refill_after = after;
+        self.rebuild(None);
         self
     }
 
@@ -1798,6 +1882,24 @@ async fn fill_gaps(shared: &Shared, cfg: &Config, sink: &FeedSink) {
         };
         budget -= 1;
         *checks.entry(job.channel.clone()).or_default() += 1;
+        // Gaps are only ever filled in conversations the owner is in. A gap can exist elsewhere
+        // (an older cursor, an event that overflowed the queue), and is dropped here.
+        match shared.dir.is_member(&job.channel, job.kind).await {
+            Ok(true) => {}
+            Ok(false) => {
+                shared.drop_mark(&job.channel);
+                continue;
+            }
+            Err(e) if is_fatal(&e) => {
+                shared.set_fatal(e);
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "slack gap check postponed: membership of its conversation is unknown");
+                checks.insert(job.channel.clone(), MAX_CHECKS_PER_ROUND);
+                continue;
+            }
+        }
         let generation = shared.generation();
         match shared.check_gap(cfg, &job, true).await {
             Ok(mut result) => {
@@ -1958,6 +2060,15 @@ impl Backfiller for SocketBackfiller {
                 roots: Vec::new(),
                 kind: mark.kind,
             };
+            match self.shared.dir.is_member(&channel, mark.kind).await {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) if is_fatal(&e) => return Err(e),
+                Err(e) => {
+                    tracing::warn!(error = %e, "slack backfill skipped a conversation: membership unknown");
+                    continue;
+                }
+            }
             for _ in 0..MAX_CHECKS_PER_ROUND * 3 {
                 match self.shared.check_gap(&self.cfg, &job, false).await {
                     Ok(mut r) => {
@@ -2414,18 +2525,47 @@ mod tests {
         let (sink, sink_rx) = mpsc::channel(1);
         drop(sink_rx);
         s.queued.store(1, Ordering::SeqCst);
+        // A direct message: membership is implied, so it gets as far as the send.
+        tx.send(
+            json!({"type": "message", "channel": "D1", "channel_type": "im",
+                       "user": "U1", "text": "hi", "ts": "1700000000.000100"}),
+        )
+        .await
+        .unwrap();
+        process(s.clone(), rx, sink, Duration::from_secs(60)).await;
+        assert!(!s.is_delivered("D1", "1700000000.000100"));
+        assert!(
+            !lock(&s.state).cursor.conversations.contains_key("D1"),
+            "no progress recorded for it either"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_membership_holds_a_message_back_for_a_later_check() {
+        let s = Arc::new(shared());
+        let (tx, rx) = mpsc::channel(4);
+        let (sink, mut sink_rx) = mpsc::channel(4);
+        s.queued.store(1, Ordering::SeqCst);
+        // The lookup cannot reach Slack (port 9), so membership is unknown.
         tx.send(
             json!({"type": "message", "channel": "C1", "channel_type": "channel",
                        "user": "U1", "text": "hi", "ts": "1700000000.000100"}),
         )
         .await
         .unwrap();
+        drop(tx);
         process(s.clone(), rx, sink, Duration::from_secs(60)).await;
-        assert!(!s.is_delivered("C1", "1700000000.000100"));
-        assert!(
-            !lock(&s.state).cursor.conversations.contains_key("C1"),
-            "no progress recorded for it either"
-        );
+        while let Ok(e) = sink_rx.try_recv() {
+            assert!(
+                !matches!(e, FeedEvent::Message(_)),
+                "fail closed: nothing delivered"
+            );
+        }
+        let gaps = s.pending_gaps();
+        assert_eq!(gaps.len(), 1, "the conversation is checked again later");
+        assert_eq!(gaps[0].from, "1700000000.000099");
+        assert!(lock(&s.state).next_fill_at.is_some());
+        assert_eq!(lock(&s.stats).drops.get("membership unknown"), Some(&1));
     }
 
     #[test]

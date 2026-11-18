@@ -44,6 +44,11 @@ struct Mock {
     history_429: usize,
     /// `users.conversations` requests still to answer with an error.
     members_errors: usize,
+    /// Public channels the owner can read but is not in: `conversations.info` knows them,
+    /// `users.conversations` does not list them.
+    outsiders: HashMap<String, Value>,
+    /// An error every `conversations.info` answers with.
+    info_error: Option<&'static str>,
     token_misuse: Vec<String>,
 }
 
@@ -157,8 +162,15 @@ impl Mock {
                 }
             }
             "conversations.info" => {
+                if let Some(e) = self.info_error {
+                    return json!({"ok": false, "error": e});
+                }
                 let id = q.get("channel").cloned().unwrap_or_default();
-                match self.conversations.get(&id) {
+                match self
+                    .conversations
+                    .get(&id)
+                    .or_else(|| self.outsiders.get(&id))
+                {
                     Some(c) => json!({"ok": true, "channel": c}),
                     None => json!({"ok": false, "error": "channel_not_found"}),
                 }
@@ -1042,6 +1054,10 @@ async fn a_hello_during_a_gap_check_loses_and_repeats_nothing() {
     let mut s = Slack::start().await;
     history(&s, "C1", &[(1, "seen 1"), (2, "missed 1")]);
     history(&s, "C2", &[(1, "seen 2"), (3, "missed 2")]);
+    s.mock.lock().unwrap().conversations.insert(
+        "C2".into(),
+        json!({"id": "C2", "name": "random", "is_channel": true, "is_member": true}),
+    );
     let mut src = s
         .source()
         .with_backfill_request_gap(Duration::from_millis(150));
@@ -1263,4 +1279,167 @@ async fn a_short_outage_still_checks_every_direct_message() {
         "direct and group messages only; a quiet channel keeps the short window"
     );
     assert_eq!(s.requests("users.conversations").len(), 1);
+}
+
+/// A public channel the owner can read but is not in.
+fn outsider(s: &Slack, id: &str, name: &str) {
+    s.mock.lock().unwrap().outsiders.insert(
+        id.into(),
+        json!({"id": id, "name": name, "is_channel": true, "is_member": false}),
+    );
+}
+
+#[tokio::test]
+async fn only_conversations_the_owner_is_in_are_delivered() {
+    let mut s = Slack::start().await;
+    outsider(&s, "C9", "its_recv-inv-ship");
+    s.mock.lock().unwrap().conversations.get_mut("C1").unwrap()["is_member"] = json!(true);
+    let (mut rx, _run) = s.run(s.source());
+    let mut conn = s.accept().await;
+    send(&mut conn, hello()).await;
+
+    // `message.channels` on a user token also reports channels the owner merely can read.
+    send(
+        &mut conn,
+        envelope(
+            "e1",
+            "Ev1",
+            message("C9", "channel", &s.ts(1), "U2", "not for you"),
+        ),
+    )
+    .await;
+    send(
+        &mut conn,
+        envelope(
+            "e2",
+            "Ev2",
+            message("C1", "channel", &s.ts(2), "U2", "for you"),
+        ),
+    )
+    .await;
+    assert_eq!(next_message(&mut rx).await.text, "for you");
+
+    // The owner joins: from then on the channel delivers.
+    send(
+        &mut conn,
+        envelope(
+            "e3",
+            "Ev3",
+            json!({"type": "member_joined_channel", "user": "UME", "channel": "C9",
+                   "channel_type": "C", "team": "T1"}),
+        ),
+    )
+    .await;
+    send(
+        &mut conn,
+        envelope(
+            "e4",
+            "Ev4",
+            message("C9", "channel", &s.ts(3), "U2", "welcome"),
+        ),
+    )
+    .await;
+    let m = next_message(&mut rx).await;
+    assert_eq!(m.text, "welcome");
+    assert_eq!(m.conversation_id, "C9");
+    // And no gap check is ever opened for a channel while the owner was not in it.
+    let cp = loop {
+        if let FeedEvent::Checkpoint(c) = next_event(&mut rx).await {
+            break c;
+        }
+    };
+    assert!(cp["conversations"]["C1"].is_object());
+}
+
+#[tokio::test]
+async fn a_channel_joined_without_an_event_delivers_after_the_list_refreshes() {
+    let mut s = Slack::start().await;
+    outsider(&s, "C9", "later");
+    let src = s
+        .source()
+        .with_directory_refresh(Duration::from_millis(300))
+        .with_keepalive(Duration::from_millis(50), Duration::from_secs(5));
+    let (mut rx, _run) = s.run(src);
+    let mut conn = s.accept().await;
+    send(&mut conn, hello()).await;
+    send(
+        &mut conn,
+        envelope(
+            "e1",
+            "Ev1",
+            message("C9", "channel", &s.ts(1), "U2", "before"),
+        ),
+    )
+    .await;
+    // The owner joins in Slack; no event says so, but the membership list does.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    {
+        let mut m = s.mock.lock().unwrap();
+        let mut c = m.outsiders.remove("C9").unwrap();
+        c["is_member"] = json!(true);
+        m.conversations.insert("C9".into(), c);
+    }
+    let started = std::time::Instant::now();
+    loop {
+        send(
+            &mut conn,
+            envelope(
+                &format!("e{}", started.elapsed().as_millis()),
+                &format!("Ev{}", started.elapsed().as_millis()),
+                message("C9", "channel", &s.ts(2), "U2", "after"),
+            ),
+        )
+        .await;
+        match tokio::time::timeout(Duration::from_millis(300), rx.recv()).await {
+            Ok(Some(FeedEvent::Message(m))) => {
+                assert_eq!(
+                    m.text, "after",
+                    "the message from before joining never comes"
+                );
+                break;
+            }
+            _ if started.elapsed() > Duration::from_secs(8) => panic!("never delivered"),
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn unknown_membership_fails_closed_and_is_checked_again() {
+    let mut s = Slack::start().await;
+    history(&s, "C1", &[(1, "held back")]);
+    {
+        // Neither conversations.info nor the membership list can be read.
+        let mut m = s.mock.lock().unwrap();
+        m.info_error = Some("internal_error");
+        m.members_errors = usize::MAX;
+    }
+    let src = s
+        .source()
+        .with_refill_after(Duration::from_millis(100))
+        .with_keepalive(Duration::from_millis(50), Duration::from_secs(5));
+    let (mut rx, _run) = s.run(src);
+    let mut conn = s.accept().await;
+    send(&mut conn, hello()).await;
+    send(
+        &mut conn,
+        envelope(
+            "e1",
+            "Ev1",
+            message("C1", "channel", &s.ts(1), "U2", "held back"),
+        ),
+    )
+    .await;
+    // While membership cannot be told, nothing is delivered.
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    while let Ok(Some(e)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+        assert!(!matches!(e, FeedEvent::Message(_)), "delivered: {e:?}");
+    }
+    // Once it can, the message comes from history.
+    {
+        let mut m = s.mock.lock().unwrap();
+        m.info_error = None;
+        m.members_errors = 0;
+    }
+    assert_eq!(next_message(&mut rx).await.text, "held back");
 }

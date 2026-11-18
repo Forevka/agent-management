@@ -52,6 +52,8 @@ struct Mock {
     threads: HashMap<String, Vec<Value>>,
     users: HashMap<String, String>,
     channel_names: HashMap<String, String>,
+    /// Channels the owner can read but is not in.
+    non_members: HashSet<String>,
     faults: Vec<Fault>,
     log: Vec<Req>,
     posts: Vec<Value>,
@@ -166,7 +168,7 @@ impl Mock {
                 let id = q.get("channel").cloned().unwrap_or_default();
                 match self.channel_names.get(&id) {
                     Some(name) => Json(
-                        json!({"ok": true, "channel": {"id": id, "name": name, "is_channel": true}}),
+                        json!({"ok": true, "channel": {"id": id, "name": name, "is_channel": true, "is_member": !self.non_members.contains(&id)}}),
                     ),
                     None => Json(json!({"ok": false, "error": "channel_not_found"})),
                 }
@@ -861,6 +863,28 @@ async fn polled_messages_carry_kind_and_owner_flags() {
     assert!(!src.is_fatal(&FeedError::Api("internal_error".into())));
     assert!(!src.is_fatal(&FeedError::Api("channel_not_found".into())));
     assert!(!src.is_fatal(&FeedError::Http("timeout".into())));
+}
+
+#[tokio::test]
+async fn a_mapped_channel_the_owner_is_not_in_is_not_polled() {
+    let s = Slack::start().await;
+    s.post("C1", 1, "U1", "member");
+    s.post("C2", 2, "U1", "outsider");
+    s.mock.lock().unwrap().non_members.insert("C2".into());
+    let mut src = s.source(&["C1", "C2"]);
+    assert_eq!(texts(&src.poll().await.unwrap()), ["member"]);
+    assert_eq!(
+        src.last_errors(),
+        [("C2".to_owned(), FeedError::Api("not_in_channel".into()))]
+    );
+    assert!(
+        s.requests("conversations.history").iter().all(|r| r
+            .query
+            .get("channel")
+            .map(String::as_str)
+            != Some("C2")),
+        "its history is never read"
+    );
 }
 
 #[tokio::test]

@@ -99,9 +99,16 @@ pub struct SlackSource {
     channel_names: HashMap<String, Option<String>>,
     /// Channel id to its kind, learned from the same `conversations.info` call as the name.
     channel_kinds: HashMap<String, ConversationKind>,
+    /// Whether the owner is in each channel, and when that was checked.
+    members: HashMap<String, (bool, Instant)>,
     auth: Option<AuthInfo>,
     last_errors: Vec<(String, FeedError)>,
 }
+
+/// How long a membership answer is trusted by the poller: a "no" briefly, so joining the channel
+/// takes effect within minutes; a "yes" for hours.
+const MEMBER_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+const NOT_MEMBER_TTL: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Debug, Default, Clone)]
 struct AuthInfo {
@@ -157,6 +164,7 @@ impl SlackSource {
             users: HashMap::new(),
             channel_names: HashMap::new(),
             channel_kinds: HashMap::new(),
+            members: HashMap::new(),
             auth: None,
             last_errors: Vec::new(),
         }
@@ -288,6 +296,34 @@ impl SlackSource {
                 Ok(())
             }
         }
+    }
+
+    /// Whether the owner is in `channel`, from `conversations.info` (cached). Its name and kind
+    /// are kept from the same answer.
+    async fn check_membership(&mut self, channel: &str) -> Result<bool, FeedError> {
+        if let Some((member, at)) = self.members.get(channel) {
+            let ttl = if *member { MEMBER_TTL } else { NOT_MEMBER_TTL };
+            if at.elapsed() < ttl {
+                return Ok(*member);
+            }
+        }
+        let info: ConversationInfo = self
+            .api
+            .get("conversations.info", &[("channel", channel)])
+            .await?;
+        let conv = info.channel.unwrap_or_default();
+        let kind = conv.kind();
+        let member = match kind {
+            ConversationKind::Direct | ConversationKind::Group => true,
+            // Slack states `is_member` for the token's user. Should it ever not, the owner
+            // mapped this channel on purpose, which is taken as consent.
+            _ => conv.is_member.unwrap_or(true),
+        };
+        self.channel_kinds.insert(channel.to_owned(), kind);
+        self.channel_names.insert(channel.to_owned(), conv.name);
+        self.members
+            .insert(channel.to_owned(), (member, Instant::now()));
+        Ok(member)
     }
 
     /// Fetches what is new in one channel's history into `out`, and notices thread activity.
@@ -761,7 +797,33 @@ impl Source for SlackSource {
             .map(|i| self.channels[(first + i) % n].clone())
             .collect();
 
+        // Channels confirmed this poll to be ones the owner is in; only they are read.
+        let mut allowed: HashSet<String> = HashSet::new();
         for channel in &order {
+            // A mapped channel can be public and readable without the owner being in it, but
+            // only conversations the owner is a member of may produce messages. When that
+            // cannot be told, the channel is skipped this poll and its cursor does not move.
+            match self.check_membership(channel).await {
+                Ok(true) => {
+                    allowed.insert(channel.clone());
+                }
+                Ok(false) => {
+                    tracing::warn!(channel = %channel, "slack: the owner is not in this mapped channel; not polled");
+                    self.last_errors
+                        .push((channel.clone(), FeedError::Api("not_in_channel".into())));
+                    continue;
+                }
+                Err(e) if is_fatal(&e) => return Err(e),
+                Err(e @ (FeedError::RateLimited(_) | FeedError::Http(_))) => {
+                    stop = Some(e);
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(channel = %channel, error = %e, "slack membership check failed");
+                    self.last_errors.push((channel.clone(), e));
+                    continue;
+                }
+            }
             let mut st = staged.channels.get(channel).cloned().unwrap_or_default();
             let result = self.poll_history(channel, &mut st, now, &mut out).await;
             // The channel state is consistent with `out` whether or not the call failed: it
@@ -784,7 +846,7 @@ impl Source for SlackSource {
         // Threads, most recently active first, within the per-poll budget.
         let window = self.thread_window.as_secs_f64();
         let mut due: Vec<(String, String, f64)> = Vec::new();
-        for channel in &order {
+        for channel in order.iter().filter(|c| allowed.contains(*c)) {
             if let Some(st) = staged.channels.get_mut(channel) {
                 st.prune_threads(now, window, self.max_threads);
                 due.extend(
