@@ -14,9 +14,12 @@ use iroh::protocol::Router;
 use serde_json::{Value, json};
 
 use crate::{
-    Config, MIGRATOR, Orchestrator, Vault,
+    Config, From, MIGRATOR, Orchestrator, Vault,
     auth::DbAuth,
-    chat::fake::{FakeChat, Op},
+    chat::{
+        Notify,
+        fake::{FakeChat, Op},
+    },
     human::{self, Answer},
     model::{HumanItemRow, NewAgent, TaskRow},
     tasks::{self, CreateTask},
@@ -69,6 +72,44 @@ where
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// Waits until each message in `ids` has been edited to show `needle`, with no buttons left.
+async fn wait_retired(chat: &FakeChat, ids: &[i64], needle: &str) {
+    for &id in ids {
+        wait_for(&format!("copy {id} shows {needle:?}"), || async {
+            chat.ops
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|op| {
+                    matches!(
+                        op,
+                        Op::Edit { id: i, html, keyboard, .. }
+                            if *i == id && html.contains(needle) && keyboard.is_empty()
+                    )
+                })
+                .then_some(())
+        })
+        .await;
+    }
+}
+
+/// The card and the pointer of an item, once both are out and recorded.
+async fn copies(db: &sqlx::PgPool, id: i64) -> (i64, i64) {
+    wait_for("the item announced, its pointer recorded", || async {
+        let (msg, copies): (Option<i64>, Vec<i64>) =
+            sqlx::query_as("select tg_msg, tg_msgs from human_items where id = $1")
+                .bind(id)
+                .fetch_one(db)
+                .await
+                .unwrap();
+        match (msg, copies.as_slice()) {
+            (Some(card), [pointer]) => Some((card, *pointer)),
+            _ => None,
+        }
+    })
+    .await
 }
 
 fn node_status(data_dir: &std::path::Path) -> Option<fleet_node::config::status::Status> {
@@ -289,6 +330,10 @@ async fn task_lifecycle_through_a_real_node() {
     o.push_node_settings(&node_id).await.unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
 
+    // As if the owner had just written to the task: "typing…" shows until the agent waits on
+    // the owner (its first act is a question, before any `result`).
+    o.working.show(None, From::Orchestrator, None, "demo-BS-1");
+    assert!(o.working.is_showing("demo-BS-1"));
     // The brain would call this through create_task.
     let task: TaskRow = tasks::create_task(
         &o,
@@ -310,6 +355,10 @@ async fn task_lifecycle_through_a_real_node() {
 
     // 1. AskUserQuestion during planning, answered from the web page.
     let q = wait_for("question item", || open_item(&db, &task.id, "question")).await;
+    assert!(
+        !o.working.is_showing(&task.id),
+        "no typing while the agent waits on the owner"
+    );
     let mut answers = serde_json::Map::new();
     answers.insert("Which color?".into(), json!("Blue"));
     human::answer(&o, q.id, Answer::Questions(answers))
@@ -324,7 +373,35 @@ async fn task_lifecycle_through_a_real_node() {
             .unwrap()
             .contains("Paint it")
     );
+    // The plan shows twice, both with its buttons: the card in "needs you" (it sounds) and the
+    // pointer in the task topic (silent).
+    // The item exists before it is announced; wait until both messages are out and recorded.
+    let (card, pointer) = copies(&db, plan.id).await;
+    let sent = |id: i64| {
+        chat.ops
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|op| match op {
+                Op::Send {
+                    id: i,
+                    keyboard,
+                    notify,
+                    ..
+                } if *i == id => Some((keyboard.len(), *notify)),
+                _ => None,
+            })
+            .unwrap()
+    };
+    assert!(
+        sent(card).0 > 0 && sent(pointer).0 > 0,
+        "both carry buttons"
+    );
+    assert_eq!(sent(card).1, Notify::Sound);
+    assert_eq!(sent(pointer).1, Notify::Silent);
     human::answer(&o, plan.id, Answer::Approve).await.unwrap();
+    // Answered once (here as if on the card), every copy shows it, without buttons.
+    wait_retired(&chat, &[card, pointer], "answered").await;
 
     // 3. Milestones and a non-blocking-for-the-process question, answered by button.
     let ask = wait_for("ask item", || open_item(&db, &task.id, "ask")).await;
@@ -402,11 +479,31 @@ async fn task_lifecycle_through_a_real_node() {
             .any(|op| matches!(op, Op::BotProfile(_, n) if n == "Alice · implementor")),
         "bot renamed"
     );
-    assert!(
-        ops.iter()
-            .any(|op| matches!(op, Op::Edit { html, .. } if html.contains("2/2"))),
-        "checklist ticked"
+    // One step done, one skipped by the agent (with its reason, escaped), one left open and so
+    // shown skipped once the task completed: a finished task never shows ☐.
+    let final_checklist = ops
+        .iter()
+        .rev()
+        .find_map(|op| match op {
+            Op::Edit { html, .. } if html.contains("Milestones") => Some(html.clone()),
+            _ => None,
+        })
+        .expect("checklist edited");
+    assert_eq!(
+        final_checklist,
+        "<b>Milestones</b> · 1/3 · 2 skipped\n☑ Paint\n➖ <s>Prime</s> <i>(already &lt;primed&gt;)</i>\n➖ <s>Ship</s>\n"
     );
+    // Sound only where the owner is needed or a task ended.
+    for (needle, expected) in [
+        ("<b>Milestones</b>", Notify::Silent),
+        ("🆕 <b>demo-BS-1</b>", Notify::Silent),
+        ("📋 Plan ready", Notify::Silent),
+        ("❓ <b>Q-", Notify::Sound),
+        ("✅ <b>Done.</b>", Notify::Sound),
+        ("Pushed with token", Notify::Silent),
+    ] {
+        assert_eq!(chat.notify_of(needle), Some(expected), "{needle}");
+    }
     assert!(
         ops.iter()
             .any(|op| matches!(op, Op::Close(t) if Some(*t) == task.topic_id)),
@@ -544,6 +641,77 @@ async fn task_lifecycle_through_a_real_node() {
             .unwrap();
     assert_eq!(plans, 1, "no duplicate plan item");
 
+    // 7b. A permission prompt: "typing…" stops while the agent waits on the owner, and a typed
+    //     reply to its pointer in the task topic denies it, passing the owner's words on.
+    let permission_call = |call_id: &str| fleet_proto::ToolCall {
+        call_id: call_id.into(),
+        agent_id: task.agent_id.clone().unwrap(),
+        task_id: task.id.clone(),
+        tool: "permission".into(),
+        args: json!({"tool_name": "Bash", "input": {"command": "rm -rf build"}}).to_string(),
+    };
+    o.working.show(None, From::Orchestrator, None, &task.id);
+    let pending = crate::tools::handle(&o, node_key, permission_call("perm-typed"))
+        .await
+        .unwrap();
+    assert!(pending.is_none(), "waits for the owner");
+    assert!(
+        !o.working.is_showing(&task.id),
+        "no typing while the agent waits on the owner"
+    );
+    let perm = open_item(&db, &task.id, "permission").await.unwrap();
+    let (perm_card, perm_pointer) = copies(&db, perm.id).await;
+    let topic = o.task(&task.id).await.unwrap().unwrap().topic_id.unwrap();
+    let reply: fleet_telegram::Message = serde_json::from_value(json!({
+        "message_id": 9100,
+        "date": 1_700_000_000,
+        "chat": { "id": -100, "type": "supergroup", "is_forum": true },
+        "from": { "id": 42, "is_bot": false, "first_name": "Owner" },
+        "message_thread_id": topic,
+        "is_topic_message": true,
+        "text": "not the build dir",
+        "reply_to_message": {
+            "message_id": perm_pointer,
+            "date": 1_700_000_000,
+            "chat": { "id": -100, "type": "supergroup", "is_forum": true },
+        },
+    }))
+    .unwrap();
+    crate::tg::owner_message(&o, &reply).await.unwrap();
+    let decision = wait_for("the typed reply denies the prompt", || async {
+        let answer: Option<sqlx::types::Json<Value>> = sqlx::query_scalar(
+            "select answer from human_items where id = $1 and state = 'answered'",
+        )
+        .bind(perm.id)
+        .fetch_optional(&db)
+        .await
+        .unwrap()
+        .flatten();
+        answer.and_then(|a| a.0.get("decision").cloned())
+    })
+    .await;
+    assert_eq!(decision["behavior"], "deny");
+    assert!(
+        decision["message"]
+            .as_str()
+            .unwrap()
+            .contains("not the build dir"),
+        "the agent gets the owner's words: {decision}"
+    );
+    wait_retired(
+        &chat,
+        &[perm_card, perm_pointer],
+        "denied: not the build dir",
+    )
+    .await;
+    // Another prompt, left open: when the run ends (step 9) it is cancelled on every copy.
+    let pending = crate::tools::handle(&o, node_key, permission_call("perm-left-open"))
+        .await
+        .unwrap();
+    assert!(pending.is_none());
+    let left = open_item(&db, &task.id, "permission").await.unwrap();
+    let (left_card, left_pointer) = copies(&db, left.id).await;
+
     // 8. A tool call claiming the task from another node is refused.
     let foreign = crate::tools::handle(
         &o,
@@ -572,6 +740,8 @@ async fn task_lifecycle_through_a_real_node() {
         leftovers.is_empty(),
         "secrets removed when the runs exit: {leftovers:?}"
     );
+    // The prompt left open in 7b is cancelled with the run, and no copy keeps its buttons.
+    wait_retired(&chat, &[left_card, left_pointer], "cancelled").await;
     // The brain hears about the stop once, as a stop: the stale exit of step 6 told it nothing.
     wait_for("brain told the task stopped", || async {
         (brain_heard(&db, "[Task demo-BS-1 stopped").await > 0).then_some(())
@@ -1319,6 +1489,38 @@ async fn task_lifecycle_through_a_real_node() {
     tasks::stop(&o, &after, false).await.unwrap();
     wait_for("brain told of the fourth stop", || async {
         (brain_heard(&db, "[Task demo-BS-1 stopped").await == 4).then_some(())
+    })
+    .await;
+
+    // 16. The owner writes in General: the message gets 👀 at once and "typing…" shows in
+    //     General while the brain works on it, until its turn ends.
+    let owner_msg: fleet_telegram::Message = serde_json::from_value(json!({
+        "message_id": 9001,
+        "date": 1_700_000_000,
+        "chat": { "id": -100, "type": "supergroup", "is_forum": true },
+        "from": { "id": 42, "is_bot": false, "first_name": "Owner" },
+        "text": "how is it going?",
+    }))
+    .unwrap();
+    crate::tg::owner_message(&o, &owner_msg).await.unwrap();
+    wait_for("brain gets the owner's message", || async {
+        (brain_heard(&db, "[Message from the owner] how is it going?").await == 1).then_some(())
+    })
+    .await;
+    // The first "typing…" always follows the reaction, even if the turn ended meanwhile.
+    wait_for("👀, then typing in General as the orchestrator", || async {
+        let ops = chat.ops.lock().unwrap();
+        let react = ops
+            .iter()
+            .position(|o| *o == Op::React(9001, "👀".into()))?;
+        // After the reaction: earlier steps showed typing in General as the orchestrator too.
+        ops[react..]
+            .contains(&Op::Typing(From::Orchestrator, None))
+            .then_some(())
+    })
+    .await;
+    wait_for("typing stops when the brain's turn ends", || async {
+        (!o.working.is_showing("brain")).then_some(())
     })
     .await;
 

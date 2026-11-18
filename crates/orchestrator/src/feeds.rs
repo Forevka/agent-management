@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
 use crate::{
-    chat::{From, clip, esc},
+    chat::{From, Notify, clip, esc},
     core::Orchestrator,
 };
 
@@ -216,6 +216,7 @@ pub async fn ingest(o: &Arc<Orchestrator>, messages: &[FeedMessage]) -> Result<(
 }
 
 /// A few messages go out one by one; bursts become one digest, to stay within Telegram limits.
+/// Silently: a mirror is for reading, and what needs the owner comes as a proposal.
 async fn mirror(o: &Orchestrator, topic: i64, msgs: &[&FeedMessage]) {
     let line = |m: &FeedMessage| {
         let who = esc(m
@@ -235,7 +236,14 @@ async fn mirror(o: &Orchestrator, topic: i64, msgs: &[&FeedMessage]) {
         for m in msgs {
             let _ = o
                 .chat
-                .send(From::Orchestrator, Some(topic), &line(m), vec![], None)
+                .send(
+                    From::Orchestrator,
+                    Some(topic),
+                    &line(m),
+                    vec![],
+                    None,
+                    Notify::Silent,
+                )
                 .await;
         }
     } else {
@@ -253,6 +261,7 @@ async fn mirror(o: &Orchestrator, topic: i64, msgs: &[&FeedMessage]) {
                 &format!("{}{more}", body.join("\n")),
                 vec![],
                 None,
+                Notify::Silent,
             )
             .await;
     }

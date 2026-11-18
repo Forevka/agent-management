@@ -569,6 +569,80 @@ async fn ok_response_with_wrong_shape_is_decode_error() {
 }
 
 #[tokio::test]
+async fn set_message_reaction_sends_one_emoji_reaction() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(api_path("setMessageReaction")))
+        .respond_with(ok(json!(true)))
+        .mount(&server)
+        .await;
+    bot(&server)
+        .await
+        .set_message_reaction(GROUP, 55, "👀")
+        .await
+        .expect("setMessageReaction succeeds");
+    let request = &requests_to(&server, "setMessageReaction").await[0];
+    assert_eq!(
+        json_body(request),
+        json!({
+            "chat_id": GROUP,
+            "message_id": 55,
+            "reaction": [{ "type": "emoji", "emoji": "👀" }],
+        })
+    );
+}
+
+#[tokio::test]
+async fn send_chat_action_targets_the_topic_or_general() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(api_path("sendChatAction")))
+        .respond_with(ok(json!(true)))
+        .mount(&server)
+        .await;
+    let bot = bot(&server).await;
+    bot.send_chat_action(GROUP, Some(42), "typing")
+        .await
+        .expect("in a topic");
+    bot.send_chat_action(GROUP, None, "typing")
+        .await
+        .expect("in General");
+    let requests = requests_to(&server, "sendChatAction").await;
+    assert_eq!(
+        json_body(&requests[0]),
+        json!({ "chat_id": GROUP, "message_thread_id": 42, "action": "typing" })
+    );
+    assert_eq!(
+        json_body(&requests[1]),
+        json!({ "chat_id": GROUP, "action": "typing" })
+    );
+}
+
+#[tokio::test]
+async fn silent_messages_disable_the_notification() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(api_path("sendMessage")))
+        .respond_with(ok(sent_message(7, None, "x")))
+        .mount(&server)
+        .await;
+    let bot = bot(&server).await;
+    bot.send_message(&SendMessage::new(GROUP, "loud"))
+        .await
+        .unwrap();
+    bot.send_message(&SendMessage::new(GROUP, "quiet").silent())
+        .await
+        .unwrap();
+    let requests = requests_to(&server, "sendMessage").await;
+    assert!(
+        json_body(&requests[0])
+            .get("disable_notification")
+            .is_none()
+    );
+    assert_eq!(json_body(&requests[1])["disable_notification"], json!(true));
+}
+
+#[tokio::test]
 async fn transport_errors_do_not_leak_the_token() {
     // Bind and drop a listener so the port is very likely closed.
     let port = std::net::TcpListener::bind("127.0.0.1:0")

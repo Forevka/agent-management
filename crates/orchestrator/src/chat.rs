@@ -40,6 +40,17 @@ impl Button {
 
 pub type Keyboard = Vec<Vec<Button>>;
 
+/// Whether a message makes the owner's phone sound. The fleet posts a lot; only what needs the
+/// owner, or tells them how work ended, may interrupt them (see `docs/plan.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Notify {
+    /// Needs the owner (plans, questions, permissions, proposals, `ask`), a task's outcome
+    /// (done, failed, stopped), or the brain answering the owner.
+    Sound,
+    /// Everything else: briefs, checklists, progress, queue notes, pointers, FYI items, feeds.
+    Silent,
+}
+
 /// One forum group. Topic ids are Telegram `message_thread_id`s; `None` is the General topic.
 #[async_trait]
 pub trait Chat: Send + Sync + 'static {
@@ -55,7 +66,14 @@ pub trait Chat: Send + Sync + 'static {
         html: &str,
         keyboard: Keyboard,
         reply_to: Option<i64>,
+        notify: Notify,
     ) -> Result<i64>;
+    /// Reacts to a message (as the orchestrator), e.g. to show it was received. `emoji` must be
+    /// one Telegram allows as a reaction.
+    async fn react(&self, message_id: i64, emoji: &str) -> Result<()>;
+    /// Shows "typing…" in a topic, as `from`, for a few seconds. Skipped (not an error) when
+    /// that bot has no room under its rate limit right now: it is only a hint.
+    async fn typing(&self, from: From, topic: Option<i64>) -> Result<()>;
     async fn edit(&self, from: From, message_id: i64, html: &str, keyboard: Keyboard)
     -> Result<()>;
     async fn send_file(
@@ -115,12 +133,16 @@ pub mod fake {
             topic: Option<i64>,
             html: String,
             keyboard: Keyboard,
+            notify: Notify,
         },
         Edit {
             from: From,
             id: i64,
             html: String,
+            keyboard: Keyboard,
         },
+        React(i64, String),
+        Typing(From, Option<i64>),
         File {
             topic: Option<i64>,
             name: String,
@@ -158,6 +180,14 @@ pub mod fake {
                 })
                 .collect()
         }
+
+        /// Whether the sent message whose text contains `needle` (the first one) sounded.
+        pub fn notify_of(&self, needle: &str) -> Option<Notify> {
+            self.ops.lock().unwrap().iter().find_map(|o| match o {
+                Op::Send { html, notify, .. } if html.contains(needle) => Some(*notify),
+                _ => None,
+            })
+        }
     }
 
     #[async_trait]
@@ -192,6 +222,7 @@ pub mod fake {
             html: &str,
             keyboard: Keyboard,
             _r: Option<i64>,
+            notify: Notify,
         ) -> Result<i64> {
             let id = self.id();
             self.ops.lock().unwrap().push(Op::Send {
@@ -200,14 +231,27 @@ pub mod fake {
                 topic,
                 html: html.into(),
                 keyboard,
+                notify,
             });
             Ok(id)
         }
-        async fn edit(&self, from: From, id: i64, html: &str, _k: Keyboard) -> Result<()> {
+        async fn react(&self, message_id: i64, emoji: &str) -> Result<()> {
+            self.ops
+                .lock()
+                .unwrap()
+                .push(Op::React(message_id, emoji.into()));
+            Ok(())
+        }
+        async fn typing(&self, from: From, topic: Option<i64>) -> Result<()> {
+            self.ops.lock().unwrap().push(Op::Typing(from, topic));
+            Ok(())
+        }
+        async fn edit(&self, from: From, id: i64, html: &str, keyboard: Keyboard) -> Result<()> {
             self.ops.lock().unwrap().push(Op::Edit {
                 from,
                 id,
                 html: html.into(),
+                keyboard,
             });
             Ok(())
         }

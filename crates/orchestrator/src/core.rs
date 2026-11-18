@@ -12,7 +12,7 @@ use sqlx::PgPool;
 use tokio::sync::mpsc;
 
 use crate::{
-    chat::{Chat, From, esc},
+    chat::{Chat, From, Notify, esc},
     config::Config,
     model::{NodeRow, TaskRow, status},
     vault::Vault,
@@ -37,7 +37,14 @@ pub struct Orchestrator {
     /// Messages for the brain, delivered in order by one background task, so that whatever
     /// reports to the brain (node events, approvals) never waits for its session to start.
     brain_tx: mpsc::UnboundedSender<String>,
+    /// The owner's view of agents working on what they wrote (see [`crate::working`]).
+    pub working: Arc<crate::working::Working>,
+    /// Task -> when it last posted with a sound (see [`Orchestrator::allow_loud_post`]).
+    loud_posts: std::sync::Mutex<HashMap<String, tokio::time::Instant>>,
 }
+
+/// How often one task may post with a sound (`fleet agent post --notify`).
+pub const LOUD_POST_EVERY: Duration = Duration::from_secs(600);
 
 impl Orchestrator {
     pub fn new(
@@ -54,6 +61,7 @@ impl Orchestrator {
                 .ok()
         });
         let (brain_tx, mut brain_rx) = mpsc::unbounded_channel::<String>();
+        let chat_for_working = chat.clone();
         let o = Arc::new(Self {
             db,
             vault,
@@ -66,6 +74,8 @@ impl Orchestrator {
             invite_addr: Default::default(),
             locks: Default::default(),
             brain_tx,
+            working: crate::working::Working::new(chat_for_working),
+            loud_posts: Default::default(),
         });
         // Weak, so the consumer does not keep the orchestrator alive; the channel closes with it.
         let weak = Arc::downgrade(&o);
@@ -83,6 +93,30 @@ impl Orchestrator {
             }
         });
         o
+    }
+
+    /// Shows the owner that their message `message_id` arrived and that the task's agent works
+    /// on it (see [`crate::working`]). Never waits.
+    pub fn show_working(&self, message_id: i64, from: From, topic: Option<i64>, task_id: &str) {
+        self.working.show(Some(message_id), from, topic, task_id);
+    }
+
+    /// Stops "typing…" for the task: the agent replied, or waits on the owner.
+    pub fn stop_working(&self, task_id: &str) {
+        self.working.stop(task_id);
+    }
+
+    /// Whether the task may post with a sound now (and if so, records that it did). In memory:
+    /// a restart only forgets when the last loud post was.
+    pub fn allow_loud_post(&self, task_id: &str) -> bool {
+        let now = tokio::time::Instant::now();
+        let mut loud = self.loud_posts.lock().unwrap();
+        loud.retain(|_, at| now.duration_since(*at) < LOUD_POST_EVERY);
+        if loud.contains_key(task_id) {
+            return false;
+        }
+        loud.insert(task_id.to_owned(), now);
+        true
     }
 
     /// Queues a message for the brain (see `brain_tx`). Never waits.
@@ -210,12 +244,13 @@ impl Orchestrator {
             .fetch_all(&self.db)
             .await?;
             self.runs_lost(&ended, "its node restarted").await;
-            sqlx::query(
-                "update human_items set state = 'cancelled' where node_id = $1 and state = 'open' and kind in ('plan','question','permission')",
+            let cancelled: Vec<crate::model::HumanItemRow> = sqlx::query_as(
+                "update human_items set state = 'cancelled' where node_id = $1 and state = 'open' and kind in ('plan','question','permission') returning *",
             )
             .bind(&id)
-            .execute(&self.db)
+            .fetch_all(&self.db)
             .await?;
+            crate::human::retire_copies(self, cancelled, "cancelled: the agent's node restarted");
         }
         sqlx::query("update nodes set incarnation = $2 where id = $1")
             .bind(&id)
@@ -343,10 +378,23 @@ impl Orchestrator {
                         .await?;
                 }
             }
-            AgentEventKind::Output { json } => self.record(&task_id, "out", &json).await?,
+            AgentEventKind::Output { json } => {
+                // The end of a turn ends "typing…" (a cheap check first: most lines are not).
+                if current
+                    && json.contains("\"result\"")
+                    && serde_json::from_str::<serde_json::Value>(&json)
+                        .is_ok_and(|v| v["type"] == "result")
+                {
+                    self.working.turn_ended(&task_id, &run_id);
+                }
+                self.record(&task_id, "out", &json).await?
+            }
             AgentEventKind::Stderr { line } => self.record(&task_id, "err", &line).await?,
             AgentEventKind::Exited { code } => {
                 self.record(&task_id, "exit", &format!("{code:?}")).await?;
+                if current {
+                    self.working.run_ended(&task_id);
+                }
                 // A run that ended before it started gives back what it took.
                 crate::tasks::release_run_messages(self, &run_id).await?;
                 let Some(task) = task.filter(|_| current) else {
@@ -368,13 +416,19 @@ impl Orchestrator {
                 if !ours {
                     return Ok(());
                 }
-                // Cancel questions the dead session can no longer receive answers for.
-                sqlx::query(
-                    "update human_items set state = 'cancelled' where task_id = $1 and state = 'open' and kind in ('plan','question','permission')",
+                // Cancel questions the dead session can no longer receive answers for, and show it
+                // on every copy of them (in the background: node events must not wait for Telegram).
+                let cancelled: Vec<crate::model::HumanItemRow> = sqlx::query_as(
+                    "update human_items set state = 'cancelled' where task_id = $1 and state = 'open' and kind in ('plan','question','permission') returning *",
                 )
                 .bind(&task_id)
-                .execute(&self.db)
+                .fetch_all(&self.db)
                 .await?;
+                crate::human::retire_copies(
+                    self,
+                    cancelled,
+                    "cancelled: the agent's session ended",
+                );
                 // An agent that finished, or a session closed while idle, simply rests; anything
                 // else that ends a run is worth telling the owner about.
                 let idle_exit = code == Some(0)
@@ -403,7 +457,14 @@ impl Orchestrator {
                     let how = code.map_or("killed".into(), |c| format!("exit code {c}"));
                     let note =
                         format!("⏹ Agent session ended ({how}). Reply in this topic to resume it.");
-                    self.post_task(&task, &note).await;
+                    // How a task ended is worth a sound, unless it was stopped on purpose: whoever
+                    // stopped it knows.
+                    let notify = if task.status == status::STOPPED {
+                        Notify::Silent
+                    } else {
+                        Notify::Sound
+                    };
+                    self.post_task(&task, &note, notify).await;
                     crate::tasks::notify_brain(
                         self,
                         &task,
@@ -418,6 +479,9 @@ impl Orchestrator {
             }
             AgentEventKind::SpawnFailed { reason } => {
                 self.record(&task_id, "spawn_failed", &reason).await?;
+                if current {
+                    self.working.run_ended(&task_id);
+                }
                 crate::tasks::release_run_messages(self, &run_id).await?;
                 let Some(task) = task.filter(|_| current) else {
                     return Ok(());
@@ -447,6 +511,7 @@ impl Orchestrator {
                 self.post_task(
                     &task,
                     &format!("⚠️ Could not start the agent: {}", esc(&reason)),
+                    Notify::Sound,
                 )
                 .await;
                 crate::tasks::notify_brain(
@@ -514,11 +579,11 @@ impl Orchestrator {
     }
 
     /// Posts in a task's topic as the task's agent (or the orchestrator if it has no bot).
-    pub async fn post_task(&self, task: &TaskRow, html: &str) {
+    pub async fn post_task(&self, task: &TaskRow, html: &str, notify: Notify) {
         let from = self.task_sender(task).await;
         if let Err(e) = self
             .chat
-            .send(from, task.topic_id, html, vec![], None)
+            .send(from, task.topic_id, html, vec![], None, notify)
             .await
         {
             tracing::warn!("posting to {} failed: {e:#}", task.id);
@@ -543,8 +608,10 @@ impl Orchestrator {
     /// ending is expected and not worth a message).
     pub(crate) async fn runs_lost(self: &Arc<Self>, ended: &[TaskRow], why: &str) {
         // A run lost before it started (revoked mid-dispatch) gives back the messages it took,
-        // and its task waits for the next node, which `dispatch_queued` finds.
+        // and its task waits for the next node, which `dispatch_queued` finds. Nothing will
+        // answer the owner from a lost run, so "typing…" ends too.
         for task in ended {
+            self.working.run_ended(&task.id);
             let Some(run) = &task.run_id else { continue };
             match crate::tasks::release_run_messages(self, run).await {
                 Ok(0) => {}

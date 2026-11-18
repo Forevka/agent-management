@@ -12,10 +12,10 @@ use fleet_telegram::{
 use tokio::sync::RwLock;
 
 use crate::{
-    chat::{Chat, From, Keyboard, clip, esc},
+    chat::{Chat, From, Keyboard, Notify, clip, esc},
     core::Orchestrator,
     human::{self, Answer},
-    model::TaskRow,
+    model::{BRAIN_TASK, TaskRow},
     tasks,
 };
 
@@ -128,10 +128,14 @@ impl Chat for TelegramChat {
         html: &str,
         keyboard: Keyboard,
         reply_to: Option<i64>,
+        notify: Notify,
     ) -> Result<i64> {
         let mut msg = SendMessage::new(self.chat_id, limit(html)).html();
         if let Some(t) = topic {
             msg = msg.thread(t);
+        }
+        if notify == Notify::Silent {
+            msg = msg.silent();
         }
         if let Some(m) = markup(&keyboard) {
             msg = msg.keyboard(m);
@@ -140,6 +144,38 @@ impl Chat for TelegramChat {
             msg = msg.reply_to(r);
         }
         Ok(self.sender(from).await.send_message(&msg).await?.message_id)
+    }
+    // Feedback, not content: straight to the API rather than through the send queue, so it never
+    // waits behind (or holds up) real messages. The caller only logs a failure.
+    // Through the orchestrator bot's rate limiter like any call to the group, waiting for room.
+    async fn react(&self, message_id: i64, emoji: &str) -> Result<()> {
+        let bot = self.orchestrator.bot().clone();
+        Ok(self
+            .orchestrator
+            .run(self.chat_id, || {
+                bot.set_message_reaction(self.chat_id, message_id, emoji)
+            })
+            .await?)
+    }
+    // A hint renewed every few seconds: it only takes room under the sending bot's rate limit
+    // that is free right now (real messages come first), and backs off when Telegram asks to.
+    async fn typing(&self, from: From, topic: Option<i64>) -> Result<()> {
+        let sender = self.sender(from).await;
+        let limiter = sender.limiter(self.chat_id);
+        if !limiter.try_acquire() {
+            return Ok(());
+        }
+        match sender
+            .bot()
+            .send_chat_action(self.chat_id, topic, "typing")
+            .await
+        {
+            Err(fleet_telegram::TgError::RetryAfter(secs)) => {
+                limiter.block_for(Duration::from_secs(secs)).await;
+                Ok(())
+            }
+            other => Ok(other?),
+        }
     }
     async fn edit(
         &self,
@@ -335,6 +371,7 @@ async fn handle_update(o: &Arc<Orchestrator>, bot: &Bot, chat_id: i64, u: Update
                 &format!("⚠️ {}", esc(&format!("{e:#}"))),
                 vec![],
                 Some(msg.message_id),
+                Notify::Sound,
             )
             .await;
     }
@@ -361,7 +398,7 @@ fn callback(data: &str) -> Result<(i64, Answer)> {
     Ok((id, ans))
 }
 
-async fn owner_message(o: &Arc<Orchestrator>, msg: &Message) -> Result<()> {
+pub(crate) async fn owner_message(o: &Arc<Orchestrator>, msg: &Message) -> Result<()> {
     let Some(text) = msg
         .text_or_caption()
         .map(str::trim)
@@ -389,12 +426,23 @@ async fn owner_message(o: &Arc<Orchestrator>, msg: &Message) -> Result<()> {
                 &esc(&res),
                 vec![],
                 Some(msg.message_id),
+                // The owner just acted; the confirmation needs no sound.
+                Notify::Silent,
             )
             .await?;
         return Ok(());
     }
-    match topic {
-        None => tasks::to_brain(o, format!("[Message from the owner] {text}")).await,
+    // The owner sees at once that the message arrived (a reaction) and that work is going on
+    // ("typing…" until the agent's turn ends). Fire and forget: delivery never waits for it.
+    // In a task topic "typing…" comes from the agent who is working, not the orchestrator.
+    let (task_id, delivered) = match topic {
+        None => {
+            o.show_working(msg.message_id, From::Orchestrator, None, BRAIN_TASK);
+            (
+                BRAIN_TASK.to_owned(),
+                tasks::to_brain(o, format!("[Message from the owner] {text}")).await,
+            )
+        }
         Some(t) => {
             let task: Option<TaskRow> = sqlx::query_as("select * from tasks where topic_id = $1")
                 .bind(t)
@@ -402,13 +450,22 @@ async fn owner_message(o: &Arc<Orchestrator>, msg: &Message) -> Result<()> {
                 .await?;
             match task {
                 Some(task) => {
-                    tasks::deliver(o, &task, format!("[Message from the human] {text}")).await
+                    let from = o.task_sender(&task).await;
+                    o.show_working(msg.message_id, from, Some(t), &task.id);
+                    let r =
+                        tasks::deliver(o, &task, format!("[Message from the human] {text}")).await;
+                    (task.id, r)
                 }
                 // Human and feed topics only take replies to specific items.
-                None => Ok(()),
+                None => return Ok(()),
             }
         }
+    };
+    // Kept for later (no node can take it now) or not delivered: nobody is working on it.
+    if !matches!(delivered, Ok(tasks::Delivered::ToRun)) {
+        o.stop_working(&task_id);
     }
+    delivered.map(drop)
 }
 
 async fn command(
@@ -489,6 +546,8 @@ async fn command(
             &html,
             vec![],
             Some(msg.message_id),
+            // An answer to a command the owner just typed.
+            Notify::Silent,
         )
         .await?;
     Ok(())

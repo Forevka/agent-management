@@ -18,7 +18,7 @@ use fleet_proto::{Body, ToolResult};
 use serde_json::{Value, json};
 
 use crate::{
-    chat::{Button, From, Keyboard, clip, esc},
+    chat::{Button, From, Keyboard, Notify, clip, esc},
     core::Orchestrator,
     model::{HumanItemRow, TaskRow, status},
     tasks,
@@ -64,6 +64,12 @@ pub async fn create(o: &Orchestrator, item: NewItem<'_>) -> Result<HumanItemRow>
     .bind(&item.call_id)
     .fetch_one(&o.db)
     .await?;
+    // The agent now waits on the owner: "typing…" would say the opposite.
+    if item.blocking
+        && let Some(task) = item.task
+    {
+        o.stop_working(&task.id);
+    }
     if let Err(e) = announce(o, &row, item.task).await {
         tracing::warn!("announcing Q-{} failed: {e:#}", row.id);
     }
@@ -231,31 +237,65 @@ async fn announce(o: &Orchestrator, row: &HumanItemRow, task: Option<&TaskRow>) 
         Some(p) => Some(tasks::human_topic(o, p, row.blocking).await?),
         None => None,
     };
+    // What needs the owner sounds ("needs you"); an FYI item does not.
+    let notify = if row.blocking {
+        Notify::Sound
+    } else {
+        Notify::Silent
+    };
     let msg = o
         .chat
-        .send(from, topic, &html, keyboard.clone(), None)
+        .send(from, topic, &html, keyboard.clone(), None, notify)
         .await?;
-    sqlx::query("update human_items set tg_msg = $2 where id = $1")
-        .bind(row.id)
-        .bind(msg)
-        .execute(&o.db)
-        .await?;
+    let state: String =
+        sqlx::query_scalar("update human_items set tg_msg = $2 where id = $1 returning state")
+            .bind(row.id)
+            .bind(msg)
+            .fetch_one(&o.db)
+            .await?;
+    settle_late_copy(o, from, row.id, msg, &state).await;
     if let Some(t) = task {
         let pointer = match row.kind.as_str() {
             "plan" => format!("📋 Plan ready: see <b>Q-{}</b>.", row.id),
             _ => format!("⏸ Waiting on <b>Q-{}</b>.", row.id),
         };
+        // Plans and questions can be answered from the task topic too, so the pointer carries
+        // the same buttons. Like every copy, it is recorded and updated when the item is
+        // answered (see `answer`). It is silent: the card in "needs you" already sounded.
         let kb = if matches!(row.kind.as_str(), "plan" | "question") {
             keyboard
         } else {
             vec![]
         };
-        let _ = o
+        let sender = o.task_sender(t).await;
+        if let Ok(copy) = o
             .chat
-            .send(o.task_sender(t).await, t.topic_id, &pointer, kb, None)
-            .await;
+            .send(sender, t.topic_id, &pointer, kb, None, Notify::Silent)
+            .await
+        {
+            let state: String = sqlx::query_scalar(
+                "update human_items set tg_msgs = array_append(tg_msgs, $2) where id = $1 returning state",
+            )
+            .bind(row.id)
+            .bind(copy)
+            .fetch_one(&o.db)
+            .await?;
+            settle_late_copy(o, sender, row.id, copy, &state).await;
+        }
     }
     Ok(())
+}
+
+/// A copy recorded after its item was already answered or cancelled (the owner was quick, or
+/// the run ended meanwhile) missed the update of all copies: it gets the outcome here.
+async fn settle_late_copy(o: &Orchestrator, from: From, id: i64, msg: i64, state: &str) {
+    if state == "open" {
+        return;
+    }
+    let html = format!("<b>Q-{id}</b> is {}.", esc(state));
+    if let Err(e) = o.chat.edit(from, msg, &html, vec![]).await {
+        tracing::debug!("updating a late copy of Q-{id} failed: {e:#}");
+    }
 }
 
 const LINK_PLACEHOLDER: &str = "about:fleet-item-";
@@ -326,24 +366,8 @@ pub async fn answer(o: &Arc<Orchestrator>, id: i64, ans: Answer) -> Result<Strin
             .bind(stored)
             .execute(&o.db)
             .await?;
-            if let Some(msg) = row.tg_msg {
-                let from = match &row.task_id {
-                    Some(t) => match o.task(t).await? {
-                        Some(task) => o.task_sender(&task).await,
-                        None => From::Orchestrator,
-                    },
-                    None => From::Orchestrator,
-                };
-                let _ = o
-                    .chat
-                    .edit(
-                        from,
-                        msg,
-                        &format!("✅ <b>Q-{id}</b> answered: {}", esc(&clip(summary, 500))),
-                        vec![],
-                    )
-                    .await;
-            }
+            // Every copy now shows the outcome, wherever it was answered.
+            retire_copies(o, vec![row.clone()], &format!("answered: {summary}"));
             if let Some(task_id) = &row.task_id {
                 // Still waiting if another blocking question of the task is open.
                 sqlx::query(
@@ -481,6 +505,16 @@ async fn apply(o: &Arc<Orchestrator>, row: &HumanItemRow, ans: Answer) -> Result
             )?;
             Ok(("denied".into(), json!({"allow": false})))
         }
+        // A typed reply to a permission prompt (its card or its pointer) is a "no, and here is
+        // why": the agent gets the owner's words instead of a bare denial.
+        ("permission", Answer::Text(t)) => {
+            reply_permission(
+                o,
+                row,
+                json!({"behavior": "deny", "message": format!("The human denied this action and wrote: {t}")}),
+            )?;
+            Ok((format!("denied: {t}"), json!({"allow": false, "note": t})))
+        }
         ("task_proposal", Answer::Accept) => {
             let project = p["project"].as_str().unwrap_or_default().to_owned();
             let agent = pick_implementor(o, &project).await?;
@@ -569,6 +603,40 @@ async fn apply(o: &Arc<Orchestrator>, row: &HumanItemRow, ans: Answer) -> Result
     }
 }
 
+/// Shows `outcome` ("answered: …", "cancelled: …") on every message that shows these items,
+/// their cards and their pointers in task topics, and removes the buttons, so nothing answered
+/// or cancelled still looks open anywhere. In the background, so a button press is answered at
+/// once and node events never wait for Telegram; a failed edit is only logged.
+pub fn retire_copies(o: &Arc<Orchestrator>, rows: Vec<HumanItemRow>, outcome: &str) {
+    if rows.is_empty() {
+        return;
+    }
+    let (o, outcome) = (o.clone(), outcome.to_owned());
+    let icon = if outcome.starts_with("answered") {
+        "✅"
+    } else {
+        "⏹"
+    };
+    tokio::spawn(async move {
+        for row in rows {
+            // All copies of an item were sent by the same bot: its task's, or the orchestrator.
+            let from = match &row.task_id {
+                Some(t) => match o.task(t).await {
+                    Ok(Some(task)) => o.task_sender(&task).await,
+                    _ => From::Orchestrator,
+                },
+                None => From::Orchestrator,
+            };
+            let html = format!("{icon} <b>Q-{}</b> {}", row.id, esc(&clip(&outcome, 500)));
+            for msg in row.tg_msg.iter().chain(&row.tg_msgs) {
+                if let Err(e) = o.chat.edit(from, *msg, &html, vec![]).await {
+                    tracing::debug!("updating a copy of Q-{} failed: {e:#}", row.id);
+                }
+            }
+        }
+    });
+}
+
 /// Reports an admin change's outcome to the brain. Queued, in order with the brain's other
 /// reports: the change already happened, and the owner's button press is answered without
 /// waiting for the brain's session to start.
@@ -642,7 +710,15 @@ pub async fn remind(o: &Orchestrator) -> Result<()> {
         );
         let _ = o
             .chat
-            .send(From::Orchestrator, Some(topic), &text, vec![], row.tg_msg)
+            // A reminder is a call for the owner.
+            .send(
+                From::Orchestrator,
+                Some(topic),
+                &text,
+                vec![],
+                row.tg_msg,
+                Notify::Sound,
+            )
             .await;
         sqlx::query("update human_items set reminded_at = now() where id = $1")
             .bind(row.id)
@@ -655,10 +731,13 @@ pub async fn remind(o: &Orchestrator) -> Result<()> {
 /// Finds the open item a Telegram reply refers to.
 pub async fn by_message(o: &Orchestrator, msg_id: i64) -> Result<Option<HumanItemRow>> {
     Ok(
-        sqlx::query_as("select * from human_items where tg_msg = $1 and state = 'open'")
-            .bind(msg_id)
-            .fetch_optional(&o.db)
-            .await?,
+        // A reply to any copy of the item (the card or its pointer) answers it.
+        sqlx::query_as(
+            "select * from human_items where (tg_msg = $1 or $1 = any(tg_msgs)) and state = 'open'",
+        )
+        .bind(msg_id)
+        .fetch_optional(&o.db)
+        .await?,
     )
 }
 

@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 
 use crate::{
     admin,
-    chat::{From, clip, esc},
+    chat::{From, Notify, clip, esc},
     core::Orchestrator,
     human::{self, NewItem},
     model::{AgentRow, BRAIN_AGENT, NewAgent, TaskRow},
@@ -84,18 +84,43 @@ pub async fn handle(
         }
         "milestone_done" => {
             let idx = args["index"].as_i64().context("index required")?;
-            let n =
-                sqlx::query("update milestones set done = true where task_id = $1 and idx = $2")
-                    .bind(&task.id)
-                    .bind(idx as i32)
-                    .execute(&o.db)
-                    .await?
-                    .rows_affected();
+            let n = sqlx::query(
+                "update milestones set done = true, skipped = false, skip_reason = null where task_id = $1 and idx = $2",
+            )
+            .bind(&task.id)
+            .bind(idx as i32)
+            .execute(&o.db)
+            .await?
+            .rows_affected();
             if n == 0 {
                 bail!("no milestone {idx}; call milestones_set first");
             }
             render_checklist(o, &task, false).await?;
             ok(format!("milestone {idx} done"))
+        }
+        // A step the plan had but the work did not need: shown struck through, so a finished
+        // checklist says what was left out instead of leaving it open.
+        "milestone_skip" => {
+            let idx = args["index"].as_i64().context("index required")?;
+            let reason = args["reason"]
+                .as_str()
+                .map(str::trim)
+                .filter(|r| !r.is_empty())
+                .map(|r| clip(r, 200));
+            let n = sqlx::query(
+                "update milestones set skipped = true, done = false, skip_reason = $3 where task_id = $1 and idx = $2",
+            )
+            .bind(&task.id)
+            .bind(idx as i32)
+            .bind(&reason)
+            .execute(&o.db)
+            .await?
+            .rows_affected();
+            if n == 0 {
+                bail!("no milestone {idx}; call milestones_set first");
+            }
+            render_checklist(o, &task, false).await?;
+            ok(format!("milestone {idx} skipped"))
         }
         "ask_human" => {
             let question = args["question"].as_str().context("question required")?;
@@ -167,14 +192,25 @@ pub async fn handle(
             o.post_task(
                 &task,
                 &format!("→ <b>{}</b>: {}", esc(&target.name), esc(&clip(text, 300))),
+                Notify::Silent,
             )
             .await;
             ok(format!("Delivered to {}.", target.name))
         }
+        // Progress is silent unless the agent says it is worth the owner's attention now.
         "post" => {
             let text = args["text"].as_str().context("text required")?;
-            o.post_task(&task, &esc(&clip(text, 1500))).await;
-            ok("posted".into())
+            // At most one loud post per task per LOUD_POST_EVERY: an agent that marks every
+            // update urgent would make the owner mute the group.
+            let loud = args["notify"].as_bool().unwrap_or(false) && o.allow_loud_post(&task.id);
+            let notify = if loud { Notify::Sound } else { Notify::Silent };
+            o.post_task(&task, &esc(&clip(text, 1500)), notify).await;
+            ok(if args["notify"].as_bool().unwrap_or(false) && !loud {
+                "posted silently: this task already notified the owner in the last 10 minutes"
+                    .into()
+            } else {
+                "posted".into()
+            })
         }
         "complete" => {
             // Already redacted, like every tool's arguments.
@@ -189,15 +225,9 @@ pub async fn handle(
                     .await?
                     .rows_affected()
                     == 1;
-            o.post_task(
-                &task,
-                &format!("✅ <b>Done.</b>\n{}", esc(&clip(&summary, 3000))),
-            )
-            .await;
-            if let Some(topic) = task.topic_id {
-                let _ = o.chat.close_topic(topic).await;
-            }
-            // Once per finish. The summary is the agent's own words: framed as quoted data.
+            // Right after the commit, and once: the one call that finished the task tells the
+            // brain (the summary is the agent's own words, framed as quoted data); a retry finds
+            // the task done already and does not tell it again.
             if finished {
                 tasks::notify_brain(
                     o,
@@ -211,8 +241,39 @@ pub async fn handle(
                     ),
                 );
             }
+            // The task is done whatever happens next: what follows is shown on a best-effort
+            // basis, so a Telegram or database hiccup cannot leave it half-finished.
+            // A finished task shows no open step: what was never ticked was left out.
+            match sqlx::query(
+                "update milestones set skipped = true where task_id = $1 and not done and not skipped",
+            )
+            .bind(&task.id)
+            .execute(&o.db)
+            .await
+            {
+                Ok(r) if r.rows_affected() > 0 => {
+                    if let Err(e) = render_checklist(o, &task, false).await {
+                        tracing::warn!("updating {}'s checklist failed: {e:#}", task.id);
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!("skipping {}'s open steps failed: {e:#}", task.id),
+            }
+            o.post_task(
+                &task,
+                &format!("✅ <b>Done.</b>\n{}", esc(&clip(&summary, 3000))),
+                Notify::Sound,
+            )
+            .await;
+            if let Some(topic) = task.topic_id
+                && let Err(e) = o.chat.close_topic(topic).await
+            {
+                tracing::warn!("closing {}'s topic failed: {e:#}", task.id);
+            }
             // The session ends after this turn, freeing the node; follow-ups resume it.
-            tasks::stop(o, &task, true).await?;
+            if let Err(e) = tasks::stop(o, &task, true).await {
+                tracing::warn!("ending {}'s session failed: {e:#}", task.id);
+            }
             ok("Task closed. The session stays resumable for follow-ups.".into())
         }
         "memory_retain" | "memory_recall" | "memory_reflect" | "memory_banks" => {
@@ -329,6 +390,8 @@ pub async fn handle(
         }
         "reply_owner" => {
             let text = args["text"].as_str().context("text required")?;
+            // The answer the owner is waiting for: it sounds, and ends "typing…".
+            o.stop_working(&task.id);
             o.chat
                 .send(
                     From::Orchestrator,
@@ -336,6 +399,7 @@ pub async fn handle(
                     &esc(&clip(text, 3500)),
                     vec![],
                     None,
+                    Notify::Sound,
                 )
                 .await?;
             ok("sent".into())
@@ -408,16 +472,13 @@ async fn permission(
 
 /// Posts (first time) or edits the task's milestone checklist.
 async fn render_checklist(o: &Orchestrator, task: &TaskRow, replace: bool) -> Result<()> {
-    let items: Vec<(String, bool)> =
-        sqlx::query_as("select title, done from milestones where task_id = $1 order by idx")
-            .bind(&task.id)
-            .fetch_all(&o.db)
-            .await?;
-    let done = items.iter().filter(|(_, d)| *d).count();
-    let mut html = format!("<b>Milestones</b> · {done}/{}\n", items.len());
-    for (title, d) in &items {
-        html.push_str(&format!("{} {}\n", if *d { "☑" } else { "☐" }, esc(title)));
-    }
+    let items: Vec<Milestone> = sqlx::query_as(
+        "select title, done, skipped, skip_reason from milestones where task_id = $1 order by idx",
+    )
+    .bind(&task.id)
+    .fetch_all(&o.db)
+    .await?;
+    let html = checklist_html(&items);
     let from = o.task_sender(task).await;
     let current: Option<i64> =
         sqlx::query_scalar("select checklist_msg_id from tasks where id = $1")
@@ -427,9 +488,10 @@ async fn render_checklist(o: &Orchestrator, task: &TaskRow, replace: bool) -> Re
     match current.filter(|_| !replace) {
         Some(msg) => o.chat.edit(from, msg, &html, vec![]).await?,
         None => {
+            // Progress: the owner looks when they want to.
             let msg = o
                 .chat
-                .send(from, task.topic_id, &html, vec![], None)
+                .send(from, task.topic_id, &html, vec![], None, Notify::Silent)
                 .await?;
             sqlx::query("update tasks set checklist_msg_id = $2 where id = $1")
                 .bind(&task.id)
@@ -439,6 +501,38 @@ async fn render_checklist(o: &Orchestrator, task: &TaskRow, replace: bool) -> Re
         }
     }
     Ok(())
+}
+
+/// A milestone row: title, done, skipped, skip reason.
+type Milestone = (String, bool, bool, Option<String>);
+
+/// The checklist message: ☑ done, ➖ skipped (struck through, with the reason), ☐ open. The
+/// header counts what was done out of all steps, and mentions what was skipped.
+fn checklist_html(items: &[Milestone]) -> String {
+    let done = items.iter().filter(|m| m.1).count();
+    let skipped = items.iter().filter(|m| m.2 && !m.1).count();
+    let mut html = format!("<b>Milestones</b> · {done}/{}", items.len());
+    if skipped > 0 {
+        html.push_str(&format!(" · {skipped} skipped"));
+    }
+    html.push('\n');
+    for (title, done, skipped, reason) in items {
+        let line = match (done, skipped) {
+            (true, _) => format!("☑ {}", esc(title)),
+            (false, true) => format!(
+                "➖ <s>{}</s>{}",
+                esc(title),
+                reason
+                    .as_deref()
+                    .map(|r| format!(" <i>({})</i>", esc(r)))
+                    .unwrap_or_default()
+            ),
+            (false, false) => format!("☐ {}", esc(title)),
+        };
+        html.push_str(&line);
+        html.push('\n');
+    }
+    html
 }
 
 /// `fleet agent memory ...`: forwards to Hindsight under the caller's bank rules.
@@ -508,5 +602,29 @@ async fn memory(
                     .join("\n")
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checklist_shows_done_skipped_and_open_steps() {
+        let m =
+            |t: &str, d: bool, s: bool, r: Option<&str>| (t.to_owned(), d, s, r.map(str::to_owned));
+        let html = checklist_html(&[
+            m("Create worktree", false, true, Some("already on <main>")),
+            m("Append", true, false, None),
+            m("Verify", false, false, None),
+        ]);
+        assert_eq!(
+            html,
+            "<b>Milestones</b> · 1/3 · 1 skipped\n➖ <s>Create worktree</s> <i>(already on &lt;main&gt;)</i>\n☑ Append\n☐ Verify\n"
+        );
+        // Nothing skipped: no mention of it.
+        assert!(
+            checklist_html(&[m("A", true, false, None)]).starts_with("<b>Milestones</b> · 1/1\n")
+        );
     }
 }

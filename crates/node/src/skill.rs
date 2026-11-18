@@ -36,7 +36,14 @@ exits non-zero and prints an error. For long text, pass `-` and pipe the text in
 - `fleet agent milestones "Investigate" "Implement" "Test" "Open PR"`: once, after the plan is
   approved; 3-8 short items.
 - `fleet agent done 0`: tick off milestone 0, 1, ... as you finish them.
-- `fleet agent post "One short sentence."`: rarely, for something the human should see now.
+- `fleet agent skip 0 --reason "already set up"`: a step the work turned out not to need. It
+  shows struck through, with the reason.
+- Before `complete`, tick or skip every step. Anything still open when you complete is shown
+  as skipped.
+- `fleet agent post "One short sentence."`: a progress note. It is silent; add `--notify`
+  only when the human should see it now (a blocker, a surprise, something risky you found).
+  One `--notify` post per task per 10 minutes makes a sound; later ones are posted silently.
+  Questions go through `fleet agent ask`, never a post.
 - `fleet agent complete - <<'EOF'` then the summary, then `EOF`: finish with what changed,
   where (branch/PR) and how it was tested. This closes the topic. Your session stays
   resumable for follow-ups.

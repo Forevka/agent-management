@@ -82,6 +82,8 @@ pub struct HumanItemRow {
     pub node_id: Option<String>,
     pub call_id: Option<String>,
     pub created_at: DateTime<Utc>,
+    /// Further messages showing the item besides `tg_msg` (its pointer in the task topic).
+    pub tg_msgs: Vec<i64>,
 }
 
 /// Task states. Kept as text in the database so they read well in SQL.

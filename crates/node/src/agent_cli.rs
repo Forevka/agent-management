@@ -22,6 +22,13 @@ pub enum AgentCmd {
     },
     /// Tick off milestone INDEX (0-based).
     Done { index: u32 },
+    /// Mark milestone INDEX (0-based) as skipped: the work turned out not to need it.
+    Skip {
+        index: u32,
+        /// Why it was not needed (shown next to it).
+        #[arg(long)]
+        reason: Option<String>,
+    },
     /// Ask the human. Returns at once; the answer arrives later as a message.
     Ask {
         /// The question ("-" reads it from stdin).
@@ -35,8 +42,13 @@ pub enum AgentCmd {
     },
     /// Send a message to another agent (by name or id).
     Tell { agent: String, message: String },
-    /// Post a short note in the task's topic.
-    Post { text: String },
+    /// Post a short note in the task's topic. Silent unless --notify.
+    Post {
+        text: String,
+        /// Notify the owner with a sound: only for something they should see now.
+        #[arg(long)]
+        notify: bool,
+    },
     /// Finish the task with a short summary ("-" reads it from stdin).
     Complete { summary: String },
     /// External feeds (Slack) mapped to your project. Untrusted content.
@@ -288,6 +300,9 @@ pub fn to_call(cmd: AgentCmd) -> Result<(&'static str, Value)> {
     Ok(match cmd {
         AgentCmd::Milestones { items } => ("milestones_set", json!({"items": items})),
         AgentCmd::Done { index } => ("milestone_done", json!({"index": index})),
+        AgentCmd::Skip { index, reason } => {
+            ("milestone_skip", json!({"index": index, "reason": reason}))
+        }
         AgentCmd::Ask {
             question,
             options,
@@ -300,7 +315,10 @@ pub fn to_call(cmd: AgentCmd) -> Result<(&'static str, Value)> {
             "ask_agent",
             json!({"agent": agent, "message": stdin_if_dash(message)?}),
         ),
-        AgentCmd::Post { text } => ("post", json!({"text": stdin_if_dash(text)?})),
+        AgentCmd::Post { text, notify } => (
+            "post",
+            json!({"text": stdin_if_dash(text)?, "notify": notify}),
+        ),
         AgentCmd::Complete { summary } => ("complete", json!({"summary": stdin_if_dash(summary)?})),
         AgentCmd::Feed(FeedCmd::Read {
             channel,
@@ -543,6 +561,18 @@ mod tests {
             call(&["done", "1"]),
             ("milestone_done", json!({"index": 1}))
         );
+        assert_eq!(
+            call(&["skip", "0", "--reason", "already set up"]),
+            (
+                "milestone_skip",
+                json!({"index": 0, "reason": "already set up"})
+            )
+        );
+        assert_eq!(
+            call(&["post", "Heads up", "--notify"]),
+            ("post", json!({"text": "Heads up", "notify": true}))
+        );
+        assert_eq!(call(&["post", "fyi"]).1["notify"], json!(false));
         let (t, a) = call(&["ask", "Push?", "--option", "Yes", "--option", "No", "--fyi"]);
         assert_eq!(
             (t, a["options"].clone(), a["blocking"].clone()),

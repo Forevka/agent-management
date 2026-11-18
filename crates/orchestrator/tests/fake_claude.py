@@ -77,7 +77,7 @@ for line in sys.stdin:
         r = tool("permission", {"tool_name": "ExitPlanMode", "input": {"plan": "# Plan\n1. Paint it\n2. Ship it"}})
         out({"type": "plan_decision", "decision": json.loads(r["result"])})
         tool("memory_recall", {"query": "paint", "shared": True})
-        tool("milestones_set", {"items": ["Paint", "Ship"]})
+        tool("milestones_set", {"items": ["Paint", "Prime", "Ship"]})
         tool("milestone_done", {"index": 0})
         tool("ask_human", {"question": "Push the branch? It uses token " + jira_token(), "options": ["Yes", "No"], "blocking": True})
         out({"type": "result", "subtype": "success", "total_cost_usd": 0.0})
@@ -98,7 +98,8 @@ for line in sys.stdin:
         tool("web_link", {"page": "/secrets", "text": "Set the Jira token"})
         out({"type": "result", "subtype": "success", "total_cost_usd": 0.0})
     elif text.startswith("[Answer to Q-"):
-        tool("milestone_done", {"index": 1})
+        # One step skipped with a reason, one left open: completing shows it skipped too.
+        tool("milestone_skip", {"index": 1, "reason": "already <primed>"})
         tool("memory_retain", {"content": "Bikeshed is blue", "bank": "notes"})
         token = jira_token()
         tool("post", {"text": "Pushed with token " + token})

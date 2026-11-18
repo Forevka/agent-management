@@ -7,7 +7,7 @@ use fleet_proto::{Body, SecretFile, SpawnAgent, StopAgent};
 use serde_json::{Value, json};
 
 use crate::{
-    chat::{From, clip, esc},
+    chat::{From, Notify, clip, esc},
     core::Orchestrator,
     model::{AgentRow, BRAIN_AGENT, BRAIN_TASK, NewAgent, NodeRow, ProjectRow, TaskRow, status},
     prompts,
@@ -196,7 +196,15 @@ pub async fn create_task(o: &Arc<Orchestrator>, req: CreateTask) -> Result<TaskR
     );
     let _ = o
         .chat
-        .send(From::Orchestrator, Some(topic), &intro, vec![], None)
+        // The brief is for reading later; the owner just asked for the work.
+        .send(
+            From::Orchestrator,
+            Some(topic),
+            &intro,
+            vec![],
+            None,
+            Notify::Silent,
+        )
         .await;
     o.audit(
         "orchestrator",
@@ -464,6 +472,7 @@ async fn dispatch_locked(
                     "⚠️ Could not prepare the agent's run: {}",
                     esc(&format!("{e:#}"))
                 ),
+                Notify::Sound,
             )
             .await;
             return Ok(Dispatched::Waiting);
@@ -471,6 +480,8 @@ async fn dispatch_locked(
     };
     o.server
         .send(node.id.parse()?, Body::SpawnAgent(Box::new(spawn)));
+    // A new run takes its first message as one turn (see `working`).
+    o.working.message_sent(&task.id, &run_id);
     Ok(Dispatched::Started)
 }
 
@@ -502,7 +513,8 @@ async fn queue(
             .await?;
     }
     if let Some(note) = note {
-        o.post_task(task, &note).await;
+        // Queue notes are progress, not a call for the owner.
+        o.post_task(task, &note, Notify::Silent).await;
     }
     Ok(Dispatched::Waiting)
 }
@@ -736,7 +748,7 @@ async fn project_secret_values(o: &Orchestrator, project: &str) -> Result<Vec<St
 /// reports for an idle brain) must start one run, not two, and the second message must go to
 /// the run the first one started. The lock also keeps that run's spawn ahead of the message on
 /// the link, so the node never sees a message for a run it does not have yet.
-pub async fn deliver(o: &Arc<Orchestrator>, task: &TaskRow, text: String) -> Result<()> {
+pub async fn deliver(o: &Arc<Orchestrator>, task: &TaskRow, text: String) -> Result<Delivered> {
     let lock = o.task_lock(&task.id);
     let _held = lock.lock().await;
     let task = o.task(&task.id).await?.context("task vanished")?;
@@ -756,10 +768,12 @@ pub async fn deliver(o: &Arc<Orchestrator>, task: &TaskRow, text: String) -> Res
                 text,
             },
         );
+        // One more message the run will answer with a turn of its own (see working).
+        o.working.message_sent(&task.id, run_id);
         Ok(true)
     };
     if send(&task, text.clone())? {
-        return Ok(());
+        return Ok(Delivered::ToRun);
     }
     if matches!(
         task.status.as_str(),
@@ -769,12 +783,13 @@ pub async fn deliver(o: &Arc<Orchestrator>, task: &TaskRow, text: String) -> Res
         let _ = o.chat.reopen_topic(topic).await;
     }
     match dispatch_locked(o, &task, Some(text.clone()), task.session_id.clone()).await? {
-        Dispatched::Started | Dispatched::Waiting => Ok(()),
+        Dispatched::Started => Ok(Delivered::ToRun),
+        Dispatched::Waiting => Ok(Delivered::Queued),
         // Claimed by something that did not take the lock: hand the text to that run.
         Dispatched::Lost => {
             let task = o.task(&task.id).await?.context("task vanished")?;
             if send(&task, text)? {
-                return Ok(());
+                return Ok(Delivered::ToRun);
             }
             // No run took it: the claim was refused because the agent is gone.
             let agent_exists: bool =
@@ -790,6 +805,15 @@ pub async fn deliver(o: &Arc<Orchestrator>, task: &TaskRow, text: String) -> Res
             bail!("task {} changed while delivering; try again", task.id)
         }
     }
+}
+
+/// Where [deliver] put the text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivered {
+    /// To the task's running run, or to the run it just started.
+    ToRun,
+    /// Kept for later: no node can take the task now (or its run could not be prepared).
+    Queued,
 }
 
 /// Stops a task's agent. Graceful lets it finish its current turn; the session stays resumable.
@@ -866,7 +890,7 @@ pub async fn dispatch_queued(o: &Arc<Orchestrator>) {
     }
 }
 
-pub async fn to_brain(o: &Arc<Orchestrator>, text: String) -> Result<()> {
+pub async fn to_brain(o: &Arc<Orchestrator>, text: String) -> Result<Delivered> {
     ensure_brain(o).await?;
     let task = o.task(BRAIN_TASK).await?.context("brain task missing")?;
     deliver(o, &task, text).await

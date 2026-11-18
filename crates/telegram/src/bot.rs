@@ -317,6 +317,42 @@ impl Bot {
         decode_response("sendDocument", response).await
     }
 
+    /// `setMessageReaction`: sets the bot's reaction to a message, replacing any it had.
+    /// `emoji` must be one of the emoji Telegram allows as reactions (`ReactionTypeEmoji`), and
+    /// the chat must allow it.
+    pub async fn set_message_reaction(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        emoji: &str,
+    ) -> Result<(), TgError> {
+        let params = json!({
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "reaction": [{ "type": "emoji", "emoji": emoji }],
+        });
+        self.call::<Value>("setMessageReaction", &params)
+            .await
+            .map(drop)
+    }
+
+    /// `sendChatAction`, e.g. `"typing"`: Telegram shows it for about five seconds, or until the
+    /// bot's next message, so a longer wait needs it sent again.
+    pub async fn send_chat_action(
+        &self,
+        chat_id: i64,
+        thread_id: Option<i64>,
+        action: &str,
+    ) -> Result<(), TgError> {
+        let mut params = json!({ "chat_id": chat_id, "action": action });
+        if let Some(thread_id) = thread_id {
+            params["message_thread_id"] = json!(thread_id);
+        }
+        self.call::<Value>("sendChatAction", &params)
+            .await
+            .map(drop)
+    }
+
     /// `deleteMessage`.
     pub async fn delete_message(&self, chat_id: i64, message_id: i64) -> Result<(), TgError> {
         let params = json!({ "chat_id": chat_id, "message_id": message_id });

@@ -23,6 +23,7 @@ pub mod tg;
 pub mod tools;
 pub mod vault;
 pub mod web;
+pub mod working;
 
 #[cfg(test)]
 mod e2e;

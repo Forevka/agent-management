@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
-    chat::{From, clip, esc},
+    chat::{From, Notify, clip, esc},
     core::Orchestrator,
     human::{self, NewItem},
     model::{AgentRow, BRAIN_AGENT, BRAIN_TASK, HumanItemRow, NodeRow, TaskRow},
@@ -696,13 +696,14 @@ pub async fn execute(o: &Arc<Orchestrator>, actor: Actor, action: &AdminAction) 
             .bind(&id)
             .fetch_all(&mut *tx)
             .await?;
-            sqlx::query(
-                "update human_items set state = 'cancelled' where node_id = $1 and state = 'open' and kind in ('plan','question','permission')",
+            let cancelled: Vec<HumanItemRow> = sqlx::query_as(
+                "update human_items set state = 'cancelled' where node_id = $1 and state = 'open' and kind in ('plan','question','permission') returning *",
             )
             .bind(&id)
-            .execute(&mut *tx)
+            .fetch_all(&mut *tx)
             .await?;
             tx.commit().await?;
+            human::retire_copies(o, cancelled, "cancelled: the agent's node was revoked");
             // Ask the node to stop those runs, after the delete so it cannot be readmitted. (A
             // node that comes back is refused, and then stops all its agents itself.)
             let key = id.parse::<fleet_net::EndpointId>().ok();
@@ -1718,7 +1719,8 @@ pub async fn send_link(o: &Orchestrator, page: &str, text: Option<&str>) -> Resu
         esc(page)
     );
     o.chat
-        .send(From::Orchestrator, None, &html, vec![], None)
+        // The owner is asked to do something on that page.
+        .send(From::Orchestrator, None, &html, vec![], None, Notify::Sound)
         .await?;
     Ok(format!(
         "Sent the owner a login link to {page} in Telegram (you do not get the link)."
