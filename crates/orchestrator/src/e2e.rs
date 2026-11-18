@@ -1667,7 +1667,7 @@ async fn workflow_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat
 
     call_as(
         o,
-        "Alice",
+        task.agent_id.as_deref().unwrap(),
         &task.id,
         "workflow_finish",
         json!({"summary": "Watches #code-review and drafts replies.", "schedule": "every:1h"}),
