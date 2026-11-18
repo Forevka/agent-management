@@ -46,6 +46,9 @@ pub struct Orchestrator {
     /// The fleet's own sessions that are stuck: when each is tried next, and the wait after that
     /// (see `tasks::retry_stuck_builtins`).
     pub builtin_retry: std::sync::Mutex<HashMap<String, crate::tasks::RetryState>>,
+    /// Runs of the fleet's own sessions that have not ended, with where their first text came
+    /// from: a run that fails on its node tells the owner when it was their message.
+    pub builtin_runs: std::sync::Mutex<HashMap<String, crate::tasks::Origin>>,
 }
 
 /// How often one task may post with a sound (`fleet agent post --notify`).
@@ -83,6 +86,7 @@ impl Orchestrator {
             loud_posts: Default::default(),
             secretary_turns: Default::default(),
             builtin_retry: Default::default(),
+            builtin_runs: Default::default(),
         });
         // Weak, so the consumer does not keep the orchestrator alive; the channel closes with it.
         let weak = Arc::downgrade(&o);
@@ -307,11 +311,26 @@ impl Orchestrator {
         Ok(())
     }
 
+    /// The owner changed a node's settings (web UI, or an approved proposal): the node gets
+    /// them, the fleet's own sessions on its projects start a new episode of "could not start"
+    /// notices (a fix that fails again is told, even with the same reason), and if they are
+    /// stuck they are tried again soon.
+    pub async fn node_settings_changed(&self, node_id: &str) -> Result<()> {
+        if let Some(node) = self.node(node_id).await? {
+            for id in [crate::model::BRAIN_TASK, crate::model::SECRETARY_TASK] {
+                if let Some(task) = self.task(id).await?
+                    && node.has_project(&task.project)
+                {
+                    self.record(id, "settings", node_id).await?;
+                }
+            }
+        }
+        crate::tasks::retry_builtins_now(self);
+        self.push_node_settings(node_id).await
+    }
+
     /// Sends a node how to start Claude. Called on connect and after edits in the web UI.
     pub async fn push_node_settings(&self, node_id: &str) -> Result<()> {
-        // New settings (a fixed Claude command, say; also sent on connect) may let a stuck
-        // session of the fleet start.
-        crate::tasks::retry_builtins_now(self);
         let node = self.node(node_id).await?.context("unknown node")?;
         let auth = match (node.auth_mode.as_str(), &node.auth_secret) {
             ("oauth_token", Some(s)) => ClaudeAuth::OAuthToken(self.vault.decrypt(s)?),
@@ -418,6 +437,7 @@ impl Orchestrator {
             AgentEventKind::Stderr { line } => self.record(&task_id, "err", &line).await?,
             AgentEventKind::Exited { code } => {
                 self.record(&task_id, "exit", &format!("{code:?}")).await?;
+                self.builtin_runs.lock().unwrap().remove(&run_id);
                 if current {
                     self.working.run_ended(&task_id, &run_id);
                     crate::secretary::run_ended(self, &run_id);
@@ -508,6 +528,13 @@ impl Orchestrator {
             }
             AgentEventKind::SpawnFailed { reason } => {
                 self.record(&task_id, "spawn_failed", &reason).await?;
+                // Who the run was for: a run started by the owner's own message tells them why.
+                let origin = self
+                    .builtin_runs
+                    .lock()
+                    .unwrap()
+                    .remove(&run_id)
+                    .unwrap_or(crate::tasks::Origin::Other);
                 if current {
                     self.working.run_ended(&task_id, &run_id);
                     crate::secretary::run_ended(self, &run_id);
@@ -543,7 +570,7 @@ impl Orchestrator {
                 crate::tasks::notice(
                     self,
                     &task,
-                    &crate::tasks::Origin::Other,
+                    &origin,
                     &format!("⚠️ Could not start the agent: {}", esc(&reason)),
                     Notify::Sound,
                     &format!("spawn: {}", crate::tasks::stable_reason(&reason)),
@@ -565,6 +592,12 @@ impl Orchestrator {
                 // marked gone; if the task has moved on to a newer run, the text simply goes
                 // there.
                 self.record(&task_id, "undelivered", &text).await?;
+                let origin = self
+                    .builtin_runs
+                    .lock()
+                    .unwrap()
+                    .remove(&run_id)
+                    .unwrap_or(crate::tasks::Origin::Other);
                 crate::tasks::release_run_messages(self, &run_id).await?;
                 if let Some(task) = task {
                     {
@@ -581,13 +614,19 @@ impl Orchestrator {
                     // The brain's own messages go through its queue, in order with the rest,
                     // and never hold up node events while its session starts.
                     if task.id == crate::model::BRAIN_TASK {
-                        self.tell_brain(text);
+                        // The owner's own message is redelivered as theirs (so they hear if it
+                        // cannot be); anything else goes through the brain's queue, in order.
+                        if let crate::tasks::Origin::Owner(_) = origin {
+                            crate::tasks::to_brain_as(self, text, origin).await?;
+                        } else {
+                            self.tell_brain(text);
+                        }
                         return Ok(());
                     }
                     // The secretary's next run takes it as a turn of nobody's in particular.
                     let redelivered = if task.id == crate::model::SECRETARY_TASK {
                         crate::secretary::run_ended(self, &run_id);
-                        crate::secretary::redeliver(self, text.clone()).await
+                        crate::secretary::redeliver(self, text.clone(), origin).await
                     } else {
                         crate::tasks::deliver(self, &task, text.clone()).await
                     };
@@ -622,16 +661,24 @@ impl Orchestrator {
 
     /// Posts in a task's topic as the task's agent (or the orchestrator if it has no bot).
     pub async fn post_task(&self, task: &TaskRow, html: &str, notify: Notify) {
+        self.post_task_ok(task, html, notify).await;
+    }
+
+    /// [`Self::post_task`], saying whether the post went out.
+    pub async fn post_task_ok(&self, task: &TaskRow, html: &str, notify: Notify) -> bool {
         let from = self.task_sender(task).await;
-        if let Err(e) = self
+        match self
             .chat
             .send(from, task.topic_id, html, vec![], None, notify)
             .await
         {
-            tracing::warn!("posting to {} failed: {e:#}", task.id);
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!("posting to {} failed: {e:#}", task.id);
+                false
+            }
         }
     }
-
     pub async fn task_sender(&self, task: &TaskRow) -> From {
         let Some(agent) = &task.agent_id else {
             return From::Orchestrator;
@@ -654,6 +701,7 @@ impl Orchestrator {
         // answer the owner from a lost run, so "typing…" ends too.
         for task in ended {
             let Some(run) = &task.run_id else { continue };
+            self.builtin_runs.lock().unwrap().remove(run);
             self.working.run_ended(&task.id, run);
             crate::secretary::run_ended(self, run);
             match crate::tasks::release_run_messages(self, run).await {

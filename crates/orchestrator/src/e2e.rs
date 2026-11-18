@@ -941,7 +941,7 @@ async fn secretary_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeCha
         .execute(db)
         .await
         .unwrap();
-    o.push_node_settings(&node_id).await.unwrap();
+    o.node_settings_changed(&node_id).await.unwrap();
     // (A minute after the last attempt at the soonest; skipped here.)
     tasks::retry_due_now(o, SECRETARY_TASK);
     tasks::retry_stuck_builtins(o).await;
@@ -995,7 +995,7 @@ async fn secretary_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeCha
                 .execute(db)
                 .await
                 .unwrap();
-            o.push_node_settings(&node).await.unwrap();
+            o.node_settings_changed(&node).await.unwrap();
         }
     };
     set_brain_command(vec!["/nonexistent/fleet-e2e-claude".into()]).await;
@@ -1041,6 +1041,32 @@ async fn secretary_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeCha
         told_before + 1,
         "told once, not on every retry"
     );
+    // The owner's own message to the broken brain is always told why.
+    let at = o.task("brain").await.unwrap().unwrap().dispatched_at;
+    let ping: fleet_telegram::Message = serde_json::from_value(json!({
+        "message_id": 9400,
+        "date": 1_700_000_000,
+        "chat": { "id": -100, "type": "supergroup", "is_forum": true },
+        "from": { "id": 42, "is_bot": false, "first_name": "Owner" },
+        "text": "are you there?",
+    }))
+    .unwrap();
+    crate::tg::owner_message(o, &ping).await.unwrap();
+    wait_for("the owner's message fails on the node", || failed_after(at)).await;
+    wait_for("the owner is told again", || async {
+        (could_not() == told_before + 2).then_some(())
+    })
+    .await;
+    // A "fix" that fails the same way is told too: the settings change starts a new episode.
+    set_brain_command(vec!["/nonexistent/another-claude".into()]).await;
+    let at = o.task("brain").await.unwrap().unwrap().dispatched_at;
+    tasks::retry_due_now(o, "brain");
+    tasks::retry_stuck_builtins(o).await;
+    wait_for("the new command fails too", || failed_after(at)).await;
+    wait_for("the failed fix is told", || async {
+        (could_not() == told_before + 3).then_some(())
+    })
+    .await;
     set_brain_command(brain_command.0.clone()).await;
     tasks::retry_due_now(o, "brain");
     tasks::retry_stuck_builtins(o).await;

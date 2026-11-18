@@ -505,7 +505,14 @@ async fn dispatch_locked(
     } else {
         Origin::Other
     };
-    crate::secretary::run_started(o, &task.id, &run_id, first);
+    crate::secretary::run_started(o, &task.id, &run_id, first.clone());
+    if crate::model::is_builtin_task(&task.id) {
+        o.builtin_runs.lock().unwrap().insert(run_id.clone(), first);
+        // Any start, by a retry or by a new text, counts for the minimum gap between retries.
+        if let Some(r) = o.builtin_retry.lock().unwrap().get_mut(&task.id) {
+            r.last = Some(std::time::Instant::now());
+        }
+    }
     Ok(Dispatched::Started)
 }
 
@@ -577,7 +584,7 @@ async fn try_notice(
     if builtin && !matches!(origin, Origin::Owner(_)) {
         let told: bool = sqlx::query_scalar(
             "select exists(select 1 from task_events where task_id = $1 and kind = 'notice' and data = $2
-               and id > coalesce((select max(id) from task_events where task_id = $1 and kind = 'out'), 0))",
+               and id > coalesce((select max(id) from task_events where task_id = $1 and kind in ('out', 'settings')), 0))",
         )
         .bind(&task.id)
         .bind(key)
@@ -587,14 +594,14 @@ async fn try_notice(
             return Ok(());
         }
     }
-    if builtin {
+    // Recorded as told only once it was: a post that failed is tried again next time.
+    if o.post_task_ok(task, html, notify).await && builtin {
         sqlx::query("insert into task_events (task_id, kind, data) values ($1, 'notice', $2)")
             .bind(&task.id)
             .bind(key)
             .execute(&o.db)
             .await?;
     }
-    o.post_task(task, html, notify).await;
     Ok(())
 }
 
@@ -605,9 +612,9 @@ pub(crate) fn stable_reason(reason: &str) -> String {
         .split_whitespace()
         .map(|w| {
             if w.contains('/') || w.contains('\\') {
-                "<path>"
+                "{path}"
             } else if w.chars().filter(char::is_ascii_digit).count() >= 3 {
-                "<n>"
+                "{n}"
             } else {
                 w
             }
@@ -1205,9 +1212,10 @@ async fn stuck(o: &Orchestrator, task: &TaskRow) -> Result<bool> {
         return Ok(false);
     }
     Ok(sqlx::query_scalar(
-        "select exists(select 1 from messages where task_id = $1 and from_agent is null and run_id is null)",
+        "select exists(select 1 from messages where task_id = $1 and to_agent = $2 and from_agent is null and run_id is null)",
     )
     .bind(&task.id)
+    .bind(&task.agent_id)
     .fetch_one(&o.db)
     .await?)
 }

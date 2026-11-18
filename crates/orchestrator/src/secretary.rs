@@ -230,9 +230,10 @@ async fn deliver(o: &Arc<Orchestrator>, origin: Origin, text: String) -> Result<
     tasks::deliver_as(o, &task, text, origin).await
 }
 
-/// A text the node handed back (its run was gone) goes to the next run.
-pub async fn redeliver(o: &Arc<Orchestrator>, text: String) -> Result<Delivered> {
-    deliver(o, Origin::Other, text).await
+/// A text the node handed back (its run was gone) goes to the next run, as from whoever the
+/// run it was meant for was started by.
+pub async fn redeliver(o: &Arc<Orchestrator>, text: String, origin: Origin) -> Result<Delivered> {
+    deliver(o, origin, text).await
 }
 /// The owner wrote in the Inbox topic: trusted, and answered there.
 pub async fn owner_message(o: &Arc<Orchestrator>, message_id: i64, text: &str) -> Result<()> {

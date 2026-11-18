@@ -891,7 +891,7 @@ pub async fn save_node_settings(
         json!({"node": n.id, "auth_mode": mode}),
     )
     .await;
-    let push_error = o.push_node_settings(&n.id).await.err().map(|e| {
+    let push_error = o.node_settings_changed(&n.id).await.err().map(|e| {
         tracing::warn!("pushing settings to {} failed: {e:#}", n.name);
         format!("{e:#}")
     });
