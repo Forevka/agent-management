@@ -1017,7 +1017,16 @@ async fn secretary_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeCha
         .unwrap();
     wait_for("the brain fails to start", || failed_after(None)).await;
     assert_eq!(could_not(), told_before + 1, "the owner is told");
+    // The first round only arms the first wait: no dispatch yet (the node settings pushed above
+    // must not have made it due).
+    let first_failure = o.task("brain").await.unwrap().unwrap().dispatched_at;
     tasks::retry_stuck_builtins(o).await;
+    assert_eq!(
+        o.task("brain").await.unwrap().unwrap().dispatched_at,
+        first_failure,
+        "not retried at once"
+    );
+    assert_eq!(o.builtin_retry.lock().unwrap()["brain"].wait.as_secs(), 300);
     let mut waits = vec![];
     for _ in 0..3 {
         let at = o.task("brain").await.unwrap().unwrap().dispatched_at;

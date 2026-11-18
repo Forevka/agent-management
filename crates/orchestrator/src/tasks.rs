@@ -1264,23 +1264,19 @@ async fn retry_stuck(o: &Arc<Orchestrator>, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// The fleet's own stuck sessions are tried at the next round, but not sooner than a minute
-/// after their last attempt: a node connected, or settings or a node's projects changed, so
-/// what kept them from starting may be fixed.
+/// The fleet's own sessions already found stuck are tried at the next round, but not sooner than
+/// a minute after their last attempt: a node connected, or settings or a node's projects
+/// changed, so what kept them from starting may be fixed. Only sessions with an entry (seen
+/// stuck by `retry_stuck`): an entry made here for a healthy session would stay "due" and make
+/// its first retry immediate whenever it later got stuck, skipping the first wait.
 pub fn retry_builtins_now(o: &Orchestrator) {
     let mut retry = o.builtin_retry.lock().unwrap();
     let now = std::time::Instant::now();
-    for id in [BRAIN_TASK, crate::model::SECRETARY_TASK] {
-        let r = retry.entry(id.to_owned()).or_insert(RetryState {
-            at: now,
-            wait: BUILTIN_RETRY_FIRST,
-            last: None,
-        });
+    for r in retry.values_mut() {
         let earliest = r.last.map_or(now, |l| l + BUILTIN_RETRY_MIN_GAP);
         r.at = r.at.min(earliest.max(now));
     }
 }
-
 /// A run of one of the fleet's sessions started: it is no longer stuck.
 pub fn builtin_started(o: &Orchestrator, task_id: &str) {
     o.builtin_retry.lock().unwrap().remove(task_id);
