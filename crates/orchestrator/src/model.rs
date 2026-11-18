@@ -176,6 +176,9 @@ pub struct TodoRow {
     pub updated_at: DateTime<Utc>,
     pub due: Option<DateTime<Utc>>,
     pub tg_msg: Option<i64>,
+    /// A workflow (task id) this todo is about: "Run workflow" nudges it instead of the brain
+    /// creating a new task.
+    pub workflow_task: Option<String>,
 }
 
 #[derive(Debug, Clone, FromRow)]

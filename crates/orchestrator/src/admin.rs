@@ -995,6 +995,40 @@ pub async fn add_bot(o: &Orchestrator, token: &str) -> Result<()> {
 const SECRETS_REACH: &str =
     "⚠️ The orchestrator can direct this project's agents, and so can reach these values.";
 
+/// Whether `s` already looks like a raw Slack id (`C0123ABCD`), not a name to resolve.
+fn looks_like_slack_id(s: &str) -> bool {
+    s.len() <= 32 && !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// A Slack channel id (`C0123ABCD`), or a name (`#code-review`/`code-review`) resolved against
+/// every conversation the secretary has already seen (`feed_conversations`, filled in for every
+/// conversation the owner is in, mapped or not — unlike `feed_channels`, which only has entries
+/// once mapped, so this is the only place a name can be resolved before a channel is mapped).
+async fn resolve_slack_channel(o: &Orchestrator, input: &str) -> Result<String> {
+    let input = input.trim();
+    ensure!(!input.is_empty(), "channel required");
+    if looks_like_slack_id(input) {
+        return Ok(input.to_owned());
+    }
+    let needle = input.trim_start_matches('#');
+    let matches: Vec<(String, String)> = sqlx::query_as(
+        "select conversation_id, name from feed_conversations
+         where source = 'slack' and kind in ('channel', 'private')
+           and lower(ltrim(name, '#')) = lower($1)",
+    )
+    .bind(needle)
+    .fetch_all(&o.db)
+    .await?;
+    match matches.len() {
+        1 => Ok(matches.into_iter().next().unwrap().0),
+        0 => bail!(
+            "no Slack channel named {input:?} is known yet (the secretary learns a channel's \
+             name once it sees a message there); give the channel id instead (like C0123ABCD)"
+        ),
+        _ => bail!("more than one Slack channel is named {input:?}; give the channel id instead"),
+    }
+}
+
 /// Checks that a proposed change can run, resolves names to ids, and describes it for the owner.
 /// The description is written here from the parsed action, never taken from the proposer. It
 /// says what changes first; free text (names and descriptions, written by the brain, a node, an
@@ -1156,11 +1190,7 @@ pub async fn prepare(o: &Orchestrator, action: AdminAction) -> Result<(AdminActi
             triage,
         } => {
             let p = tasks::project(o, &project).await?;
-            let ch = channel.trim().to_owned();
-            ensure!(
-                !ch.is_empty() && ch.len() <= 32 && ch.chars().all(|c| c.is_ascii_alphanumeric()),
-                "give the Slack channel id (like C0123ABCD), not its name"
-            );
+            let ch = resolve_slack_channel(o, &channel).await?;
             let current: Option<Option<String>> = sqlx::query_scalar(
                 "select project from feed_channels where source = 'slack' and channel_id = $1",
             )
@@ -1191,7 +1221,7 @@ pub async fn prepare(o: &Orchestrator, action: AdminAction) -> Result<(AdminActi
         }
         A::ChannelRemove { project, channel } => {
             let p = tasks::project(o, &project).await?;
-            let ch = channel.trim().to_owned();
+            let ch = resolve_slack_channel(o, &channel).await?;
             let name: Option<String> = sqlx::query_scalar(
                 "select name from feed_channels where source = 'slack' and channel_id = $1 and project = $2",
             )
@@ -2084,6 +2114,16 @@ async fn status_json(o: &Orchestrator) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slack_id_shape() {
+        assert!(looks_like_slack_id("C0123ABCD"));
+        assert!(looks_like_slack_id("C1"));
+        assert!(!looks_like_slack_id(""));
+        assert!(!looks_like_slack_id("code-review"));
+        assert!(!looks_like_slack_id("#code-review"));
+        assert!(!looks_like_slack_id(&"C".repeat(33)));
+    }
 
     #[test]
     fn actions_round_trip_through_json() {

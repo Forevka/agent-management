@@ -128,6 +128,31 @@ pub async fn start(o: &Arc<Orchestrator>, task: &TaskRow, schedule: Option<&str>
     Ok(())
 }
 
+/// Every workflow, newest first: for the brain and the secretary to find one by id when the
+/// owner names it (e.g. so a todo can link to it, or a request can `send-to-task` it instead of
+/// creating a new one).
+pub async fn list(o: &Orchestrator) -> Result<String> {
+    let rows: Vec<(String, String, Option<String>, bool)> = sqlx::query_as(
+        "select w.task_id, t.title, w.schedule, w.enabled
+         from workflows w join tasks t on t.id = w.task_id
+         order by w.created_at desc",
+    )
+    .fetch_all(&o.db)
+    .await?;
+    let out: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(task_id, title, schedule, enabled)| {
+            json!({
+                "task": task_id,
+                "title": title,
+                "schedule": schedule,
+                "enabled": enabled,
+            })
+        })
+        .collect();
+    Ok(serde_json::to_string_pretty(&out)?)
+}
+
 /// Whether a button's callback data is a workflow's (`wf|<task id>|<action>`).
 pub fn is_button(data: &str) -> bool {
     data.starts_with("wf|")

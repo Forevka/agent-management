@@ -21,7 +21,7 @@ use crate::{
         fake::{FakeChat, Op},
     },
     human::{self, Answer},
-    model::{HumanItemRow, NewAgent, TaskRow, WorkflowRow},
+    model::{HumanItemRow, NewAgent, TaskRow, TodoRow, WorkflowRow},
     tasks::{self, CreateTask},
 };
 
@@ -1827,6 +1827,182 @@ async fn workflow_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat
     wait_retired(chat, &[card_msg], "deleted").await;
 }
 
+/// A Slack channel can be mapped by name, not just by raw id (CLAUDE.md: new tool/flow needs
+/// e2e coverage) — this was the owner's actual friction: the orchestrator had no way to resolve
+/// a name, so it always had to ask for the raw id.
+async fn channel_by_name_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool) {
+    for (conv, name) in [
+        ("CCODEREVIEW1", "#code-review"),
+        ("CDUP1", "#dup-channel"),
+        ("CDUP2", "#dup-channel"),
+    ] {
+        sqlx::query(
+            "insert into feed_conversations (source, conversation_id, name, kind) values ('slack', $1, $2, 'channel')",
+        )
+        .bind(conv)
+        .bind(name)
+        .execute(db)
+        .await
+        .unwrap();
+    }
+    let propose = |channel: &'static str| async move {
+        call_as(
+            o,
+            "orchestrator",
+            "brain",
+            "admin_propose",
+            json!({"action": "channel_add", "params": {"project": "demo", "channel": channel}}),
+        )
+        .await
+    };
+    propose("#code-review").await.unwrap();
+    let last: HumanItemRow = sqlx::query_as(
+        "select * from human_items where kind = 'admin_change' order by id desc limit 1",
+    )
+    .fetch_one(db)
+    .await
+    .unwrap();
+    assert_eq!(
+        last.payload.0["action"]["channel"], "CCODEREVIEW1",
+        "resolved from '#code-review' to its id, {:?}",
+        last.payload.0
+    );
+    propose("code-review").await.unwrap();
+    let last: HumanItemRow = sqlx::query_as(
+        "select * from human_items where kind = 'admin_change' order by id desc limit 1",
+    )
+    .fetch_one(db)
+    .await
+    .unwrap();
+    assert_eq!(
+        last.payload.0["action"]["channel"], "CCODEREVIEW1",
+        "resolved the same way without the leading '#'"
+    );
+    // Already id-shaped: used as is, no lookup.
+    propose("C0123ABCD").await.unwrap();
+    let last: HumanItemRow = sqlx::query_as(
+        "select * from human_items where kind = 'admin_change' order by id desc limit 1",
+    )
+    .fetch_one(db)
+    .await
+    .unwrap();
+    assert_eq!(last.payload.0["action"]["channel"], "C0123ABCD");
+    let e = propose("#no-such-channel").await.unwrap_err();
+    assert!(
+        e.to_string().contains("not known yet"),
+        "{e}: a clear error, not a request to guess"
+    );
+    let e = propose("#dup-channel").await.unwrap_err();
+    assert!(
+        e.to_string().contains("more than one"),
+        "{e}: an ambiguous name is refused, not guessed"
+    );
+}
+
+/// A todo linked to a workflow: "Run workflow" tells the brain to nudge that task instead of
+/// creating a new one (the owner's own idea for "secretary notices a message, I get asked to
+/// run the workflow"). CLAUDE.md: new tool/flow needs e2e coverage.
+async fn workflow_linked_todo_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool) {
+    use crate::model::{SECRETARY_AGENT, SECRETARY_TASK};
+    let task = tasks::create_task(
+        o,
+        CreateTask {
+            project: "demo".into(),
+            title: "Code review triage".into(),
+            brief: "Stand-in for a workflow task.".into(),
+            ticket: Some("WF-2".into()),
+            agent: Some("Alice".into()),
+            new_agent: None,
+            model: None,
+            effort: None,
+        },
+    )
+    .await
+    .unwrap();
+    wait_for(&format!("{} starts", task.id), || async {
+        events(db, &task.id)
+            .await
+            .into_iter()
+            .find(|e| e["subtype"] == "init")
+    })
+    .await;
+    tasks::stop(o, &task, false).await.unwrap();
+    wait_for(&format!("{} stops", task.id), || async {
+        o.task(&task.id).await.unwrap().filter(|t| !t.running)
+    })
+    .await;
+    // A real workflow would exist via `workflow_finish`; inserted directly here since that path
+    // is already covered by `workflow_flow` and isn't what this test is about.
+    sqlx::query("insert into workflows (task_id, schedule) values ($1, 'every:1h')")
+        .bind(&task.id)
+        .execute(db)
+        .await
+        .unwrap();
+
+    let listed = call_as(
+        o,
+        SECRETARY_AGENT,
+        SECRETARY_TASK,
+        "workflow_list",
+        json!({}),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(listed.result.contains(&task.id), "{}", listed.result);
+
+    // Rejected: not an existing workflow.
+    let e = call_as(
+        o,
+        SECRETARY_AGENT,
+        SECRETARY_TASK,
+        "todo_add",
+        json!({"title": "x", "workflow": "no-such-task"}),
+    )
+    .await
+    .unwrap_err();
+    assert!(e.to_string().contains("does not exist"), "{e}");
+
+    call_as(
+        o,
+        SECRETARY_AGENT,
+        SECRETARY_TASK,
+        "todo_add",
+        json!({"title": "Review the open MRs", "workflow": task.id}),
+    )
+    .await
+    .unwrap();
+    let todo: TodoRow = sqlx::query_as("select * from todos where title = 'Review the open MRs'")
+        .fetch_one(db)
+        .await
+        .unwrap();
+    assert_eq!(todo.workflow_task.as_deref(), Some(task.id.as_str()));
+
+    let reply = crate::secretary::button(o, &format!("t|{}|m", todo.id))
+        .await
+        .unwrap();
+    assert!(reply.contains("sent to the orchestrator"), "{reply}");
+    let status: String = sqlx::query_scalar("select status from todos where id = $1")
+        .bind(todo.id)
+        .fetch_one(db)
+        .await
+        .unwrap();
+    assert_eq!(status, "tasked");
+    wait_for(
+        "the brain is told to nudge the workflow, not create a task",
+        || async {
+            events(db, "brain").await.into_iter().find(|e| {
+                e["type"] == "assistant"
+                    && e["message"]["content"][0]["text"]
+                        .as_str()
+                        .unwrap_or("")
+                        .contains(&format!("send-to-task {} ", task.id))
+            })
+        },
+    )
+    .await;
+}
+
 /// Whether the message `id` sounded when it was sent.
 fn notify_of_msg(chat: &FakeChat, id: Option<i64>) -> Option<Notify> {
     chat.ops.lock().unwrap().iter().find_map(|op| match op {
@@ -3406,6 +3582,10 @@ async fn task_lifecycle_through_a_real_node() {
 
     // 19. Workflows: `workflow_finish` keeps the topic open and posts a control card.
     workflow_flow(&o, &db, &chat).await;
+
+    // 20. A Slack channel can be mapped by name, and a todo can nudge an existing workflow.
+    channel_by_name_flow(&o, &db).await;
+    workflow_linked_todo_flow(&o, &db).await;
 
     stop_brain().await;
     let _ = std::fs::remove_dir_all(&data_dir);

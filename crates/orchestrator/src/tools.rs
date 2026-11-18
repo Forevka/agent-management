@@ -57,6 +57,7 @@ pub async fn handle(
             "permission"
                 | "feed_read"
                 | "feed_search"
+                | "workflow_list"
                 | "memory_retain"
                 | "memory_recall"
                 | "memory_reflect"
@@ -393,6 +394,9 @@ pub async fn handle(
         "feed_search" => {
             ok(crate::feeds::search(o, &task.project, is_brain || is_secretary, &args).await?)
         }
+        // Read-only, so the brain and the secretary can both find a workflow by id: the brain
+        // to `send-to-task` one instead of creating a new task, the secretary to link a todo.
+        "workflow_list" => ok(workflows::list(o).await?),
         name if secretary::TOOLS.contains(&name) => {
             if !is_secretary {
                 bail!("{name} is only available to the secretary");

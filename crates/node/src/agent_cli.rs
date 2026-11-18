@@ -68,6 +68,9 @@ pub enum AgentCmd {
     /// Long-term memory (Hindsight), in banks under your own prefix.
     #[command(subcommand)]
     Memory(MemoryCmd),
+    /// Existing workflows (a task turned into a standing automation).
+    #[command(subcommand)]
+    Workflow(WorkflowCmd),
     // Orchestrator (brain) only.
     /// List projects, their nodes and open tasks.
     Projects,
@@ -202,7 +205,7 @@ pub enum AdminCmd {
     ProjectBind { project: String, folder: String },
     /// Propose taking a secret folder away from a project.
     ProjectUnbind { project: String, folder: String },
-    /// Propose mirroring a Slack channel (its id, e.g. C0123ABCD) into a project.
+    /// Propose mirroring a Slack channel (its id, e.g. C0123ABCD, or its name) into a project.
     ChannelAdd {
         project: String,
         channel: String,
@@ -313,6 +316,10 @@ pub enum TodoCmd {
         /// YYYY-MM-DD.
         #[arg(long)]
         due: Option<String>,
+        /// A workflow's task id (see `fleet agent workflow list`): "Run workflow" nudges it
+        /// instead of the owner being asked to create a new task.
+        #[arg(long)]
+        workflow: Option<String>,
     },
     /// List todos (open by default).
     List {
@@ -363,6 +370,12 @@ pub enum RuleCmd {
         #[arg(long)]
         because: Option<String>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WorkflowCmd {
+    /// Existing workflows, newest first: task id, title, schedule, enabled.
+    List,
 }
 
 #[derive(Debug, Subcommand)]
@@ -477,6 +490,7 @@ pub fn to_call(cmd: AgentCmd) -> Result<(&'static str, Value)> {
         AgentCmd::Feed(FeedCmd::Search { query, limit }) => {
             ("feed_search", json!({"query": query, "limit": limit}))
         }
+        AgentCmd::Workflow(WorkflowCmd::List) => ("workflow_list", json!({})),
         AgentCmd::Memory(MemoryCmd::Retain {
             text,
             context,
@@ -553,9 +567,10 @@ pub fn to_call(cmd: AgentCmd) -> Result<(&'static str, Value)> {
             detail,
             sources,
             due,
+            workflow,
         }) => (
             "todo_add",
-            json!({"title": title, "detail": detail.map(stdin_if_dash).transpose()?, "refs": sources, "due": due}),
+            json!({"title": title, "detail": detail.map(stdin_if_dash).transpose()?, "refs": sources, "due": due, "workflow": workflow}),
         ),
         AgentCmd::Todo(TodoCmd::List { status }) => ("todo_list", json!({"status": status})),
         AgentCmd::Todo(TodoCmd::Update { id, status }) => {
@@ -862,9 +877,14 @@ mod tests {
             ]),
             (
                 "todo_add",
-                json!({"title": "Reply to Al", "detail": null, "refs": ["s:c:1"], "due": "2026-11-20"})
+                json!({"title": "Reply to Al", "detail": null, "refs": ["s:c:1"], "due": "2026-11-20", "workflow": null})
             )
         );
+        assert_eq!(
+            call(&["todo", "add", "--title", "x", "--workflow", "wf-1"]).1["workflow"],
+            json!("wf-1")
+        );
+        assert_eq!(call(&["workflow", "list"]), ("workflow_list", json!({})));
         assert_eq!(
             call(&["todo", "update", "T-3", "--status", "done"]),
             ("todo_update", json!({"id": "T-3", "status": "done"}))
