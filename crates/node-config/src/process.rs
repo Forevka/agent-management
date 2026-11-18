@@ -92,6 +92,9 @@ mod tests {
     #[cfg(any(windows, target_os = "linux"))]
     #[test]
     fn another_process_does_not_match() {
+        // Linux stamps start times in clock ticks (10 ms), so a child spawned right after this
+        // test process started could share its stamp. Real pid reuse cannot happen that fast.
+        std::thread::sleep(std::time::Duration::from_millis(50));
         let mut cmd = if cfg!(windows) {
             let mut c = std::process::Command::new("ping");
             c.args(["-n", "3", "127.0.0.1"]);
