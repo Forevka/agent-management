@@ -45,7 +45,7 @@ pub struct Orchestrator {
     pub secretary_turns: std::sync::Mutex<crate::secretary::Turns>,
     /// The fleet's own sessions that are stuck: when each is tried next, and the wait after that
     /// (see `tasks::retry_stuck_builtins`).
-    pub builtin_retry: std::sync::Mutex<HashMap<String, (std::time::Instant, std::time::Duration)>>,
+    pub builtin_retry: std::sync::Mutex<HashMap<String, crate::tasks::RetryState>>,
 }
 
 /// How often one task may post with a sound (`fleet agent post --notify`).
@@ -309,7 +309,8 @@ impl Orchestrator {
 
     /// Sends a node how to start Claude. Called on connect and after edits in the web UI.
     pub async fn push_node_settings(&self, node_id: &str) -> Result<()> {
-        // New settings (a fixed Claude command, say) may let a stuck session of the fleet start.
+        // New settings (a fixed Claude command, say; also sent on connect) may let a stuck
+        // session of the fleet start.
         crate::tasks::retry_builtins_now(self);
         let node = self.node(node_id).await?.context("unknown node")?;
         let auth = match (node.auth_mode.as_str(), &node.auth_secret) {
@@ -329,6 +330,11 @@ impl Orchestrator {
 
     async fn node_info(self: &Arc<Self>, peer: EndpointId, info: NodeInfo) -> Result<()> {
         let id = peer.to_string();
+        let projects_before: Option<sqlx::types::Json<Vec<fleet_proto::ProjectMapping>>> =
+            sqlx::query_scalar("select projects from nodes where id = $1")
+                .bind(&id)
+                .fetch_optional(&self.db)
+                .await?;
         sqlx::query("update nodes set projects = $2, running = $3, max_agents = $4, last_seen = now() where id = $1")
             .bind(&id)
             .bind(sqlx::types::Json(&info.projects))
@@ -348,10 +354,12 @@ impl Orchestrator {
         .fetch_all(&self.db)
         .await?;
         self.runs_lost(&ended, "its node no longer runs it").await;
-        // Capacity or projects may have changed: try queued work, and the fleet's own sessions
-        // if they are stuck (what kept them from starting may be fixed now).
+        // Capacity or projects may have changed: try queued work. The fleet's own stuck sessions
+        // only when the node's projects changed (a node reports on every spawn and exit).
         crate::tasks::dispatch_queued(self).await;
-        crate::tasks::retry_builtins_now(self);
+        if projects_before.is_none_or(|p| p.0 != info.projects) {
+            crate::tasks::retry_builtins_now(self);
+        }
         Ok(())
     }
 
@@ -370,6 +378,8 @@ impl Orchestrator {
         match kind {
             AgentEventKind::Started { .. } => {
                 if current {
+                    // A run of the fleet's own sessions started: it is no longer stuck.
+                    crate::tasks::builtin_started(self, &task_id);
                     crate::tasks::run_started(self, &run_id).await?;
                     sqlx::query(
                         "update agents set last_active = now(), preferred_node = $2 where id = $1",
@@ -528,10 +538,15 @@ impl Orchestrator {
                 if !ours {
                     return Ok(());
                 }
-                self.post_task(
+                // For the fleet's own sessions, retried by themselves, once per episode and
+                // reason (see `tasks::notice`); for a task, every time (the owner asked for it).
+                crate::tasks::notice(
+                    self,
                     &task,
+                    &crate::tasks::Origin::Other,
                     &format!("⚠️ Could not start the agent: {}", esc(&reason)),
                     Notify::Sound,
+                    &format!("spawn: {}", crate::tasks::stable_reason(&reason)),
                 )
                 .await;
                 crate::tasks::notify_brain(

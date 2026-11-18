@@ -909,10 +909,15 @@ async fn secretary_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeCha
         0,
         "no batch behind a waiting one"
     );
-    // Not retried at once (the first wait is minutes), then retried: nobody is told again.
-    tasks::retry_stuck_builtins(o).await.unwrap();
-    tasks::retry_builtins_now(o);
-    tasks::retry_stuck_builtins(o).await.unwrap();
+    // Not retried at once (the first wait is minutes); retried when due, and it does run (a new
+    // dispatch), but nobody is told again.
+    let dispatched = || async { o.task(SECRETARY_TASK).await.unwrap().unwrap().dispatched_at };
+    let before = dispatched().await;
+    tasks::retry_stuck_builtins(o).await;
+    assert_eq!(dispatched().await, before, "not at once");
+    tasks::retry_due_now(o, SECRETARY_TASK);
+    tasks::retry_stuck_builtins(o).await;
+    assert_ne!(dispatched().await, before, "the retry ran");
     assert_eq!(cannot(), 1, "a retry does not tell the owner again");
     // The owner's own message is always told why it cannot be handled now.
     let stuck: fleet_telegram::Message = serde_json::from_value(json!({
@@ -937,7 +942,9 @@ async fn secretary_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeCha
         .await
         .unwrap();
     o.push_node_settings(&node_id).await.unwrap();
-    tasks::retry_stuck_builtins(o).await.unwrap();
+    // (A minute after the last attempt at the soonest; skipped here.)
+    tasks::retry_due_now(o, SECRETARY_TASK);
+    tasks::retry_stuck_builtins(o).await;
     let muted: crate::model::RuleRow = wait_for("the secretary is back and handles what waited", || async {
         sqlx::query_as(
             "select * from secretary_rules where text = 'mute everything from the ops channel' and tg_msg is not null",
@@ -964,6 +971,78 @@ async fn secretary_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeCha
         .then_some(())
     })
     .await;
+    // The brain failing on its node at every start (the program is missing): the owner hears
+    // it once, and the retries back off.
+    let brain = o.task("brain").await.unwrap().unwrap();
+    let brain_node = brain.node_id.clone().unwrap();
+    let brain_command: sqlx::types::Json<Vec<String>> =
+        sqlx::query_scalar("select claude_command from nodes where id = $1")
+            .bind(&brain_node)
+            .fetch_one(db)
+            .await
+            .unwrap();
+    tasks::stop(o, &brain, false).await.unwrap();
+    wait_for("the brain stopped", || async {
+        o.task("brain").await.unwrap().filter(|t| !t.running)
+    })
+    .await;
+    let set_brain_command = |cmd: Vec<String>| {
+        let node = brain_node.clone();
+        async move {
+            sqlx::query("update nodes set claude_command = $2 where id = $1")
+                .bind(&node)
+                .bind(sqlx::types::Json(cmd))
+                .execute(db)
+                .await
+                .unwrap();
+            o.push_node_settings(&node).await.unwrap();
+        }
+    };
+    set_brain_command(vec!["/nonexistent/fleet-e2e-claude".into()]).await;
+    let could_not = || {
+        chat.sent()
+            .iter()
+            .filter(|(_, _, h, _)| h.contains("Could not start the agent"))
+            .count()
+    };
+    let told_before = could_not();
+    let failed_after = |at: Option<chrono::DateTime<chrono::Utc>>| async move {
+        o.task("brain")
+            .await
+            .unwrap()
+            .filter(|t| !t.running && t.status == "failed" && t.dispatched_at != at)
+    };
+    tasks::to_brain(o, "[Test] anyone home?".into())
+        .await
+        .unwrap();
+    wait_for("the brain fails to start", || failed_after(None)).await;
+    assert_eq!(could_not(), told_before + 1, "the owner is told");
+    tasks::retry_stuck_builtins(o).await;
+    let mut waits = vec![];
+    for _ in 0..3 {
+        let at = o.task("brain").await.unwrap().unwrap().dispatched_at;
+        tasks::retry_due_now(o, "brain");
+        tasks::retry_stuck_builtins(o).await;
+        wait_for("the retry fails on the node", || failed_after(at)).await;
+        waits.push(o.builtin_retry.lock().unwrap()["brain"].wait.as_secs());
+    }
+    assert_eq!(waits, [600, 1200, 1800], "backing off");
+    assert_eq!(
+        could_not(),
+        told_before + 1,
+        "told once, not on every retry"
+    );
+    set_brain_command(brain_command.0.clone()).await;
+    tasks::retry_due_now(o, "brain");
+    tasks::retry_stuck_builtins(o).await;
+    wait_for("the brain is back with what waited", || async {
+        (brain_heard(db, "[Test] anyone home?").await == 1).then_some(())
+    })
+    .await;
+    assert!(
+        !o.builtin_retry.lock().unwrap().contains_key("brain"),
+        "cleared once it started"
+    );
     // The daily digest is asked for once per day, at its hour; the day is recorded after.
     let hour = o.cfg.secretary.digest_hour;
     assert!(

@@ -526,9 +526,7 @@ pub async fn run(o: Arc<Orchestrator>) {
             tracing::warn!("handing messages to the secretary failed: {e:#}");
         }
         // The fleet's own sessions that are stuck with texts waiting (see the function).
-        if let Err(e) = tasks::retry_stuck_builtins(&o).await {
-            tracing::warn!("retrying the fleet's own sessions failed: {e:#}");
-        }
+        tasks::retry_stuck_builtins(&o).await;
         if digest
             && n.is_multiple_of(12)
             && let Err(e) = digest_if_due(&o).await

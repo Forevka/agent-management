@@ -323,15 +323,22 @@ async fn dispatch_locked(
         .bind(task.dispatched_at.unwrap_or(task.created_at))
         .fetch_one(&o.db)
         .await?;
-        // The owner's own message is always told why it waits.
-        let note = if told && !matches!(origin, Origin::Owner(_)) {
+        // For the fleet's own sessions the owner's own message is always told why it waits
+        // (they are retried by the fleet's texts; the owner should not wonder).
+        let tell_owner =
+            crate::model::is_builtin_task(&task.id) && matches!(origin, Origin::Owner(_));
+        let note = if told && !tell_owner {
             None
         } else {
-            sqlx::query("insert into task_events (task_id, kind, data) values ($1, 'waiting', $2)")
+            if !told {
+                sqlx::query(
+                    "insert into task_events (task_id, kind, data) values ($1, 'waiting', $2)",
+                )
                 .bind(&task.id)
                 .bind(format!("no node has project {}", task.project))
                 .execute(&o.db)
                 .await?;
+            }
             Some(format!(
                 "⏳ Waiting for a node with project <b>{}</b>: run <code>fleet project map {} &lt;dir&gt;</code> on a host.",
                 esc(&task.project),
@@ -475,17 +482,16 @@ async fn dispatch_locked(
             .await?;
             release_run_messages(o, &run_id).await?;
             tracing::warn!("preparing a run of {} failed: {e:#}", task.id);
+            let reason = format!("{e:#}");
             notice(
                 o,
                 task,
                 origin,
-                &format!(
-                    "⚠️ Could not prepare the agent's run: {}",
-                    esc(&format!("{e:#}"))
-                ),
+                &format!("⚠️ Could not prepare the agent's run: {}", esc(&reason)),
                 Notify::Sound,
+                &format!("prepare: {}", stable_reason(&reason)),
             )
-            .await?;
+            .await;
             return Ok(Dispatched::Waiting);
         }
     };
@@ -500,7 +506,6 @@ async fn dispatch_locked(
         Origin::Other
     };
     crate::secretary::run_started(o, &task.id, &run_id, first);
-    o.builtin_retry.lock().unwrap().remove(&task.id);
     Ok(Dispatched::Started)
 }
 
@@ -536,43 +541,80 @@ async fn queue(
     }
     // Queue notes are progress, not a call for the owner.
     if let Some(note) = note {
-        notice(o, task, origin, &note, Notify::Silent).await?;
+        notice(o, task, origin, &note, Notify::Silent, &note).await;
     }
     Ok(Dispatched::Waiting)
 }
 
 /// Tells the owner why a task cannot run now. For the fleet's own sessions, which are retried by
-/// every text they get (batches, reports), each reason is told once per episode (since the
-/// session last produced output); the owner's own message is always told the current reason.
-async fn notice(
+/// every text they get (batches, reports) and by `retry_stuck_builtins`, each reason (`key`: the
+/// reason without what changes from one attempt to the next) is told once per episode, since
+/// the session last produced output; the owner's own message is always told the current reason.
+/// Best effort, like every post: a failure here is logged and never fails the delivery whose
+/// text is already kept.
+pub(crate) async fn notice(
     o: &Orchestrator,
     task: &TaskRow,
     origin: &Origin,
     html: &str,
     notify: Notify,
+    key: &str,
+) {
+    if let Err(e) = try_notice(o, task, origin, html, notify, key).await {
+        tracing::warn!("telling the owner about {} failed: {e:#}", task.id);
+    }
+}
+
+async fn try_notice(
+    o: &Orchestrator,
+    task: &TaskRow,
+    origin: &Origin,
+    html: &str,
+    notify: Notify,
+    key: &str,
 ) -> Result<()> {
-    if crate::model::is_builtin_task(&task.id) && !matches!(origin, Origin::Owner(_)) {
+    let builtin = crate::model::is_builtin_task(&task.id);
+    if builtin && !matches!(origin, Origin::Owner(_)) {
         let told: bool = sqlx::query_scalar(
             "select exists(select 1 from task_events where task_id = $1 and kind = 'notice' and data = $2
-               and at > coalesce((select max(at) from task_events where task_id = $1 and kind = 'out'), '-infinity'))",
+               and id > coalesce((select max(id) from task_events where task_id = $1 and kind = 'out'), 0))",
         )
         .bind(&task.id)
-        .bind(html)
+        .bind(key)
         .fetch_one(&o.db)
         .await?;
         if told {
             return Ok(());
         }
     }
-    sqlx::query("insert into task_events (task_id, kind, data) values ($1, 'notice', $2)")
-        .bind(&task.id)
-        .bind(html)
-        .execute(&o.db)
-        .await?;
+    if builtin {
+        sqlx::query("insert into task_events (task_id, kind, data) values ($1, 'notice', $2)")
+            .bind(&task.id)
+            .bind(key)
+            .execute(&o.db)
+            .await?;
+    }
     o.post_task(task, html, notify).await;
     Ok(())
 }
 
+/// A reason without what changes from one attempt to the next (paths, ids, numbers), so the
+/// same trouble is recognised as the same.
+pub(crate) fn stable_reason(reason: &str) -> String {
+    reason
+        .split_whitespace()
+        .map(|w| {
+            if w.contains('/') || w.contains('\\') {
+                "<path>"
+            } else if w.chars().filter(char::is_ascii_digit).count() >= 3 {
+                "<n>"
+            } else {
+                w
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 /// Every node with the number of agent runs it is assigned (from our own bookkeeping, which is
 /// current even before the node reports back).
 async fn node_load(o: &Orchestrator) -> Result<Vec<(NodeRow, i64)>> {
@@ -1029,6 +1071,34 @@ pub async fn stop(o: &Orchestrator, task: &TaskRow, graceful: bool) -> Result<()
     if !graceful {
         sqlx::query("update tasks set status = 'stopped', updated_at = now() where id = $1 and status <> 'done'").bind(&task.id).execute(&o.db).await?;
     }
+    stop_run(o, &task, graceful)
+}
+
+/// Starts one of the fleet's own sessions (brain, secretary) afresh: forgets its session and
+/// stops its run, in one step under the task's lock, so neither a message in between nor the
+/// stopped run reporting its session late brings the old session back. Its next text starts a
+/// new one (texts already waiting are picked up by `retry_stuck_builtins`).
+pub async fn reset_builtin(o: &Orchestrator, id: &str) -> Result<()> {
+    ensure!(
+        crate::model::is_builtin_task(id),
+        "{id} is not one of the fleet's own sessions"
+    );
+    let lock = o.task_lock(id);
+    let _held = lock.lock().await;
+    let Some(task) = o.task(id).await? else {
+        return Ok(());
+    };
+    sqlx::query(
+        "update tasks set session_id = null, status = 'stopped', updated_at = now() where id = $1",
+    )
+    .bind(id)
+    .execute(&o.db)
+    .await?;
+    stop_run(o, &task, false)
+}
+
+/// Tells the node to stop the task's run, if it has one.
+fn stop_run(o: &Orchestrator, task: &TaskRow, graceful: bool) -> Result<()> {
     // Only a running task has a process to stop; otherwise the node would stop whatever its
     // agent is running now, possibly another task.
     if let (true, Some(node), Some(agent)) = (task.running, &task.node_id, &task.agent_id) {
@@ -1095,74 +1165,132 @@ pub async fn dispatch_queued(o: &Arc<Orchestrator>) {
 /// most (the wait doubles in between).
 const BUILTIN_RETRY_FIRST: std::time::Duration = std::time::Duration::from_secs(300);
 const BUILTIN_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(1800);
+/// A retry asked for at once (a node connected, settings changed) still waits this long after
+/// the last attempt.
+const BUILTIN_RETRY_MIN_GAP: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// When a stuck session of the fleet is tried next, the wait after that, and when it was last
+/// tried. Cleared only when a run actually starts (see `core`), so a run that fails on its node
+/// keeps backing off.
+#[derive(Debug, Clone, Copy)]
+pub struct RetryState {
+    pub at: std::time::Instant,
+    pub wait: std::time::Duration,
+    pub last: Option<std::time::Instant>,
+}
 
 /// Starts the fleet's own sessions (brain, secretary) that are stuck: not running, failed to
-/// start or queued for a node, with texts waiting for them. Nothing else would: ordinary tasks
-/// are started by the owner's messages and by `dispatch_queued`, but these get their texts from
-/// the fleet (reports, batches the secretary holds back while one waits). Tried every
-/// [`BUILTIN_RETRY_FIRST`], backing off to [`BUILTIN_RETRY_MAX`], and at once after a node
-/// connects or a node's settings change ([`retry_builtins_now`]).
-pub async fn retry_stuck_builtins(o: &Arc<Orchestrator>) -> Result<()> {
+/// start, queued for a node or stopped (a reset), with texts waiting for them. Nothing else
+/// would: ordinary tasks are started by the owner's messages and by `dispatch_queued`, but these
+/// get their texts from the fleet (reports, batches the secretary holds back while one waits).
+/// Tried after [`BUILTIN_RETRY_FIRST`], backing off to [`BUILTIN_RETRY_MAX`], and sooner after a
+/// node connects or settings change ([`retry_builtins_now`]).
+pub async fn retry_stuck_builtins(o: &Arc<Orchestrator>) {
     for id in [BRAIN_TASK, crate::model::SECRETARY_TASK] {
-        let Some(task) = o.task(id).await? else {
-            continue;
-        };
-        let waiting: bool = sqlx::query_scalar(
-            "select exists(select 1 from messages where task_id = $1 and from_agent is null and run_id is null)",
-        )
-        .bind(id)
-        .fetch_one(&o.db)
-        .await?;
-        let stuck = !task.running
-            && matches!(task.status.as_str(), status::FAILED | status::QUEUED)
-            && waiting;
-        let due = {
-            let mut retry = o.builtin_retry.lock().unwrap();
-            let now = std::time::Instant::now();
-            match retry.get_mut(id) {
-                _ if !stuck => {
-                    retry.remove(id);
-                    false
-                }
-                None => {
-                    retry.insert(
-                        id.to_owned(),
-                        (now + BUILTIN_RETRY_FIRST, BUILTIN_RETRY_FIRST),
-                    );
-                    false
-                }
-                Some((at, wait)) if now >= *at => {
-                    *wait = (*wait * 2).min(BUILTIN_RETRY_MAX);
-                    *at = now + *wait;
-                    true
-                }
-                Some(_) => false,
-            }
-        };
-        if !due {
-            continue;
+        // One session's trouble must not keep the other from being tried.
+        if let Err(e) = retry_stuck(o, id).await {
+            tracing::warn!("trying {id} again failed: {e:#}");
         }
-        let lock = o.task_lock(id);
-        let _held = lock.lock().await;
-        let task = o.task(id).await?.context("task vanished")?;
-        if task.running {
-            continue;
-        }
-        tracing::info!("trying {id} again: it is stuck with texts waiting");
-        let resume = task.session_id.clone();
-        dispatch_locked(o, &task, None, resume, &Origin::Other).await?;
     }
+}
+
+/// Whether a session of the fleet is stuck with texts waiting.
+async fn stuck(o: &Orchestrator, task: &TaskRow) -> Result<bool> {
+    if task.running
+        || !matches!(
+            task.status.as_str(),
+            status::FAILED | status::QUEUED | status::STOPPED
+        )
+    {
+        return Ok(false);
+    }
+    Ok(sqlx::query_scalar(
+        "select exists(select 1 from messages where task_id = $1 and from_agent is null and run_id is null)",
+    )
+    .bind(&task.id)
+    .fetch_one(&o.db)
+    .await?)
+}
+
+async fn retry_stuck(o: &Arc<Orchestrator>, id: &str) -> Result<()> {
+    let Some(task) = o.task(id).await? else {
+        return Ok(());
+    };
+    let is_stuck = stuck(o, &task).await?;
+    let due = {
+        let mut retry = o.builtin_retry.lock().unwrap();
+        let now = std::time::Instant::now();
+        match retry.get_mut(id) {
+            // Not stuck, and not starting either: forget it (a starting run keeps its entry
+            // until it reports that it started).
+            _ if !is_stuck && !task.running => {
+                retry.remove(id);
+                false
+            }
+            _ if !is_stuck => false,
+            None => {
+                retry.insert(
+                    id.to_owned(),
+                    RetryState {
+                        at: now + BUILTIN_RETRY_FIRST,
+                        wait: BUILTIN_RETRY_FIRST,
+                        last: None,
+                    },
+                );
+                false
+            }
+            Some(r) if now >= r.at => {
+                r.wait = (r.wait * 2).min(BUILTIN_RETRY_MAX);
+                r.at = now + r.wait;
+                r.last = Some(now);
+                true
+            }
+            Some(_) => false,
+        }
+    };
+    if !due {
+        return Ok(());
+    }
+    // Under the lock, afresh: a message may have started it, or taken what waited, meanwhile.
+    let lock = o.task_lock(id);
+    let _held = lock.lock().await;
+    let task = o.task(id).await?.context("task vanished")?;
+    if !stuck(o, &task).await? {
+        return Ok(());
+    }
+    tracing::info!("trying {id} again: it is stuck with texts waiting");
+    let resume = task.session_id.clone();
+    dispatch_locked(o, &task, None, resume, &Origin::Other).await?;
     Ok(())
 }
 
-/// The fleet's own stuck sessions are tried at the next round (a node connected, a node's
-/// settings changed: what kept them from starting may be fixed).
+/// The fleet's own stuck sessions are tried at the next round, but not sooner than a minute
+/// after their last attempt: a node connected, or settings or a node's projects changed, so
+/// what kept them from starting may be fixed.
 pub fn retry_builtins_now(o: &Orchestrator) {
     let mut retry = o.builtin_retry.lock().unwrap();
     let now = std::time::Instant::now();
     for id in [BRAIN_TASK, crate::model::SECRETARY_TASK] {
-        let wait = retry.get(id).map_or(BUILTIN_RETRY_FIRST, |(_, w)| *w);
-        retry.insert(id.to_owned(), (now, wait));
+        let r = retry.entry(id.to_owned()).or_insert(RetryState {
+            at: now,
+            wait: BUILTIN_RETRY_FIRST,
+            last: None,
+        });
+        let earliest = r.last.map_or(now, |l| l + BUILTIN_RETRY_MIN_GAP);
+        r.at = r.at.min(earliest.max(now));
+    }
+}
+
+/// A run of one of the fleet's sessions started: it is no longer stuck.
+pub fn builtin_started(o: &Orchestrator, task_id: &str) {
+    o.builtin_retry.lock().unwrap().remove(task_id);
+}
+
+/// Tests: the next round tries `id` (skipping the waits).
+#[cfg(test)]
+pub(crate) fn retry_due_now(o: &Orchestrator, id: &str) {
+    if let Some(r) = o.builtin_retry.lock().unwrap().get_mut(id) {
+        r.at = std::time::Instant::now();
     }
 }
 pub async fn to_brain(o: &Arc<Orchestrator>, text: String) -> Result<Delivered> {
@@ -1284,6 +1412,18 @@ mod tests {
         let out = newest_within(vec![b(500), owner.clone(), b(900)], 100);
         assert_eq!(&out[1..], &[owner, b(900)][..], "never clipped");
     }
+    #[test]
+    fn reasons_are_compared_without_what_changes() {
+        assert_eq!(
+            stable_reason("spawning /opt/x/claude failed (os error 2) for run 3f9a12b7c0de"),
+            stable_reason("spawning /opt/y/claude failed (os error 2) for run 77aa0011bb22")
+        );
+        assert_ne!(
+            stable_reason("auth failed"),
+            stable_reason("no such program")
+        );
+    }
+
     #[test]
     fn widening_flags_keep_the_secretary_off_a_node() {
         let cmd = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();

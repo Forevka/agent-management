@@ -703,6 +703,13 @@ async fn task_page(State(o): State<O>, h: HeaderMap, Path(id): Path<String>) -> 
 
 /// Shows assistant text and tool use from stream-json events; everything else stays terse.
 fn transcript_line(kind: &str, data: &str) -> String {
+    // What the owner was told about the task (stored as the HTML or reason that was used).
+    if kind == "notice" {
+        return format!(
+            "<span class=muted>📣 told the owner: {}</span>",
+            esc(&clip(&plain_text(data), 500))
+        );
+    }
     if kind != "out" {
         return format!("<code>{}</code>", esc(&clip(data, 500)));
     }
@@ -739,6 +746,24 @@ fn transcript_line(kind: &str, data: &str) -> String {
         ),
         _ => String::new(),
     }
+}
+
+/// Telegram HTML as plain text: tags dropped, the few entities `chat::esc` writes turned back.
+fn plain_text(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut in_tag = false;
+    for c in html.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' if in_tag => in_tag = false,
+            c if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&amp;", "&")
 }
 
 // ---------------------------------------------------------------- projects
@@ -1447,5 +1472,13 @@ mod tests {
         );
         assert!(l.contains("hi") && l.contains("Bash"));
         assert!(transcript_line("out", r#"{"type":"user"}"#).is_empty());
+        let n = transcript_line(
+            "notice",
+            "⏳ Waiting for <b>a&amp;b</b>: run <code>map &lt;dir&gt;</code>",
+        );
+        assert!(
+            n.contains("told the owner: ⏳ Waiting for a&amp;b: run map &lt;dir&gt;"),
+            "{n}"
+        );
     }
 }
