@@ -353,11 +353,7 @@ async fn replies_go_into_the_thread() {
         .await
         .unwrap();
     let posts = g.requests("/v1/spaces/AAA/messages").await;
-    let last = posts
-        .iter()
-        .filter(|r| r.method.as_str() == "POST")
-        .next_back()
-        .unwrap();
+    let last = posts.iter().rfind(|r| r.method.as_str() == "POST").unwrap();
     let body: Value = serde_json::from_slice(&last.body).unwrap();
     assert_eq!(body["thread"]["name"], "spaces/AAA/threads/t9");
     // The closest link Google documents is the space's.

@@ -1336,7 +1336,11 @@ async fn secretary_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeCha
             "from": { "id": 42, "is_bot": false, "first_name": "Owner" },
             "message_thread_id": inbox,
             "is_topic_message": true,
-            "reply_to_message": { "message_id": dave_msg },
+            "reply_to_message": {
+                "message_id": dave_msg,
+                "date": 1_700_000_000,
+                "chat": { "id": -100, "type": "supergroup", "is_forum": true },
+            },
             "text": "tell him Friday works",
         }))
         .unwrap()
