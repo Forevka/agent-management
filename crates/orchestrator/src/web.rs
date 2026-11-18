@@ -1297,7 +1297,7 @@ pub(crate) async fn render_inbox(o: &Orchestrator) -> Result<String> {
     refs.extend(triage.iter().flat_map(|t| t.1.clone()));
     let msgs = secretary::messages_by_ref(o, &refs).await?;
     let source = |r: &str| match msgs.get(r) {
-        Some((conv, author, text, link)) => {
+        Some((conv, author, text, link, attention)) => {
             let who = format!("{} · {}", esc(conv), esc(author.as_deref().unwrap_or("?")));
             let who = match link {
                 Some(l) if l.starts_with("https://") => {
@@ -1305,7 +1305,13 @@ pub(crate) async fn render_inbox(o: &Orchestrator) -> Result<String> {
                 }
                 _ => who,
             };
-            format!("{who}: {}", esc(&clip(text, 200)))
+            // A conversation the owner turned down in its source, as the secretary sees it.
+            let badge = match attention.as_deref() {
+                Some("muted") => " <span class=pill>muted</span>",
+                Some("mentions_only") => " <span class=pill>mentions only</span>",
+                _ => "",
+            };
+            format!("{who}{badge}: {}", esc(&clip(text, 200)))
         }
         None => format!("<span class=muted>{} (no longer kept)</span>", esc(r)),
     };

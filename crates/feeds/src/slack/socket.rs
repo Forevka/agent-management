@@ -153,6 +153,7 @@ struct Config {
     send_timeout: Duration,
     checkpoint_every: Duration,
     directory_refresh: Duration,
+    attention_refresh: Duration,
     event_queue: usize,
     /// Plain `ws://` URLs are accepted only from a test server, never from Slack.
     allow_plain_ws: bool,
@@ -181,6 +182,7 @@ impl Default for Config {
             send_timeout: Duration::from_secs(10),
             checkpoint_every: Duration::from_secs(10),
             directory_refresh: Duration::from_secs(6 * 60 * 60),
+            attention_refresh: Duration::from_secs(30 * 60),
             event_queue: 50_000,
             allow_plain_ws: false,
         }
@@ -480,6 +482,7 @@ impl Shared {
                 user.clone(),
                 gates.clone(),
                 cfg.directory_refresh,
+                cfg.attention_refresh,
             )),
             gates,
             user,
@@ -850,6 +853,7 @@ impl Shared {
             }
         }
         let auth = self.auth();
+        let attention = self.dir.attention(channel);
         shape_message(
             raw,
             Shape {
@@ -863,6 +867,10 @@ impl Shared {
             |id| self.dir.cached_user(id),
             |id| self.dir.cached_conversation_name(id),
         )
+        .map(|mut m| {
+            m.conversation_attention = attention;
+            m
+        })
     }
 
     /// Handles one pushed event: the events to deliver, and the progress to record once they
@@ -871,6 +879,15 @@ impl Shared {
         let mut out = Handled::default();
         let meta = EventMeta::of(&ev);
         if self.membership_event(&ev, meta.event_type.as_deref()) {
+            return out;
+        }
+        // Documented for RTM only; applied should Slack ever send it here.
+        if meta.event_type.as_deref() == Some("pref_change") {
+            if let (Some(name), Some(value)) =
+                (ev.get("name").and_then(Value::as_str), ev.get("value"))
+            {
+                self.dir.apply_pref(name, value);
+            }
             return out;
         }
         if meta.event_type.as_deref() != Some("message") {
@@ -1565,6 +1582,14 @@ impl SlackSocket {
         self
     }
 
+    /// How often the owner's notification settings (mutes, mentions only) are re-read
+    /// (default 30 minutes), separately from the membership refresh.
+    pub fn with_attention_refresh(mut self, every: Duration) -> Self {
+        self.cfg.attention_refresh = every;
+        self.rebuild(None);
+        self
+    }
+
     /// The owner's Slack user id, once `auth.test` has answered.
     pub fn self_user_id(&self) -> Option<String> {
         self.shared.auth().user_id
@@ -1786,8 +1811,9 @@ impl SlackSocket {
                     if *hello {
                         self.shared.alive(unix_now());
                     }
+                    let due = self.shared.dir.refresh_due() || self.shared.dir.attention_due();
                     let wanted = self.shared.request_due_fill()
-                        || (self.shared.dir.refresh_due() && self.shared.request_maintenance());
+                        || (due && self.shared.request_maintenance());
                     if wanted {
                         *maintenance = Some(self.spawn_maintenance(sink.clone()));
                     }
@@ -1829,6 +1855,8 @@ impl SlackSocket {
                         Err(e) => tracing::warn!(error = %e, "slack membership refresh failed"),
                     }
                 }
+                // Mutes on their own, shorter interval; paced through the same gate.
+                shared.dir.refresh_attention_if_due().await;
                 if !shared.maintenance_continue() {
                     guard.armed = false;
                     break;
@@ -2440,6 +2468,7 @@ mod tests {
                 id: "D1".into(),
                 name: None,
                 kind: ConversationKind::Direct,
+                attention: None,
             }],
             "1700000000.000000",
             false,
@@ -2464,11 +2493,13 @@ mod tests {
                     id: "D1".into(),
                     name: None,
                     kind: ConversationKind::Direct,
+                    attention: None,
                 },
                 crate::Conversation {
                     id: "C1".into(),
                     name: None,
                     kind: ConversationKind::Channel,
+                    attention: None,
                 },
             ],
             "1700000000.000000",

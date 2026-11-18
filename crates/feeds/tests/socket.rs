@@ -5,7 +5,7 @@
 //! `apps.connections.open`, which must be a POST) and implements history and replies with
 //! Slack's paging and `oldest` semantics, so gap checks are tested against realistic answers.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -15,7 +15,8 @@ use axum::http::{HeaderMap, Method, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use fleet_feeds::{
-    ConversationKind, FeedError, FeedEvent, FeedMessage, SlackSocket, Source, SourceStatus,
+    Attention, ConversationKind, FeedError, FeedEvent, FeedMessage, SlackSocket, Source,
+    SourceStatus,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
@@ -49,6 +50,12 @@ struct Mock {
     outsiders: HashMap<String, Value>,
     /// An error every `conversations.info` answers with.
     info_error: Option<&'static str>,
+    /// Conversations the owner muted (left out with `exclude_muted=true`).
+    muted: HashSet<String>,
+    /// `users.conversations` with `exclude_muted` fails.
+    mute_list_error: bool,
+    /// What `users.prefs.get` answers; an error when `None`.
+    prefs: Option<Value>,
     token_misuse: Vec<String>,
 }
 
@@ -180,9 +187,23 @@ impl Mock {
                     self.members_errors -= 1;
                     return json!({"ok": false, "error": "internal_error"});
                 }
-                let channels: Vec<Value> = self.conversations.values().cloned().collect();
+                let exclude_muted = q.get("exclude_muted").map(String::as_str) == Some("true");
+                if exclude_muted && self.mute_list_error {
+                    return json!({"ok": false, "error": "internal_error"});
+                }
+                let channels: Vec<Value> = self
+                    .conversations
+                    .iter()
+                    .filter(|(id, _)| !(exclude_muted && self.muted.contains(*id)))
+                    .map(|(_, c)| c.clone())
+                    .collect();
                 json!({"ok": true, "channels": channels, "response_metadata": {"next_cursor": ""}})
             }
+            "users.prefs.get" => match &self.prefs {
+                Some(p) => json!({"ok": true, "prefs": p}),
+                // What an undocumented method may well answer a user token with.
+                None => json!({"ok": false, "error": "not_allowed_token_type"}),
+            },
             _ => json!({"ok": false, "error": "unknown_method"}),
         }
     }
@@ -347,6 +368,14 @@ impl Slack {
             .filter(|(m, _)| m == method)
             .map(|(_, q)| q.clone())
             .collect()
+    }
+
+    /// Membership list reads, leaving out the mute-state reads that accompany them.
+    fn member_lists(&self) -> usize {
+        self.requests("users.conversations")
+            .iter()
+            .filter(|q| !q.contains_key("exclude_muted"))
+            .count()
     }
 
     fn assert_tokens_handled(&self) {
@@ -1166,7 +1195,7 @@ async fn a_failed_member_list_is_retried_and_still_seeds() {
     send(&mut conn, hello()).await;
     let m = next_message(&mut rx).await;
     assert_eq!(m.text, "while you were away");
-    assert_eq!(s.requests("users.conversations").len(), 2);
+    assert_eq!(s.member_lists(), 2);
 }
 
 #[tokio::test]
@@ -1278,7 +1307,7 @@ async fn a_short_outage_still_checks_every_direct_message() {
         ["D1", "G1"],
         "direct and group messages only; a quiet channel keeps the short window"
     );
-    assert_eq!(s.requests("users.conversations").len(), 1);
+    assert_eq!(s.member_lists(), 1);
 }
 
 /// A public channel the owner can read but is not in.
@@ -1442,4 +1471,152 @@ async fn unknown_membership_fails_closed_and_is_checked_again() {
         m.members_errors = 0;
     }
     assert_eq!(next_message(&mut rx).await.text, "held back");
+}
+
+#[tokio::test]
+async fn notification_settings_reach_the_directory_and_messages() {
+    let mut s = Slack::start().await;
+    {
+        let mut m = s.mock.lock().unwrap();
+        m.conversations.insert(
+            "C2".into(),
+            json!({"id": "C2", "name": "gitlab-notifications", "is_channel": true, "is_member": true}),
+        );
+        // C2 muted in Slack; G1 set to mentions only (only the undocumented prefs say so).
+        m.muted.insert("C2".into());
+        m.prefs = Some(json!({
+            "muted_channels": "C2",
+            "all_notifications_prefs": json!({
+                "channels": {"G1": {"desktop": "mention", "mobile": "mention"}}
+            }).to_string()
+        }));
+    }
+    let src = s.source();
+    let dir = src.directory().unwrap();
+    let (mut rx, _run) = s.run(src);
+    let mut conn = s.accept().await;
+    send(&mut conn, hello()).await;
+
+    let by_id = |list: Vec<fleet_feeds::Conversation>| {
+        list.into_iter()
+            .map(|c| (c.id, c.attention))
+            .collect::<HashMap<_, _>>()
+    };
+    let all = by_id(dir.conversations().await.unwrap());
+    assert_eq!(all["C2"], Some(Attention::Muted));
+    assert_eq!(all["G1"], Some(Attention::MentionsOnly));
+    assert_eq!(all["C1"], Some(Attention::Normal));
+    assert_eq!(
+        dir.conversation("C2").await.unwrap().attention,
+        Some(Attention::Muted)
+    );
+
+    // Messages carry it too.
+    send(
+        &mut conn,
+        envelope(
+            "e1",
+            "Ev1",
+            message("C2", "channel", &s.ts(1), "U2", "pipeline failed"),
+        ),
+    )
+    .await;
+    let m = next_message(&mut rx).await;
+    assert_eq!(m.conversation_attention, Some(Attention::Muted));
+}
+
+#[tokio::test]
+async fn unreadable_notification_settings_leave_attention_unknown() {
+    let mut s = Slack::start().await;
+    {
+        let mut m = s.mock.lock().unwrap();
+        m.mute_list_error = true;
+        // `prefs` stays `None`: users.prefs.get refuses the token.
+    }
+    let src = s.source();
+    let dir = src.directory().unwrap();
+    let (mut rx, _run) = s.run(src);
+    let mut conn = s.accept().await;
+    send(&mut conn, hello()).await;
+    let all = dir.conversations().await.unwrap();
+    assert!(!all.is_empty());
+    assert!(all.iter().all(|c| c.attention.is_none()));
+    // Delivery is unaffected.
+    send(
+        &mut conn,
+        envelope(
+            "e1",
+            "Ev1",
+            message("D1", "im", &s.ts(1), "U1", "still here"),
+        ),
+    )
+    .await;
+    let m = next_message(&mut rx).await;
+    assert_eq!(m.text, "still here");
+    assert_eq!(m.conversation_attention, None);
+}
+
+#[tokio::test]
+async fn documented_mutes_work_without_the_undocumented_prefs() {
+    let mut s = Slack::start().await;
+    s.mock.lock().unwrap().muted.insert("C1".into());
+    let src = s.source();
+    let dir = src.directory().unwrap();
+    let (_rx, _run) = s.run(src);
+    let mut conn = s.accept().await;
+    send(&mut conn, hello()).await;
+    let all: HashMap<String, Option<Attention>> = dir
+        .conversations()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|c| (c.id, c.attention))
+        .collect();
+    assert_eq!(all["C1"], Some(Attention::Muted));
+    assert_eq!(all["D1"], Some(Attention::Normal));
+}
+
+#[tokio::test]
+async fn a_new_mute_counts_on_its_own_shorter_interval() {
+    let mut s = Slack::start().await;
+    let src = s
+        .source()
+        .with_attention_refresh(Duration::from_millis(200))
+        .with_keepalive(Duration::from_millis(50), Duration::from_secs(5));
+    let dir = src.directory().unwrap();
+    let (_rx, _run) = s.run(src);
+    let mut conn = s.accept().await;
+    send(&mut conn, hello()).await;
+    assert_eq!(
+        dir.conversations()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|c| c.id == "C1")
+            .unwrap()
+            .attention,
+        Some(Attention::Normal)
+    );
+    // The owner mutes the channel in Slack.
+    s.mock.lock().unwrap().muted.insert("C1".into());
+    let started = std::time::Instant::now();
+    loop {
+        if dir.conversation("C1").await.unwrap().attention == Some(Attention::Muted) {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the mute never counted"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Only the settings were re-read; the membership list (6 h by default) was not.
+    assert_eq!(s.member_lists(), 1);
+    assert!(
+        s.requests("users.conversations")
+            .iter()
+            .filter(|q| q.contains_key("exclude_muted"))
+            .count()
+            >= 2
+    );
 }

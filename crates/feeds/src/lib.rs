@@ -120,6 +120,43 @@ pub struct FeedMessage {
     /// is context ("the owner already answered"), not something to triage.
     #[serde(default)]
     pub from_owner: bool,
+    /// How much the owner has asked the source to notify them about this conversation (muted,
+    /// mentions only). `None` when the source does not know.
+    #[serde(default)]
+    pub conversation_attention: Option<Attention>,
+}
+
+/// How much attention the owner gives a conversation, as set in the source itself (Slack's
+/// mute and notification settings, say). Upper layers use it to lower the priority of
+/// conversations the owner has quietened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum Attention {
+    /// The owner is notified only when mentioned.
+    MentionsOnly,
+    /// The owner muted the conversation or turned its notifications off.
+    Muted,
+    /// Notifications as usual. A level written by a newer version reads as this one.
+    #[serde(other)]
+    Normal,
+}
+
+impl Attention {
+    /// A short stable name, for storage and display; the same string serde writes.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::MentionsOnly => "mentions_only",
+            Self::Muted => "muted",
+        }
+    }
+}
+
+impl fmt::Display for Attention {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// What a running source hands over, in order.
@@ -208,6 +245,9 @@ pub struct Conversation {
     /// A human name: the channel name, or for a direct message the other person's name.
     pub name: Option<String>,
     pub kind: ConversationKind,
+    /// The owner's notification setting for it, when the source can tell.
+    #[serde(default)]
+    pub attention: Option<Attention>,
 }
 
 /// A message author as a [`Directory`] knows them.

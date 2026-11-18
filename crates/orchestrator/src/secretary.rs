@@ -284,7 +284,7 @@ pub async fn note_from_brain(o: &Arc<Orchestrator>, text: &str) -> Result<()> {
 }
 
 /// id, source, conversation id, conversation name, kind, message id, thread, author, text,
-/// subject, ts, mentions the owner.
+/// subject, ts, mentions the owner, the conversation's attention setting (when known).
 type Pending = (
     i64,
     String,
@@ -298,6 +298,7 @@ type Pending = (
     Option<String>,
     f64,
     bool,
+    Option<String>,
 );
 
 fn personal(p: &Pending) -> bool {
@@ -331,9 +332,10 @@ pub async fn flush(o: &Arc<Orchestrator>, force: bool) -> Result<usize> {
         return Ok(0);
     }
     // Cheap first: whether anything is due at all (this runs every few seconds).
+    // Messages of muted conversations never hurry a batch: they ride along in the next one.
     let (waiting, oldest_secs, personal_due): (i64, Option<f64>, Option<bool>) =
         sqlx::query_as(&format!(
-            "select count(*), extract(epoch from now() - min(m.created_at))::float8,
+            "select count(*) filter (where v.attention is distinct from 'muted'), extract(epoch from now() - min(m.created_at))::float8,
                     bool_or({PERSONAL_SQL} and m.created_at <= now() - make_interval(secs => $1))
              from feed_messages m
              left join feed_conversations v on v.source = m.source and v.conversation_id = m.channel_id
@@ -342,7 +344,7 @@ pub async fn flush(o: &Arc<Orchestrator>, force: bool) -> Result<usize> {
         .bind(cfg.debounce_secs as f64)
         .fetch_one(&o.db)
         .await?;
-    if waiting == 0 {
+    if oldest_secs.is_none() {
         return Ok(0);
     }
     let due = force
@@ -364,7 +366,7 @@ pub async fn flush(o: &Arc<Orchestrator>, force: bool) -> Result<usize> {
     }
     let pending: Vec<Pending> = sqlx::query_as(
         "select m.id, m.source, m.channel_id, coalesce(nullif(v.name, ''), m.channel_id), coalesce(v.kind, 'channel'),
-                m.msg_id, m.thread_id, m.author, m.text, m.subject, m.ts, m.mentions_owner
+                m.msg_id, m.thread_id, m.author, m.text, m.subject, m.ts, m.mentions_owner, v.attention
          from feed_messages m
          left join feed_conversations v on v.source = m.source and v.conversation_id = m.channel_id
          where m.secretary = 'pending' order by m.id limit 5000",
@@ -434,7 +436,7 @@ fn message_line(p: &Pending) -> String {
     let at = DateTime::from_timestamp(p.10 as i64, 0)
         .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
         .unwrap_or_default();
-    json!({
+    let mut line = json!({
         "ref": msg_ref(&p.1, &p.2, &p.5),
         "conversation": p.3,
         "kind": p.4,
@@ -444,8 +446,28 @@ fn message_line(p: &Pending) -> String {
         "mentions_owner": p.11,
         "subject": p.9,
         "text": clip(&p.8, 1500),
-    })
-    .to_string()
+    });
+    // Only when the owner turned it down (muted, mentions only): that is what changes triage.
+    if let Some(a) = p.12.as_deref().filter(|a| *a != "normal") {
+        line["attention"] = json!(a);
+    }
+    line.to_string()
+}
+
+/// Tests: the lines the next batch would show for the waiting messages.
+#[cfg(test)]
+pub(crate) async fn pending_lines(o: &Orchestrator) -> Vec<String> {
+    let pending: Vec<Pending> = sqlx::query_as(
+        "select m.id, m.source, m.channel_id, coalesce(nullif(v.name, ''), m.channel_id), coalesce(v.kind, 'channel'),
+                m.msg_id, m.thread_id, m.author, m.text, m.subject, m.ts, m.mentions_owner, v.attention
+         from feed_messages m
+         left join feed_conversations v on v.source = m.source and v.conversation_id = m.channel_id
+         where m.secretary = 'pending' order by m.id",
+    )
+    .fetch_all(&o.db)
+    .await
+    .unwrap();
+    pending.iter().map(message_line).collect()
 }
 
 async fn batch_text(
@@ -1192,8 +1214,15 @@ async fn set_rule_active(o: &Orchestrator, id: i64, active: bool) -> Result<Opti
     .await?)
 }
 
-/// What the web page shows of a message ref: conversation, author, text, link.
-pub type RefInfo = (String, Option<String>, String, Option<String>);
+/// What the web page shows of a message ref: conversation, author, text, link, and the
+/// conversation's attention setting when known.
+pub type RefInfo = (
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<String>,
+);
 
 /// The stored messages behind refs (those still kept), by ref.
 pub async fn messages_by_ref(
@@ -1214,8 +1243,9 @@ pub async fn messages_by_ref(
         Option<String>,
         String,
         Option<String>,
+        Option<String>,
     )> = sqlx::query_as(
-        "select m.source, m.channel_id, m.msg_id, coalesce(nullif(v.name, ''), m.channel_id), m.author, m.text, m.permalink
+        "select m.source, m.channel_id, m.msg_id, coalesce(nullif(v.name, ''), m.channel_id), m.author, m.text, m.permalink, v.attention
              from feed_messages m
              left join feed_conversations v on v.source = m.source and v.conversation_id = m.channel_id
              where (m.source, m.channel_id, m.msg_id) in (select * from unnest($1::text[], $2::text[], $3::text[]))",
@@ -1227,8 +1257,8 @@ pub async fn messages_by_ref(
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(s, c, m, conv, author, text, link)| {
-            (msg_ref(&s, &c, &m), (conv, author, text, link))
+        .map(|(s, c, m, conv, author, text, link, attention)| {
+            (msg_ref(&s, &c, &m), (conv, author, text, link, attention))
         })
         .collect())
 }
@@ -1499,6 +1529,35 @@ mod tests {
         assert_eq!(t.owner_turn(), Some("a b c"));
         t.run_ended("r3");
         assert_eq!(t.owner_turn(), None);
+    }
+
+    #[test]
+    fn batch_lines_say_when_a_conversation_is_turned_down() {
+        let p = |a: Option<&str>| -> Pending {
+            (
+                1,
+                "memchat".into(),
+                "C1".into(),
+                "gitlab-notifications".into(),
+                "channel".into(),
+                "m1".into(),
+                None,
+                Some("bot".into()),
+                "pipeline failed".into(),
+                None,
+                1_763_000_000.0,
+                false,
+                a.map(Into::into),
+            )
+        };
+        let line = |a| serde_json::from_str::<Value>(&message_line(&p(a))).unwrap();
+        let muted = line(Some("muted"));
+        assert_eq!(muted["attention"], "muted");
+        assert_eq!(muted["ref"], "memchat:C1:m1");
+        assert_eq!(line(Some("mentions_only"))["attention"], "mentions_only");
+        // Nothing to say when the owner reads it normally, or the source cannot tell.
+        assert!(line(Some("normal")).get("attention").is_none());
+        assert!(line(None).get("attention").is_none());
     }
 
     #[test]

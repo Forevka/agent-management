@@ -743,6 +743,7 @@ fn shape_message(
         subject: None,
         mentions_owner,
         from_owner,
+        conversation_attention: None,
     })
 }
 

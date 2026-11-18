@@ -447,6 +447,35 @@ impl ConvKind {
     }
 }
 
+/// How much attention the owner gives a conversation in its source (a muted Slack channel, one
+/// set to mentions only), when the source can tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attention {
+    Normal,
+    MentionsOnly,
+    Muted,
+}
+
+impl Attention {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::MentionsOnly => "mentions_only",
+            Self::Muted => "muted",
+        }
+    }
+}
+
+impl std::convert::From<fleet_feeds::Attention> for Attention {
+    fn from(a: fleet_feeds::Attention) -> Self {
+        match a {
+            fleet_feeds::Attention::Muted => Self::Muted,
+            fleet_feeds::Attention::MentionsOnly => Self::MentionsOnly,
+            _ => Self::Normal,
+        }
+    }
+}
+
 /// One message from any source, in the source-agnostic shape everything above the adapters
 /// works on (storage, the secretary, mirrors, the feed tools).
 #[derive(Debug, Clone, PartialEq)]
@@ -468,6 +497,8 @@ pub struct Incoming {
     pub mentions_owner: bool,
     /// The owner wrote it: context for summaries, nothing to triage.
     pub from_owner: bool,
+    /// The conversation's attention setting, when the source reports it.
+    pub attention: Option<Attention>,
 }
 
 impl Incoming {
@@ -510,6 +541,8 @@ impl std::convert::From<&FeedMessage> for Incoming {
             ts_unix: m.ts_unix,
             mentions_owner: m.mentions_owner,
             from_owner: m.from_owner,
+            // Unknown when the source cannot tell: the stored setting then stays.
+            attention: m.conversation_attention.map(Attention::from),
         }
     }
 }
@@ -537,15 +570,17 @@ pub async fn ingest(o: &Arc<Orchestrator>, messages: &[Incoming]) -> Result<()> 
     let mut by_channel: BTreeMap<(String, String), Vec<&Incoming>> = BTreeMap::new();
     for m in messages {
         sqlx::query(
-            "insert into feed_conversations (source, conversation_id, name, kind) values ($1, $2, coalesce($3, ''), $4)
+            "insert into feed_conversations (source, conversation_id, name, kind, attention) values ($1, $2, coalesce($3, ''), $4, $5)
              on conflict (source, conversation_id) do update
              set name = coalesce(nullif($3, ''), feed_conversations.name),
-                 kind = case when $4 = 'other' then feed_conversations.kind else $4 end",
+                 kind = case when $4 = 'other' then feed_conversations.kind else $4 end,
+                 attention = coalesce($5, feed_conversations.attention)",
         )
         .bind(&m.source)
         .bind(&m.conversation_id)
         .bind(&m.conversation_name)
         .bind(m.conversation_kind.as_str())
+        .bind(m.attention.map(Attention::as_str))
         .execute(&o.db)
         .await?;
         // Triage channels go to the brain as they always did; everything else is the

@@ -79,7 +79,11 @@ pub fn secretary_system_prompt(memory: bool) -> String {
            Titles are actionable and short: who, what, by when (\"Reply to Alice about the invoice by Friday\"). Put context in the detail. Check `fleet agent todo list` first so you do not add a duplicate.\n\
          - escalate: needs the orchestrator's judgement: work for an agent (a bug, a feature, an incident) or a reply worth drafting. `fleet agent escalate --summary \"...\" --source <ref>`. \
            Escalate rarely; the orchestrator decides on tasks and replies, you never do.\n\
-         Messages to the owner personally (kind direct or group, or mentions_owner) deserve more attention than channel traffic. One call can cover many refs.\n\n\
+         Messages to the owner personally (kind direct or group, or mentions_owner) deserve more attention than channel traffic. One call can cover many refs.\n\
+         A message line may carry `attention`: how much attention the owner gives that conversation in its source. \
+         `muted`: low priority; note or ignore it, and make a todo or escalate only when it mentions the owner or is unmistakably urgent and addressed to them. \
+         `mentions_only`: act only on mentions of the owner or clear direct asks to them. Summaries may still cover such conversations briefly. \
+         A rule from the owner saying a conversation is muted or low priority (\"#gitlab-notifications is muted\") means the same as `attention: muted` for it, whatever the line says.\n\n\
          ## Rules\n\
          Every batch lists the owner's rules. Follow them; they only make triage quieter or louder. \
          Add a rule (`fleet agent rule add --text \"...\" --because \"<the owner's words>\"`) only when the owner (or a relayed note) asks for it in this turn, quoting what they said. \

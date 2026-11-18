@@ -1173,6 +1173,57 @@ async fn secretary_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeCha
         !o.builtin_retry.lock().unwrap().contains_key("brain"),
         "cleared once it started"
     );
+    // A conversation the owner muted in its source (when the source says so): its messages
+    // never hurry a batch, ride along in the next one marked `attention: muted`, and the web
+    // page shows the badge.
+    let muted: Vec<FeedEvent> = (0..60)
+        .map(|i| {
+            FeedEvent::Message(fleet_feeds::FeedMessage {
+                conversation_attention: Some(fleet_feeds::Attention::Muted),
+                ..incoming(
+                    "C-mute",
+                    "gitlab-notifications",
+                    ConvKind::Channel,
+                    &format!("g{i}"),
+                    "GitLab",
+                    "pipeline passed",
+                )
+            })
+        })
+        .collect();
+    deliver_feed(o, muted).await;
+    assert_eq!(
+        secretary::flush(o, false).await.unwrap(),
+        0,
+        "sixty muted messages do not hurry a batch (fifty others would)"
+    );
+    let lines = secretary::pending_lines(o).await;
+    assert_eq!(lines.len(), 60, "{lines:#?}");
+    assert!(
+        lines.iter().all(|l| l.contains("\"attention\":\"muted\"")),
+        "{lines:#?}"
+    );
+    assert_eq!(
+        secretary::flush(o, true).await.unwrap(),
+        60,
+        "they ride along"
+    );
+    wait_for("a muted message is triaged", || async {
+        sqlx::query_scalar::<_, i64>(
+            "select count(*) from secretary_triage where exists (select 1 from unnest(refs) r where r like 'memchat:C-mute:%')",
+        )
+        .fetch_one(db)
+        .await
+        .unwrap()
+        .gt(&0)
+        .then_some(())
+    })
+    .await;
+    let page = crate::web::render_inbox(o).await.unwrap();
+    assert!(
+        page.contains("gitlab-notifications · GitLab</a> <span class=pill>muted</span>"),
+        "the muted badge on the triage log"
+    );
     // The daily digest is asked for once per day, at its hour; the day is recorded after.
     let hour = o.cfg.secretary.digest_hour;
     assert!(
