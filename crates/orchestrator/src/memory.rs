@@ -65,6 +65,38 @@ impl Hindsight {
         Ok(serde_json::from_str(&text).unwrap_or(Value::String(text)))
     }
 
+    /// [`Self::call`] for a thing that may not exist yet: `None` on 404, an error on anything
+    /// else that failed.
+    async fn maybe(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<Option<Value>> {
+        let mut req = self.http.request(method, format!("{}{path}", self.base));
+        if let Some(k) = &self.key {
+            req = req.bearer_auth(k);
+        }
+        if let Some(b) = body {
+            req = req.json(&b);
+        }
+        let resp = req.send().await.context("Hindsight is unreachable")?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            bail!(
+                "Hindsight answered {status}: {}",
+                crate::chat::clip(&text, 300)
+            );
+        }
+        Ok(Some(
+            serde_json::from_str(&text).unwrap_or(Value::String(text)),
+        ))
+    }
+
     /// Stores a memory. Processing (fact extraction) runs in the background on Hindsight.
     pub async fn retain(&self, bank: &str, content: &str, context: Option<&str>) -> Result<String> {
         let mut item = json!({ "content": content });
@@ -126,6 +158,73 @@ impl Hindsight {
             .as_str()
             .map(str::to_owned)
             .unwrap_or_else(|| v.to_string()))
+    }
+
+    /// A **mental model** is a document Hindsight keeps up to date by reflecting over a bank: it
+    /// is given a question once and re-answers it as memories accumulate, on its own schedule and
+    /// in `delta` mode (editing what changed rather than rewriting). That is what makes it worth
+    /// more than an ad-hoc `reflect` for anything standing — the fleet's own lessons, say (see
+    /// `retro`): the thinking has already happened by the time something needs to read it.
+    ///
+    /// `None` when there is no such model yet, so a caller can create it.
+    pub async fn mental_model(&self, bank: &str, id: &str) -> Result<Option<Value>> {
+        self.maybe(
+            reqwest::Method::GET,
+            &format!("/v1/default/banks/{bank}/mental-models/{id}"),
+            None,
+        )
+        .await
+    }
+
+    /// A **directive** is a standing instruction for a bank: it shapes how Hindsight extracts
+    /// facts from everything retained there, so what the fleet remembers about itself comes out
+    /// in a usable shape rather than as prose. Created once, by name.
+    pub async fn ensure_directive(&self, bank: &str, name: &str, content: &str) -> Result<bool> {
+        let existing = self
+            .call(
+                reqwest::Method::GET,
+                &format!("/v1/default/banks/{bank}/directives"),
+                None,
+            )
+            .await?;
+        let listed = existing["directives"]
+            .as_array()
+            .or_else(|| existing.as_array())
+            .cloned()
+            .unwrap_or_default();
+        if listed.iter().any(|d| d["name"] == name) {
+            return Ok(false);
+        }
+        self.call(
+            reqwest::Method::POST,
+            &format!("/v1/default/banks/{bank}/directives"),
+            Some(json!({"name": name, "content": content, "priority": 100, "is_active": true})),
+        )
+        .await?;
+        Ok(true)
+    }
+
+    /// Creates one. `spec` is Hindsight's `CreateMentalModelRequest`: at least `name` and
+    /// `source_query`, plus the `trigger` that decides when it refreshes itself.
+    pub async fn mental_model_create(&self, bank: &str, spec: Value) -> Result<Value> {
+        self.call(
+            reqwest::Method::POST,
+            &format!("/v1/default/banks/{bank}/mental-models"),
+            Some(spec),
+        )
+        .await
+    }
+
+    /// Asks for a refresh now, on top of whatever schedule it has. Asynchronous on Hindsight's
+    /// side: it answers with an operation, not the new content.
+    pub async fn mental_model_refresh(&self, bank: &str, id: &str) -> Result<()> {
+        self.call(
+            reqwest::Method::POST,
+            &format!("/v1/default/banks/{bank}/mental-models/{id}/refresh"),
+            Some(json!({})),
+        )
+        .await
+        .map(drop)
     }
 
     pub async fn banks(&self) -> Result<Vec<String>> {

@@ -332,6 +332,9 @@ pub async fn handle(
                     crate::memory::Outcome::Done,
                     &summary,
                 );
+                // And if this task was the fleet improving itself, the retrospective's own
+                // memory learns whether the idea was worth the work.
+                crate::retro::remember_task_outcome(o, &task.id, "done", &summary);
             }
             // The task is done whatever happens next: what follows is shown on a best-effort
             // basis, so a Telegram or database hiccup cannot leave it half-finished.

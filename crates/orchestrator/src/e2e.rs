@@ -3244,8 +3244,15 @@ async fn habit_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) {
 }
 
 /// The daily retrospective: the fleet reads its own day, proposes improvements to itself, and
-/// the owner's tap is the only thing that turns one into work.
-async fn retro_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) {
+/// the owner's tap is the only thing that turns one into work. Its memory is the loop: what it
+/// concluded, what the owner decided and what came of the work are retained, and Hindsight keeps
+/// a standing document over them that the next day's digest opens with.
+async fn retro_flow(
+    o: &Arc<Orchestrator>,
+    db: &sqlx::PgPool,
+    chat: &FakeChat,
+    hindsight: &std::sync::Mutex<Vec<(String, Value)>>,
+) {
     // The project a proposal may become a task in: the fleet's own source. Deliberately not
     // mapped on a node here, so the task it creates queues instead of spawning into a checkout
     // this test does not have — what matters is that the task exists and says the right thing.
@@ -3254,8 +3261,39 @@ async fn retro_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) {
         .await
         .unwrap();
 
-    // The digest is the orchestrator's own work: it must carry the day as it really was.
+    // The digest is the orchestrator's own work: it must carry the day as it really was. The
+    // first one also creates the lessons document, which does not exist yet, so it has nothing
+    // to open with.
+    let first = crate::retro::digest(o, "2026-11-18").await.unwrap();
+    assert!(
+        !first.contains("learned so far"),
+        "nothing is claimed to be learned before anything was"
+    );
+    let created = hindsight
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(p, _)| p == "fleet/mental-models")
+        .cloned()
+        .expect("the lessons document is created on first use");
+    assert_eq!(created.1["id"], "fleet-lessons");
+    assert_eq!(created.1["trigger"]["mode"], "delta", "{}", created.1);
+    assert!(
+        created.1["trigger"]["refresh_cron"].is_string()
+            && created.1["source_query"]
+                .as_str()
+                .unwrap()
+                .contains("dismissed by the owner"),
+        "it is asked the question that makes it useful: {}",
+        created.1
+    );
+    // Now that it exists, every digest opens with what the fleet has learned.
     let digest = crate::retro::digest(o, "2026-11-19").await.unwrap();
+    assert!(
+        digest.contains("## What this fleet has learned so far")
+            && digest.contains("Settled: node restarts lose questions"),
+        "the day is read against the lessons: {digest}"
+    );
     for needle in [
         "## Tasks",
         "demo-BS-1",
@@ -3391,6 +3429,51 @@ async fn retro_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) {
         !crate::retro::run_for(o, "2026-11-19").await.unwrap(),
         "a day is reviewed once"
     );
+
+    // What closes the loop: the verdict, the owner's decisions and what became of the work are
+    // all retained in the fleet's own bank, and the standing document is asked to take them in.
+    let retained = wait_for("the day's thinking is remembered", || async {
+        let calls = hindsight.lock().unwrap().clone();
+        let memories: Vec<String> = calls
+            .iter()
+            .filter(|(p, _)| p == "fleet/memories")
+            .map(|(_, b)| {
+                b["items"][0]["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+            .collect();
+        (memories.len() >= 3).then_some(memories)
+    })
+    .await;
+    assert!(
+        retained
+            .iter()
+            .any(|m| m.contains("Retrospective of 2026-11-19")),
+        "the verdict: {retained:#?}"
+    );
+    assert!(
+        retained
+            .iter()
+            .any(|m| m.contains("the owner took it up as fleet-src-")),
+        "what the owner wanted done: {retained:#?}"
+    );
+    assert!(
+        retained
+            .iter()
+            .any(|m| m.contains("the owner dismissed it")),
+        "and what they did not: {retained:#?}"
+    );
+    wait_for("the lessons document is asked to take it in", || async {
+        hindsight
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(p, _)| p == "fleet/mental-models/fleet-lessons/refresh")
+            .then_some(())
+    })
+    .await;
 }
 
 /// Housekeeping tidies the forum: a finished task's topic goes once it has been quiet, and
@@ -3579,6 +3662,7 @@ async fn task_lifecycle_through_a_real_node() {
             routing::{get, post},
         };
         let calls = hindsight_calls.clone();
+        let reads = hindsight_calls.clone();
         let app = Web::new()
             .route(
                 "/v1/default/banks",
@@ -3593,6 +3677,32 @@ async fn task_lifecycle_through_a_real_node() {
                 async move {
                     calls.lock().unwrap().push((format!("{bank}/{rest}"), body));
                     Json(json!({"success": true, "results": [{"text": "Blue was chosen last time", "context": "previous task"}]}))
+                }
+            })
+            // A mental model (the standing document Hindsight keeps for the retrospective) is
+            // read with GET: missing until it has been created, and then it has content.
+            .get({
+                let calls = reads.clone();
+                move |P((bank, rest)): P<(String, String)>| {
+                    let calls = calls.clone();
+                    async move {
+                        let created = calls
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .any(|(p, _): &(String, Value)| p.ends_with("mental-models"));
+                        if !rest.starts_with("mental-models") || !created {
+                            return (axum::http::StatusCode::NOT_FOUND, Json(json!({})));
+                        }
+                        (
+                            axum::http::StatusCode::OK,
+                            Json(json!({
+                                "id": "fleet-lessons", "bank_id": bank,
+                                "content": "Settled: node restarts lose questions (fixed, P-1).",
+                                "last_refreshed_at": "2026-11-19T04:00:00Z",
+                            })),
+                        )
+                    }
                 }
             }),
         );
@@ -3863,10 +3973,13 @@ async fn task_lifecycle_through_a_real_node() {
     wait_retired(&chat, &[card, pointer], "answered").await;
 
     // 3. Milestones and a non-blocking-for-the-process question, answered by button.
-    let ask = wait_for("ask item", || async {
+    // The third of the three asks by its own words, not "the newest blocking one": the agent
+    // makes them in order, so waiting for this one means all three exist and the superseding
+    // has happened. (Waiting for the newest instead is a race the first one wins sometimes.)
+    let ask = wait_for("the ask that replaced the others", || async {
         sqlx::query_as::<_, HumanItemRow>(
             "select * from human_items where task_id = $1 and kind = 'ask' and state = 'open'
-             and blocking order by id desc limit 1",
+             and payload->>'question' like 'Push the branch?%' limit 1",
         )
         .bind(&task.id)
         .fetch_optional(&db)
@@ -5101,7 +5214,7 @@ async fn task_lifecycle_through_a_real_node() {
 
     // 23. The daily retrospective: the fleet reviews its own day and proposes how to be better.
     //     After the habits flow, so the day it reads has really happened.
-    retro_flow(&o, &db, &chat).await;
+    retro_flow(&o, &db, &chat, &hindsight_calls).await;
 
     // 24. Housekeeping deletes a finished task's topic once it goes quiet, and nothing else's.
     //     After the API flow: it leaves a task without a topic, which the API no longer reads.

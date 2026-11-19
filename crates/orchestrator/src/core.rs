@@ -524,6 +524,13 @@ impl Orchestrator {
                     if !ours {
                         return Ok(());
                     }
+                    // A task the retrospective proposed that did not get there is a lesson too.
+                    crate::retro::remember_task_outcome(
+                        self,
+                        &task.id,
+                        new_status,
+                        &format!("the session ended ({code:?}) without completing"),
+                    );
                     let how = code.map_or("killed".into(), |c| format!("exit code {c}"));
                     let note =
                         format!("⏹ Agent session ended ({how}). Reply in this topic to resume it.");
