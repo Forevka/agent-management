@@ -2978,6 +2978,114 @@ async fn wait_retired(chat: &FakeChat, ids: &[i64], needle: &str) {
     }
 }
 
+/// Housekeeping tidies the forum: a finished task's topic goes once it has been quiet, and
+/// nothing else's does. A topic deleted this way comes back if the task is picked up again.
+async fn topic_cleanup_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) {
+    let agent: String = sqlx::query_scalar("select id from agents where name = 'Alice'")
+        .fetch_one(db)
+        .await
+        .unwrap();
+    // A finished task that has been quiet for two hours, built by hand so this flow does not
+    // depend on an agent being free at the end of the test.
+    let quiet = |id: &'static str, title: &'static str| {
+        let agent = agent.clone();
+        async move {
+            let topic = o
+                .chat
+                .create_topic(&format!("{id} · {title}"))
+                .await
+                .unwrap();
+            sqlx::query(
+                "insert into tasks (id, project, title, brief, agent_id, status, topic_id, updated_at)
+                 values ($1, 'demo', $2, 'nothing to do', $3, 'done', $4, now() - interval '2 hours')",
+            )
+            .bind(id)
+            .bind(title)
+            .bind(&agent)
+            .bind(topic)
+            .execute(db)
+            .await
+            .unwrap();
+            topic
+        }
+    };
+    let first = quiet("demo-ZZ-1", "Tidy me").await;
+    let deletes = |chat: &FakeChat| {
+        chat.ops
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|op| match op {
+                Op::Delete(t) => Some(*t),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+
+    tasks::prune_topics(o).await.unwrap();
+    // The quiet one is gone, and only it: every other topic in this fleet — the standing ones,
+    // the projects' "needs you", the feed channels', the tasks that are still busy — is left.
+    assert_eq!(
+        deletes(chat),
+        vec![first],
+        "only the quiet task's topic is deleted"
+    );
+    let gone: Option<i64> = sqlx::query_scalar("select topic_id from tasks where id = 'demo-ZZ-1'")
+        .fetch_one(db)
+        .await
+        .unwrap();
+    assert_eq!(gone, None, "the task no longer points at a topic");
+
+    // Picked up again, it gets a topic named as before instead of talking in General. The
+    // delivery itself may well queue (its agent is busy by now); the topic is what matters.
+    let task = o.task("demo-ZZ-1").await.unwrap().unwrap();
+    let _ = tasks::deliver(o, &task, "[Message from the human] one more coat".into()).await;
+    let again: Option<i64> =
+        sqlx::query_scalar("select topic_id from tasks where id = 'demo-ZZ-1'")
+            .fetch_one(db)
+            .await
+            .unwrap();
+    assert!(
+        again.is_some() && again != Some(first),
+        "a new topic: {again:?}"
+    );
+    assert_eq!(
+        chat.ops
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|op| matches!(op, Op::CreateTopic(n, _) if n == "demo-ZZ-1 · Tidy me"))
+            .count(),
+        2,
+        "the new topic is named like the one it replaces"
+    );
+
+    // A bot without the right asks the owner to grant it, once, and stops trying for a day
+    // rather than filling the log every five minutes.
+    *chat.may_delete_topics.lock().unwrap() = false;
+    let second = quiet("demo-ZZ-2", "Tidy me too").await;
+    tasks::prune_topics(o).await.unwrap();
+    assert_eq!(deletes(chat).len(), 2, "it tried the second one");
+    let still: Option<i64> =
+        sqlx::query_scalar("select topic_id from tasks where id = 'demo-ZZ-2'")
+            .fetch_one(db)
+            .await
+            .unwrap();
+    assert_eq!(
+        still,
+        Some(second),
+        "a topic it may not delete is still known"
+    );
+    assert!(
+        chat.ops.lock().unwrap().iter().any(
+            |op| matches!(op, Op::Send { html, .. } if html.contains("<b>Delete messages</b>"))
+        ),
+        "the owner is told what to grant"
+    );
+    tasks::prune_topics(o).await.unwrap();
+    assert_eq!(deletes(chat).len(), 2, "and it does not ask again today");
+}
+
 /// The card and the pointer of an item, once both are out and recorded.
 async fn copies(db: &sqlx::PgPool, id: i64) -> (i64, i64) {
     wait_for("the item announced, its pointer recorded", || async {
@@ -3114,6 +3222,8 @@ async fn task_lifecycle_through_a_real_node() {
                 max_batch: 6,
                 ..crate::config::SecretaryConfig::test()
             },
+            // On, so the housekeeping that deletes a finished task's quiet topic is covered.
+            delete_topics_after_minutes: 60,
             ..Config::test()
         },
         auth.clone(),
@@ -4570,6 +4680,10 @@ async fn task_lifecycle_through_a_real_node() {
     // 21. The JSON API the web UI runs on, including the session history the UI now shows.
     //     Last, so it reads a fleet that has really done work.
     api_flow(&o, &db).await;
+
+    // 22. Housekeeping deletes a finished task's topic once it goes quiet, and nothing else's.
+    //     After the API flow: it leaves a task without a topic, which the API no longer reads.
+    topic_cleanup_flow(&o, &db, &chat).await;
 
     stop_brain().await;
     let _ = std::fs::remove_dir_all(&data_dir);

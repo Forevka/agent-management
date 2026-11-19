@@ -75,7 +75,10 @@ Do the same in your provider's cloud firewall if it has one.
 2. **Group.** Create a group, then in its settings turn on **Topics** (this
    makes it a supergroup with forum topics).
 3. Add the bot to the group and **promote it to admin** with at least
-   *Manage Topics*, *Delete Messages* and *Pin Messages*.
+   *Manage Topics*, *Delete Messages* and *Pin Messages*. *Delete Messages* is
+   what lets it delete a finished task's topic once that topic goes quiet
+   (`FLEET_TOPIC_DELETE_AFTER_MINUTES`, an hour by default); without the right
+   it says so once and leaves every topic alone.
 4. **Chat ID and your user ID.** Send any message in the group, then:
 
    ```sh

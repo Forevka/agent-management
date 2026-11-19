@@ -251,6 +251,16 @@ impl Bot {
             .await
     }
 
+    /// `deleteForumTopic`: removes a topic **and every message in it**. The bot needs the
+    /// `can_delete_messages` admin right as well as `can_manage_topics`. The General topic
+    /// cannot be deleted.
+    pub async fn delete_forum_topic(&self, chat_id: i64, thread_id: i64) -> Result<(), TgError> {
+        let params = json!({ "chat_id": chat_id, "message_thread_id": thread_id });
+        self.call::<Value>("deleteForumTopic", &params)
+            .await
+            .map(drop)
+    }
+
     /// `answerCallbackQuery`. `text`, if given, shows as a toast on the presser's client.
     pub async fn answer_callback_query(&self, id: &str, text: Option<&str>) -> Result<(), TgError> {
         let mut params = json!({ "callback_query_id": id });

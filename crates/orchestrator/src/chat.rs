@@ -51,6 +51,16 @@ pub enum Notify {
     Silent,
 }
 
+/// How deleting a topic went. Anything other than these two is an ordinary error worth retrying.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Deleted {
+    /// The topic is gone: this call removed it, or it was not there any more.
+    Gone,
+    /// The bot may not delete it (it needs the `can_delete_messages` admin right). Only the
+    /// owner can change that, so a caller on a timer should stop asking rather than retry.
+    NotAllowed,
+}
+
 /// One forum group. Topic ids are Telegram `message_thread_id`s; `None` is the General topic.
 #[async_trait]
 pub trait Chat: Send + Sync + 'static {
@@ -58,6 +68,9 @@ pub trait Chat: Send + Sync + 'static {
     async fn rename_topic(&self, topic: i64, name: &str) -> Result<()>;
     async fn close_topic(&self, topic: i64) -> Result<()>;
     async fn reopen_topic(&self, topic: i64) -> Result<()>;
+    /// Deletes a topic and everything written in it. Used only for a finished task's own topic
+    /// (see `Orchestrator::prune_topics`), never for a standing one.
+    async fn delete_topic(&self, topic: i64) -> Result<Deleted>;
     /// Sends HTML text; returns the message id.
     async fn send(
         &self,
@@ -127,6 +140,7 @@ pub mod fake {
         Rename(i64, String),
         Close(i64),
         Reopen(i64),
+        Delete(i64),
         Send {
             id: i64,
             from: From,
@@ -151,10 +165,21 @@ pub mod fake {
         RemoveBot(i64),
     }
 
-    #[derive(Default)]
     pub struct FakeChat {
         pub ops: Mutex<Vec<Op>>,
         next: Mutex<i64>,
+        /// Whether `delete_topic` is allowed, so a test can play a bot without the right.
+        pub may_delete_topics: Mutex<bool>,
+    }
+
+    impl Default for FakeChat {
+        fn default() -> Self {
+            Self {
+                ops: Mutex::default(),
+                next: Mutex::default(),
+                may_delete_topics: Mutex::new(true),
+            }
+        }
     }
 
     impl FakeChat {
@@ -214,6 +239,15 @@ pub mod fake {
         async fn reopen_topic(&self, topic: i64) -> Result<()> {
             self.ops.lock().unwrap().push(Op::Reopen(topic));
             Ok(())
+        }
+        async fn delete_topic(&self, topic: i64) -> Result<Deleted> {
+            self.ops.lock().unwrap().push(Op::Delete(topic));
+            // A test that wants the refusal sets `may_delete_topics` to false.
+            Ok(if *self.may_delete_topics.lock().unwrap() {
+                Deleted::Gone
+            } else {
+                Deleted::NotAllowed
+            })
         }
         async fn send(
             &self,

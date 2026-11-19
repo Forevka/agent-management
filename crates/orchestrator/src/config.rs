@@ -23,6 +23,9 @@ pub struct Config {
     pub retention_days: i64,
     /// Remind about unanswered blocking items after this many minutes.
     pub remind_after_minutes: i64,
+    /// Delete a finished task's topic once it has been quiet this long, so the forum does not
+    /// fill up with work that is over. `0` keeps every topic for ever.
+    pub delete_topics_after_minutes: i64,
     /// The secretary's settings (see `secretary`).
     pub secretary: SecretaryConfig,
     /// Models and effort levels the brain may choose for a task (the owner's own settings on
@@ -182,6 +185,7 @@ impl Config {
             magic_link_minutes: env_num("FLEET_MAGIC_LINK_MINUTES", 60 * 24),
             retention_days: env_num("FLEET_RETENTION_DAYS", 90),
             remind_after_minutes: env_num("FLEET_REMIND_AFTER_MINUTES", 120),
+            delete_topics_after_minutes: env_num("FLEET_TOPIC_DELETE_AFTER_MINUTES", 60),
             secretary: SecretaryConfig::from_env(),
             allowed_models,
             allowed_efforts,
@@ -200,6 +204,8 @@ impl Config {
             magic_link_minutes: 60,
             retention_days: 90,
             remind_after_minutes: 120,
+            // Off by default in tests: the one test that wants it sets its own value.
+            delete_topics_after_minutes: 0,
             secretary: SecretaryConfig::test(),
             allowed_models: default_allowed_models("opus"),
             allowed_efforts: DEFAULT_ALLOWED_EFFORTS.map(str::to_owned).to_vec(),

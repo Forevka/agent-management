@@ -12,7 +12,7 @@ use fleet_telegram::{
 use tokio::sync::RwLock;
 
 use crate::{
-    chat::{Chat, From, Keyboard, Notify, clip, esc},
+    chat::{Chat, Deleted, From, Keyboard, Notify, clip, esc},
     core::Orchestrator,
     human::{self, Answer},
     model::{BRAIN_TASK, TaskRow},
@@ -120,6 +120,20 @@ impl Chat for TelegramChat {
             .bot()
             .reopen_forum_topic(self.chat_id, topic)
             .await?)
+    }
+    async fn delete_topic(&self, topic: i64) -> Result<Deleted> {
+        match self
+            .orchestrator
+            .bot()
+            .delete_forum_topic(self.chat_id, topic)
+            .await
+        {
+            // A topic that is already gone is the state we wanted.
+            Ok(()) => Ok(Deleted::Gone),
+            Err(e) if e.is_thread_gone() => Ok(Deleted::Gone),
+            Err(e) if e.is_missing_rights() => Ok(Deleted::NotAllowed),
+            Err(e) => Err(e.into()),
+        }
     }
     async fn send(
         &self,

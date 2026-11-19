@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail, ensure};
+use chrono::{DateTime, Utc};
 use fleet_proto::{Body, SecretFile, SpawnAgent, StopAgent};
 use serde_json::{Value, json};
 
@@ -185,10 +186,7 @@ pub async fn create_task(o: &Arc<Orchestrator>, req: CreateTask) -> Result<TaskR
     if o.task(&id).await?.is_some() {
         bail!("task {id} already exists; use send_to_task to continue it");
     }
-    let topic = o
-        .chat
-        .create_topic(&clip(&format!("{id} · {}", req.title), 120))
-        .await?;
+    let topic = o.chat.create_topic(&topic_name(&id, &req.title)).await?;
     sqlx::query("insert into tasks (id, project, title, brief, agent_id, status, topic_id, model, effort) values ($1, $2, $3, $4, $5, 'queued', $6, $7, $8)")
         .bind(&id)
         .bind(&proj.slug)
@@ -1060,6 +1058,125 @@ pub enum Origin {
     Other,
 }
 
+/// A task topic's name, so a topic made again later looks like the one before it.
+fn topic_name(id: &str, title: &str) -> String {
+    clip(&format!("{id} · {title}"), 120)
+}
+
+/// Gives a task a topic it no longer has, and remembers it. Only for a task whose topic was
+/// deleted after it went quiet: a task is created with one.
+async fn new_topic(o: &Orchestrator, task: &TaskRow) -> Result<i64> {
+    let topic = o
+        .chat
+        .create_topic(&topic_name(&task.id, &task.title))
+        .await?;
+    sqlx::query("update tasks set topic_id = $2 where id = $1")
+        .bind(&task.id)
+        .bind(topic)
+        .execute(&o.db)
+        .await?;
+    Ok(topic)
+}
+
+/// Deletes the topic of a task that is over and has been quiet for a while, so the forum does
+/// not fill up with finished work. Run from housekeeping.
+///
+/// Only a task's own topic, ever: the standing topics (Inbox, Rules, agent-communication), a
+/// project's "needs you" topic and the feed channels' topics belong to no task, so this query
+/// cannot reach them, and the fleet's own sessions are skipped explicitly. A task still waiting
+/// on the owner keeps its topic too, and `topic_id` is cleared only when Telegram confirms, so
+/// nothing is forgotten that still exists.
+pub async fn prune_topics(o: &Orchestrator) -> Result<()> {
+    let after = o.cfg.delete_topics_after_minutes;
+    if after <= 0 {
+        return Ok(());
+    }
+    if deletes_blocked(o).await {
+        return Ok(());
+    }
+    let stale: Vec<(String, i64)> = sqlx::query_as(
+        "select id, topic_id from tasks
+         where topic_id is not null and not running
+           and status in ('done', 'stopped', 'failed')
+           and updated_at < now() - make_interval(mins => $1::int)
+           and not exists (select 1 from human_items
+                           where task_id = tasks.id and state = 'open' and blocking)
+         order by updated_at
+         limit 20",
+    )
+    .bind(after as i32)
+    .fetch_all(&o.db)
+    .await?;
+    for (id, topic) in stale {
+        if crate::model::is_builtin_task(&id) {
+            continue;
+        }
+        match o.chat.delete_topic(topic).await {
+            Ok(crate::chat::Deleted::Gone) => {
+                sqlx::query("update tasks set topic_id = null where id = $1 and topic_id = $2")
+                    .bind(&id)
+                    .bind(topic)
+                    .execute(&o.db)
+                    .await?;
+                o.audit(
+                    "orchestrator",
+                    "topic.delete",
+                    serde_json::json!({"task": id, "topic": topic}),
+                )
+                .await;
+            }
+            // The owner has to grant the right; asking again every five minutes would only
+            // fill the log, so this stands down for a day and says so once.
+            Ok(crate::chat::Deleted::NotAllowed) => {
+                block_deletes(o).await;
+                return Ok(());
+            }
+            Err(e) => tracing::warn!("deleting {id}'s topic failed: {e:#}"),
+        }
+    }
+    Ok(())
+}
+
+/// Key under which "the bot may not delete topics" is remembered, with the time it may be worth
+/// trying again.
+const DELETE_BLOCKED_KEY: &str = "topic_delete_blocked_until";
+
+async fn deletes_blocked(o: &Orchestrator) -> bool {
+    let until = o
+        .kv_get(DELETE_BLOCKED_KEY)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.as_str().and_then(|s| s.parse::<DateTime<Utc>>().ok()));
+    until.is_some_and(|u| u > Utc::now())
+}
+
+/// Stops trying for a day and tells the owner once what to change. Theirs to fix: a bot cannot
+/// give itself an admin right.
+async fn block_deletes(o: &Orchestrator) {
+    let _ = o
+        .kv_set(
+            DELETE_BLOCKED_KEY,
+            serde_json::json!((Utc::now() + chrono::Duration::hours(24)).to_rfc3339()),
+        )
+        .await;
+    tracing::warn!("cannot delete finished tasks' topics: the bot lacks the right");
+    o.chat
+        .send(
+            From::Orchestrator,
+            None,
+            "🧹 I cannot tidy up finished tasks' topics: I need the <b>Delete messages</b> admin \
+             right in this group (alongside Manage topics). Give it to me and I will clear them \
+             as they go quiet, or set <code>FLEET_TOPIC_DELETE_AFTER_MINUTES=0</code> to leave \
+             every topic alone. I will not ask again today.",
+            vec![],
+            None,
+            Notify::Silent,
+        )
+        .await
+        .ok();
+}
+
 /// [`deliver`], saying where the text comes from.
 pub async fn deliver_as(
     o: &Arc<Orchestrator>,
@@ -1069,7 +1186,7 @@ pub async fn deliver_as(
 ) -> Result<Delivered> {
     let lock = o.task_lock(&task.id);
     let _held = lock.lock().await;
-    let task = o.task(&task.id).await?.context("task vanished")?;
+    let mut task = o.task(&task.id).await?.context("task vanished")?;
     let agent_id = task.agent_id.clone().context("task has no agent")?;
     let send = |task: &TaskRow, text: String| -> Result<bool> {
         let (true, Some(node), Some(run_id)) = (task.running, &task.node_id, &task.run_id) else {
@@ -1106,9 +1223,20 @@ pub async fn deliver_as(
     if matches!(
         task.status.as_str(),
         status::DONE | status::STOPPED | status::FAILED
-    ) && let Some(topic) = task.topic_id
-    {
-        let _ = o.chat.reopen_topic(topic).await;
+    ) {
+        match task.topic_id {
+            Some(topic) => {
+                let _ = o.chat.reopen_topic(topic).await;
+            }
+            // Its topic was deleted once the task went quiet (`prune_topics`), so the follow-up
+            // gets a new one rather than landing in General. Not for the fleet's own sessions:
+            // the brain has no topic of its own and talks in General on purpose.
+            None if !crate::model::is_builtin_task(&task.id) => match new_topic(o, &task).await {
+                Ok(topic) => task.topic_id = Some(topic),
+                Err(e) => tracing::warn!("a new topic for {} failed: {e:#}", task.id),
+            },
+            None => {}
+        }
     }
     match dispatch_locked(
         o,
