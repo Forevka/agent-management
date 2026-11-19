@@ -531,12 +531,12 @@ async fn secretary_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeCha
         assert!(e.to_string().contains(why), "{tool}: {e}");
     }
     // The Inbox topic has the todos, silent, with Done / Dismiss / Make task.
-    let inbox = secretary::inbox_topic_if_any(o).await.unwrap().unwrap();
+    let inbox = crate::topics::inbox_if_any(o).await.unwrap().unwrap();
     assert!(
         chat.ops
             .lock()
             .unwrap()
-            .contains(&Op::CreateTopic(secretary::INBOX_TOPIC_NAME.into(), inbox))
+            .contains(&Op::CreateTopic(crate::topics::INBOX.into(), inbox))
     );
     let todos: Vec<crate::model::TodoRow> = sqlx::query_as("select * from todos order by id")
         .fetch_all(db)
@@ -558,6 +558,47 @@ async fn secretary_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeCha
     );
     assert_eq!(keyboard.concat().len(), 3);
     assert_eq!(notify_of_msg(chat, invoice.tg_msg), Some(Notify::Silent));
+    // Fleet chatter stays out of the Inbox, which is only for third parties reaching the owner:
+    // every rule change has its own topic, and a note the brain relays goes to
+    // agent-communication.
+    let rules_topic = crate::topics::rules(o).await.unwrap();
+    assert_ne!(rules_topic, inbox);
+    let rule: crate::model::RuleRow =
+        sqlx::query_as("select * from secretary_rules order by id limit 1")
+            .fetch_one(db)
+            .await
+            .unwrap();
+    let (_, topic, html, _) = chat
+        .sent()
+        .into_iter()
+        .find(|(id, ..)| Some(*id) == rule.tg_msg)
+        .expect("the rule was posted");
+    assert_eq!(topic, Some(rules_topic), "a rule change goes to Rules");
+    assert!(html.contains("Rule R-"), "{html}");
+    let agents_topic = crate::topics::agents(o).await.unwrap();
+    assert_ne!(agents_topic, inbox);
+    secretary::note_from_brain(o, "include the ticket key when escalating")
+        .await
+        .unwrap();
+    wait_for("the relayed note goes to agent-communication", || async {
+        chat.sent()
+            .into_iter()
+            .find(|(_, t, h, _)| *t == Some(agents_topic) && h.contains("Twilight relayed"))
+    })
+    .await;
+    for (name, id) in [
+        (crate::topics::RULES, rules_topic),
+        (crate::topics::AGENTS, agents_topic),
+    ] {
+        let made = chat
+            .ops
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|op| matches!(op, Op::CreateTopic(n, i) if n == name && *i == id))
+            .count();
+        assert_eq!(made, 1, "{name} is created once, on first use");
+    }
     // The brain got the escalation, framed untrusted, with the refs.
     wait_for("brain gets the escalation", || async {
         (brain_heard(db, "[Escalation from the secretary]").await == 1).then_some(())
@@ -1825,6 +1866,52 @@ async fn workflow_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat
         .unwrap();
     assert!(gone.is_none());
     wait_retired(chat, &[card_msg], "deleted").await;
+}
+
+/// Agents messaging each other is the fleet's own chatter: the copy the owner can read goes to
+/// agent-communication, not into the sending task's topic (which stays that agent's work).
+async fn agent_chatter_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) {
+    let worker = o.task("demo-BS-1").await.unwrap().unwrap();
+    // A second agent of the same project, with a task to receive messages in. Made directly:
+    // this is about where the copy is posted, not about starting another session.
+    sqlx::query(
+        "insert into agents (id, name, role, project) values ('rev-1', 'Reviewer', 'reviewer', 'demo') on conflict do nothing",
+    )
+    .execute(db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "insert into tasks (id, project, title, brief, agent_id, status) values ('demo-REV-1', 'demo', 'Review', '', 'rev-1', 'done') on conflict do nothing",
+    )
+    .execute(db)
+    .await
+    .unwrap();
+    call_as(
+        o,
+        worker.agent_id.as_deref().unwrap(),
+        &worker.id,
+        "ask_agent",
+        json!({"agent": "Reviewer", "message": "please review fleet/demo-BS-1"}),
+    )
+    .await
+    .unwrap();
+    let agents_topic = crate::topics::agents(o).await.unwrap();
+    let (_, topic, html, _) = wait_for("the copy of the message to Reviewer", || async {
+        chat.sent()
+            .into_iter()
+            .find(|(_, _, h, _)| h.contains("please review fleet/demo-BS-1"))
+    })
+    .await;
+    assert_eq!(
+        topic,
+        Some(agents_topic),
+        "agent-to-agent copies go to agent-communication, not {:?}",
+        worker.topic_id
+    );
+    assert!(
+        html.contains("Alice") && html.contains("Reviewer") && html.contains(&worker.id),
+        "it says who said it to whom, and about which task: {html}"
+    );
 }
 
 /// A Slack channel can be mapped by name, not just by raw id (CLAUDE.md: new tool/flow needs
@@ -3583,7 +3670,9 @@ async fn task_lifecycle_through_a_real_node() {
     // 19. Workflows: `workflow_finish` keeps the topic open and posts a control card.
     workflow_flow(&o, &db, &chat).await;
 
-    // 20. A Slack channel can be mapped by name, and a todo can nudge an existing workflow.
+    // 20. Fleet chatter has its own topic; a Slack channel can be mapped by name; and a todo
+    //     can nudge an existing workflow.
+    agent_chatter_flow(&o, &db, &chat).await;
     channel_by_name_flow(&o, &db).await;
     workflow_linked_todo_flow(&o, &db).await;
 

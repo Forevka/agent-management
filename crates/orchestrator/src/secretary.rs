@@ -29,10 +29,9 @@ use crate::{
     feeds::{ConvKind, msg_ref, parse_ref},
     model::{RuleRow, SECRETARY_AGENT, SECRETARY_TASK, TaskRow, TodoRow},
     tasks::{self, Delivered, Origin},
+    topics,
 };
 
-pub const INBOX_TOPIC_NAME: &str = "📋 Inbox";
-const INBOX_TOPIC_KEY: &str = "inbox_topic";
 /// When the owner last wrote to the secretary (in the Inbox topic).
 const OWNER_AT_KEY: &str = "secretary_owner_at";
 const DIGEST_DAY_KEY: &str = "secretary_digest_day";
@@ -148,7 +147,7 @@ pub async fn ensure(o: &Orchestrator) -> Result<TaskRow> {
     .bind(slug)
     .execute(&o.db)
     .await?;
-    let topic = match inbox_topic(o).await {
+    let topic = match topics::inbox(o).await {
         Ok(t) => Some(t),
         Err(e) => {
             tracing::warn!("creating the Inbox topic failed: {e:#}");
@@ -170,48 +169,20 @@ pub async fn ensure(o: &Orchestrator) -> Result<TaskRow> {
         .context("the secretary's task is missing")
 }
 
-async fn kv_get(o: &Orchestrator, key: &str) -> Result<Option<Value>> {
-    Ok(sqlx::query_scalar("select value from kv where key = $1")
-        .bind(key)
-        .fetch_optional(&o.db)
-        .await?)
-}
-
-async fn kv_set(o: &Orchestrator, key: &str, value: Value) -> Result<()> {
-    sqlx::query(
-        "insert into kv (key, value) values ($1, $2) on conflict (key) do update set value = $2",
-    )
-    .bind(key)
-    .bind(value)
-    .execute(&o.db)
-    .await?;
-    Ok(())
-}
-
-/// The Inbox topic, if it was created already.
-pub async fn inbox_topic_if_any(o: &Orchestrator) -> Result<Option<i64>> {
-    Ok(kv_get(o, INBOX_TOPIC_KEY).await?.and_then(|v| v.as_i64()))
-}
-
-/// The Inbox topic, created on first use like the projects' topics.
-pub async fn inbox_topic(o: &Orchestrator) -> Result<i64> {
-    if let Some(t) = inbox_topic_if_any(o).await? {
-        return Ok(t);
-    }
-    // One creator: two first uses at once must not make two topics.
-    let lock = o.task_lock("secretary:inbox-topic");
-    let _held = lock.lock().await;
-    if let Some(t) = inbox_topic_if_any(o).await? {
-        return Ok(t);
-    }
-    let t = o.chat.create_topic(INBOX_TOPIC_NAME).await?;
-    kv_set(o, INBOX_TOPIC_KEY, json!(t)).await?;
-    Ok(t)
-}
-
-/// Posts to the Inbox topic as the orchestrator, returning the message id.
+/// Posts to the Inbox topic as the orchestrator, returning the message id. Only for what the
+/// Inbox is for: third parties reaching the owner (see [`crate::topics`]).
 async fn post(o: &Orchestrator, html: &str, keyboard: Keyboard, notify: Notify) -> Result<i64> {
-    let topic = inbox_topic(o).await?;
+    post_to(o, topics::inbox(o).await?, html, keyboard, notify).await
+}
+
+/// Posts to `topic` as the orchestrator, returning the message id.
+async fn post_to(
+    o: &Orchestrator,
+    topic: i64,
+    html: &str,
+    keyboard: Keyboard,
+    notify: Notify,
+) -> Result<i64> {
     o.chat
         .send(
             From::Orchestrator,
@@ -245,12 +216,14 @@ pub async fn owner_message(
     text: &str,
     reply_to: Option<i64>,
 ) -> Result<()> {
-    let topic = inbox_topic(o).await?;
+    let topic = topics::inbox(o).await?;
     o.show_working(message_id, From::Orchestrator, Some(topic), SECRETARY_TASK);
-    let last = kv_get(o, OWNER_AT_KEY)
+    let last = o
+        .kv_get(OWNER_AT_KEY)
         .await?
         .and_then(|v| v.as_str().map(str::to_owned));
-    kv_set(o, OWNER_AT_KEY, json!(Utc::now().to_rfc3339())).await?;
+    o.kv_set(OWNER_AT_KEY, json!(Utc::now().to_rfc3339()))
+        .await?;
     let since = match last {
         Some(at) => format!("The owner last wrote to you at {at}."),
         None => "The owner has not written to you before.".into(),
@@ -355,20 +328,26 @@ async fn post_about(
     Ok(msg)
 }
 
-/// The brain relays something the owner said (e.g. in General) to the secretary. Shown in the
-/// Inbox too, so the owner sees what the secretary was told in their name.
+/// The brain relays something the owner said (e.g. in General) to the secretary. Shown in
+/// agent-communication, so the owner can see what the secretary was told in their name without
+/// it crowding the Inbox.
 pub async fn note_from_brain(o: &Arc<Orchestrator>, text: &str) -> Result<()> {
     let text = clip(text.trim(), 2000);
     ensure!(!text.is_empty(), "the note is empty");
-    if let Err(e) = post(
-        o,
-        &format!("🗒 <b>Twilight relayed:</b> {}", esc(&text)),
-        vec![],
-        Notify::Silent,
-    )
+    if let Err(e) = async {
+        let topic = topics::agents(o).await?;
+        post_to(
+            o,
+            topic,
+            &format!("🗒 <b>Twilight relayed:</b> {}", esc(&text)),
+            vec![],
+            Notify::Silent,
+        )
+        .await
+    }
     .await
     {
-        tracing::warn!("showing a note to the secretary in the Inbox failed: {e:#}");
+        tracing::warn!("showing a note to the secretary failed: {e:#}");
     }
     deliver(
         o,
@@ -703,7 +682,7 @@ pub async fn digest_at(o: &Arc<Orchestrator>, hour: i64, day: &str) -> Result<bo
     if hour != o.cfg.secretary.digest_hour {
         return Ok(false);
     }
-    if kv_get(o, DIGEST_DAY_KEY)
+    if o.kv_get(DIGEST_DAY_KEY)
         .await?
         .as_ref()
         .and_then(Value::as_str)
@@ -712,7 +691,7 @@ pub async fn digest_at(o: &Arc<Orchestrator>, hour: i64, day: &str) -> Result<bo
         return Ok(false);
     }
     request_digest(o, day).await?;
-    kv_set(o, DIGEST_DAY_KEY, json!(day)).await?;
+    o.kv_set(DIGEST_DAY_KEY, json!(day)).await?;
     Ok(true)
 }
 
@@ -948,8 +927,9 @@ pub async fn tool(o: &Arc<Orchestrator>, name: &str, args: &Value) -> Result<Str
                     "\n⚠️ This was not added in answer to your own message. If you did not ask for it, tap Undo.",
                 );
             }
-            let msg = post(
+            let msg = post_to(
                 o,
+                topics::rules(o).await?,
                 &html,
                 vec![vec![Button::callback("↩️ Undo", format!("r|{}|u", row.id))]],
                 if asked { Notify::Silent } else { Notify::Sound },
@@ -1003,8 +983,9 @@ pub async fn tool(o: &Arc<Orchestrator>, name: &str, args: &Value) -> Result<Str
                     "\n⚠️ This was not done in answer to your own message. If you did not ask for it, tap Restore.",
                 );
             }
-            post(
+            post_to(
                 o,
+                topics::rules(o).await?,
                 &html,
                 vec![vec![Button::callback(
                     "↩️ Restore",
@@ -1525,8 +1506,9 @@ pub async fn owner_rule(o: &Orchestrator, text: &str) -> Result<RuleRow> {
     .bind(&text)
     .fetch_one(&o.db)
     .await?;
-    let msg = post(
+    let msg = post_to(
         o,
+        topics::rules(o).await?,
         &format!("📝 <b>Rule R-{}</b> added by you: {}", row.id, esc(&text)),
         vec![vec![Button::callback("↩️ Undo", format!("r|{}|u", row.id))]],
         Notify::Silent,
@@ -1605,8 +1587,9 @@ pub async fn button(o: &Arc<Orchestrator>, data: &str) -> Result<String> {
                 return Ok(format!("R-{id} is active already."));
             };
             // The new message is the rule's from now on: Undo there removes it again.
-            let msg = post(
+            let msg = post_to(
                 o,
+                topics::rules(o).await?,
                 &format!("📝 <b>Rule R-{id}</b> restored: {}", esc(&rule.text)),
                 vec![vec![Button::callback("↩️ Undo", format!("r|{id}|u"))]],
                 Notify::Silent,

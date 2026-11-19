@@ -239,7 +239,7 @@ async fn announce(o: &Orchestrator, row: &HumanItemRow, task: Option<&TaskRow>) 
     let keyboard = with_links(o, row.id, keyboard).await?;
     // A reply draft answers the owner in the Inbox, where they asked for it.
     let topic = match &row.project {
-        _ if row.kind == "reply" => Some(crate::secretary::inbox_topic(o).await?),
+        _ if row.kind == "reply" => Some(crate::topics::inbox(o).await?),
         Some(p) => Some(tasks::human_topic(o, p, row.blocking).await?),
         None => None,
     };

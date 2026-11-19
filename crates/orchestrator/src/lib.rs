@@ -22,6 +22,7 @@ pub mod secretary;
 pub mod tasks;
 pub mod tg;
 pub mod tools;
+pub mod topics;
 pub mod vault;
 pub mod web;
 pub mod workflows;

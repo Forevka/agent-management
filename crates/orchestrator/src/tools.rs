@@ -214,12 +214,36 @@ pub async fn handle(
                 agent.name, agent.role, task.id, agent.name
             );
             tasks::deliver(o, &target_task, framed).await?;
-            o.post_task(
-                &task,
-                &format!("→ <b>{}</b>: {}", esc(&target.name), esc(&clip(text, 300))),
-                Notify::Silent,
-            )
-            .await;
+            // Agents talking to each other is the fleet's own chatter, not the owner's work
+            // log: it goes to agent-communication, as the sender's bot, so one topic reads as
+            // the whole conversation across tasks (see `topics`).
+            if let Err(e) = async {
+                let topic = crate::topics::agents(o).await?;
+                o.chat
+                    .send(
+                        o.task_sender(&task).await,
+                        Some(topic),
+                        &format!(
+                            "<b>{}</b> → <b>{}</b> <i>({})</i>: {}",
+                            esc(&agent.name),
+                            esc(&target.name),
+                            esc(&task.id),
+                            esc(&clip(text, 300))
+                        ),
+                        vec![],
+                        None,
+                        Notify::Silent,
+                    )
+                    .await
+            }
+            .await
+            {
+                tracing::warn!(
+                    "showing {}'s message to {} failed: {e:#}",
+                    task.id,
+                    target.name
+                );
+            }
             ok(format!("Delivered to {}.", target.name))
         }
         // Progress is silent unless the agent says it is worth the owner's attention now.

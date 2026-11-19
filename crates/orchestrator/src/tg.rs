@@ -480,7 +480,7 @@ pub(crate) async fn owner_message(o: &Arc<Orchestrator>, msg: &Message) -> Resul
             )
         }
         // The Inbox topic is the secretary's.
-        Some(t) if crate::secretary::inbox_topic_if_any(o).await? == Some(t) => {
+        Some(t) if crate::topics::inbox_if_any(o).await? == Some(t) => {
             return crate::secretary::owner_message(
                 o,
                 msg.message_id,

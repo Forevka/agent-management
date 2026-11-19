@@ -798,6 +798,25 @@ impl Orchestrator {
             .await?)
     }
 
+    /// The fleet's small key/value store: topic ids, cursors, the digest's day.
+    pub async fn kv_get(&self, key: &str) -> Result<Option<serde_json::Value>> {
+        Ok(sqlx::query_scalar("select value from kv where key = $1")
+            .bind(key)
+            .fetch_optional(&self.db)
+            .await?)
+    }
+
+    pub async fn kv_set(&self, key: &str, value: serde_json::Value) -> Result<()> {
+        sqlx::query(
+            "insert into kv (key, value) values ($1, $2) on conflict (key) do update set value = $2",
+        )
+        .bind(key)
+        .bind(value)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
     pub async fn audit(&self, actor: &str, action: &str, detail: serde_json::Value) {
         let _ = sqlx::query("insert into audit_log (actor, action, detail) values ($1, $2, $3)")
             .bind(actor)
