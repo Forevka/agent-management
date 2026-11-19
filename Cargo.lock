@@ -1148,6 +1148,7 @@ dependencies = [
  "fleet-proto",
  "fleet-telegram",
  "form_urlencoded",
+ "http-body-util",
  "iroh",
  "pulldown-cmark",
  "rand 0.9.5",
@@ -1158,6 +1159,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "tokio",
+ "tower",
  "tracing",
  "wiremock",
 ]

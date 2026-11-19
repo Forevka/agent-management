@@ -9,6 +9,7 @@
 #![allow(clippy::type_complexity)]
 
 pub mod admin;
+pub mod api;
 pub mod auth;
 pub mod chat;
 pub mod config;

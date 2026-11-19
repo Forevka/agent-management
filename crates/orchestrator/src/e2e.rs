@@ -2114,6 +2114,251 @@ async fn jira_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool) {
     assert!(e.to_string().contains("unknown tool"), "{e}");
 }
 
+/// The JSON API the web UI is built on, driven through the real axum router so routing, the
+/// cookie check and the status codes are the ones a browser gets.
+///
+/// What matters here is that the API is not a second way into the fleet: it authenticates the
+/// same way, refuses the same things, and answers an approval through `human::answer` exactly
+/// as Telegram's buttons do.
+async fn api_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool) {
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let app = crate::web::router(o.clone());
+    // A session cookie, as a magic link would leave behind.
+    let session = crate::web::random_token();
+    sqlx::query(
+        "insert into web_sessions (token, expires_at) values ($1, now() + interval '1 day')",
+    )
+    .bind(&session)
+    .execute(db)
+    .await
+    .unwrap();
+    let cookie = format!("fleet_session={session}");
+
+    let call = |method: &str, uri: &str, cookie: Option<String>, body: Option<Value>| {
+        let app = app.clone();
+        let method = method.to_owned();
+        let uri = uri.to_owned();
+        async move {
+            let mut req = axum::http::Request::builder()
+                .method(method.as_str())
+                .uri(&uri);
+            if let Some(c) = cookie {
+                req = req.header(axum::http::header::COOKIE, c);
+            }
+            let req = match &body {
+                Some(b) => req
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(serde_json::to_vec(b).unwrap())),
+                None => req.body(axum::body::Body::empty()),
+            }
+            .unwrap();
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let bytes = res.into_body().collect().await.unwrap().to_bytes();
+            let json: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+            (status, json)
+        }
+    };
+
+    // Without the cookie there is nothing: not even the read-only overview.
+    let (status, body) = call("GET", "/api/overview", None, None).await;
+    assert_eq!(status, 401, "{body}");
+    assert!(
+        body["error"].as_str().unwrap_or_default().contains("/web"),
+        "the 401 tells the owner how to sign in: {body}"
+    );
+
+    // The overview: what is waiting, what is running, and a line per project.
+    let (status, body) = call("GET", "/api/overview", Some(cookie.clone()), None).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["slug"] == "demo"),
+        "{body}"
+    );
+
+    // Sessions: every run the fleet has started, which is the history the old UI never kept.
+    // `demo-BS-1` has really run by now, through a real node.
+    let (status, body) = call("GET", "/api/runs?project=demo", Some(cookie.clone()), None).await;
+    assert_eq!(status, 200, "{body}");
+    let runs = body["runs"].as_array().unwrap();
+    assert!(
+        !runs.is_empty(),
+        "the project's sessions are recorded: {body}"
+    );
+    assert!(
+        runs.iter().all(|r| r["project"] == "demo"),
+        "the filter holds: {body}"
+    );
+    assert!(
+        runs.iter().any(|r| r["session"].is_string()),
+        "a run remembers which Claude session it was: {body}"
+    );
+
+    // A task's own sessions, and a finished task is still listed — the other half of the gap.
+    let (status, body) = call("GET", "/api/tasks?project=demo", Some(cookie.clone()), None).await;
+    assert_eq!(status, 200, "{body}");
+    let tasks = body["tasks"].as_array().unwrap();
+    assert!(
+        tasks
+            .iter()
+            .any(|t| t["id"] == "demo-BS-1" && t["sessions"].as_i64().unwrap_or(0) > 0),
+        "each task says how many sessions it has had: {body}"
+    );
+    assert!(
+        !tasks.iter().any(|t| t["id"] == "brain"),
+        "the fleet's own standing sessions stay out unless asked for: {body}"
+    );
+    let (_, body) = call("GET", "/api/tasks?builtin=true", Some(cookie.clone()), None).await;
+    assert!(
+        body["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["id"] == "brain"),
+        "...and are there when asked for: {body}"
+    );
+    // A search is bound, not formatted: a quote in the query is just a character.
+    let (status, _) = call(
+        "GET",
+        "/api/tasks?q=%27%20or%201%3D1--",
+        Some(cookie.clone()),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let (status, body) = call("GET", "/api/tasks/demo-BS-1", Some(cookie.clone()), None).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(!body["sessions"].as_array().unwrap().is_empty(), "{body}");
+    let (status, body) = call(
+        "GET",
+        "/api/tasks/demo-BS-1/events?limit=5",
+        Some(cookie.clone()),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(!body["events"].as_array().unwrap().is_empty(), "{body}");
+
+    // A node's settings never carry its secret out to the browser.
+    let (status, body) = call("GET", "/api/nodes", Some(cookie.clone()), None).await;
+    assert_eq!(status, 200, "{body}");
+    let text = body.to_string();
+    assert!(
+        !text.contains("auth_secret\":\"") && text.contains("has_auth_secret"),
+        "a node's stored secret is reported as present, never sent: {body}"
+    );
+
+    // A secret folder's values are write-only from here: the API lists keys, never values.
+    let folder: i64 = sqlx::query_scalar("select id from secret_folders order by id limit 1")
+        .fetch_one(db)
+        .await
+        .unwrap();
+    let (status, body) = call(
+        "GET",
+        &format!("/api/secrets/{folder}"),
+        Some(cookie.clone()),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|k| k["value"].is_null()),
+        "no value is ever read back: {body}"
+    );
+
+    // A mutation needs a JSON body: the cookie is SameSite=Strict, and this is the second lock
+    // against a cross-site form post.
+    let app2 = app.clone();
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/api/inbox")
+        .header(axum::http::header::COOKIE, cookie.clone())
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        )
+        .body(axum::body::Body::from("op=rule_add&body[text]=x"))
+        .unwrap();
+    assert_eq!(
+        app2.oneshot(req).await.unwrap().status(),
+        415,
+        "a form post is refused"
+    );
+
+    // An unknown operation is refused by name rather than half-applied.
+    let (status, body) = call(
+        "POST",
+        "/api/inbox",
+        Some(cookie.clone()),
+        Some(json!({"op": "wat", "body": {}})),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+
+    // A rule added through the UI is the secretary's own rule, by the same path Telegram uses.
+    let (status, body) = call(
+        "POST",
+        "/api/inbox",
+        Some(cookie.clone()),
+        Some(json!({"op": "rule_add", "body": {"text": "web rules are the same rules"}})),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let (_, body) = call("GET", "/api/inbox", Some(cookie.clone()), None).await;
+    assert!(
+        body["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["text"] == "web rules are the same rules"),
+        "{body}"
+    );
+
+    // An approval through the API is the same decision as the Telegram button: the item is
+    // answered and the agent is told.
+    let item = crate::human::create(
+        o,
+        crate::human::NewItem {
+            task: None,
+            project: Some("demo".into()),
+            agent_id: None,
+            kind: "admin_change",
+            blocking: false,
+            payload: json!({"summary": "nothing much", "action": {"kind": "noop"}}),
+            node_id: None,
+            call_id: None,
+        },
+    )
+    .await
+    .unwrap()
+    .id;
+    let (status, body) = call(
+        "POST",
+        &format!("/api/items/{item}"),
+        Some(cookie.clone()),
+        Some(json!({"op": "dismiss", "body": {}})),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let state: String = sqlx::query_scalar("select state from human_items where id = $1")
+        .bind(item)
+        .fetch_one(db)
+        .await
+        .unwrap();
+    assert_ne!(state, "open", "the item is decided");
+}
+
 /// Waiting without a session (CLAUDE.md: new tool/flow needs e2e coverage): an agent asks the
 /// orchestrator to wake it, and is woken by the same delivery a follow-up uses. A condition in
 /// plain words goes to the brain, which writes the Rhai for it.
@@ -4125,6 +4370,10 @@ async fn task_lifecycle_through_a_real_node() {
     agent_chatter_flow(&o, &db, &chat).await;
     channel_by_name_flow(&o, &db).await;
     workflow_linked_todo_flow(&o, &db).await;
+
+    // 21. The JSON API the web UI runs on, including the session history the UI now shows.
+    //     Last, so it reads a fleet that has really done work.
+    api_flow(&o, &db).await;
 
     stop_brain().await;
     let _ = std::fs::remove_dir_all(&data_dir);

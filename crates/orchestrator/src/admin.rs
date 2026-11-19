@@ -2291,7 +2291,7 @@ pub async fn projects_json(o: &Orchestrator) -> Result<Value> {
     Ok(Value::Array(out))
 }
 
-async fn project_json(o: &Orchestrator, slug: &str) -> Result<Value> {
+pub(crate) async fn project_json(o: &Orchestrator, slug: &str) -> Result<Value> {
     let p = tasks::project(o, slug).await?;
     let folder_ids: Vec<i64> = sqlx::query_scalar(
         "select folder_id from project_secrets where project = $1 order by folder_id",

@@ -44,6 +44,7 @@ pub fn router(o: O) -> Router {
         .route("/nodes/{id}", get(node_page).post(node_post))
         .route("/agents", get(agents_page).post(agents_post))
         .route("/inbox", get(inbox_page).post(inbox_post))
+        .merge(crate::api::router())
         .layer(axum::middleware::map_response(security_headers))
         .with_state(o)
 }
@@ -125,7 +126,7 @@ async fn login(State(o): State<O>, Path(token): Path<String>) -> Response {
     ([(header::SET_COOKIE, cookie)], Redirect::to(&target)).into_response()
 }
 
-async fn authed(o: &Orchestrator, headers: &HeaderMap) -> bool {
+pub(crate) async fn authed(o: &Orchestrator, headers: &HeaderMap) -> bool {
     let Some(token) = headers
         .get_all(header::COOKIE)
         .iter()

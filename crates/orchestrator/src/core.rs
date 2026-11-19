@@ -418,6 +418,13 @@ impl Orchestrator {
                         .bind(&session_id)
                         .execute(&self.db)
                         .await?;
+                    // The run's own record of which Claude session it was, so a session can be
+                    // found again after the task has moved on to later ones.
+                    sqlx::query("update runs set session_id = $2 where run_id = $1")
+                        .bind(&run_id)
+                        .bind(&session_id)
+                        .execute(&self.db)
+                        .await?;
                 }
             }
             AgentEventKind::Output { json } => {
@@ -437,6 +444,15 @@ impl Orchestrator {
             AgentEventKind::Stderr { line } => self.record(&task_id, "err", &line).await?,
             AgentEventKind::Exited { code } => {
                 self.record(&task_id, "exit", &format!("{code:?}")).await?;
+                // A run ends here whether or not it is still the task's current one: a replaced
+                // run is over too, and its row is history either way.
+                sqlx::query(
+                    "update runs set status = 'ended', ended_at = now(), outcome = $2 where run_id = $1 and ended_at is null",
+                )
+                .bind(&run_id)
+                .bind(format!("exit {code:?}"))
+                .execute(&self.db)
+                .await?;
                 self.builtin_runs.lock().unwrap().remove(&run_id);
                 if current {
                     self.working.run_ended(&task_id, &run_id);
@@ -739,6 +755,16 @@ impl Orchestrator {
         // answer the owner from a lost run, so "typing…" ends too.
         for task in ended {
             let Some(run) = &task.run_id else { continue };
+            // No exit event is coming for these (the process died with its node, or was
+            // revoked), so this is where their history is closed. Why it ended is worth
+            // keeping: a lost run reads differently from one that finished.
+            let _ = sqlx::query(
+                "update runs set status = 'ended', ended_at = now(), outcome = $2 where run_id = $1 and ended_at is null",
+            )
+            .bind(run)
+            .bind(format!("lost: {why}"))
+            .execute(&self.db)
+            .await;
             self.builtin_runs.lock().unwrap().remove(run);
             self.working.run_ended(&task.id, run);
             crate::secretary::run_ended(self, run);

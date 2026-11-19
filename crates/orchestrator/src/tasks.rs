@@ -456,6 +456,21 @@ async fn dispatch_locked(
         )
         .await;
     }
+    // The run is now this task's; remember it as history. A run row outlives the task's
+    // `run_id`, which only ever holds the current one, so the owner can look back at the
+    // sessions of a task or a project. This is deliberately after the claim: a lost claim is
+    // not a session that happened.
+    sqlx::query(
+        "insert into runs (run_id, task_id, project, agent_id, node_id) values ($1, $2, $3, $4, $5)
+         on conflict (run_id) do nothing",
+    )
+    .bind(&run_id)
+    .bind(&task.id)
+    .bind(&task.project)
+    .bind(&agent.id)
+    .bind(&node.id)
+    .execute(&o.db)
+    .await?;
     // The run takes the task's waiting messages and the new one. They stay in the queue, tagged
     // with the run, until the node reports it started (then they go); a run that never starts
     // gives them back (`release_run_messages`), so the next one gets them.
