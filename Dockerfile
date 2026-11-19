@@ -8,6 +8,18 @@
 # Run:    docker run --rm fleet:local --help
 
 ARG RUST_VERSION=1
+ARG NODE_VERSION=22
+
+# ---- web UI -----------------------------------------------------------------
+# The single-page app is embedded into the binary, so it is built first and its
+# output copied into the Rust build. Only apps/web is copied here, so a change
+# anywhere else in the tree does not rebuild it.
+FROM node:${NODE_VERSION}-bookworm-slim AS web
+WORKDIR /web
+COPY apps/web/package.json apps/web/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY apps/web/ ./
+RUN npm run build
 
 # ---- build ------------------------------------------------------------------
 # The builder and the runtime must be the same Debian release, so the binary
@@ -22,6 +34,9 @@ ENV CARGO_TERM_COLOR=always \
     SQLX_OFFLINE=true
 
 COPY . .
+# The built UI, which crates/orchestrator embeds. It lands where a local
+# `npm run build` would have put it, so the Rust side needs no special case.
+COPY --from=web /web/dist ./apps/web/dist
 
 # Cache mounts keep the registry and target/ between builds without cargo-chef.
 # target/ lives only in the cache mount, so the binary is copied out in the

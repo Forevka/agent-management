@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <!-- No external anything: the page is served from the orchestrator and must work on a
+         machine with no internet, so fonts and scripts are all bundled. The icon is inline for
+         the same reason, and because a file would only be a second request to 404. -->
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='4' fill='%233e63dd'/%3E%3Cpath d='M4 4h8v2H6.5v2.5H11v2H6.5V13H4z' fill='white'/%3E%3C/svg%3E"
+    />
+    <title>Fleet</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

@@ -615,7 +615,18 @@ async fn command(
             tasks::stop(o, &task, false).await?;
             format!("Stopping <b>{}</b>.", esc(&id))
         }
-        "/web" => format!("<a href=\"{}\">Open the fleet dashboard</a> (link valid for one login).", esc(&crate::web::magic_link(o, "/").await?)),
+        // `/web` opens the dashboard; `/web /sessions?project=dap` opens exactly that page, so a
+        // link can point at whatever is being discussed.
+        "/web" => {
+            let page = arg.trim();
+            let page = if page.is_empty() { "/" } else { page };
+            let url = crate::web::magic_link(o, page).await?;
+            format!(
+                "<a href=\"{}\">Open <code>{}</code></a> (link valid for one login).",
+                esc(&url),
+                esc(page)
+            )
+        }
         "/invite" => {
             let ticket = crate::web::new_invite(o).await?;
             format!("Run on the new host:\n<code>fleet join {}</code>\nSingle use.", esc(&ticket))

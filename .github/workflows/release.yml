@@ -32,6 +32,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-linux
+      # The web UI is embedded into the binary, so it is built first. Without this the
+      # release would ship build.rs's "the UI was not built" placeholder.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+      - name: Build the web UI
+        working-directory: apps/web
+        run: npm ci && npm run build
       - name: Build
         run: cargo build --release --locked --package fleet --bin fleet
       - name: Stage asset
@@ -69,7 +79,13 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: apps/tray/package-lock.json
+          cache-dependency-path: |
+            apps/web/package-lock.json
+            apps/tray/package-lock.json
+      # Embedded into fleet.exe, so it comes before the cargo build.
+      - name: Build the web UI
+        working-directory: apps/web
+        run: npm ci && npm run build
       - name: Build
         run: cargo build --release --locked --package fleet --bin fleet --target x86_64-pc-windows-msvc
       - name: Tray version matches the workspace

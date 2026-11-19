@@ -763,12 +763,12 @@ async fn secret(State(o): State<O>, h: HeaderMap, Path(id): Path<i64>) -> Api {
             .fetch_optional(&o.db)
             .await?
             .context("no such folder")?;
-    let keys: Vec<(String, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
-        "select key, updated_at from secret_items where folder_id = $1 order by key",
-    )
-    .bind(id)
-    .fetch_all(&o.db)
-    .await?;
+    // Only the key names. A value is write-only from here, and the table keeps no timestamp.
+    let keys: Vec<String> =
+        sqlx::query_scalar("select key from secret_items where folder_id = $1 order by key")
+            .bind(id)
+            .fetch_all(&o.db)
+            .await?;
     let projects: Vec<String> = sqlx::query_scalar(
         "select project from project_secrets where folder_id = $1 order by project",
     )
@@ -785,7 +785,7 @@ async fn secret(State(o): State<O>, h: HeaderMap, Path(id): Path<i64>) -> Api {
             .find(|(p, _)| Some(*p) == preset.as_deref())
             .map(|(_, keys)| *keys)
             .unwrap_or(&[]),
-        "keys": keys.iter().map(|(k, at)| json!({"key": k, "updated_at": at})).collect::<Vec<_>>(),
+        "keys": keys.iter().map(|k| json!({"key": k})).collect::<Vec<_>>(),
         "projects": projects,
     })))
 }
@@ -1013,13 +1013,26 @@ async fn inbox(State(o): State<O>, h: HeaderMap) -> Api {
     .fetch_all(&o.db)
     .await?;
     let (pending, batches_today, messages_today): (i64, i64, i64) = sqlx::query_as(
-        "select (select count(*) from feed_messages where not handled),
-                (select count(*) from secretary_batches where at > now() - interval '24 hours'),
-                (select count(*) from feed_messages where at > now() - interval '24 hours')",
+        "select (select count(*) from feed_messages where secretary = 'pending'),
+                (select count(*) from secretary_batches where at > now() - interval '1 day'),
+                (select coalesce(sum(messages), 0) from secretary_batches where at > now() - interval '1 day')",
     )
     .fetch_one(&o.db)
     .await?;
+    // Every todo and triage row cites the messages behind it. Resolved here, in one lookup, so
+    // the UI can show who wrote what instead of an opaque reference — including whether the
+    // owner has that conversation muted, which is why the secretary left it alone.
+    let mut refs: Vec<String> = todos.iter().flat_map(|t| t.refs.clone()).collect();
+    refs.extend(triage.iter().flat_map(|t| t.1.clone()));
+    let sources = secretary::messages_by_ref(&o, &refs).await?;
     Ok(Json(json!({
+        "sources": sources.iter().map(|(r, m)| (r.clone(), json!({
+            "label": m.label(),
+            "link": m.web_link(),
+            "attention": m.attention,
+            // Clipped: a source line is a hint, not the message.
+            "text": crate::chat::clip(&m.text, 400),
+        }))).collect::<serde_json::Map<_, _>>(),
         "todos": todos.iter().map(|t| json!({
             "id": t.id, "title": t.title, "detail": t.detail, "refs": t.refs,
             "status": t.status, "created_by": t.created_by, "created_at": t.created_at,

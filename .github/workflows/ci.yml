@@ -42,6 +42,26 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+  # The web UI is its own build (TypeScript, then Vite). The Rust jobs do not need it: when
+  # apps/web/dist is missing, crates/orchestrator's build.rs embeds a placeholder page, so a
+  # Rust-only change needs no node. This job is what proves the real UI still compiles.
+  web:
+    name: web UI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+      - name: Install
+        working-directory: apps/web
+        run: npm ci
+      - name: Typecheck and build
+        working-directory: apps/web
+        run: npm run build
+
   test-linux:
     name: test (linux, postgres)
     runs-on: ubuntu-latest

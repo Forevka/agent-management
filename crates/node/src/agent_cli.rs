@@ -267,8 +267,10 @@ pub enum AdminCmd {
     FolderDelete { folder: String },
     /// Propose deleting one key's value from a secret folder.
     SecretUnset { folder: String, key: String },
-    /// Send the owner a login link to a web page, e.g. to enter a token or secret value there
-    /// (/agents, /secrets/<id>, /nodes/<id>, /projects/<slug>). You do not get the link.
+    /// Send the owner a login link to any page of the fleet's UI, so they land on the exact
+    /// thing you are talking about: /tasks/<id>, /sessions, /inbox, /projects/<slug>, /agents,
+    /// /nodes/<id>, /secrets/<id> (to enter a token), /items/<id>, and filtered views such as
+    /// `/tasks?project=bioins&status=failed`. You never see the link yourself.
     Link {
         page: String,
         /// One line telling the owner what to do there.

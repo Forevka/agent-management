@@ -805,21 +805,49 @@ async fn secretary_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeCha
             .unwrap()
             .contains("reopened")
     );
-    // The web page: open todos with their actions, the rules, the triage log; message text
-    // escaped.
-    let page = crate::web::render_inbox(o).await.unwrap();
-    assert!(page.contains(&format!("<b>T-{budget}</b> Review Dave")));
+    // What the Inbox page is given: the open todos, the rules, and the triage log. Message text
+    // travels verbatim — escaping is the renderer's job now, and the UI puts every one of these
+    // into a text node, so a `<script>` in a Slack message is characters, not markup.
+    let inbox = api_get(o, "/api/inbox").await;
+    let todos = inbox["todos"].as_array().unwrap();
     assert!(
-        page.contains("name=action value=m"),
-        "open todos can be acted on"
+        todos
+            .iter()
+            .any(|t| t["id"] == budget && t["title"] == "Review Dave" && t["status"] == "open"),
+        "{inbox}"
     );
-    assert!(page.contains("Messages in #random are noise"));
-    assert!(page.contains("lunch anyone? &lt;script&gt;") && !page.contains("<script>"));
     assert!(
-        page.contains("https://memchat.test/C-rand/m3"),
-        "sources link out"
+        inbox["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["text"] == "Messages in #random are noise"),
+        "{inbox}"
     );
-    assert!(page.contains("task requested"));
+    let triage = inbox["triage"].as_array().unwrap();
+    assert!(
+        triage.iter().any(|t| t["note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("lunch anyone? <script>")),
+        "the message's own characters, not an escaped copy: {inbox}"
+    );
+    assert!(
+        triage.iter().any(|t| t["refs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r.as_str() == Some("https://memchat.test/C-rand/m3"))),
+        "sources are listed"
+    );
+    assert!(
+        triage.iter().any(|t| t["decision"] == "task requested"
+            || t["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("task requested")),
+        "the triage log says a task was asked for: {inbox}"
+    );
 
     // Batching limits. Up to max_batch (6 here) are shown, personal ones first; channel
     // traffic beyond that is only counted, personal messages wait for the next batch.
@@ -1289,10 +1317,20 @@ async fn secretary_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeCha
         .then_some(())
     })
     .await;
-    let page = crate::web::render_inbox(o).await.unwrap();
+    // The Inbox page is told which cited conversations the owner has muted, so it can say why
+    // the secretary left one alone.
+    let inbox = api_get(o, "/api/inbox").await;
     assert!(
-        page.contains("gitlab-notifications · GitLab</a> <span class=pill>muted</span>"),
-        "the muted badge on the triage log"
+        inbox["sources"]
+            .as_object()
+            .unwrap()
+            .values()
+            .any(|s| s["label"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("gitlab-notifications")
+                && s["attention"] == "muted"),
+        "{inbox}"
     );
     // The daily digest is asked for once per day, at its hour; the day is recorded after.
     let hour = o.cfg.secretary.digest_hour;
@@ -2114,6 +2152,34 @@ async fn jira_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool) {
     assert!(e.to_string().contains("unknown tool"), "{e}");
 }
 
+/// A read of the web API as the owner, for flows that want to check what the UI is shown.
+/// Mints its own session row, so it does not depend on another flow having run.
+async fn api_get(o: &Arc<Orchestrator>, uri: &str) -> Value {
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let session = crate::web::random_token();
+    sqlx::query(
+        "insert into web_sessions (token, expires_at) values ($1, now() + interval '1 day')",
+    )
+    .bind(&session)
+    .execute(&o.db)
+    .await
+    .unwrap();
+    let req = axum::http::Request::builder()
+        .uri(uri)
+        .header(
+            axum::http::header::COOKIE,
+            format!("fleet_session={session}"),
+        )
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let res = crate::web::router(o.clone()).oneshot(req).await.unwrap();
+    assert_eq!(res.status(), 200, "GET {uri}");
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
 /// The JSON API the web UI is built on, driven through the real axum router so routing, the
 /// cookie check and the status codes are the ones a browser gets.
 ///
@@ -2161,6 +2227,34 @@ async fn api_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool) {
             (status, json)
         }
     };
+
+    // Every read, in one pass. A hand-written query can name a column that does not exist, and
+    // that only shows at runtime: this way one run reports all of them instead of one per CI
+    // round, which is exactly how `/api/secrets/{id}` was caught selecting a timestamp the
+    // table never had.
+    let folder_id: i64 = sqlx::query_scalar("select id from secret_folders order by id limit 1")
+        .fetch_one(db)
+        .await
+        .unwrap();
+    for uri in [
+        "/api/overview",
+        "/api/tasks",
+        "/api/tasks?project=demo&status=done&q=demo&builtin=true",
+        "/api/tasks/demo-BS-1",
+        "/api/tasks/demo-BS-1/events",
+        "/api/runs",
+        "/api/runs?project=demo&task=demo-BS-1",
+        "/api/projects",
+        "/api/projects/demo",
+        "/api/secrets",
+        &format!("/api/secrets/{folder_id}"),
+        "/api/nodes",
+        "/api/agents",
+        "/api/inbox",
+    ] {
+        let (status, body) = call("GET", uri, Some(cookie.clone()), None).await;
+        assert_eq!(status, 200, "GET {uri} answered {status}: {body}");
+    }
 
     // Without the cookie there is nothing: not even the read-only overview.
     let (status, body) = call("GET", "/api/overview", None, None).await;
@@ -2256,13 +2350,9 @@ async fn api_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool) {
     );
 
     // A secret folder's values are write-only from here: the API lists keys, never values.
-    let folder: i64 = sqlx::query_scalar("select id from secret_folders order by id limit 1")
-        .fetch_one(db)
-        .await
-        .unwrap();
     let (status, body) = call(
         "GET",
-        &format!("/api/secrets/{folder}"),
+        &format!("/api/secrets/{folder_id}"),
         Some(cookie.clone()),
         None,
     )

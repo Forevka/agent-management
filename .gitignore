@@ -4,3 +4,10 @@ fleet-data/
 *.tmp
 deploy/.env
 HANDOFF.md
+
+# The web UI's build output and dependencies. `apps/web/dist` is embedded into the binary at
+# compile time (crates/orchestrator/build.rs leaves a placeholder when it is missing), so it is
+# built, never committed.
+node_modules/
+apps/web/dist/
+*.tsbuildinfo

@@ -2136,10 +2136,31 @@ pub async fn run_approved(o: &Arc<Orchestrator>, row: &HumanItemRow) -> Result<(
 const MAX_LINKS_PER_HOUR: i64 = 5;
 
 /// Pages a link may point at: the web UI's own pages, never the login route.
+/// Which pages the orchestrator may send the owner to. A whitelist rather than "any path",
+/// because the brain chooses this and the link it produces is a login: the owner should never
+/// be sent somewhere that is not a page of this UI. [`crate::web::safe_target`] is the second
+/// check, on the way out of the redirect.
 fn link_allowed(page: &str) -> bool {
     let Some(rest) = page.strip_prefix('/') else {
         return false;
     };
+    // A filtered view is a page too — `/tasks?project=bioins&status=failed` is often exactly
+    // the thing worth linking to. The query is allowed to carry only what the UI's own filters
+    // use, so it cannot smuggle a quote, a space or a control character.
+    let (rest, query) = match rest.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (rest, None),
+    };
+    if let Some(q) = query {
+        let ok = !q.is_empty()
+            && q.len() <= 200
+            && q.chars().all(|c| {
+                c.is_ascii_alphanumeric() || matches!(c, '=' | '&' | '-' | '_' | '.' | '%' | '+')
+            });
+        if !ok {
+            return false;
+        }
+    }
     let mut parts = rest.split('/');
     let first = parts.next().unwrap_or_default();
     let second = parts.next();
@@ -2147,7 +2168,10 @@ fn link_allowed(page: &str) -> bool {
         return false;
     }
     match (first, second) {
-        ("" | "projects" | "secrets" | "nodes" | "agents", None) => true,
+        (
+            "" | "projects" | "secrets" | "nodes" | "agents" | "tasks" | "sessions" | "inbox",
+            None,
+        ) => true,
         ("projects" | "secrets" | "nodes" | "items" | "tasks", Some(s)) => {
             !s.is_empty()
                 && s.chars()
@@ -2163,7 +2187,7 @@ pub async fn send_link(o: &Orchestrator, page: &str, text: Option<&str>) -> Resu
     let page = page.trim();
     ensure!(
         link_allowed(page),
-        "page must be one of /, /projects[/<slug>], /secrets[/<folder-id>], /nodes[/<node-id>], /agents, /items/<id>, /tasks/<id>"
+        "page must be one of /, /tasks[/<id>], /sessions, /projects[/<slug>], /inbox, /agents, /nodes[/<node-id>], /secrets[/<folder-id>], /items/<id>, optionally with a filter query such as /tasks?project=bioins&status=failed"
     );
     let text = clip(
         text.map(str::trim)
@@ -2500,6 +2524,15 @@ mod tests {
             "/nodes/abc",
             "/agents",
             "/items/5",
+            // The pages the new UI added, and the filtered views worth linking to: the point of
+            // a link is to land on the exact thing being discussed.
+            "/tasks",
+            "/tasks/demo-BS-1",
+            "/sessions",
+            "/inbox",
+            "/sessions?project=dap",
+            "/tasks?project=bioins&status=failed",
+            "/tasks?q=jira%20token",
         ] {
             assert!(link_allowed(ok), "{ok}");
         }
@@ -2513,6 +2546,13 @@ mod tests {
             "/agents/x",
             "https://evil.example",
             "/items/",
+            // A query is for the UI's filters, not a place to hide a payload.
+            "/tasks?",
+            "/tasks?q=<script>",
+            "/tasks?q=a b",
+            "/tasks?q='",
+            "/tasks?q=a\nb",
+            &format!("/tasks?q={}", "x".repeat(300)),
         ] {
             assert!(!link_allowed(bad), "{bad}");
         }

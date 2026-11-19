@@ -21,6 +21,11 @@ iroh.workspace = true
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "migrate", "json", "chrono"] }
 chrono = { version = "0.4", features = ["serde"] }
 axum = { version = "0.8", features = ["form", "query"] }
+# The web UI is compiled into the binary: one artefact to deploy, and the UI can never be out
+# of step with the API it talks to. `debug-embed` makes a debug build behave like a release
+# one, instead of reading the files from disk at runtime.
+rust-embed = { version = "8", features = ["debug-embed"] }
+mime_guess = "2"
 chacha20poly1305 = "0.10"
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 async-trait = "0.1"
