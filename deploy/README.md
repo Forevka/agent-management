@@ -486,9 +486,24 @@ docker image prune -f
 - Take a backup first (`deploy/scripts/backup.sh`).
 
 **Nodes:** releases are pushed to nodes once update-on-approval is
-implemented. Until then, by hand:
+implemented. Until then, by hand — and **update the nodes whenever the
+`fleet agent` CLI changed**, not only on a protocol bump: that CLI lives in the
+node's binary, so a new agent command (or a changed one) simply does not exist
+for the sessions on a node still running the old one. The orchestrator will
+offer the tool, the agent will call it, and it will get "unrecognised
+subcommand".
 
 - Linux: replace `/usr/local/bin/fleet`, then `sudo systemctl restart fleet-node`.
+  On the VPS the binary comes out of the image that was just built:
+
+  ```sh
+  CID=$(docker create fleet:local)
+  docker cp "$CID:/usr/local/bin/fleet" /usr/local/bin/fleet.new
+  docker rm -v "$CID"
+  mv /usr/local/bin/fleet.new /usr/local/bin/fleet && chmod 755 /usr/local/bin/fleet
+  sudo systemctl restart fleet-node
+  su - fleet -c 'fleet agent --help'   # check it is the new one
+  ```
 - Windows: rerun `install-node.ps1 -FleetExe <new exe> -TrayExe <new tray exe>`
   (no `-Ticket`). It stops the node and the tray, replaces the binaries and
   restarts the task; the node's key is kept.
