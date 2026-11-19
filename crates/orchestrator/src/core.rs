@@ -481,6 +481,11 @@ impl Orchestrator {
                 }
                 // Cancel questions the dead session can no longer receive answers for, and show it
                 // on every copy of them (in the background: node events must not wait for Telegram).
+                // Not `ask`, deliberately, and not `human::close_all`: an `ask` blocks the owner,
+                // never the process, and answering one resumes the session (`human::apply` →
+                // `deliver`). Most sessions end while an `ask` waits — a session closed when idle
+                // is the normal case — so cancelling those would break the flow instead of
+                // tidying it. A task that is really over closes them in `tools::complete`.
                 let cancelled: Vec<crate::model::HumanItemRow> = sqlx::query_as(
                     "update human_items set state = 'cancelled' where task_id = $1 and state = 'open' and kind in ('plan','question','permission') returning *",
                 )

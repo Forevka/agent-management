@@ -1,5 +1,6 @@
 import { Badge, Box, Card, Flex, Grid, Heading, Link as RLink, Table, Text } from '@radix-ui/themes'
 import { Link } from 'react-router-dom'
+import { HOLDS_THE_AGENT } from '../api'
 import type { Overview } from '../api'
 import { Empty, Loaded, Section, StatusBadge, When, useApi } from '../ui'
 
@@ -63,7 +64,7 @@ export default function Dashboard() {
                         <Text size="2" color="gray">
                           {i.task ?? i.project ?? ''}
                         </Text>
-                        {i.blocking && (
+                        {HOLDS_THE_AGENT.includes(i.kind) && (
                           <Text size="1" color="red">
                             an agent is stopped until you answer
                           </Text>

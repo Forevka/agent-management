@@ -495,12 +495,19 @@ async fn item(State(o): State<O>, h: HeaderMap, Path(id): Path<i64>) -> Api {
     };
     let shape = |i: &HumanItemRow| {
         let mut v = item_json(i);
-        // `human::shown` is what the owner may see: a payload with secrets redacted.
-        v["payload"] = human::shown(&i.payload.0).clone();
+        // `human::owner_payload` is what the owner may see, with secrets redacted and the
+        // question, plan or summary where the page looks for it.
+        v["payload"] = human::owner_payload(i);
         v["state"] = json!(i.state);
         v
     };
     let mut v = shape(&it);
+    // The page answers a question on its own, so it says which task is waiting, by name.
+    if let Some(id) = &it.task_id
+        && let Some(task) = o.task(id).await?
+    {
+        v["task_title"] = json!(task.title);
+    }
     v["related"] = json!(
         related
             .iter()

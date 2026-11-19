@@ -144,6 +144,17 @@ pub async fn handle(
         "ask_human" => {
             let question = args["question"].as_str().context("question required")?;
             let blocking = args["blocking"].as_bool().unwrap_or(true);
+            // An agent running this is not itself blocked in a question, so anything blocking of
+            // its own still open is either the same thing in older words or a call it has moved
+            // on from (an `AskUserQuestion` the session abandoned). One open question per task:
+            // the owner answers the live one instead of guessing which of two identical cards
+            // still counts. Fail-closed, unlike the cleanup in `complete`: queueing a second
+            // question for the owner is worse than this tool call failing and being retried.
+            let withdrawn = if blocking {
+                human::supersede(o, &task.id, "the agent asked again").await?
+            } else {
+                vec![]
+            };
             let row = human::create(
                 o,
                 NewItem {
@@ -158,8 +169,19 @@ pub async fn handle(
                 },
             )
             .await?;
+            // Which earlier questions this one replaced, so the agent stops waiting for them.
+            let replaced = match withdrawn.as_slice() {
+                [] => String::new(),
+                ids => format!(
+                    " This replaces {}, which no longer waits for an answer.",
+                    ids.iter()
+                        .map(|id| format!("Q-{id}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            };
             ok(format!(
-                "Queued as Q-{}. The answer will arrive as a message starting with [Answer to Q-{}].",
+                "Queued as Q-{}. The answer will arrive as a message starting with [Answer to Q-{}].{replaced}",
                 row.id, row.id
             ))
         }
@@ -319,6 +341,13 @@ pub async fn handle(
             }
             // Like the brain's report, posted and closed once: a retry adds no second "Done".
             if finished {
+                // A finished task asks nothing. Whatever is still open is a question the agent
+                // went on without, and leaving it would keep the owner "needed" for a task that
+                // is over. Best-effort: the task is done whatever happens here.
+                if let Err(e) = human::close_all(o, &task.id, "the task finished without it").await
+                {
+                    tracing::warn!("closing {}'s open questions failed: {e:#}", task.id);
+                }
                 o.post_task(
                     &task,
                     &format!("✅ <b>Done.</b>\n{}", esc(&clip(&summary, 3000))),
@@ -393,6 +422,11 @@ pub async fn handle(
                 Err(e) => tracing::warn!("skipping {}'s open steps failed: {e:#}", task.id),
             }
             if finished {
+                // As for `complete`: this run is over, so nothing of it still waits on the owner.
+                if let Err(e) = human::close_all(o, &task.id, "the task finished without it").await
+                {
+                    tracing::warn!("closing {}'s open questions failed: {e:#}", task.id);
+                }
                 o.post_task(
                     &task,
                     &format!("📌 <b>Workflow set up.</b>\n{}", esc(&clip(&summary, 3000))),

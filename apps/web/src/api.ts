@@ -37,6 +37,11 @@ export const act = <T = { done: unknown },>(path: string, op: string, body: unkn
 
 // ---------------------------------------------------------------- shapes
 
+/// The kinds that hold a tool call open, where the agent's process really is stopped until the
+/// owner answers. An item's `blocking` is not that: it means "the owner is needed", and an `ask`
+/// or a proposal blocks nobody.
+export const HOLDS_THE_AGENT = ['plan', 'question', 'permission']
+
 export type Item = {
   id: number
   kind: string
@@ -47,7 +52,10 @@ export type Item = {
   created_at: string
   summary: string
   state?: string
+  /// What the owner may see of the call behind the item, secrets redacted: the question, the
+  /// questions, the plan or the proposed change, depending on the kind.
   payload?: Record<string, unknown>
+  task_title?: string
   related?: Item[]
 }
 

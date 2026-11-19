@@ -5,6 +5,7 @@ import {
 import { CheckCircledIcon, InfoCircledIcon } from '@radix-ui/react-icons'
 import { Link, useParams } from 'react-router-dom'
 import * as api from '../api'
+import { HOLDS_THE_AGENT } from '../api'
 import type { Item as ItemT } from '../api'
 import { ErrorNote, Loaded, Pre, useApi } from '../ui'
 
@@ -82,6 +83,10 @@ function Questions({ item, answers, set }: { item: ItemT; answers: Answers; set:
   )
 }
 
+/// The kinds this page has a form for. Anything else still has to be readable, so it falls back
+/// to its payload as text: an item the owner cannot see is an item they cannot answer.
+const WITH_FORM = ['plan', 'question', 'permission', 'ask', 'admin_change', 'task_proposal', 'slack_reply', 'reply']
+
 export default function Item() {
   const { id = '' } = useParams()
   const path = `/api/items/${encodeURIComponent(id)}`
@@ -142,7 +147,29 @@ export default function Item() {
                   {it.task}
                 </Link>
               )}
+              {it.agent && (
+                <Text size="2" color="gray">
+                  {it.agent}
+                </Text>
+              )}
             </Flex>
+            {/* What is waiting, in words, so the question can be answered from this page alone. */}
+            {(() => {
+              const waiting = HOLDS_THE_AGENT.includes(it.kind)
+                ? 'the agent is stopped until you answer.'
+                : it.kind === 'ask'
+                  ? 'your answer reaches the agent as a message; it keeps working meanwhile.'
+                  : ''
+              return (
+                (it.task_title || waiting) && (
+                  <Text as="div" size="2" color="gray" mb="2" className="fleet-wrap">
+                    {it.task_title}
+                    {it.task_title && waiting ? ' — ' : ''}
+                    {waiting}
+                  </Text>
+                )
+              )
+            })()}
             {it.state && it.state !== 'open' && (
               <Callout.Root color="gray" my="3">
                 <Callout.Icon>
@@ -183,7 +210,7 @@ export default function Item() {
             {it.kind === 'ask' && (
               <Card my="3">
                 <Text as="div" weight="medium" mb="2" className="fleet-wrap">
-                  {str(p.question)}
+                  {str(p.question) || it.summary}
                 </Text>
                 <RadioGroup.Root value={choice} onValueChange={setChoice}>
                   <Flex direction="column" gap="2">
@@ -297,6 +324,20 @@ export default function Item() {
                     Dismiss
                   </Button>
                 </Flex>
+              </Card>
+            )}
+
+            {/* A kind this page has no form for: it is still shown, as text, and answered in
+                Telegram. Better than a page that looks empty. */}
+            {!WITH_FORM.includes(it.kind) && (
+              <Card my="3">
+                <Text as="div" size="2" color="gray" mb="2">
+                  {it.summary || 'The agent is waiting on you.'}
+                </Text>
+                <Pre>{str(p)}</Pre>
+                <Text as="p" size="1" color="gray" mt="2">
+                  Answer this one in Telegram.
+                </Text>
               </Card>
             )}
 

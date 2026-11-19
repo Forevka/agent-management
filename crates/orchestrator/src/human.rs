@@ -48,6 +48,33 @@ pub(crate) fn shown(p: &Value) -> &Value {
     }
 }
 
+/// What the owner is shown of an item, with everything the page needs at the top level.
+///
+/// The kinds that come from a Claude tool call keep the call under `input`, and the owner's copy
+/// of it (secret values redacted) under `display`; the kinds an agent or the orchestrator writes
+/// for the owner are already written for them. So this flattens the first group and passes the
+/// second through, and the page finds `question`, `questions`, `plan` or `summary` in the same
+/// place whatever the kind.
+pub(crate) fn owner_payload(row: &HumanItemRow) -> Value {
+    let p = &row.payload.0;
+    match row.kind.as_str() {
+        "plan" | "question" | "permission" => {
+            let mut v = shown(p).clone();
+            // The tool's name lives beside the call, not inside it.
+            match v.as_object_mut() {
+                Some(obj) => {
+                    obj.insert("tool_name".into(), p["tool_name"].clone());
+                    v
+                }
+                // Nothing to flatten (a call that is not an object). Still never `input`, which
+                // is the raw call: `v` is the owner's copy whatever shape it has.
+                None => json!({"tool_name": p["tool_name"], "input": v}),
+            }
+        }
+        _ => p.clone(),
+    }
+}
+
 pub async fn create(o: &Orchestrator, item: NewItem<'_>) -> Result<HumanItemRow> {
     let project = item
         .project
@@ -751,6 +778,93 @@ pub fn retire_copies(o: &Arc<Orchestrator>, rows: Vec<HumanItemRow>, outcome: &s
             }
         }
     });
+}
+
+/// One blocking question per task: the agent has asked again, so what it asked before is
+/// withdrawn. Returns the ids it withdrew.
+///
+/// Deliberately not scoped to a run: the question being retired usually belongs to the run that
+/// walked away from it, which is the whole reason it is still open. Only blocking items are
+/// touched — a `--fyi` note is fire-and-forget by design and may wait for its answer as long as
+/// it likes.
+pub async fn supersede(o: &Arc<Orchestrator>, task_id: &str, why: &str) -> Result<Vec<i64>> {
+    cancel(o, task_id, &["ask", "question"], true, true, why).await
+}
+
+/// Nothing waits on the owner for a task that is over: every open item of it is closed, blocking
+/// or not. No denial is sent, because the session is ending anyway and a prompt the node asks
+/// again after a reconnect is answered from the item's own state (`tools::permission`); denying
+/// here would instead let the agent take another turn on a task already reported as finished.
+pub async fn close_all(o: &Arc<Orchestrator>, task_id: &str, why: &str) -> Result<Vec<i64>> {
+    cancel(o, task_id, &[], false, false, why).await
+}
+
+/// Cancels the task's open items and shows `why` as the outcome on every copy of them, Telegram
+/// included ("cancelled: …"). `kinds` narrows which; empty is every kind. With `release_calls`,
+/// an item that blocked a tool call gets a denial, so an agent still waiting on an answer that
+/// will never come is let go instead of hanging. If this leaves the task with no blocking item,
+/// it goes back to running, exactly as answering the last one would.
+async fn cancel(
+    o: &Arc<Orchestrator>,
+    task_id: &str,
+    kinds: &[&str],
+    only_blocking: bool,
+    release_calls: bool,
+    why: &str,
+) -> Result<Vec<i64>> {
+    let kinds: Vec<String> = kinds.iter().map(|k| (*k).to_owned()).collect();
+    let rows: Vec<HumanItemRow> = sqlx::query_as(
+        "update human_items set state = 'cancelled',
+                answer = coalesce(answer, '{}'::jsonb) || jsonb_build_object('cancelled', $4::text)
+         where task_id = $1 and state = 'open'
+           and (cardinality($2::text[]) = 0 or kind = any($2::text[]))
+           and (not $3::bool or blocking)
+         returning *",
+    )
+    .bind(task_id)
+    .bind(&kinds)
+    .bind(only_blocking)
+    .bind(why)
+    .fetch_all(&o.db)
+    .await?;
+    let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+    if rows.is_empty() {
+        return Ok(ids);
+    }
+    if release_calls {
+        for row in &rows {
+            // Both are set together, and `reply_permission` needs both.
+            if row.node_id.is_some()
+                && row.call_id.is_some()
+                && let Err(e) = reply_permission(
+                    o,
+                    row,
+                    json!({
+                        "behavior": "deny",
+                        "message": format!("Withdrawn ({why}); ask again if you still need an answer."),
+                    }),
+                )
+            {
+                tracing::debug!("letting Q-{} go failed: {e:#}", row.id);
+            }
+        }
+    }
+    sqlx::query(
+        "update tasks set status = 'running', updated_at = now() where id = $1 and status = 'waiting'
+         and not exists (select 1 from human_items where task_id = $1 and state = 'open' and blocking)",
+    )
+    .bind(task_id)
+    .execute(&o.db)
+    .await?;
+    // Audited like an answer: the owner's queue losing an item is a change worth a record.
+    o.audit(
+        "orchestrator",
+        "item.cancel",
+        json!({"items": ids, "task": task_id, "why": why}),
+    )
+    .await;
+    retire_copies(o, rows, &format!("cancelled: {why}"));
+    Ok(ids)
 }
 
 /// Reports an admin change's outcome to the brain. Queued, in order with the brain's other

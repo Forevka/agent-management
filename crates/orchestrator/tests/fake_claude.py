@@ -84,6 +84,11 @@ for line in sys.stdin:
         tool("memory_recall", {"query": "paint", "shared": True})
         tool("milestones_set", {"items": ["Paint", "Prime", "Ship"]})
         tool("milestone_done", {"index": 0})
+        # Asked once, then asked again in better words: the fleet must leave one open question,
+        # not two cards saying the same thing. The note in between blocks nobody, so asking
+        # something else must not take it away.
+        tool("ask_human", {"question": "Should I push?", "options": ["Yes", "No"], "blocking": True})
+        tool("ask_human", {"question": "FYI: the bikeshed had two coats already.", "blocking": False})
         tool("ask_human", {"question": "Push the branch? It uses token " + jira_token(), "options": ["Yes", "No"], "blocking": True})
         out({"type": "result", "subtype": "success", "total_cost_usd": 0.0})
     elif text.startswith("[Message from the owner] admin"):
@@ -156,6 +161,9 @@ for line in sys.stdin:
         tool("memory_retain", {"content": "Bikeshed is blue", "bank": "notes"})
         token = jira_token()
         tool("post", {"text": "Pushed with token " + token})
+        # Left behind on purpose: finishing the task must close it, so nothing of a task that is
+        # over still waits on the owner.
+        tool("ask_human", {"question": "Anything else before I close?"})
         tool("complete", {"summary": "Painted and shipped with token " + token + ". " + text[:60]})
         out({"type": "result", "subtype": "success", "total_cost_usd": 0.0})
     else:

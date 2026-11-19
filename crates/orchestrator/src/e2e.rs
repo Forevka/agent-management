@@ -3260,6 +3260,13 @@ async fn task_lifecycle_through_a_real_node() {
         !o.working.is_showing(&task.id),
         "no typing while the agent waits on the owner"
     );
+    // What the page shows: the questions themselves, flattened out of the tool call they came in.
+    let q_api = api_get(&o, &format!("/api/items/{}", q.id)).await;
+    assert_eq!(
+        q_api["payload"]["questions"][0]["question"], "Which color?",
+        "the item API carries the questions: {q_api:#}"
+    );
+    assert_eq!(q_api["payload"]["tool_name"], "AskUserQuestion");
     let mut answers = serde_json::Map::new();
     answers.insert("Which color?".into(), json!("Blue"));
     human::answer(&o, q.id, Answer::Questions(answers))
@@ -3331,11 +3338,48 @@ async fn task_lifecycle_through_a_real_node() {
     wait_retired(&chat, &[card, pointer], "answered").await;
 
     // 3. Milestones and a non-blocking-for-the-process question, answered by button.
-    let ask = wait_for("ask item", || open_item(&db, &task.id, "ask")).await;
+    let ask = wait_for("ask item", || async {
+        sqlx::query_as::<_, HumanItemRow>(
+            "select * from human_items where task_id = $1 and kind = 'ask' and state = 'open'
+             and blocking order by id desc limit 1",
+        )
+        .bind(&task.id)
+        .fetch_optional(&db)
+        .await
+        .unwrap()
+    })
+    .await;
     assert_eq!(
         ask.payload.0["question"], "Push the branch? It uses token [secret]",
         "a secret the agent quotes in a question is redacted"
     );
+    // Asked twice, one card: the earlier wording is cancelled when the agent asks again, so
+    // "waiting on you" never shows the same question twice. The note in between blocks nobody,
+    // so it is left alone.
+    let asked: Vec<(i64, bool, String)> = sqlx::query_as(
+        "select id, blocking, state from human_items where task_id = $1 and kind = 'ask' order by id",
+    )
+    .bind(&task.id)
+    .fetch_all(&db)
+    .await
+    .unwrap();
+    assert_eq!(asked.len(), 3, "all three asks are on record: {asked:?}");
+    assert_eq!(asked[0].2, "cancelled", "the superseded question is closed");
+    assert_eq!(
+        (asked[1].1, asked[1].2.as_str()),
+        (false, "open"),
+        "a note nobody is blocked on survives the next question"
+    );
+    assert_eq!(asked[2].0, ask.id);
+    // The page can answer it without opening the task: the question, its options and whose task
+    // it is all come with the item, not just its one-line summary.
+    let ask_api = api_get(&o, &format!("/api/items/{}", ask.id)).await;
+    assert_eq!(
+        ask_api["payload"]["question"], "Push the branch? It uses token [secret]",
+        "the item API carries the question itself: {ask_api:#}"
+    );
+    assert_eq!(ask_api["payload"]["options"][0], "Yes");
+    assert_eq!(ask_api["task_title"], "Paint the bikeshed");
     human::answer(&o, ask.id, Answer::Choice(0)).await.unwrap();
 
     // 4. The agent completes.
@@ -3344,6 +3388,19 @@ async fn task_lifecycle_through_a_real_node() {
             .await
             .unwrap()
             .filter(|t| t.status == "done")
+    })
+    .await;
+    // A task that is over leaves nothing waiting on the owner: the question the agent asked on
+    // its way out is closed with it (the status lands first, so wait for the items).
+    wait_for("the done task's questions closed", || async {
+        let open: i64 = sqlx::query_scalar(
+            "select count(*) from human_items where task_id = $1 and state = 'open'",
+        )
+        .bind(&task.id)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        (open == 0).then_some(())
     })
     .await;
     // The brain hears about it, with the agent's report quoted as data and the project secret
