@@ -690,7 +690,7 @@ async fn command(
             tasks::reset_builtin(o, crate::model::SECRETARY_TASK).await?;
             "The secretary will start a fresh session with its next batch or your next message in the Inbox (its todos and rules stay).".into()
         }
-        "/help" | "/start" => "Write in General to talk to the orchestrator, or in 📋 Inbox to talk to the secretary. Reply in a task topic to talk to its agent; reply to a question to answer it.\n/status /queue /tasks /stop [task] /web /invite /brain_reset /secretary_reset".into(),
+        "/help" | "/start" => "Write in General to talk to the orchestrator, or in 📋 Inbox to talk to the secretary. Reply in a task topic to talk to its agent; reply to a question to answer it.\n/status /queue /tasks /habits /wakeups /stop [task] /web /invite /brain_reset /secretary_reset".into(),
         _ => format!("Unknown command {}. Try /help.", esc(cmd)),
     };
     o.chat
