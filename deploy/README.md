@@ -382,6 +382,53 @@ If the refresh token is revoked, or its scopes no longer cover what the
 secretary needs, the orchestrator says so in General and the feed stays off
 until the `gchat` folder changes.
 
+### The daily retrospective
+
+Once a day the fleet reviews its own day — tasks, your decisions and requests,
+the agents' chatter, and what went wrong — and proposes improvements **to the
+fleet itself** in the **📈 Retro** topic. One tap on a proposal turns it into a
+task on the fleet's own code; `/retro` lists them, and the web UI has a Retro
+page.
+
+It is off until you give it an hour, and a proposal cannot become a task until
+it has somewhere to work:
+
+1. **A clone of this repository**, separate from any working tree you edit
+   yourself, on a node that can actually build it — it needs `cargo`, `node`
+   and (for the Postgres-backed e2e) a Postgres it may create databases in. A
+   VPS with only `git` cannot verify a Rust change, so prefer a PC node:
+
+   ```sh
+   git clone https://github.com/<you>/agent-management.git C:\repos\fleet-src
+   ```
+
+2. **A project for it**, created like any other on the Projects page (slug
+   `fleet-src` by default, `FLEET_RETRO_PROJECT` to change it), then mapped to
+   that clone on the node that holds it:
+
+   ```sh
+   fleet project map fleet-src C:\repos\fleet-src
+   ```
+
+   Give it no secret folder: with no credentials the agent cannot push, so its
+   work stays a local branch until you look at it. That is deliberate — the
+   brief it gets says to branch, keep `fmt`, `clippy` and the tests green, and
+   never push or deploy.
+
+3. **The hour**, in `.env` (`FLEET_TIMEZONE` decides the zone), plus the model
+   it should think with:
+
+   ```sh
+   FLEET_RETRO_HOUR=7
+   FLEET_RETRO_MODEL=opus
+   FLEET_RETRO_EFFORT=high
+   ```
+
+The retrospective holds no secrets, runs in an empty directory with only
+`fleet agent` in its shell, and can do exactly two things: propose and
+conclude. It cannot create a task, answer you, message an agent or change a
+setting — every proposal waits for your tap.
+
 ## 7. Backups
 
 `deploy/scripts/backup.sh` dumps both databases and the roles, and archives
