@@ -2060,6 +2060,14 @@ async fn wakeup_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool) {
         .execute(db)
         .await
         .unwrap();
+    // Waking resumed Alice's session, and an agent runs one session at a time: leave her free
+    // for whatever the test does next.
+    let woken = o.task(&worker.id).await.unwrap().unwrap();
+    tasks::stop(o, &woken, false).await.unwrap();
+    wait_for("the woken session ends", || async {
+        o.task(&worker.id).await.unwrap().filter(|t| !t.running)
+    })
+    .await;
 }
 
 /// Agents messaging each other is the fleet's own chatter: the copy the owner can read goes to
