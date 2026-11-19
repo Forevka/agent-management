@@ -56,6 +56,7 @@ pub fn router() -> Router<O> {
         .route("/api/agents", get(agents).post(agents_act))
         .route("/api/inbox", get(inbox).post(inbox_act))
         .route("/api/habits", get(habits).post(habits_act))
+        .route("/api/retro", get(retro).post(retro_act))
         .route("/api/invite", post(invite))
 }
 
@@ -1116,5 +1117,30 @@ async fn habits_act(State(o): State<O>, h: HeaderMap, Json(a): Json<Act>) -> Api
         }
     };
     let note = crate::habits::button(&o, &format!("hb|{id}|{action}")).await?;
+    Ok(Json(json!({"done": note})))
+}
+
+// ---------------------------------------------------------------- retrospective
+
+async fn retro(State(o): State<O>, h: HeaderMap) -> Api {
+    guard!(o, h);
+    Ok(Json(crate::retro::json(&o).await?))
+}
+
+/// The same two decisions the cards offer, by the same code path.
+async fn retro_act(State(o): State<O>, h: HeaderMap, Json(a): Json<Act>) -> Api {
+    guard!(o, h, write);
+    let id = a.body["id"].as_i64().context("id is required")?;
+    let action = match a.op.as_str() {
+        "make_task" => "t",
+        "dismiss" => "x",
+        other => {
+            return Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                format!("unknown operation {other:?}"),
+            ));
+        }
+    };
+    let note = crate::retro::button(&o, &format!("rt|{id}|{action}")).await?;
     Ok(Json(json!({"done": note})))
 }

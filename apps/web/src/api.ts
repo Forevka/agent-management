@@ -170,6 +170,21 @@ export type Inbox = {
   stats: { pending: number; batches_today: number; messages_today: number }
 }
 
+/// The daily retrospective: what the fleet concluded about its own days, and what it proposes
+/// doing about it. `detail` is a session's own prose — rendered as text, never as markup.
+export type Retro = {
+  proposals: {
+    id: number
+    area: string
+    title: string
+    detail: string
+    state: string
+    task: string | null
+    run: number | null
+  }[]
+  runs: { id: number; day: string; verdict: string | null; proposals: number }[]
+}
+
 /// A habit: something the owner kept doing that the fleet now does for them. `what` is the
 /// server's own one-line rendering of it, so the page and Telegram say the same thing.
 export type Habits = {

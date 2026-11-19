@@ -2477,7 +2477,7 @@ fn link_allowed(page: &str) -> bool {
     match (first, second) {
         (
             "" | "projects" | "secrets" | "nodes" | "agents" | "tasks" | "sessions" | "inbox"
-            | "habits",
+            | "habits" | "retro",
             None,
         ) => true,
         ("projects" | "secrets" | "nodes" | "items" | "tasks", Some(s)) => {

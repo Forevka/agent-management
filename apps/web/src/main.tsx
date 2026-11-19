@@ -19,6 +19,7 @@ import NodeDetail from './pages/NodeDetail'
 import Agents from './pages/Agents'
 import Inbox from './pages/Inbox'
 import Habits from './pages/Habits'
+import Retro from './pages/Retro'
 import Item from './pages/Item'
 
 createRoot(document.getElementById('root')!).render(
@@ -44,6 +45,7 @@ createRoot(document.getElementById('root')!).render(
             <Route path="/agents" element={<Agents />} />
             <Route path="/inbox" element={<Inbox />} />
             <Route path="/habits" element={<Habits />} />
+            <Route path="/retro" element={<Retro />} />
             <Route path="/items/:id" element={<Item />} />
           </Route>
         </Routes>

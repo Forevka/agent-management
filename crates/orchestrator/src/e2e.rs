@@ -2282,6 +2282,8 @@ async fn api_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool) {
             &["todos", "rules", "triage"],
             &["stats", "sources"],
         ),
+        ("/api/habits", &["habits"], &[]),
+        ("/api/retro", &["proposals", "runs"], &[]),
     ] {
         let (status, body) = call("GET", uri, Some(cookie.clone()), None).await;
         assert_eq!(status, 200, "GET {uri} answered {status}: {body}");
