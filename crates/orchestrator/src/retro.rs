@@ -208,13 +208,60 @@ pub async fn run_for(o: &Arc<Orchestrator>, day: &str) -> Result<bool> {
 
 // ---------------------------------------------------------------- the fleet's lessons
 
+/// When Hindsight should refresh the lessons document, as a UTC cron — an hour before the
+/// retrospective reads it, so what it reads is current rather than a day old.
+///
+/// Hindsight's crons are UTC and `FLEET_RETRO_HOUR` is the owner's own hour, so the conversion
+/// goes through their zone (Postgres does it, which also keeps it right across a DST change).
+async fn refresh_cron(o: &Orchestrator) -> String {
+    let before = (o.cfg.retro.hour.clamp(0, 23) + 23) % 24;
+    let hour: i32 = sqlx::query_scalar(
+        "select extract(hour from
+                  ((date_trunc('day', now() at time zone $1) + make_interval(hours => $2::int))
+                    at time zone $1) at time zone 'UTC')::int",
+    )
+    .bind(&o.cfg.secretary.timezone)
+    .bind(before as i32)
+    .fetch_one(&o.db)
+    .await
+    .unwrap_or(before as i32);
+    format!("0 {hour} * * *")
+}
+
+/// How the document keeps itself: editing what changed rather than rewriting (`delta`), from the
+/// fleet's own experience, with one full regeneration a week to clear the drift that leaves.
+fn trigger(cron: &str) -> Value {
+    json!({
+        "mode": "delta",
+        "refresh_cron": cron,
+        "full_refresh_cron": "0 4 * * 0",
+        "min_refresh_interval_seconds": 3600,
+        "fact_types": ["experience", "world"],
+        "budget": "mid",
+    })
+}
+
 /// The lessons document, created on first use and read as it stands. `None` when there is no
 /// memory service configured or it cannot be reached: the retrospective then reads the day
 /// alone, which is worse but still works.
 async fn lessons(o: &Orchestrator) -> Option<String> {
     let hs = o.memory.as_ref()?;
+    let cron = refresh_cron(o).await;
     match hs.mental_model(LESSONS_BANK, LESSONS_MODEL).await {
         Ok(Some(model)) => {
+            // The owner can move the retrospective's hour, and the document's own schedule has
+            // to follow — its content is kept, only the trigger changes.
+            if model["trigger"]["refresh_cron"].as_str() != Some(cron.as_str())
+                && let Err(e) = hs
+                    .mental_model_patch(
+                        LESSONS_BANK,
+                        LESSONS_MODEL,
+                        json!({"trigger": trigger(&cron)}),
+                    )
+                    .await
+            {
+                tracing::warn!("re-scheduling the lessons document failed: {e:#}");
+            }
             let content = model["content"].as_str().unwrap_or_default().trim();
             (!content.is_empty()).then(|| clip(content, 4000))
         }
@@ -222,33 +269,12 @@ async fn lessons(o: &Orchestrator) -> Option<String> {
             // First time: ask Hindsight to start keeping it. It refreshes itself an hour before
             // the retrospective runs, so the document is already up to date when it is read, and
             // in `delta` mode, which edits what changed rather than rewriting the whole thing.
-            // Hindsight's cron is UTC; the retrospective's hour is the owner's own. An hour
-            // before the review, converted through their zone, so the document is current when
-            // it is read rather than refreshed just after.
-            let before = (o.cfg.retro.hour.clamp(0, 23) + 23) % 24;
-            let hour: i32 = sqlx::query_scalar(
-                "select extract(hour from
-                          ((date_trunc('day', now() at time zone $1) + make_interval(hours => $2::int))
-                            at time zone $1) at time zone 'UTC')::int",
-            )
-            .bind(&o.cfg.secretary.timezone)
-            .bind(before as i32)
-            .fetch_one(&o.db)
-            .await
-            .unwrap_or(before as i32);
             let spec = json!({
                 "id": LESSONS_MODEL,
                 "name": "What this fleet has learned about itself",
                 "source_query": LESSONS_QUERY,
                 "max_tokens": 1200,
-                "trigger": {
-                    "mode": "delta",
-                    "refresh_cron": format!("0 {hour} * * *"),
-                    "full_refresh_cron": "0 4 * * 0",
-                    "min_refresh_interval_seconds": 3600,
-                    "fact_types": ["experience", "world"],
-                    "budget": "mid",
-                },
+                "trigger": trigger(&cron),
             });
             // How what the fleet retains about itself should be read: a standing instruction for
             // the bank, so the facts come out in the shape the document needs instead of as

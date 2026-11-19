@@ -215,6 +215,18 @@ impl Hindsight {
         .await
     }
 
+    /// Changes an existing model — its trigger, when the owner's settings move under it. Keeps
+    /// the content it has: a document that took days to build is not worth losing to a cron.
+    pub async fn mental_model_patch(&self, bank: &str, id: &str, patch: Value) -> Result<()> {
+        self.call(
+            reqwest::Method::PATCH,
+            &format!("/v1/default/banks/{bank}/mental-models/{id}"),
+            Some(patch),
+        )
+        .await
+        .map(drop)
+    }
+
     /// Asks for a refresh now, on top of whatever schedule it has. Asynchronous on Hindsight's
     /// side: it answers with an operation, not the new content.
     pub async fn mental_model_refresh(&self, bank: &str, id: &str) -> Result<()> {
