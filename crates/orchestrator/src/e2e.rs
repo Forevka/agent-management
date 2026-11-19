@@ -3039,7 +3039,37 @@ async fn habit_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) {
     };
     assert_eq!(count().await, 0, "reflection offers, it does not decide");
 
-    // 3. The brain proposes one (as it would from that reflection) and nothing happens until the
+    // 3. What a proposal may not be, checked before the one that is accepted: a pattern woven
+    //    out of wildcards (it would cover the whole project), and a job the owner has not in
+    //    fact settled on.
+    let habit_add = |pattern: &str, project: &str| crate::admin::AdminAction::HabitAdd {
+        kind: "decide".into(),
+        why: "you approved three MR reviews unchanged".into(),
+        project: Some(project.into()),
+        title_like: Some(pattern.into()),
+        decision: Some("approve".into()),
+        schedule: None,
+        brief: None,
+    };
+    for (pattern, why) in [
+        ("%a%e%i%o%", "a pattern of wildcards covers everything"),
+        (
+            "sand the shed%",
+            "the owner has not approved three of these",
+        ),
+    ] {
+        let refused = crate::admin::prepare(o, habit_add(pattern, "demo")).await;
+        assert!(refused.is_err(), "{why}: {pattern:?} was accepted");
+    }
+    // Nor anything in the fleet's own project, where its secrets reach sessions.
+    assert!(
+        crate::admin::prepare(o, habit_add("review mr !#%", "fleet"))
+            .await
+            .is_err(),
+        "the brain's own project is not open to habits"
+    );
+
+    //    The brain proposes one (as it would from that reflection) and nothing happens until the
     //    owner taps Approve.
     let proposed = crate::admin::propose(
         o,
@@ -3058,13 +3088,15 @@ async fn habit_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) {
     .fetch_one(db)
     .await
     .unwrap();
+    let summary = item.payload.0["summary"].as_str().unwrap().to_owned();
+    // What the owner reads is what actually happened, and what it will really cover.
     assert!(
-        item.payload.0["summary"]
-            .as_str()
-            .unwrap()
-            .contains("3 such plans were approved by hand"),
-        "the owner reads what it is based on: {}",
-        item.payload.0["summary"]
+        summary.contains("you approved 3 of these by hand in the last 14 days and sent none back"),
+        "{summary}"
+    );
+    assert!(
+        summary.contains("their briefs are not part of what you are approving here"),
+        "the card says plainly that it covers tasks the brain creates: {summary}"
     );
     human::answer(o, item.id, Answer::Accept).await.unwrap();
     let habit: crate::model::HabitRow = sqlx::query_as("select * from habits order by id limit 1")
@@ -3156,6 +3188,23 @@ async fn habit_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) {
     .await;
     human::answer(o, plan.id, Answer::Approve).await.unwrap();
     done(sixth.id).await;
+    //    And it stays taken back: tomorrow's reflection does not offer the same thing again,
+    //    even though the owner has now approved more of these by hand than ever.
+    sqlx::query("delete from kv where key = 'habits_reflect_day'")
+        .execute(db)
+        .await
+        .unwrap();
+    assert!(
+        !crate::habits::reflect_if_due(o).await.unwrap(),
+        "a paused habit covers its shape: nothing left to propose"
+    );
+    // Nor may a second habit be proposed over the paused one's ground.
+    assert!(
+        crate::admin::prepare(o, habit_add("review mr !#%", "demo"))
+            .await
+            .is_err(),
+        "the paused habit already covers that"
+    );
 
     // 7. The other kind: a standing request of the owner's, made without being asked, and made
     //    once per interval rather than every tick.

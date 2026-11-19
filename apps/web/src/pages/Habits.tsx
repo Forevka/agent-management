@@ -34,6 +34,9 @@ export default function Habits() {
                       {h.active ? 'on' : 'paused'}
                     </Badge>
                     <Badge variant="soft">{h.kind === 'decide' ? 'decides' : 'does'}</Badge>
+                    <Text size="1" color="gray">
+                      up to {h.cap}/day
+                    </Text>
                     {h.last_used_at && (
                       <Text size="1" color="gray">
                         last acted <When at={h.last_used_at} />
@@ -95,10 +98,13 @@ export default function Habits() {
       <Section title="How a habit is born">
         <Text as="p" size="2" color="gray" className="fleet-wrap">
           Once a day the orchestrator looks at what you have been deciding and asking for. If the
-          same decision has gone your way three times with nothing sent back for changes, it
-          offers a habit as an ordinary Approve / Reject card. A habit never answers a plan that
-          names a blocker, an open question or an unclear acceptance criterion, never acts more
-          than ten times a day, and pauses itself the moment you stop a task it approved.
+          same decision has gone your way three times in a fortnight with nothing sent back for
+          changes, it offers a habit as an ordinary Approve / Reject card — and only your tap
+          creates one. A habit never answers a plan that names a blocker, an open question or an
+          unclear acceptance criterion, never answers while another question of that task is open,
+          and stands aside for good once you send any plan of that shape back. Each one is capped
+          per day (see each habit above), and the card it leaves in the task’s topic has a button
+          that stops the task and pauses the habit.
         </Text>
       </Section>
     </>

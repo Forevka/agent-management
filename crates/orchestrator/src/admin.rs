@@ -1949,6 +1949,12 @@ pub async fn prepare(o: &Orchestrator, action: AdminAction) -> Result<(AdminActi
                 "decide" => {
                     let project = project.context("project required for a decide habit")?;
                     let slug = tasks::project(o, &project).await?.slug;
+                    // The fleet's own project is where its secrets reach sessions; the brain may
+                    // not even bind a folder there, let alone approve work in it.
+                    ensure!(
+                        slug != o.cfg.brain_project,
+                        "a habit cannot decide for the fleet's own project"
+                    );
                     let pattern = title_like
                         .context("title_like required: which tasks this covers")?
                         .trim()
@@ -1958,33 +1964,87 @@ pub async fn prepare(o: &Orchestrator, action: AdminAction) -> Result<(AdminActi
                         decision.as_deref() == Some("approve"),
                         "the only decision a habit may make is \"approve\""
                     );
-                    // It must match work the owner has really approved: a habit is learned from
-                    // what they did, so a pattern matching nothing they ever saw is a mistake.
-                    let seen: i64 = sqlx::query_scalar(&format!(
-                        "select count(*) from human_items h join tasks t on t.id = h.task_id
-                          where h.kind = 'plan' and h.state = 'answered'
-                            and coalesce((h.answer->>'approved')::bool, false)
-                            and t.project = $1 and {shape} like $2",
-                        shape = crate::habits::SHAPE_SQL.replace("{}", "t.title"),
+                    // A habit the owner paused covers its shape for good: bringing it back is
+                    // their call, not something the next reflection may propose around.
+                    let clashes: Option<(i64, bool)> = sqlx::query_as(
+                        "select id, active from habits
+                          where kind = 'decide' and project = $1
+                            and ($2 like title_like or title_like like $2)
+                          order by id limit 1",
+                    )
+                    .bind(&slug)
+                    .bind(&pattern)
+                    .fetch_optional(&o.db)
+                    .await?;
+                    if let Some((other, active)) = clashes {
+                        bail!(
+                            "habit H-{other} already covers that{}; the owner changes it with \
+                             /habits",
+                            if active { "" } else { " (paused)" }
+                        );
+                    }
+                    // What the owner is really being asked for: how much of this they have
+                    // decided themselves, and how much they have never seen. The same bar
+                    // reflection uses, so an accepted proposal means what the card says.
+                    let shape = crate::habits::SHAPE_SQL.replace("{}", "t.title");
+                    let (approved, revised, unseen): (i64, i64, i64) = sqlx::query_as(&format!(
+                        "select
+                           (select count(*) from human_items h join tasks t on t.id = h.task_id
+                             where h.kind = 'plan' and h.state = 'answered'
+                               and coalesce((h.answer->>'approved')::bool, false)
+                               and h.answered_at > now() - make_interval(days => $3::int)
+                               and t.project = $1 and {shape} like $2),
+                           (select count(*) from human_items h join tasks t on t.id = h.task_id
+                             where h.kind = 'plan' and h.state = 'answered'
+                               and not coalesce((h.answer->>'approved')::bool, true)
+                               and h.answered_at > now() - make_interval(days => $3::int)
+                               and t.project = $1 and {shape} like $2),
+                           (select count(*) from tasks t
+                             where t.project = $1 and {shape} like $2
+                               and not exists (select 1 from human_items h
+                                                where h.task_id = t.id and h.kind = 'plan'
+                                                  and h.state = 'answered'))"
                     ))
                     .bind(&slug)
                     .bind(&pattern)
+                    .bind(crate::habits::WINDOW_DAYS as i32)
                     .fetch_one(&o.db)
                     .await?;
                     ensure!(
-                        seen > 0,
-                        "no plan the owner approved in {slug} has a title like {pattern:?}; \
-                         a habit may only cover work they have already decided themselves"
+                        approved >= crate::habits::REPEATS,
+                        "only {approved} plan(s) like {pattern:?} were approved by hand in \
+                         {slug} in the last {} days; a habit needs {} of the owner's own \
+                         decisions behind it",
+                        crate::habits::WINDOW_DAYS,
+                        crate::habits::REPEATS
+                    );
+                    ensure!(
+                        revised == 0,
+                        "the owner sent {revised} plan(s) like {pattern:?} back for changes; \
+                         they have not settled on this"
                     );
                     let summary = format!(
                         "From now on, approve the plan of tasks in project {slug} whose title \
-                         looks like {} — {seen} such plans were approved by hand. Nothing else \
-                         changes: a plan that names a blocker, an open question or an unclear \
-                         acceptance criterion still waits for you, and so does any task you have \
-                         ever sent back for changes. At most 10 a day, every one posted in the \
-                         task's topic with a button that stops the task and pauses this. \
+                         looks like {} — you approved {approved} of these by hand in the last {} \
+                         days and sent none back{}. Nothing else changes: a plan that names a \
+                         blocker, an open question or an unclear acceptance criterion still \
+                         waits for you, so does a task with another question of its own open, \
+                         and the habit stands aside for good once you send any plan of this \
+                         shape back. At most 10 a day, each posted in the task's topic with a \
+                         button that stops the task and pauses this. Note that it covers tasks \
+                         I create, including ones I create after reading a ticket or a Slack \
+                         message — their briefs are not part of what you are approving here. \
                          Learned from: {}.",
                         q(&pattern),
+                        crate::habits::WINDOW_DAYS,
+                        if unseen > 0 {
+                            format!(
+                                ", and it also matches {unseen} task(s) of that project whose \
+                                 plans you never saw"
+                            )
+                        } else {
+                            String::new()
+                        },
                         q(&why)
                     );
                     (
@@ -2010,9 +2070,10 @@ pub async fn prepare(o: &Orchestrator, action: AdminAction) -> Result<(AdminActi
                     ensure!(!brief.is_empty(), "brief required");
                     check_len("brief", &brief, MAX_PROPOSED_DESCRIPTION)?;
                     let summary = format!(
-                        "From now on, {schedule}, do this without being asked: {}. It reaches me \
-                         as if you had just asked for it, and you can pause it any time with \
-                         /habits. Learned from: {}.",
+                        "From now on, {schedule} ({}), do this without being asked: {}. It \
+                         reaches me as if you had just asked for it, at most 10 times a day, and \
+                         /habits pauses it. Learned from: {}.",
+                        crate::habits::how_often(&schedule),
                         q(&brief),
                         q(&why)
                     );
@@ -2228,14 +2289,22 @@ async fn snapshot(o: &Orchestrator, action: &AdminAction) -> Result<Value> {
                 None => Value::Null,
             }
         }
-        // Two habits that answer the same plans would both act, so a proposal goes stale when
-        // the habits change under it. For pause and remove, what that habit is now.
-        A::HabitAdd { project, .. } => {
-            let rows: Vec<(i64, Option<String>)> = sqlx::query_as(
-                "select id, title_like from habits where active and kind = 'decide'
-                 and project is not distinct from $1 order by id",
+        // Two habits that cover the same ground would both act, so a proposal goes stale when
+        // any habit appears, is paused or is removed in the meantime — a `do` proposal too,
+        // which is why this does not filter by kind, project or active. For pause and remove,
+        // what that habit is now.
+        A::HabitAdd { .. } => {
+            let rows: Vec<(
+                i64,
+                String,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                bool,
+            )> = sqlx::query_as(
+                "select id, kind, project, title_like, schedule, active from habits
+                     order by id",
             )
-            .bind(project)
             .fetch_all(&o.db)
             .await?;
             json!(rows)

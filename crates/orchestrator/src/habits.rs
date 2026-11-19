@@ -36,11 +36,12 @@ use crate::{
 /// At most this many habits, so the mechanism stays something the owner can read in one screen.
 pub const MAX_HABITS: i64 = 20;
 
-/// How many of the owner's decisions of one shape it takes before the brain is shown them.
-const REPEATS: i64 = 3;
+/// How many of the owner's decisions of one shape it takes before the brain is shown them — and
+/// the same bar a proposal must clear, so an accepted card means what it says.
+pub(crate) const REPEATS: i64 = 3;
 
-/// How far back reflection looks.
-const WINDOW_DAYS: i64 = 14;
+/// How far back reflection and that check look.
+pub(crate) const WINDOW_DAYS: i64 = 14;
 
 /// The day reflection last ran, so it happens once a day (like the secretary's digest).
 const REFLECT_DAY_KEY: &str = "habits_reflect_day";
@@ -103,6 +104,25 @@ pub fn validate_schedule(schedule: &str) -> Result<()> {
     )
 }
 
+/// A schedule as the owner should read it before accepting it: "every:15m" is a number of times
+/// a day, and that is the part worth knowing.
+pub fn how_often(schedule: &str) -> String {
+    if let Some(rest) = schedule.strip_prefix("every:")
+        && let Ok(minutes) = workflows::parse_every_minutes(rest)
+        && minutes > 0
+    {
+        let per_day = (24 * 60) / minutes;
+        return match per_day {
+            0 | 1 => "about once a day".into(),
+            n => format!("up to {n} times a day, within its daily cap"),
+        };
+    }
+    if schedule.starts_with("weekly:") {
+        return "once a week".into();
+    }
+    "once a day".into()
+}
+
 /// Whether a `like` pattern is specific enough to be a habit of the project `slug`. A habit is
 /// one repeating *job*, so the pattern has to name the work. Two ways it can fail to:
 /// matching almost anything, or naming nothing but the project's own ticket numbering — titles
@@ -113,10 +133,26 @@ pub fn validate_title_like(pattern: &str, slug: &str) -> Result<()> {
         "the pattern matches a lowercased title, so write it in lowercase"
     );
     ensure!(pattern.len() <= 120, "the pattern is too long");
-    let solid = pattern.chars().filter(|c| !"%_ ".contains(*c)).count();
+    // No single-character wildcard, and at most two `%`: a pattern woven out of wildcards
+    // ("%a%e%i%o%") would pass a count of its letters while matching nearly every title.
     ensure!(
-        solid >= 4,
-        "{pattern:?} is too broad: name the job, e.g. 'review mr !#%'"
+        !pattern.contains('_'),
+        "`_` matches any character; write the words instead"
+    );
+    ensure!(
+        pattern.matches('%').count() <= 2,
+        "{pattern:?} is more wildcard than words: use at most two `%`"
+    );
+    // What it really pins down: the longest run of characters that must appear as written.
+    let literal = pattern
+        .split('%')
+        .map(|run| run.trim().chars().count())
+        .max()
+        .unwrap_or(0);
+    ensure!(
+        literal >= 6,
+        "{pattern:?} does not pin down a job: at least six characters in a row must be literal, \
+         e.g. 'review mr !#%'"
     );
     // The words in it, ignoring wildcards, separators and the collapsed digits.
     let words: Vec<&str> = pattern
@@ -162,30 +198,64 @@ pub async fn decide(
         );
         return Ok(None);
     }
-    // The owner having asked for changes on this task before means they are engaged with it.
-    let touched: bool = sqlx::query_scalar(
-        "select exists(select 1 from human_items where task_id = $1 and kind = 'plan'
-                       and state = 'answered' and coalesce((answer->>'approved')::bool, true) = false)",
+    // Something else of this task is already waiting on the owner: the agent asked them a
+    // question of its own, so this is not a plan to answer over their head.
+    let waiting: bool = sqlx::query_scalar(
+        "select exists(select 1 from human_items
+                       where task_id = $1 and state = 'open' and blocking and id <> $2)",
     )
     .bind(&task.id)
+    .bind(item.id)
     .fetch_one(&o.db)
     .await?;
-    if touched {
+    if waiting {
+        return Ok(None);
+    }
+    // The owner having asked for changes on *this job* means they are engaged with it again, so
+    // the habit stands aside until they take it up or remove it. Scoped to the shape, not the
+    // task, because a job's next run is a new task and three sendbacks in a row would otherwise
+    // each sail through.
+    let sent_back: bool = sqlx::query_scalar(&format!(
+        "select exists(select 1 from human_items h join tasks t on t.id = h.task_id
+                        where h.kind = 'plan' and h.state = 'answered'
+                          and not coalesce((h.answer->>'approved')::bool, true)
+                          and t.project = $1 and {shape} like $2)",
+        shape = SHAPE_SQL.replace("{}", "t.title"),
+    ))
+    .bind(&task.project)
+    .bind(habit.title_like.as_deref().unwrap_or_default())
+    .fetch_one(&o.db)
+    .await?;
+    if sent_back {
+        tracing::info!(
+            "habit {} stands aside: the owner has sent a plan of this job back",
+            habit.id
+        );
         return Ok(None);
     }
     let what = format!("approved the plan of {}", task.id);
-    // The same call the owner's tap makes, so this is an approval in every respect: the node's
-    // blocked tool call is answered, the task runs, every copy of the card shows the outcome.
-    human::answer(o, item.id, Answer::Approve).await?;
-    sqlx::query(
-        "insert into habit_uses (habit_id, task_id, item_id, what) values ($1, $2, $3, $4)",
+    // Charged to the habit *before* it acts, so the daily cap counts an application even if what
+    // follows fails, and two plans arriving at once cannot both slip under the cap.
+    let use_id: i64 = sqlx::query_scalar(
+        "insert into habit_uses (habit_id, task_id, item_id, what) values ($1, $2, $3, $4)
+         returning id",
     )
     .bind(habit.id)
     .bind(&task.id)
     .bind(item.id)
     .bind(&what)
-    .execute(&o.db)
+    .fetch_one(&o.db)
     .await?;
+    // The same call the owner's tap makes, so this is an approval in every respect: the node's
+    // blocked tool call is answered, the task runs, every copy of the card shows the outcome.
+    if let Err(e) = human::answer(o, item.id, Answer::Approve).await {
+        // It did not happen, so it is not an application: give the cap back.
+        let _ = sqlx::query("delete from habit_uses where id = $1")
+            .bind(use_id)
+            .execute(&o.db)
+            .await;
+        return Err(e);
+    }
     sqlx::query("update habits set last_used_at = now() where id = $1")
         .bind(habit.id)
         .execute(&o.db)
@@ -238,32 +308,74 @@ async fn told_the_owner(o: &Arc<Orchestrator>, habit: &HabitRow, task: &TaskRow,
         esc(habit.why.as_str()),
         esc(&clip(plan, 2500))
     );
-    // The task is named in the button, not looked up later: this is the control that takes back
-    // what the habit just did, and it must act on this task even if the habit acts again first.
+    // Stop acts on everything this habit has approved since it was last paused, not only this
+    // task: by the time the owner reads the card it may have approved another. Telegram caps
+    // callback data at 64 bytes, so a very long task id is simply left out and the handler falls
+    // back to the habit's own record — the button must never be the thing that fails.
+    let stop = format!("hb|{}|s|{}", habit.id, task.id);
     let keyboard = vec![vec![
         Button::callback(
             "⏹ Stop & ask me next time",
-            format!("hb|{}|s|{}", habit.id, task.id),
+            if stop.len() <= 60 {
+                stop
+            } else {
+                format!("hb|{}|s", habit.id)
+            },
         ),
         Button::callback("⏸ Pause this habit", format!("hb|{}|p", habit.id)),
     ]];
-    if let Some(topic) = task.topic_id
-        && let Err(e) = o
+    // In the task's own topic, or — if it has none — where the project's questions go, because a
+    // plan approved with no way back is the one thing this must never produce.
+    let topic = match task.topic_id {
+        Some(t) => Some(t),
+        None => match tasks::human_topic(o, &task.project, true).await {
+            Ok(t) => Some(t),
+            Err(e) => {
+                tracing::warn!("no topic to tell {} in: {e:#}", task.id);
+                None
+            }
+        },
+    };
+    let sent = match topic {
+        Some(t) => {
+            o.chat
+                .send(
+                    o.task_sender(task).await,
+                    Some(t),
+                    &html,
+                    keyboard,
+                    None,
+                    Notify::Silent,
+                )
+                .await
+        }
+        None => Err(anyhow::anyhow!("no topic")),
+    };
+    if let Err(e) = sent {
+        // Loud, and in the owner's own queue: an approval nobody tapped that nobody was told
+        // about is worse than the noise of saying so.
+        tracing::error!(
+            "{} was approved by habit {} unannounced: {e:#}",
+            task.id,
+            habit.id
+        );
+        let _ = o
             .chat
             .send(
-                o.task_sender(task).await,
-                Some(topic),
-                &html,
-                keyboard,
+                From::Orchestrator,
                 None,
-                Notify::Silent,
+                &format!(
+                    "⚠️ Your habit H-{} approved the plan of <b>{}</b>, but I could not post it \
+                     in its topic. /habits pauses the habit; /stop {} stops the task.",
+                    habit.id,
+                    esc(&task.id),
+                    esc(&task.id)
+                ),
+                vec![],
+                None,
+                Notify::Sound,
             )
-            .await
-    {
-        tracing::warn!(
-            "telling {} a habit approved its plan failed: {e:#}",
-            task.id
-        );
+            .await;
     }
 }
 
@@ -289,9 +401,32 @@ pub async fn run_due(o: &Arc<Orchestrator>) -> Result<()> {
                 continue;
             }
         }
+        // The same daily cap a `decide` habit has: a schedule the owner accepted as "every 15
+        // minutes" must still not be able to run away.
+        let today: i64 = sqlx::query_scalar(
+            "select count(*) from habit_uses where habit_id = $1 and at > now() - interval '1 day'",
+        )
+        .bind(habit.id)
+        .fetch_one(&o.db)
+        .await?;
+        if today >= i64::from(habit.cap) {
+            tracing::info!("habit {} has had its {} for today", habit.id, habit.cap);
+            continue;
+        }
+        // Due time advances first: a failure to deliver must not turn into the same request
+        // every five minutes, and one habit's trouble must not stop the others' (hence the
+        // `continue`s rather than `?`).
+        if let Err(e) = sqlx::query("update habits set last_used_at = now() where id = $1")
+            .bind(habit.id)
+            .execute(&o.db)
+            .await
+        {
+            tracing::warn!("marking habit {} as run failed: {e:#}", habit.id);
+            continue;
+        }
         // The owner's own words, standing: trusted exactly as far as they were when the owner
         // approved this habit, and no further. Nothing a feed message said can reach here.
-        tasks::to_brain_as(
+        if let Err(e) = tasks::to_brain_as(
             o,
             format!(
                 "[Standing request from the owner (habit H-{})] {brief}\n\
@@ -300,16 +435,16 @@ pub async fn run_due(o: &Arc<Orchestrator>) -> Result<()> {
             ),
             tasks::Origin::Other,
         )
-        .await?;
-        sqlx::query("update habits set last_used_at = now() where id = $1")
-            .bind(habit.id)
-            .execute(&o.db)
-            .await?;
-        sqlx::query("insert into habit_uses (habit_id, what) values ($1, $2)")
+        .await
+        {
+            tracing::warn!("making habit {}'s request failed: {e:#}", habit.id);
+            continue;
+        }
+        let _ = sqlx::query("insert into habit_uses (habit_id, what) values ($1, $2)")
             .bind(habit.id)
             .bind(clip(brief, 200))
             .execute(&o.db)
-            .await?;
+            .await;
         o.audit(
             &format!("owner (via habit {})", habit.id),
             "habit.request",
@@ -399,8 +534,10 @@ async fn repeated_decisions(o: &Orchestrator) -> Result<Vec<(String, String, i64
               group by 1, 2
          ) g
           where g.approved >= $2 and g.revised = 0
+            -- Paused habits count as covered too: one the owner took back must not come straight
+            -- back tomorrow as a fresh-looking suggestion.
             and not exists (select 1 from habits x
-                             where x.active and x.kind = 'decide' and x.project = g.project
+                             where x.kind = 'decide' and x.project = g.project
                                and g.shape like x.title_like)
           order by g.approved desc
           limit 5",
@@ -578,30 +715,50 @@ pub async fn button(o: &Arc<Orchestrator>, data: &str) -> Result<String> {
             pause(o, id, "you paused it").await?;
             Ok(format!("H-{id} paused; I will ask you again."))
         }
-        // The one that matters: take back what the habit just did, and do not do it again.
+        // The one that matters: take back what the habit did, and do not do it again. Everything
+        // it approved in the last day is stopped, not only the task whose card was tapped — by
+        // the time the owner reads one card the habit may have approved another, and the owner
+        // tapping "stop" means "undo this", not "undo one of these".
         "s" => {
             let habit = pause(o, id, "you stopped a task it had approved").await?;
-            // The task the button named; older cards carry none, so fall back to the last one it
-            // acted on, which is what such a card was about.
-            let task_id =
-                match which {
-                    Some(t) => Some(t),
-                    None => sqlx::query_scalar(
-                        "select task_id from habit_uses where habit_id = $1 and task_id is not null
-                     order by at desc limit 1",
-                    )
-                    .bind(habit.id)
-                    .fetch_optional(&o.db)
-                    .await?,
+            let mut ids: Vec<String> = sqlx::query_scalar(
+                "select distinct task_id from habit_uses
+                  where habit_id = $1 and task_id is not null and at > now() - interval '1 day'",
+            )
+            .bind(habit.id)
+            .fetch_all(&o.db)
+            .await?;
+            // The card's own task first, even if its application is older than a day.
+            if let Some(t) = which
+                && !ids.contains(&t)
+            {
+                ids.push(t);
+            }
+            let (mut stopped, mut finished) = (vec![], vec![]);
+            for task_id in ids {
+                let Some(task) = o.task(&task_id).await? else {
+                    continue;
                 };
-            let Some(task_id) = task_id else {
-                return Ok(format!("H-{id} paused; nothing of it was running."));
-            };
-            let Some(task) = o.task(&task_id).await? else {
-                return Ok(format!("H-{id} paused; {task_id} is gone."));
-            };
-            tasks::stop(o, &task, false).await?;
-            Ok(format!("{task_id} stopped and H-{id} paused."))
+                // Only a task still going can be stopped; saying otherwise would tell the owner
+                // work was taken back when it had already happened.
+                if task.running || !matches!(task.status.as_str(), "done" | "stopped" | "failed") {
+                    tasks::stop(o, &task, false).await?;
+                    stopped.push(task_id);
+                } else {
+                    finished.push(task_id);
+                }
+            }
+            let mut note = format!("H-{id} paused");
+            if !stopped.is_empty() {
+                note.push_str(&format!("; stopped {}", stopped.join(", ")));
+            }
+            if !finished.is_empty() {
+                note.push_str(&format!(
+                    "; {} had already finished, so there was nothing to stop",
+                    finished.join(", ")
+                ));
+            }
+            Ok(format!("{note}."))
         }
         "r" => {
             let row: Option<HabitRow> = sqlx::query_as(
@@ -727,7 +884,19 @@ mod tests {
         for ok in ["review mr !#%", "nightly build%", "deploy #", "dap mr !#%"] {
             assert!(validate_title_like(ok, "dap").is_ok(), "{ok}");
         }
-        for bad in ["%", "%%", "a%", "Review MR %", &"x".repeat(200)] {
+        for bad in [
+            "%",
+            "%%",
+            "a%",
+            "Review MR %",
+            &"x".repeat(200),
+            // Woven out of wildcards: every letter of it is "solid", and it matches almost any
+            // title there is. This is the one a review found.
+            "%a%e%i%o%",
+            "%review%mr%",
+            // `_` matches any character, so it hides breadth the owner cannot see.
+            "review m_%",
+        ] {
             assert!(validate_title_like(bad, "dap").is_err(), "{bad}");
         }
         // The trap the live fleet showed: tasks named after their ticket share a shape, but
@@ -738,6 +907,23 @@ mod tests {
             validate_title_like("bioins security review%", "bioins").is_ok(),
             "the same prefix with the work named is fine"
         );
+    }
+
+    /// What the owner is told about a schedule before accepting it: the number of times a day,
+    /// not the code.
+    #[test]
+    fn a_schedule_reads_as_how_often_it_happens() {
+        assert_eq!(
+            how_often("every:15m"),
+            "up to 96 times a day, within its daily cap"
+        );
+        assert_eq!(
+            how_often("every:12h"),
+            "up to 2 times a day, within its daily cap"
+        );
+        assert_eq!(how_often("every:24h"), "about once a day");
+        assert_eq!(how_often("weekly:mon:09:00"), "once a week");
+        assert_eq!(how_often("daily:09:00"), "once a day");
     }
 
     #[test]
