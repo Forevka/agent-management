@@ -165,13 +165,21 @@ impl Jira {
         &self.key
     }
 
-    fn url(&self, path: &str) -> String {
-        // v2, not v3: Cloud still serves it, and it reads and writes descriptions and comments
-        // as plain strings instead of Atlassian Document Format trees.
-        format!("{}/rest/api/2/{path}", self.base)
+    /// Issues, comments and transitions go through **v2**: Cloud still serves it, and it reads
+    /// and writes descriptions and comment bodies as plain strings instead of Atlassian
+    /// Document Format trees, which is what an agent can actually read and write.
+    async fn call(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<Value> {
+        self.call_at(method, &format!("rest/api/2/{path}"), body)
+            .await
     }
 
-    async fn call(
+    /// A call to an exact path under the site, for the endpoints that are not under v2.
+    async fn call_at(
         &self,
         method: reqwest::Method,
         path: &str,
@@ -179,7 +187,7 @@ impl Jira {
     ) -> Result<Value> {
         let mut req = self
             .http
-            .request(method, self.url(path))
+            .request(method, format!("{}/{path}", self.base))
             .basic_auth(&self.email, Some(&self.token))
             .header("Accept", "application/json");
         if let Some(body) = body {
@@ -218,12 +226,19 @@ impl Jira {
     }
 
     /// The issues a JQL finds, scoped to this project.
+    ///
+    /// This one endpoint is **v3**, not v2: Cloud removed `/rest/api/{2,3}/search` outright
+    /// (it answers 410 pointing at the migration), and `/rest/api/3/search/jql` is the
+    /// replacement. Mixing versions is safe here because none of the fields asked for is rich
+    /// text — the only fields that differ between v2 and v3 are ones like `description`, which
+    /// a search never returns. Paging is by `nextPageToken` now, and the response carries no
+    /// total, so what comes back says how many were read and whether more remain.
     pub async fn search(&self, jql: &str, limit: i64) -> Result<Value> {
         let jql = scoped_jql(&self.key, jql);
         let v = self
-            .call(
+            .call_at(
                 reqwest::Method::POST,
-                "search",
+                "rest/api/3/search/jql",
                 Some(json!({
                     "jql": jql,
                     "maxResults": limit.clamp(1, MAX_RESULTS),
@@ -234,7 +249,8 @@ impl Jira {
         let issues: Vec<Value> = v["issues"].as_array().cloned().unwrap_or_default();
         Ok(json!({
             "jql": jql,
-            "total": v["total"],
+            "read": issues.len(),
+            "more": v["nextPageToken"].is_string(),
             "issues": issues.iter().map(brief).collect::<Vec<_>>(),
         }))
     }
@@ -478,16 +494,17 @@ mod tests {
     #[tokio::test]
     async fn a_search_is_sent_scoped_to_the_project() {
         let server = MockServer::start().await;
+        // The new endpoint: Cloud removed /rest/api/{2,3}/search outright.
         Mock::given(method("POST"))
-            .and(path("/rest/api/2/search"))
+            .and(path("/rest/api/3/search/jql"))
             .and(body_json(json!({
                 "jql": "project = DAP AND (assignee = currentUser())",
                 "maxResults": 5,
                 "fields": ["summary", "status", "assignee", "issuetype", "priority", "duedate"],
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "total": 1,
                 "issues": [{"key": "DAP-80", "fields": {"summary": "Git integration", "status": {"name": "In Progress"}}}],
+                "nextPageToken": "more-please",
             })))
             .expect(1)
             .mount(&server)
@@ -496,8 +513,38 @@ mod tests {
             .search("assignee = currentUser()", 5)
             .await
             .unwrap();
-        assert_eq!(out["total"], 1);
+        // There is no total any more: what came back, and whether a page follows.
+        assert_eq!(out["read"], 1);
+        assert_eq!(out["more"], true);
         assert_eq!(out["issues"][0]["key"], "DAP-80");
+    }
+
+    #[tokio::test]
+    async fn searching_never_calls_the_removed_endpoint() {
+        // The regression this guards: /rest/api/2/search answered 410 in production, telling us
+        // to migrate. Nothing may call it again.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/search/jql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"issues": []})))
+            .mount(&server)
+            .await;
+        let j = Jira::for_test(&server.uri(), "BIOINS", None);
+        j.search("assignee = currentUser()", 5).await.unwrap();
+        j.sprint(5).await.unwrap();
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|r| r.url.path() == "/rest/api/3/search/jql"),
+            "every search goes to the replacement endpoint"
+        );
+        // Without a total there is nothing to report but what was read.
+        let out = j.search("assignee = currentUser()", 5).await.unwrap();
+        assert_eq!(out["read"], 0);
+        assert_eq!(out["more"], false);
     }
 
     #[tokio::test]
@@ -513,13 +560,13 @@ mod tests {
             .mount(&server)
             .await;
         Mock::given(method("POST"))
-            .and(path("/rest/api/2/search"))
+            .and(path("/rest/api/3/search/jql"))
             .and(body_json(json!({
                 "jql": "project = BIOINS AND (sprint = 99 AND assignee = currentUser()) ORDER BY status, priority DESC",
                 "maxResults": 20,
                 "fields": ["summary", "status", "assignee", "issuetype", "priority", "duedate"],
             })))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"total": 0, "issues": []})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"issues": []})))
             .expect(1)
             .mount(&server)
             .await;

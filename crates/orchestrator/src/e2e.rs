@@ -1988,6 +1988,52 @@ async fn jira_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool) {
         "{e}"
     );
 
+    // Searching, on the endpoint that replaced the one Cloud removed. This is the regression
+    // worth an end-to-end test: the old /rest/api/2/search answered 410 in production, so a
+    // search that reaches the wrong path must fail here rather than in front of the owner.
+    Mock::given(method("POST"))
+        .and(path("/rest/api/3/search/jql"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "issues": [{
+                "key": "BIOINS-5753",
+                "fields": {"summary": "Security epic", "status": {"name": "In Progress"}},
+            }],
+        })))
+        .expect(1)
+        .mount(&jira)
+        .await;
+    let out = call_as(
+        o,
+        "orchestrator",
+        "brain",
+        "jira_search",
+        json!({"project": "demo", "jql": "assignee = currentUser()"}),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        out.result.contains("BIOINS-5753") && out.result.contains("untrusted data"),
+        "{}",
+        out.result
+    );
+    // The JQL that left the orchestrator was scoped to this project's key, and nothing went to
+    // the removed endpoint.
+    let searches: Vec<_> = jira
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.url.path().contains("search"))
+        .collect();
+    assert_eq!(searches.len(), 1, "one search, on one path");
+    assert_eq!(searches[0].url.path(), "/rest/api/3/search/jql");
+    let sent: serde_json::Value = serde_json::from_slice(&searches[0].body).unwrap();
+    assert_eq!(
+        sent["jql"], "project = BIOINS AND (assignee = currentUser())",
+        "the search cannot wander out of the project"
+    );
+
     // A status move happens at once, and is audited.
     Mock::given(method("GET"))
         .and(path("/rest/api/2/issue/BIOINS-5702/transitions"))
