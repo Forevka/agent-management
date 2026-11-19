@@ -1953,7 +1953,7 @@ pub async fn prepare(o: &Orchestrator, action: AdminAction) -> Result<(AdminActi
                         .context("title_like required: which tasks this covers")?
                         .trim()
                         .to_owned();
-                    crate::habits::validate_title_like(&pattern)?;
+                    crate::habits::validate_title_like(&pattern, &slug)?;
                     ensure!(
                         decision.as_deref() == Some("approve"),
                         "the only decision a habit may make is \"approve\""
