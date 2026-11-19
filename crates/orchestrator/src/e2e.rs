@@ -1868,6 +1868,206 @@ async fn workflow_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat
     wait_retired(chat, &[card_msg], "deleted").await;
 }
 
+/// Jira, per project, through the orchestrator (CLAUDE.md: new tool/flow needs e2e coverage).
+/// The credential stays in the vault: the brain gets tools. Reads and status moves happen at
+/// once; creating an issue waits for the owner's tap.
+async fn jira_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool) {
+    use crate::admin::{Actor, AdminAction};
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
+    let jira = MockServer::start().await;
+    // The owner's credential, as the `jira` preset's keys, in the fleet's shared folder.
+    let folder: i64 = sqlx::query_scalar(
+        "insert into secret_folders (name, preset) values ('jira', 'jira') returning id",
+    )
+    .fetch_one(db)
+    .await
+    .unwrap();
+    for (key, value) in [
+        (crate::jira::URL_KEY, jira.uri()),
+        (crate::jira::EMAIL_KEY, "me@x.test".into()),
+        (crate::jira::TOKEN_KEY, "tok".into()),
+    ] {
+        sqlx::query("insert into secret_items (folder_id, key, value) values ($1, $2, $3)")
+            .bind(folder)
+            .bind(key)
+            .bind(o.vault.encrypt(&value))
+            .execute(db)
+            .await
+            .unwrap();
+    }
+    // A project with no Jira yet says so plainly instead of failing obscurely.
+    let worker = o.task("demo-BS-1").await.unwrap().unwrap();
+    let agent = worker.agent_id.clone().unwrap();
+    let e = call_as(
+        o,
+        "orchestrator",
+        "brain",
+        "jira_issue",
+        json!({"project": "demo", "issue": "BIOINS-1"}),
+    )
+    .await
+    .unwrap_err();
+    assert!(e.to_string().contains("no Jira key yet"), "{e}");
+
+    // The owner points the project at a Jira: only the key (and a board) differ per project.
+    let e = crate::admin::prepare(
+        o,
+        AdminAction::ProjectJira {
+            project: "demo".into(),
+            key: Some("not a key".into()),
+            board: None,
+            folder: None,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(e.to_string().contains("not a Jira project key"), "{e}");
+    let (action, summary) = crate::admin::prepare(
+        o,
+        AdminAction::ProjectJira {
+            project: "demo".into(),
+            key: Some("BIOINS".into()),
+            board: Some("7".into()),
+            folder: Some(String::new()),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        summary.contains("key BIOINS") && summary.contains("Board 7"),
+        "{summary}"
+    );
+    crate::admin::execute(o, Actor::Owner, &action)
+        .await
+        .unwrap();
+
+    // Reading an issue: the description arrives, framed as untrusted data.
+    Mock::given(method("GET"))
+        .and(path("/rest/api/2/issue/BIOINS-5702"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "key": "BIOINS-5702",
+            "fields": {
+                "summary": "File ownership not enforced",
+                "description": "A user can reach another user's files.",
+                "status": {"name": "To Do"},
+                "issuetype": {"name": "Bug"},
+            }
+        })))
+        .mount(&jira)
+        .await;
+    let out = call_as(
+        o,
+        "orchestrator",
+        "brain",
+        "jira_issue",
+        json!({"project": "demo", "issue": "BIOINS-5702"}),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        out.result.contains("untrusted data") && out.result.contains("another user's files"),
+        "{}",
+        out.result
+    );
+    // Another project's tracker is refused.
+    let e = call_as(
+        o,
+        "orchestrator",
+        "brain",
+        "jira_issue",
+        json!({"project": "demo", "issue": "DAP-80"}),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        e.to_string().contains("not an issue of this project"),
+        "{e}"
+    );
+
+    // A status move happens at once, and is audited.
+    Mock::given(method("GET"))
+        .and(path("/rest/api/2/issue/BIOINS-5702/transitions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "transitions": [{"id": "31", "name": "Review", "to": {"name": "In Review"}}]
+        })))
+        .mount(&jira)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/rest/api/2/issue/BIOINS-5702/transitions"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&jira)
+        .await;
+    call_as(
+        o,
+        "orchestrator",
+        "brain",
+        "jira_transition",
+        json!({"project": "demo", "issue": "BIOINS-5702", "to": "In Review"}),
+    )
+    .await
+    .unwrap();
+    let audited: i64 = sqlx::query_scalar(
+        "select count(*) from audit_log where action = 'jira.transition' and detail->>'issue' = 'BIOINS-5702'",
+    )
+    .fetch_one(db)
+    .await
+    .unwrap();
+    assert_eq!(audited, 1, "a status move is on the record");
+
+    // Creating an issue reaches Jira only after the owner taps Approve.
+    Mock::given(method("POST"))
+        .and(path("/rest/api/2/issue"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"key": "BIOINS-9000"})))
+        .expect(1)
+        .mount(&jira)
+        .await;
+    call_as(
+        o,
+        "orchestrator",
+        "brain",
+        "admin_propose",
+        json!({"action": "jira_create", "params": {"project": "demo", "summary": "Fix ownership",
+               "description": "From BIOINS-5702.", "issue_type": "Bug"}}),
+    )
+    .await
+    .unwrap();
+    let item: HumanItemRow = sqlx::query_as(
+        "select * from human_items where kind = 'admin_change' order by id desc limit 1",
+    )
+    .fetch_one(db)
+    .await
+    .unwrap();
+    assert!(
+        item.payload.0["summary"]
+            .as_str()
+            .unwrap()
+            .contains("Create a \"Bug\" in BIOINS"),
+        "{}",
+        item.payload.0["summary"]
+    );
+    assert_eq!(
+        jira.received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path() == "/rest/api/2/issue")
+            .count(),
+        0,
+        "nothing is created before the owner approves"
+    );
+    let r = human::answer(o, item.id, Answer::Accept).await.unwrap();
+    assert!(r.contains("BIOINS-9000"), "{r}");
+    // Only Alice's own project is reachable from her task: the tools are the brain's.
+    let e = call_as(o, &agent, &worker.id, "jira_sprint", json!({}))
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("unknown tool"), "{e}");
+}
+
 /// Waiting without a session (CLAUDE.md: new tool/flow needs e2e coverage): an agent asks the
 /// orchestrator to wake it, and is woken by the same delivery a follow-up uses. A condition in
 /// plain words goes to the brain, which writes the Rhai for it.
@@ -3872,8 +4072,9 @@ async fn task_lifecycle_through_a_real_node() {
     // 19. Workflows: `workflow_finish` keeps the topic open and posts a control card.
     workflow_flow(&o, &db, &chat).await;
 
-    // 20. Waiting without a session; fleet chatter has its own topic; a Slack channel can be
-    //     mapped by name; and a todo can nudge an existing workflow.
+    // 20. Jira per project; waiting without a session; fleet chatter has its own topic; a Slack
+    //     channel can be mapped by name; and a todo can nudge an existing workflow.
+    jira_flow(&o, &db).await;
     wakeup_flow(&o, &db).await;
     agent_chatter_flow(&o, &db, &chat).await;
     channel_by_name_flow(&o, &db).await;

@@ -20,6 +20,7 @@ use crate::{
     chat::{From, Notify, clip, esc},
     core::Orchestrator,
     human::{self, NewItem},
+    jira,
     model::{AgentRow, BRAIN_AGENT, BRAIN_TASK, HumanItemRow, NodeRow, TaskRow},
     tasks,
 };
@@ -105,6 +106,38 @@ pub enum AdminAction {
     ChannelRemove {
         project: String,
         channel: String,
+    },
+    /// Which Jira a project maps to: its key there (`BIOINS`), the board whose active sprint
+    /// counts as the owner's, and the credential folder only when it differs from the fleet's
+    /// shared one. An empty string clears a field; the credential itself is never part of this.
+    ProjectJira {
+        project: String,
+        #[serde(default)]
+        key: Option<String>,
+        #[serde(default)]
+        board: Option<String>,
+        #[serde(default)]
+        folder: Option<String>,
+    },
+    /// A new issue in a project's Jira. Outward-facing, so it runs only once the owner approves.
+    JiraCreate {
+        project: String,
+        summary: String,
+        #[serde(default)]
+        description: String,
+        #[serde(default)]
+        issue_type: Option<String>,
+        #[serde(default)]
+        parent: Option<String>,
+    },
+    /// Changed fields of an existing Jira issue, likewise only once the owner approves.
+    JiraUpdate {
+        project: String,
+        issue: String,
+        #[serde(default)]
+        summary: Option<String>,
+        #[serde(default)]
+        description: Option<String>,
     },
     AgentRename {
         agent: String,
@@ -496,6 +529,91 @@ pub async fn execute(o: &Arc<Orchestrator>, actor: Actor, action: &AdminAction) 
                 .await;
             projects_changed(o).await;
             Ok(format!("updated project {slug}"))
+        }
+        A::ProjectJira {
+            project,
+            key,
+            board,
+            folder,
+        } => {
+            tasks::project(o, project).await?;
+            // A field given empty clears it; a field not given stays as it is.
+            let text = |v: &Option<String>| v.as_ref().map(|s| s.trim().to_owned());
+            let key_val = text(key)
+                .map(|k| k.to_uppercase())
+                .filter(|k| !k.is_empty());
+            let folder_val = text(folder).filter(|f| !f.is_empty());
+            let board_val = match text(board).filter(|b| !b.is_empty()) {
+                Some(b) => Some(b.parse::<i32>().context("the board must be a number")?),
+                None => None,
+            };
+            sqlx::query(
+                "update projects set
+                   jira_key    = case when $2 then $3 else jira_key end,
+                   jira_board  = case when $4 then $5 else jira_board end,
+                   jira_folder = case when $6 then $7 else jira_folder end
+                 where slug = $1",
+            )
+            .bind(project)
+            .bind(key.is_some())
+            .bind(&key_val)
+            .bind(board.is_some())
+            .bind(board_val)
+            .bind(folder.is_some())
+            .bind(&folder_val)
+            .execute(&o.db)
+            .await?;
+            o.audit(
+                actor.audit_name(),
+                "project.jira",
+                json!({"project": project, "key": key_val, "board": board_val, "folder": folder_val}),
+            )
+            .await;
+            Ok(format!(
+                "project {project} now points at Jira {}",
+                key_val.unwrap_or_else(|| "(cleared)".into())
+            ))
+        }
+        A::JiraCreate {
+            project,
+            summary,
+            description,
+            issue_type,
+            parent,
+        } => {
+            let j = jira::for_project(o, project).await?;
+            let out = j
+                .create(
+                    summary,
+                    description,
+                    issue_type.as_deref().unwrap_or("Task"),
+                    parent.as_deref(),
+                )
+                .await?;
+            o.audit(
+                actor.audit_name(),
+                "jira.create",
+                json!({"project": project, "created": out["created"]}),
+            )
+            .await;
+            Ok(format!("created {}", out["created"]))
+        }
+        A::JiraUpdate {
+            project,
+            issue,
+            summary,
+            description,
+        } => {
+            let j = jira::for_project(o, project).await?;
+            j.update(issue, summary.as_deref(), description.as_deref())
+                .await?;
+            o.audit(
+                actor.audit_name(),
+                "jira.update",
+                json!({"project": project, "issue": issue}),
+            )
+            .await;
+            Ok(format!("updated {issue}"))
         }
         A::ProjectBindFolder { project, folder: f } => {
             guard_brain_secrets(o, actor, project)?;
@@ -1184,6 +1302,179 @@ pub async fn prepare(o: &Orchestrator, action: AdminAction) -> Result<(AdminActi
                 summary,
             )
         }
+        A::ProjectJira {
+            project,
+            key,
+            board,
+            folder,
+        } => {
+            let p = tasks::project(o, &project).await?;
+            let text = |v: Option<String>| v.map(|s| s.trim().to_owned());
+            let key = text(key).map(|k| k.to_uppercase());
+            let folder = text(folder);
+            let board = text(board);
+            if let Some(k) = key.as_deref().filter(|k| !k.is_empty()) {
+                ensure!(
+                    (2..=20).contains(&k.len())
+                        && k.starts_with(|c: char| c.is_ascii_uppercase())
+                        && k.chars()
+                            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'),
+                    "{k:?} is not a Jira project key (like BIOINS or DAP)"
+                );
+            }
+            if let Some(b) = board.as_deref().filter(|b| !b.is_empty()) {
+                let n: i64 = b
+                    .parse()
+                    .with_context(|| format!("board {b:?} is not a number"))?;
+                ensure!(n > 0, "the board must be positive");
+            }
+            // The folder must already hold the credential, or the brain's Jira calls would all
+            // fail later with nothing to point at. Only key names are looked at, never values.
+            if let Some(f) = folder.as_deref().filter(|f| !f.is_empty()) {
+                let have: Vec<String> = sqlx::query_scalar(
+                    "select i.key from secret_items i join secret_folders f on f.id = i.folder_id
+                     where lower(f.name) = lower($1) and i.key = any($2)",
+                )
+                .bind(f)
+                .bind(vec![
+                    jira::URL_KEY.to_owned(),
+                    jira::EMAIL_KEY.to_owned(),
+                    jira::TOKEN_KEY.to_owned(),
+                ])
+                .fetch_all(&o.db)
+                .await?;
+                let missing: Vec<&str> = [jira::URL_KEY, jira::EMAIL_KEY, jira::TOKEN_KEY]
+                    .into_iter()
+                    .filter(|k| !have.iter().any(|h| h == k))
+                    .collect();
+                ensure!(
+                    missing.is_empty(),
+                    "the secret folder {f:?} has no {}; set them there first (the `jira` preset has all three)",
+                    missing.join(", ")
+                );
+            }
+            let mut summary = format!("Project {} in Jira:", p.slug);
+            match key.as_deref() {
+                Some("") => summary.push_str(" no key (its Jira is turned off)."),
+                Some(k) => summary.push_str(&format!(" key {k}.")),
+                None => {}
+            }
+            match board.as_deref() {
+                Some("") => summary.push_str(" No board: every open sprint counts."),
+                Some(b) => summary.push_str(&format!(" Board {b} decides \"my sprint\".")),
+                None => {}
+            }
+            match folder.as_deref() {
+                Some("") => summary.push_str(&format!(
+                    " Credential from the fleet's shared folder {}.",
+                    q(jira::DEFAULT_FOLDER)
+                )),
+                Some(f) => summary.push_str(&format!(" Credential from folder {}.", q(f))),
+                None => {}
+            }
+            ensure!(
+                key.is_some() || board.is_some() || folder.is_some(),
+                "nothing to change: give a key, a board or a folder"
+            );
+            (
+                A::ProjectJira {
+                    project: p.slug,
+                    key,
+                    board,
+                    folder,
+                },
+                summary,
+            )
+        }
+        A::JiraCreate {
+            project,
+            summary,
+            description,
+            issue_type,
+            parent,
+        } => {
+            let p = tasks::project(o, &project).await?;
+            let key = project_jira_key(o, &p.slug).await?;
+            let summary_text = summary.trim().to_owned();
+            ensure!(!summary_text.is_empty(), "the issue needs a summary");
+            check_len("summary", &summary_text, 250)?;
+            let issue_type = issue_type
+                .map(|t| t.trim().to_owned())
+                .filter(|t| !t.is_empty());
+            if let Some(parent) = parent.as_deref() {
+                ensure!(
+                    jira::is_own_key(&key, parent),
+                    "the parent {parent} is not an issue of {key}"
+                );
+            }
+            let card = format!(
+                "Create a {} in {key} (project {}){}. Summary: {}.{}",
+                q(issue_type.as_deref().unwrap_or("Task")),
+                p.slug,
+                parent
+                    .as_deref()
+                    .map(|x| format!(" under {}", x.to_uppercase()))
+                    .unwrap_or_default(),
+                q(&summary_text),
+                // The agent's own words come last and quoted, like every other proposal.
+                if description.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(" Description: {}.", q(&clip(description.trim(), 700)))
+                }
+            );
+            (
+                A::JiraCreate {
+                    project: p.slug,
+                    summary: summary_text,
+                    description,
+                    issue_type,
+                    parent: parent.map(|x| x.to_uppercase()),
+                },
+                card,
+            )
+        }
+        A::JiraUpdate {
+            project,
+            issue,
+            summary,
+            description,
+        } => {
+            let p = tasks::project(o, &project).await?;
+            let key = project_jira_key(o, &p.slug).await?;
+            let issue = issue.trim().to_uppercase();
+            ensure!(
+                jira::is_own_key(&key, &issue),
+                "{issue} is not an issue of {key}, this project's Jira"
+            );
+            let summary = summary
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty());
+            let description = description.filter(|d| !d.trim().is_empty());
+            ensure!(
+                summary.is_some() || description.is_some(),
+                "nothing to change: give a summary or a description"
+            );
+            if let Some(s) = summary.as_deref() {
+                check_len("summary", s, 250)?;
+            }
+            let mut card = format!("Change {issue} in {key} (project {}).", p.slug);
+            if let Some(s) = summary.as_deref() {
+                card.push_str(&format!(" New summary: {}.", q(s)));
+            }
+            if let Some(d) = description.as_deref() {
+                card.push_str(&format!(" New description: {}.", q(&clip(d.trim(), 700))));
+            }
+            (
+                A::JiraUpdate {
+                    project: p.slug,
+                    issue,
+                    summary,
+                    description,
+                },
+                card,
+            )
+        }
         A::ChannelAdd {
             project,
             channel,
@@ -1703,6 +1994,34 @@ async fn snapshot(o: &Orchestrator, action: &AdminAction) -> Result<Value> {
             Some(id) => json!(folder_keys(o, id).await?),
             None => Value::Null,
         },
+        // What the project points at: a change approved after the owner repointed its Jira
+        // meanwhile would write to the wrong tracker.
+        A::ProjectJira { project, .. }
+        | A::JiraCreate { project, .. }
+        | A::JiraUpdate { project, .. } => {
+            let row: Option<(Option<String>, Option<i32>, Option<String>)> = sqlx::query_as(
+                "select jira_key, jira_board, jira_folder from projects where slug = $1",
+            )
+            .bind(project)
+            .fetch_optional(&o.db)
+            .await?;
+            match row {
+                Some((key, board, folder)) => json!({"key": key, "board": board, "folder": folder}),
+                None => Value::Null,
+            }
+        }
+    })
+}
+
+/// A project's Jira key, for validating an issue belongs to it without touching the credential.
+async fn project_jira_key(o: &Orchestrator, project: &str) -> Result<String> {
+    let key: Option<Option<String>> =
+        sqlx::query_scalar("select jira_key from projects where slug = $1")
+            .bind(project)
+            .fetch_optional(&o.db)
+            .await?;
+    key.flatten().filter(|k| !k.is_empty()).with_context(|| {
+        format!("project {project} has no Jira key yet; the owner sets it on the project's page")
     })
 }
 

@@ -121,23 +121,6 @@ pub fn label(source: &str, kind: &str, conversation: &str, author: Option<&str>)
     }
     parts.join(" · ")
 }
-async fn secret(o: &Orchestrator, folder: &str, key: &str) -> Result<Option<String>> {
-    // The folder name is matched without case: owners name it "Slack" as often as "slack",
-    // and a feed that silently never starts over a capital letter is worse than either.
-    let enc: Option<Vec<u8>> = sqlx::query_scalar(
-        "select i.value from secret_items i join secret_folders f on f.id = i.folder_id
-         where lower(f.name) = lower($1) and i.key = $2 order by (f.name = $1) desc, f.id limit 1",
-    )
-    .bind(folder)
-    .bind(key)
-    .fetch_optional(&o.db)
-    .await?;
-    Ok(enc
-        .map(|e| o.vault.decrypt(&e))
-        .transpose()?
-        .filter(|v| !v.trim().is_empty()))
-}
-
 /// What should run for a source instance. Compared on every round, so a token or channel
 /// change on the web UI restarts the source without restarting the orchestrator.
 #[derive(Clone, PartialEq)]
@@ -195,10 +178,10 @@ impl SourceConfig {
 }
 
 async fn slack_config(o: &Orchestrator) -> Result<Option<SourceConfig>> {
-    let Some(user) = secret(o, SLACK_FOLDER, SLACK_TOKEN_KEY).await? else {
+    let Some(user) = o.secret(SLACK_FOLDER, SLACK_TOKEN_KEY).await? else {
         return Ok(None);
     };
-    if let Some(app) = secret(o, SLACK_FOLDER, SLACK_APP_TOKEN_KEY).await? {
+    if let Some(app) = o.secret(SLACK_FOLDER, SLACK_APP_TOKEN_KEY).await? {
         return Ok(Some(SourceConfig::SlackSocket { user, app }));
     }
     let channels: Vec<String> = sqlx::query_scalar(
@@ -212,9 +195,9 @@ async fn slack_config(o: &Orchestrator) -> Result<Option<SourceConfig>> {
 /// Google Chat runs once all three parts of the owner's OAuth credential are in its folder.
 async fn gchat_config(o: &Orchestrator) -> Result<Option<SourceConfig>> {
     let (Some(client_id), Some(client_secret), Some(refresh_token)) = (
-        secret(o, GCHAT_FOLDER, GCHAT_CLIENT_ID_KEY).await?,
-        secret(o, GCHAT_FOLDER, GCHAT_CLIENT_SECRET_KEY).await?,
-        secret(o, GCHAT_FOLDER, GCHAT_REFRESH_TOKEN_KEY).await?,
+        o.secret(GCHAT_FOLDER, GCHAT_CLIENT_ID_KEY).await?,
+        o.secret(GCHAT_FOLDER, GCHAT_CLIENT_SECRET_KEY).await?,
+        o.secret(GCHAT_FOLDER, GCHAT_REFRESH_TOKEN_KEY).await?,
     ) else {
         return Ok(None);
     };

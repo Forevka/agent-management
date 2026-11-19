@@ -35,3 +35,5 @@ rustls = { version = "0.23.46", default-features = false, features = ["ring", "s
 # Paused time for the "typing…" tests.
 tokio = { workspace = true, features = ["test-util"] }
 fleet-node = { path = "../node" }
+# A stand-in Jira, so the client is tested against real request and response shapes.
+wiremock = "0.6"

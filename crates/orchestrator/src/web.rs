@@ -899,6 +899,32 @@ async fn project_page(State(o): State<O>, h: HeaderMap, Path(slug): Path<String>
              <label><input type=checkbox name=triage value=1> Triage: show new messages to the orchestrator, which may propose tasks or replies</label>\
              <button>Add channel</button></form>",
         );
+        // Jira: one credential normally serves every project, so only the key (and the board,
+        // when "my sprint" must be precise) differ here. The token itself lives in the folder.
+        let jira: (Option<String>, Option<i32>, Option<String>) = sqlx::query_as(
+            "select jira_key, jira_board, jira_folder from projects where slug = $1",
+        )
+        .bind(&slug)
+        .fetch_one(&o.db)
+        .await?;
+        s.push_str(&format!(
+            "<h2>Jira</h2><form method=post class=card><input type=hidden name=op value=jira>\
+             <label>Project key (BIOINS, DAP; empty turns Jira off for this project)\
+             <input type=text name=jira_key value=\"{key}\"></label>\
+             <label>Board id, for \"my sprint\" (optional: without it every open sprint counts)\
+             <input type=text name=jira_board value=\"{board}\"></label>\
+             <label>Secret folder with JIRA_URL, JIRA_EMAIL and JIRA_API_TOKEN \
+             (empty: the shared <code>{default}</code> folder)\
+             <input type=text name=jira_folder value=\"{folder}\"></label>\
+             <p class=muted>The credential stays here: the orchestrator calls Jira, and the \
+             agents never receive it. Reads, comments and status moves happen at once; creating \
+             or editing an issue waits for your approval.</p>\
+             <button class=primary>Save Jira</button></form>",
+            key = esc(jira.0.as_deref().unwrap_or_default()),
+            board = jira.1.map(|b| b.to_string()).unwrap_or_default(),
+            folder = esc(jira.2.as_deref().unwrap_or_default()),
+            default = esc(crate::jira::DEFAULT_FOLDER),
+        ));
         Ok(s)
     }
     .await;
@@ -937,6 +963,14 @@ async fn project_post(
             "unchannel" => AdminAction::ChannelRemove {
                 project: slug.clone(),
                 channel: field(&f, "channel").unwrap_or_default().to_owned(),
+            },
+            // Which Jira this project maps to. The credential stays in its secret folder; an
+            // empty field clears that setting.
+            "jira" => AdminAction::ProjectJira {
+                project: slug.clone(),
+                key: Some(field(&f, "jira_key").unwrap_or_default().to_owned()),
+                board: Some(field(&f, "jira_board").unwrap_or_default().to_owned()),
+                folder: Some(field(&f, "jira_folder").unwrap_or_default().to_owned()),
             },
             _ => anyhow::bail!("unknown operation"),
         };
