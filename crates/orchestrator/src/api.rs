@@ -592,7 +592,10 @@ async fn item_answer(
 
 async fn projects(State(o): State<O>, h: HeaderMap) -> Api {
     guard!(o, h);
-    Ok(Json(admin::projects_json(&o).await?))
+    // `projects_json` answers with a bare array, because that is what the brain's `admin_read`
+    // wants. Every response here is an object instead, so a field can be added later without
+    // changing the shape the UI already parses.
+    Ok(Json(json!({"projects": admin::projects_json(&o).await?})))
 }
 
 async fn projects_act(State(o): State<O>, h: HeaderMap, Json(a): Json<Act>) -> Api {

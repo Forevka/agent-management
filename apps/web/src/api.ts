@@ -112,12 +112,24 @@ export type Overview = {
   sessions_today: number
 }
 
+/// A project as the detail endpoint describes it, where `jira` is the full mapping.
 export type Project = {
   slug: string
   name: string
   description: string
   folders?: string[]
   jira?: { key: string | null; board: number | null; credential_folder: string | null }
+}
+
+/// A row of the project list, which is the brain's `admin_read` shape: here `jira` is just the
+/// project key, or null. Deliberately a separate type — the two endpoints really do differ.
+export type ProjectRow = {
+  slug: string
+  name: string
+  description: string
+  nodes: { node: string; online: boolean }[]
+  open_tasks: number
+  jira: string | null
 }
 
 export type ProjectDetail = {

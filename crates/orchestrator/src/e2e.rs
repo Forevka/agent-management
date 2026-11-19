@@ -2243,24 +2243,66 @@ async fn api_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool) {
         .fetch_one(db)
         .await
         .unwrap();
-    for uri in [
-        "/api/overview",
-        "/api/tasks",
-        "/api/tasks?project=demo&status=done&q=demo&builtin=true",
-        "/api/tasks/demo-BS-1",
-        "/api/tasks/demo-BS-1/events",
-        "/api/runs",
-        "/api/runs?project=demo&task=demo-BS-1",
-        "/api/projects",
-        "/api/projects/demo",
-        "/api/secrets",
-        &format!("/api/secrets/{folder_id}"),
-        "/api/nodes",
-        "/api/agents",
-        "/api/inbox",
+    // Each entry is what the matching page destructures. The keys matter as much as the status:
+    // `/api/projects` once answered with a bare array while the page read `.projects`, which no
+    // status code would have caught — it crashed in the browser instead.
+    let secrets_uri = format!("/api/secrets/{folder_id}");
+    for (uri, arrays, objects) in [
+        (
+            "/api/overview",
+            &["items", "tasks", "nodes", "projects"][..],
+            &[][..],
+        ),
+        ("/api/tasks", &["tasks"], &[]),
+        (
+            "/api/tasks?project=demo&status=done&q=demo&builtin=true",
+            &["tasks"],
+            &[],
+        ),
+        (
+            "/api/tasks/demo-BS-1",
+            &["milestones", "sessions", "items"],
+            &["task"],
+        ),
+        ("/api/tasks/demo-BS-1/events", &["events"], &[]),
+        ("/api/runs", &["runs"], &[]),
+        ("/api/runs?project=demo&task=demo-BS-1", &["runs"], &[]),
+        ("/api/projects", &["projects"], &[]),
+        (
+            "/api/projects/demo",
+            &["folders", "channels", "nodes", "tasks"],
+            &["project"],
+        ),
+        ("/api/secrets", &["folders", "presets"], &[]),
+        (&secrets_uri, &["keys", "expected", "projects"], &[]),
+        ("/api/nodes", &["nodes"], &[]),
+        ("/api/agents", &["agents", "bots", "efforts"], &[]),
+        (
+            "/api/inbox",
+            &["todos", "rules", "triage"],
+            &["stats", "sources"],
+        ),
     ] {
         let (status, body) = call("GET", uri, Some(cookie.clone()), None).await;
         assert_eq!(status, 200, "GET {uri} answered {status}: {body}");
+        for key in arrays {
+            assert!(
+                body[key].is_array(),
+                "GET {uri} must answer with {key} as an array: {body}"
+            );
+        }
+        for key in objects {
+            assert!(
+                body[key].is_object(),
+                "GET {uri} must answer with {key} as an object: {body}"
+            );
+        }
+    }
+    // And the fields inside a row, for the lists whose every column the UI reads by name.
+    let (_, body) = call("GET", "/api/projects", Some(cookie.clone()), None).await;
+    let row = &body["projects"][0];
+    for key in ["slug", "name", "description", "open_tasks"] {
+        assert!(!row[key].is_null(), "a project row has {key}: {body}");
     }
 
     // Without the cookie there is nothing: not even the read-only overview.

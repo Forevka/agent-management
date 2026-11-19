@@ -2,11 +2,11 @@ import { useState } from 'react'
 import { Badge, Box, Button, Card, Code, Flex, Heading, Table, Text, TextField } from '@radix-ui/themes'
 import { Link } from 'react-router-dom'
 import * as api from '../api'
-import type { Overview, Project } from '../api'
+import type { Overview, ProjectRow } from '../api'
 import { ErrorNote, Loaded, Section, useApi } from '../ui'
 
 export default function Projects() {
-  const state = useApi<{ projects: Project[] }>('/api/projects')
+  const state = useApi<{ projects: ProjectRow[] }>('/api/projects')
   // The per-project counts the overview already works out.
   const overview = useApi<Overview>('/api/overview')
   const [busy, setBusy] = useState(false)
@@ -60,8 +60,8 @@ export default function Projects() {
                       </Text>
                     </Table.Cell>
                     <Table.Cell>
-                      {p.jira?.key ? (
-                        <Badge variant="soft">{p.jira.key}</Badge>
+                      {p.jira ? (
+                        <Badge variant="soft">{p.jira}</Badge>
                       ) : (
                         <Text size="2" color="gray">
                           —
