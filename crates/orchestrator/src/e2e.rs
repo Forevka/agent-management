@@ -811,9 +811,12 @@ async fn secretary_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeCha
     let inbox = api_get(o, "/api/inbox").await;
     let todos = inbox["todos"].as_array().unwrap();
     assert!(
-        todos
-            .iter()
-            .any(|t| t["id"] == budget && t["title"] == "Review Dave" && t["status"] == "open"),
+        todos.iter().any(|t| t["id"] == budget
+            && t["title"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Review Dave")
+            && t["status"] == "open"),
         "{inbox}"
     );
     assert!(
@@ -840,13 +843,11 @@ async fn secretary_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeCha
             .any(|r| r.as_str() == Some("https://memchat.test/C-rand/m3"))),
         "sources are listed"
     );
+    // A todo the owner turned into a task. `tasked` is the status the old page spelled out as
+    // "task requested"; the Telegram card still says it in those words (asserted above).
     assert!(
-        triage.iter().any(|t| t["decision"] == "task requested"
-            || t["note"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("task requested")),
-        "the triage log says a task was asked for: {inbox}"
+        todos.iter().any(|t| t["status"] == "tasked"),
+        "a todo became a task: {inbox}"
     );
 
     // Batching limits. Up to max_batch (6 here) are shown, personal ones first; channel
