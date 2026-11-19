@@ -652,14 +652,32 @@ async fn command(
             }
         }
         "/tasks" => {
-            let rows: Vec<(String, String, String)> =
-                sqlx::query_as("select id, title, status from tasks where id not in ('brain', 'secretary') and status not in ('done') order by updated_at desc limit 30")
+            let rows: Vec<(String, String, String, bool)> =
+                sqlx::query_as("select id, title, status, running from tasks where id not in ('brain', 'secretary', 'retro') and status not in ('done') order by updated_at desc limit 30")
                     .fetch_all(&o.db)
                     .await?;
             if rows.is_empty() {
                 "No open tasks.".into()
             } else {
-                rows.iter().map(|(id, t, s)| format!("<b>{}</b> [{}] {}", esc(id), esc(s), esc(t))).collect::<Vec<_>>().join("\n")
+                // A task in progress whose agent finished its turn keeps the status `running`
+                // with no session behind it: saying "running" there is not true (see the web
+                // UI's StatusBadge, which reads the same way).
+                rows.iter()
+                    .map(|(id, t, s, live)| {
+                        let shown = match (s.as_str(), live) {
+                            ("running" | "planning", false) => "idle",
+                            (other, _) => other,
+                        };
+                        format!(
+                            "<b>{}</b> [{}]{} {}",
+                            esc(id),
+                            esc(shown),
+                            if *live { " ▶" } else { "" },
+                            esc(t)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
             }
         }
         "/stop" => {

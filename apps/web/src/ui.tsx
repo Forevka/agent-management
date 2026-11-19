@@ -112,12 +112,26 @@ const TASK_COLORS: Record<string, 'green' | 'blue' | 'amber' | 'gray' | 'red' | 
   failed: 'red',
 }
 
+/// A task's status and whether a session is live are two different things, and the orchestrator's
+/// word for the first is "running" either way: a task whose agent finished its turn keeps
+/// `status = running` (it is in progress and resumable) with no session behind it. Showing that
+/// as "running" says something untrue, so an in-progress task with nothing live reads as **idle**
+/// — the work is open, nothing is happening this second.
 export function StatusBadge({ status, running }: { status: string; running?: boolean }) {
+  const resting = !running && (status === 'running' || status === 'planning')
   return (
     <Flex gap="1" align="center" asChild>
       <span>
-        <Badge color={TASK_COLORS[status] ?? 'gray'} variant="soft">
-          {status}
+        <Badge
+          color={resting ? 'gray' : (TASK_COLORS[status] ?? 'gray')}
+          variant="soft"
+          title={
+            resting
+              ? `${status}, but no session is live: the work is open and a message resumes it`
+              : undefined
+          }
+        >
+          {resting ? 'idle' : status}
         </Badge>
         {running && (
           <Badge color="green" variant="solid" title="a session is running right now">

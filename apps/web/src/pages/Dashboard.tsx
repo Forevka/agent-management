@@ -44,7 +44,14 @@ export default function Dashboard() {
               value={d.items.length}
               color={d.items.some((i) => i.blocking) ? 'red' : undefined}
             />
-            <Stat label="tasks running" value={d.tasks.filter((t) => t.running).length} to="/tasks" color="green" />
+            {/* What is happening this second, not how many tasks are open: a task in progress
+                whose agent finished its turn has no session behind it. */}
+            <Stat
+              label="agents working now"
+              value={d.tasks.filter((t) => t.running).length}
+              to="/tasks"
+              color="green"
+            />
             <Stat label="sessions in 24h" value={d.sessions_today} to="/sessions" />
             <Stat label="open todos" value={d.todos_open} to="/inbox" />
           </Grid>
