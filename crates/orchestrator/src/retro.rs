@@ -222,7 +222,20 @@ async fn lessons(o: &Orchestrator) -> Option<String> {
             // First time: ask Hindsight to start keeping it. It refreshes itself an hour before
             // the retrospective runs, so the document is already up to date when it is read, and
             // in `delta` mode, which edits what changed rather than rewriting the whole thing.
-            let hour = o.cfg.retro.hour.clamp(0, 23);
+            // Hindsight's cron is UTC; the retrospective's hour is the owner's own. An hour
+            // before the review, converted through their zone, so the document is current when
+            // it is read rather than refreshed just after.
+            let before = (o.cfg.retro.hour.clamp(0, 23) + 23) % 24;
+            let hour: i32 = sqlx::query_scalar(
+                "select extract(hour from
+                          ((date_trunc('day', now() at time zone $1) + make_interval(hours => $2::int))
+                            at time zone $1) at time zone 'UTC')::int",
+            )
+            .bind(&o.cfg.secretary.timezone)
+            .bind(before as i32)
+            .fetch_one(&o.db)
+            .await
+            .unwrap_or(before as i32);
             let spec = json!({
                 "id": LESSONS_MODEL,
                 "name": "What this fleet has learned about itself",
@@ -230,7 +243,7 @@ async fn lessons(o: &Orchestrator) -> Option<String> {
                 "max_tokens": 1200,
                 "trigger": {
                     "mode": "delta",
-                    "refresh_cron": format!("0 {} * * *", (hour + 23) % 24),
+                    "refresh_cron": format!("0 {hour} * * *"),
                     "full_refresh_cron": "0 4 * * 0",
                     "min_refresh_interval_seconds": 3600,
                     "fact_types": ["experience", "world"],
