@@ -236,10 +236,11 @@ pub fn start(
     if let Some(dir) = exe.parent() {
         path.insert(0, dir.to_path_buf());
     }
-    // The secretary reads third parties' messages all day: it works in an empty directory of its
-    // own, so even the read-only commands Claude allows without asking see nothing there (reads
-    // outside the working directory are refused). The project mapping still picks the node.
-    let work_dir = if role == crate::skill::SECRETARY_ROLE {
+    // The secretary reads third parties' messages all day, and the retrospective reads a whole
+    // day of them: each works in an empty directory of its own, so even the read-only commands
+    // Claude allows without asking see nothing there (reads outside the working directory are
+    // refused). The project mapping still picks the node.
+    let work_dir = if role == crate::skill::SECRETARY_ROLE || role == crate::skill::RETRO_ROLE {
         let d = agent_dir.join("work");
         std::fs::create_dir_all(&d)?;
         d

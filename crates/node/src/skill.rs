@@ -434,6 +434,21 @@ mod tests {
         );
         assert!(bs.contains("secretary-note") && !ws.contains("todo add"));
         assert!(ws.contains("workflow-finish") && !ss.contains("workflow-finish"));
+        // And the retrospective gets only its own: it proposes and concludes, nothing else.
+        let r = write_plugin(&d, RETRO_ROLE).unwrap();
+        let rs = std::fs::read_to_string(r.join("skills/fleet/SKILL.md")).unwrap();
+        assert!(rs.contains("retro propose") && rs.contains("retro finish"));
+        assert!(
+            !rs.contains("create-task")
+                && !rs.contains("milestones")
+                && !rs.contains("todo add")
+                && !rs.contains("admin propose"),
+            "the retrospective is shown nothing it cannot do"
+        );
+        assert_ne!(
+            r, s,
+            "each role gets its own plugin directory, so one cannot read another's"
+        );
         std::fs::remove_dir_all(&d).unwrap();
     }
 }
