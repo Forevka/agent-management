@@ -808,8 +808,8 @@ async fn secretary_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeCha
     // What the Inbox page is given: the open todos, the rules, and the triage log. Message text
     // travels verbatim — escaping is the renderer's job now, and the UI puts every one of these
     // into a text node, so a `<script>` in a Slack message is characters, not markup.
-    let inbox = api_get(o, "/api/inbox").await;
-    let todos = inbox["todos"].as_array().unwrap();
+    let inbox_api = api_get(o, "/api/inbox").await;
+    let todos = inbox_api["todos"].as_array().unwrap();
     assert!(
         todos.iter().any(|t| t["id"] == budget
             && t["title"]
@@ -817,37 +817,43 @@ async fn secretary_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeCha
                 .unwrap_or_default()
                 .contains("Review Dave")
             && t["status"] == "open"),
-        "{inbox}"
+        "{inbox_api}"
     );
     assert!(
-        inbox["rules"]
+        inbox_api["rules"]
             .as_array()
             .unwrap()
             .iter()
             .any(|r| r["text"] == "Messages in #random are noise"),
-        "{inbox}"
+        "{inbox_api}"
     );
-    let triage = inbox["triage"].as_array().unwrap();
+    let triage = inbox_api["triage"].as_array().unwrap();
     assert!(
-        triage.iter().any(|t| t["note"]
+        triage
+            .iter()
+            .any(|t| t["decision"] == "ignore" && t["refs"][0] == "memchat:C-rand:m3"),
+        "the triage log says what it decided about each message: {inbox_api}"
+    );
+    // A row cites messages by reference; the message itself is in `sources`, which is where the
+    // page gets who wrote what and a link back to it.
+    let sources = inbox_api["sources"].as_object().unwrap();
+    let cited = &sources["memchat:C-rand:m3"];
+    assert_eq!(
+        cited["link"], "https://memchat.test/C-rand/m3",
+        "a source links back to where it was said: {inbox_api}"
+    );
+    assert!(
+        cited["text"]
             .as_str()
             .unwrap_or_default()
-            .contains("lunch anyone? <script>")),
-        "the message's own characters, not an escaped copy: {inbox}"
-    );
-    assert!(
-        triage.iter().any(|t| t["refs"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|r| r.as_str() == Some("https://memchat.test/C-rand/m3"))),
-        "sources are listed"
+            .contains("lunch anyone? <script>"),
+        "the message's own characters, not an escaped copy: {inbox_api}"
     );
     // A todo the owner turned into a task. `tasked` is the status the old page spelled out as
     // "task requested"; the Telegram card still says it in those words (asserted above).
     assert!(
         todos.iter().any(|t| t["status"] == "tasked"),
-        "a todo became a task: {inbox}"
+        "a todo became a task: {inbox_api}"
     );
 
     // Batching limits. Up to max_batch (6 here) are shown, personal ones first; channel
@@ -1320,9 +1326,9 @@ async fn secretary_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeCha
     .await;
     // The Inbox page is told which cited conversations the owner has muted, so it can say why
     // the secretary left one alone.
-    let inbox = api_get(o, "/api/inbox").await;
+    let inbox_api = api_get(o, "/api/inbox").await;
     assert!(
-        inbox["sources"]
+        inbox_api["sources"]
             .as_object()
             .unwrap()
             .values()
@@ -1331,7 +1337,7 @@ async fn secretary_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeCha
                 .unwrap_or_default()
                 .contains("gitlab-notifications")
                 && s["attention"] == "muted"),
-        "{inbox}"
+        "{inbox_api}"
     );
     // The daily digest is asked for once per day, at its hour; the day is recorded after.
     let hour = o.cfg.secretary.digest_hour;
