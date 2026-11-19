@@ -2265,15 +2265,16 @@ pub async fn read(o: &Orchestrator, what: &str, target: Option<&str>) -> Result<
 }
 
 pub async fn projects_json(o: &Orchestrator) -> Result<Value> {
-    let projects: Vec<(String, String, String)> =
-        sqlx::query_as("select slug, name, description from projects order by slug")
+    // The Jira key comes along: the brain routes a ticket to the right project by it.
+    let projects: Vec<(String, String, String, Option<String>)> =
+        sqlx::query_as("select slug, name, description, jira_key from projects order by slug")
             .fetch_all(&o.db)
             .await?;
     let nodes: Vec<NodeRow> = sqlx::query_as("select * from nodes")
         .fetch_all(&o.db)
         .await?;
     let mut out = Vec::new();
-    for (slug, name, description) in projects {
+    for (slug, name, description, jira) in projects {
         let on: Vec<Value> = nodes
             .iter()
             .filter(|n| n.has_project(&slug))
@@ -2285,7 +2286,7 @@ pub async fn projects_json(o: &Orchestrator) -> Result<Value> {
         .bind(&slug)
         .fetch_one(&o.db)
         .await?;
-        out.push(json!({"slug": slug, "name": name, "description": description, "nodes": on, "open_tasks": open}));
+        out.push(json!({"slug": slug, "name": name, "description": description, "nodes": on, "open_tasks": open, "jira": jira}));
     }
     Ok(Value::Array(out))
 }
@@ -2325,10 +2326,25 @@ async fn project_json(o: &Orchestrator, slug: &str) -> Result<Value> {
             )
         })
         .collect();
+    // Which Jira this project maps to, so the brain knows its key and board without guessing.
+    // The folder is named, never its values: the credential stays in the orchestrator.
+    let jira: (Option<String>, Option<i32>, Option<String>) =
+        sqlx::query_as("select jira_key, jira_board, jira_folder from projects where slug = $1")
+            .bind(&p.slug)
+            .fetch_one(&o.db)
+            .await?;
     Ok(json!({
         "slug": p.slug,
         "name": p.name,
         "description": p.description,
+        "jira": match &jira.0 {
+            Some(key) => json!({
+                "key": key,
+                "board": jira.1,
+                "credential_folder": jira.2.clone().unwrap_or_else(|| crate::jira::DEFAULT_FOLDER.to_owned()),
+            }),
+            None => Value::Null,
+        },
         "secret_folders": folders,
         "slack_channels": channels.iter().map(|(s, id, n, t)| json!({"source": s, "channel_id": id, "name": n, "triage": t})).collect::<Vec<_>>(),
         "nodes": on,
