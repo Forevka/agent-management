@@ -15,6 +15,7 @@ pub mod chat;
 pub mod config;
 pub mod core;
 pub mod feeds;
+pub mod habits;
 pub mod human;
 pub mod jira;
 pub mod memory;

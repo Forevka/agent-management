@@ -232,6 +232,30 @@ pub struct WorkflowRow {
     pub created_at: DateTime<Utc>,
 }
 
+/// Something the owner kept doing that the fleet now does for them (see `habits.rs`). Created
+/// only by an approved `admin_change`, so a habit always has one explicit yes behind it.
+#[derive(Debug, Clone, FromRow)]
+pub struct HabitRow {
+    pub id: i64,
+    /// `decide` (answer an item of a known shape) or `do` (a standing request on a schedule).
+    pub kind: String,
+    pub project: Option<String>,
+    pub item_kind: Option<String>,
+    /// A `like` pattern over the task title's shape, for a `decide` habit.
+    pub title_like: Option<String>,
+    pub decision: Option<String>,
+    /// `every:<N>m`/`every:<N>h`/`daily:HH:MM`/`weekly:<dow>:HH:MM`, for a `do` habit.
+    pub schedule: Option<String>,
+    pub brief: Option<String>,
+    pub why: String,
+    pub active: bool,
+    pub paused_why: Option<String>,
+    pub cap: i32,
+    pub created_at: DateTime<Utc>,
+    pub last_used_at: Option<DateTime<Utc>>,
+    pub tg_msg: Option<i64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewAgent {
     pub name: String,

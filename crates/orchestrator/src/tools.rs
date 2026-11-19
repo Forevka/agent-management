@@ -769,7 +769,7 @@ async fn permission(
     // shown (`plan`, `display`) is a copy without the project's secret values.
     let display = tasks::redact_display(o, &task.project, &args["input"]).await?;
     let payload = json!({"tool_name": tool, "input": args["input"], "plan": display["plan"], "display": display});
-    human::create(
+    let row = human::create(
         o,
         NewItem {
             task: Some(task),
@@ -783,6 +783,16 @@ async fn permission(
         },
     )
     .await?;
+    // A plan of a job the owner always approves, with nothing in it that needs them, is approved
+    // by the habit they taught instead of waiting for a tap (`habits`). Only a habit they
+    // approved can do this, and only for a plan; everything else waits, as it always did.
+    if kind == "plan" {
+        match crate::habits::decide(o, &row, task).await {
+            Ok(Some(what)) => tracing::info!("a habit {what}"),
+            Ok(None) => {}
+            Err(e) => tracing::warn!("a habit could not answer Q-{}: {e:#}", row.id),
+        }
+    }
     Ok(None)
 }
 

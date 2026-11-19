@@ -718,6 +718,18 @@ impl Orchestrator {
         Ok(())
     }
 
+    /// Keeps what the owner asked the brain for, so `habits` can notice a request of theirs
+    /// becoming a routine ("every Monday, summarise the weekend"). One row per message they
+    /// write in General; pruned with the rest of the transcript.
+    pub(crate) async fn record_owner_request(&self, text: &str) {
+        if let Err(e) = self
+            .record(crate::model::BRAIN_TASK, "owner", text.trim())
+            .await
+        {
+            tracing::warn!("keeping the owner's request failed: {e:#}");
+        }
+    }
+
     /// Posts in a task's topic as the task's agent (or the orchestrator if it has no bot).
     pub async fn post_task(&self, task: &TaskRow, html: &str, notify: Notify) {
         self.post_task_ok(task, html, notify).await;
@@ -889,6 +901,14 @@ impl Orchestrator {
             if let Err(e) = crate::tasks::prune_topics(&self).await {
                 tracing::warn!("deleting finished tasks' topics failed: {e:#}");
             }
+            // What the owner taught the fleet by deciding: the standing requests that are due,
+            // and once a day a look for a new habit worth proposing.
+            if let Err(e) = crate::habits::run_due(&self).await {
+                tracing::warn!("making the owner's standing requests failed: {e:#}");
+            }
+            if let Err(e) = crate::habits::reflect_if_due(&self).await {
+                tracing::warn!("reflecting on the owner's decisions failed: {e:#}");
+            }
             if let Err(e) = self.prune().await {
                 tracing::warn!("retention pruning failed: {e:#}");
             }
@@ -902,6 +922,7 @@ impl Orchestrator {
             "audit_log",
             "secretary_triage",
             "secretary_batches",
+            "habit_uses",
         ] {
             sqlx::query(&format!(
                 "delete from {table} where at < now() - make_interval(days => $1::int)"

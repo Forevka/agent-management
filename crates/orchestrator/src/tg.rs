@@ -384,6 +384,16 @@ async fn handle_update(o: &Arc<Orchestrator>, bot: &Bot, chat_id: i64, u: Update
                 .await;
             return;
         }
+        // Taking back something a habit did, or paused it, must always work.
+        if let Some(data) = cb.data.as_deref().filter(|d| crate::habits::is_button(d)) {
+            let reply = crate::habits::button(o, data)
+                .await
+                .unwrap_or_else(|e| format!("Failed: {e:#}"));
+            let _ = bot
+                .answer_callback_query(&cb.id, Some(&clip(&reply, 190)))
+                .await;
+            return;
+        }
         let reply = match cb.data.as_deref().map(callback) {
             Some(f) => match f {
                 Ok((id, ans)) => human::answer(o, id, ans)
@@ -483,6 +493,9 @@ pub(crate) async fn owner_message(o: &Arc<Orchestrator>, msg: &Message) -> Resul
     let (task_id, delivered) = match topic {
         None => {
             o.show_working(msg.message_id, From::Orchestrator, None, BRAIN_TASK);
+            // Kept as what the owner asked for, apart from the transcript's own lines: it is
+            // what `habits` reflects on to notice a request becoming a routine.
+            o.record_owner_request(text).await;
             (
                 BRAIN_TASK.to_owned(),
                 tasks::to_brain_as(
@@ -601,6 +614,30 @@ async fn command(
                         esc(&clip(w.wish.as_deref().unwrap_or(&w.note), 120))
                     ));
                 }
+                s
+            }
+        }
+        // What acts without asking, and the way to stop it.
+        "/habits" => {
+            let rows: Vec<crate::model::HabitRow> =
+                sqlx::query_as("select * from habits order by id")
+                    .fetch_all(&o.db)
+                    .await?;
+            if rows.is_empty() {
+                "No habits yet. I offer one when I see you deciding the same thing over and \
+                 over, and you decide whether to take it."
+                    .into()
+            } else {
+                let mut s = String::from("<b>Habits</b>\n");
+                for h in &rows {
+                    s.push_str(&format!(
+                        "{} H-{} · {}\n",
+                        if h.active { "🔁" } else { "⏸" },
+                        h.id,
+                        esc(&crate::habits::describe(h))
+                    ));
+                }
+                s.push_str("<i>Each one's card in the Rules topic has Pause and Delete.</i>");
                 s
             }
         }

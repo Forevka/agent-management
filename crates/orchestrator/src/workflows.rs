@@ -238,10 +238,15 @@ pub async fn button(o: &Arc<Orchestrator>, data: &str) -> Result<String> {
     Ok(describe(schedule.as_deref(), enabled))
 }
 
-/// Whether `schedule` is due, given when the workflow last ran. `every:<N>m`/`every:<N>h` compare
-/// elapsed time; `daily:HH:MM` compares the owner's local time and only once a calendar day (in
-/// `cfg.secretary.timezone`, the same zone the daily digest uses).
-async fn due(o: &Orchestrator, schedule: &str, last_run_at: Option<DateTime<Utc>>) -> Result<bool> {
+/// Whether `schedule` is due, given when it last ran. `every:<N>m`/`every:<N>h` compare elapsed
+/// time; `daily:HH:MM` compares the owner's local time and fires only once a calendar day (in
+/// `cfg.secretary.timezone`, the same zone the daily digest uses); `weekly:<dow>:HH:MM` is that
+/// again, on one weekday. Shared with `habits`, whose `do` habits use the same vocabulary.
+pub(crate) async fn due(
+    o: &Orchestrator,
+    schedule: &str,
+    last_run_at: Option<DateTime<Utc>>,
+) -> Result<bool> {
     if let Some(rest) = schedule.strip_prefix("every:") {
         return Ok(interval_due(parse_every_minutes(rest)?, last_run_at));
     }
@@ -260,7 +265,37 @@ async fn due(o: &Orchestrator, schedule: &str, last_run_at: Option<DateTime<Utc>
         .await?;
         return Ok(!ran_today && (hour, minute) >= (target_h, target_m));
     }
-    bail!("workflow has an unknown schedule {schedule:?}")
+    if let Some(rest) = schedule.strip_prefix("weekly:") {
+        let (dow, hhmm) = rest
+            .split_once(':')
+            .context("expected weekly:<dow>:HH:MM")?;
+        let target_dow = parse_dow(dow)?;
+        let (target_h, target_m) = parse_hhmm(hhmm)?;
+        let (today, hour, minute, ran_today): (i32, i32, i32, bool) = sqlx::query_as(
+            "select extract(dow from now() at time zone $1)::int,
+                    extract(hour from now() at time zone $1)::int,
+                    extract(minute from now() at time zone $1)::int,
+                    ($2::timestamptz is not null
+                     and to_char($2 at time zone $1, 'YYYY-MM-DD')
+                       = to_char(now() at time zone $1, 'YYYY-MM-DD'))",
+        )
+        .bind(&o.cfg.secretary.timezone)
+        .bind(last_run_at)
+        .fetch_one(&o.db)
+        .await?;
+        return Ok(!ran_today && today == target_dow && (hour, minute) >= (target_h, target_m));
+    }
+    bail!("unknown schedule {schedule:?}")
+}
+
+/// A weekday as Postgres' `extract(dow)` numbers it: Sunday is 0.
+pub(crate) fn parse_dow(s: &str) -> Result<i32> {
+    const DAYS: [&str; 7] = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+    let s = s.trim().to_ascii_lowercase();
+    DAYS.iter()
+        .position(|d| s.starts_with(d))
+        .map(|i| i as i32)
+        .with_context(|| format!("{s:?} is not a weekday (mon, tue, …)"))
 }
 
 /// Whether an `every:<N>m`/`every:<N>h` schedule is due: never run yet, or at least `minutes`
@@ -272,7 +307,7 @@ fn interval_due(minutes: i64, last_run_at: Option<DateTime<Utc>>) -> bool {
     }
 }
 
-fn parse_every_minutes(rest: &str) -> Result<i64> {
+pub(crate) fn parse_every_minutes(rest: &str) -> Result<i64> {
     if let Some(n) = rest.strip_suffix('m') {
         return n.parse().context("bad interval");
     }
@@ -282,12 +317,17 @@ fn parse_every_minutes(rest: &str) -> Result<i64> {
     bail!("bad interval {rest:?}")
 }
 
-fn parse_hhmm(s: &str) -> Result<(i32, i32)> {
+pub(crate) fn parse_hhmm(s: &str) -> Result<(i32, i32)> {
     let (h, m) = s.split_once(':').context("expected HH:MM")?;
-    Ok((
+    let (h, m): (i32, i32) = (
         h.parse().context("bad hour")?,
         m.parse().context("bad minute")?,
-    ))
+    );
+    ensure!(
+        (0..24).contains(&h) && (0..60).contains(&m),
+        "{s:?} is not a time of day"
+    );
+    Ok((h, m))
 }
 
 /// Delivers a tick to every enabled workflow whose schedule is due, so it checks what is needed

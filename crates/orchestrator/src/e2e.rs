@@ -2978,6 +2978,219 @@ async fn wait_retired(chat: &FakeChat, ids: &[i64], needle: &str) {
     }
 }
 
+/// Habits: the same decision of the owner's, three times, offered back to them once, and from
+/// then on made for them — with every way back that promise needs.
+async fn habit_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) {
+    // An agent of its own, so this flow waits on nobody else's node slot. No bot: an agent
+    // without one posts as the orchestrator, which is a supported state.
+    sqlx::query(
+        "insert into agents (id, name, role, project) values ('robin-rev', 'Robin', 'reviewer', 'demo')",
+    )
+    .execute(db)
+    .await
+    .unwrap();
+    let review = |n: i64, brief: &'static str| async move {
+        tasks::create_task(
+            o,
+            CreateTask {
+                project: "demo".into(),
+                title: format!("Review MR !{n}"),
+                brief: brief.into(),
+                ticket: Some(format!("MR{n}")),
+                agent: Some("Robin".into()),
+                new_agent: None,
+                model: None,
+                effort: None,
+            },
+        )
+        .await
+        .unwrap()
+    };
+    let done = |id: String| async move {
+        wait_for(&format!("{id} finishes"), || async {
+            o.task(&id).await.unwrap().filter(|t| t.status == "done")
+        })
+        .await;
+    };
+
+    // 1. Three of the same job, each plan approved by the owner themselves. This is the whole
+    //    input: a habit is learned from what they did, never from what someone asked for.
+    for n in 1..=3 {
+        let task = review(n, "Review it.").await;
+        let plan = wait_for("a plan to approve", || open_item(db, &task.id, "plan")).await;
+        human::answer(o, plan.id, Answer::Approve).await.unwrap();
+        done(task.id).await;
+    }
+
+    // 2. Reflection shows the brain the shape of it — and proposes nothing by itself.
+    assert!(
+        crate::habits::reflect_if_due(o).await.unwrap(),
+        "three alike decisions are worth reflecting on"
+    );
+    wait_for("the brain is shown the repeated decisions", || async {
+        (brain_heard(db, "[Reflection]").await > 0).then_some(())
+    })
+    .await;
+    let count = || async {
+        sqlx::query_scalar::<_, i64>("select count(*) from habits")
+            .fetch_one(db)
+            .await
+            .unwrap()
+    };
+    assert_eq!(count().await, 0, "reflection offers, it does not decide");
+
+    // 3. The brain proposes one (as it would from that reflection) and nothing happens until the
+    //    owner taps Approve.
+    let proposed = crate::admin::propose(
+        o,
+        &json!({"action": "habit_add", "params": {
+            "kind": "decide", "project": "demo", "title_like": "review mr !#%",
+            "decision": "approve", "why": "you approved three MR reviews unchanged",
+        }, "note": "you always approve these"}),
+    )
+    .await
+    .unwrap();
+    assert!(proposed.starts_with("Proposed as Q-"), "{proposed}");
+    assert_eq!(count().await, 0, "a proposal is not a habit");
+    let item: HumanItemRow = sqlx::query_as(
+        "select * from human_items where kind = 'admin_change' order by id desc limit 1",
+    )
+    .fetch_one(db)
+    .await
+    .unwrap();
+    assert!(
+        item.payload.0["summary"]
+            .as_str()
+            .unwrap()
+            .contains("3 such plans were approved by hand"),
+        "the owner reads what it is based on: {}",
+        item.payload.0["summary"]
+    );
+    human::answer(o, item.id, Answer::Accept).await.unwrap();
+    let habit: crate::model::HabitRow = sqlx::query_as("select * from habits order by id limit 1")
+        .fetch_one(db)
+        .await
+        .unwrap();
+    assert!(habit.active && habit.kind == "decide");
+    // Its card is in the Rules topic, where everything standing lives, with its buttons.
+    assert!(
+        chat.ops.lock().unwrap().iter().any(|op| matches!(
+            op,
+            Op::Send { html, keyboard, .. }
+                if html.contains(&format!("Habit H-{}", habit.id)) && !keyboard.is_empty()
+        )),
+        "the habit has a card to pause it from"
+    );
+
+    // 4. The fourth of that job is approved by the habit: the owner is not asked, the task runs
+    //    on, and the audit says which habit answered for them.
+    let fourth = review(4, "Review it.").await;
+    done(fourth.id.clone()).await;
+    let open: i64 = sqlx::query_scalar(
+        "select count(*) from human_items where task_id = $1 and state = 'open'",
+    )
+    .bind(&fourth.id)
+    .fetch_one(db)
+    .await
+    .unwrap();
+    assert_eq!(open, 0, "nothing was left waiting on the owner");
+    let answered: (String, Value) = sqlx::query_as(
+        "select state, answer from human_items where task_id = $1 and kind = 'plan'",
+    )
+    .bind(&fourth.id)
+    .fetch_one(db)
+    .await
+    .unwrap();
+    assert_eq!(
+        (answered.0.as_str(), &answered.1["approved"]),
+        ("answered", &json!(true))
+    );
+    let actor: String = sqlx::query_scalar(
+        "select actor from audit_log where action = 'habit.apply' order by id desc limit 1",
+    )
+    .fetch_one(db)
+    .await
+    .unwrap();
+    assert_eq!(actor, format!("owner (via habit {})", habit.id));
+    assert!(
+        chat.ops.lock().unwrap().iter().any(|op| matches!(
+            op,
+            Op::Send { html, keyboard, .. }
+                if html.contains("Plan approved by your habit") && !keyboard.is_empty()
+        )),
+        "the task's topic says so, with the way back"
+    );
+
+    // 5. A plan that says the owner is wanted still waits for them — the stopper beats the habit.
+    let unclear = review(5, "Review it. The acceptance criteria are unclear.").await;
+    let plan = wait_for("the unclear plan waits for the owner", || {
+        open_item(db, &unclear.id, "plan")
+    })
+    .await;
+    assert!(
+        crate::habits::stopper(plan.payload.0["plan"].as_str().unwrap()).is_some(),
+        "the agent asked something in it: {}",
+        plan.payload.0["plan"]
+    );
+    human::answer(o, plan.id, Answer::Approve).await.unwrap();
+    done(unclear.id).await;
+
+    // 6. One tap takes it back: the habit pauses, and the next plan of that shape waits again.
+    crate::habits::button(o, &format!("hb|{}|s", habit.id))
+        .await
+        .unwrap();
+    let paused: crate::model::HabitRow = sqlx::query_as("select * from habits where id = $1")
+        .bind(habit.id)
+        .fetch_one(db)
+        .await
+        .unwrap();
+    assert!(
+        !paused.active && paused.paused_why.is_some(),
+        "stopping what a habit did pauses it"
+    );
+    let sixth = review(6, "Review it.").await;
+    let plan = wait_for("a paused habit answers nothing", || {
+        open_item(db, &sixth.id, "plan")
+    })
+    .await;
+    human::answer(o, plan.id, Answer::Approve).await.unwrap();
+    done(sixth.id).await;
+
+    // 7. The other kind: a standing request of the owner's, made without being asked, and made
+    //    once per interval rather than every tick.
+    let (action, summary) = crate::admin::prepare(
+        o,
+        crate::admin::AdminAction::HabitAdd {
+            kind: "do".into(),
+            why: "every Monday you ask for the weekend's chat".into(),
+            project: None,
+            title_like: None,
+            decision: None,
+            schedule: Some("every:15m".into()),
+            brief: Some("Summarise the weekend's chat activity.".into()),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(summary.contains("without being asked"), "{summary}");
+    crate::admin::execute(o, crate::admin::Actor::Owner, &action)
+        .await
+        .unwrap();
+    crate::habits::run_due(o).await.unwrap();
+    let standing = "[Standing request from the owner (habit H-";
+    wait_for("the brain gets the standing request", || async {
+        (brain_heard(db, standing).await > 0).then_some(())
+    })
+    .await;
+    crate::habits::run_due(o).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        brain_heard(db, standing).await,
+        1,
+        "a schedule asks once per interval, not once per tick"
+    );
+}
+
 /// Housekeeping tidies the forum: a finished task's topic goes once it has been quiet, and
 /// nothing else's does. A topic deleted this way comes back if the task is picked up again.
 async fn topic_cleanup_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) {
@@ -4681,7 +4894,10 @@ async fn task_lifecycle_through_a_real_node() {
     //     Last, so it reads a fleet that has really done work.
     api_flow(&o, &db).await;
 
-    // 22. Housekeeping deletes a finished task's topic once it goes quiet, and nothing else's.
+    // 22. Habits: the owner's repeated decisions, offered back and then made for them.
+    habit_flow(&o, &db, &chat).await;
+
+    // 23. Housekeeping deletes a finished task's topic once it goes quiet, and nothing else's.
     //     After the API flow: it leaves a task without a topic, which the API no longer reads.
     topic_cleanup_flow(&o, &db, &chat).await;
 

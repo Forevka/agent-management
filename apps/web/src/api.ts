@@ -170,6 +170,26 @@ export type Inbox = {
   stats: { pending: number; batches_today: number; messages_today: number }
 }
 
+/// A habit: something the owner kept doing that the fleet now does for them. `what` is the
+/// server's own one-line rendering of it, so the page and Telegram say the same thing.
+export type Habits = {
+  habits: {
+    id: number
+    kind: string
+    what: string
+    project: string | null
+    schedule: string | null
+    brief: string | null
+    why: string
+    active: boolean
+    paused_why: string | null
+    cap: number
+    created_at: string
+    last_used_at: string | null
+    uses: { at: string; what: string }[]
+  }[]
+}
+
 export type Agents = {
   agents: {
     id: string

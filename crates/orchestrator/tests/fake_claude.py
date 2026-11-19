@@ -72,8 +72,19 @@ for line in sys.stdin:
         continue
     text = msg["message"]["content"]
     out({"type": "assistant", "message": {"content": [{"type": "text", "text": "got: " + text[:400]}]}})
+    # A recurring job (the habits flow): present a plan and finish, nothing else. The plan says
+    # the owner is needed only when the brief says the job is unclear, which is what lets the
+    # test show that a habit never answers such a plan.
+    if text.startswith("# Task") and "Review MR" in text and "[Message from" not in text:
+        plan = "# Plan\n1. Read the diff\n2. Post the review"
+        if "unclear" in text:
+            plan += "\n\nOpen question: which branch is the target?"
+        r = tool("permission", {"tool_name": "ExitPlanMode", "input": {"plan": plan}})
+        out({"type": "plan_decision", "decision": json.loads(r["result"])})
+        tool("complete", {"summary": "Reviewed and posted."})
+        out({"type": "result", "subtype": "success", "total_cost_usd": 0.0})
     # A brand-new task: plan, ask, work. A restarted one (brief plus messages) only answers.
-    if text.startswith("# Task") and "[Message from" not in text:
+    elif text.startswith("# Task") and "[Message from" not in text:
         q = {"questions": [{"question": "Which color?", "header": "Color", "multiSelect": False,
                             "options": [{"label": "Red", "description": ""}, {"label": "Blue", "description": ""}]}]}
         r = tool("permission", {"tool_name": "AskUserQuestion", "input": q})

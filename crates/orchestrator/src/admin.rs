@@ -196,6 +196,30 @@ pub enum AdminAction {
         folder: Ref,
         key: String,
     },
+    /// A habit: something the owner kept doing that the fleet does for them from now on (see
+    /// `habits.rs`). `decide` needs `project`, `title_like` and `decision`; `do` needs
+    /// `schedule` and `brief`. `why` is what it was learned from, in the owner's own terms,
+    /// because that is what they read before deciding whether to have it.
+    HabitAdd {
+        kind: String,
+        why: String,
+        #[serde(default)]
+        project: Option<String>,
+        #[serde(default)]
+        title_like: Option<String>,
+        #[serde(default)]
+        decision: Option<String>,
+        #[serde(default)]
+        schedule: Option<String>,
+        #[serde(default)]
+        brief: Option<String>,
+    },
+    HabitPause {
+        habit: i64,
+    },
+    HabitRemove {
+        habit: i64,
+    },
 }
 
 /// An agent setting as given (None: unchanged; empty: back to the default), checked.
@@ -969,6 +993,64 @@ pub async fn execute(o: &Arc<Orchestrator>, actor: Actor, action: &AdminAction) 
             )
             .await;
             Ok(format!("deleted {key} from secret folder {name}"))
+        }
+        // The owner's yes to a habit is the one thing that creates one: `prepare` has already
+        // checked it and written the summary they read.
+        A::HabitAdd {
+            kind,
+            why,
+            project,
+            title_like,
+            decision,
+            schedule,
+            brief,
+        } => {
+            let id: i64 = sqlx::query_scalar(
+                "insert into habits (kind, why, project, item_kind, title_like, decision, schedule, brief)
+                 values ($1, $2, $3, case when $1 = 'decide' then 'plan' end, $4, $5, $6, $7)
+                 returning id",
+            )
+            .bind(kind)
+            .bind(why)
+            .bind(project)
+            .bind(title_like)
+            .bind(decision)
+            .bind(schedule)
+            .bind(brief)
+            .fetch_one(&o.db)
+            .await?;
+            o.audit(
+                actor.audit_name(),
+                "habit.add",
+                json!({"habit": id, "kind": kind, "project": project, "title_like": title_like,
+                       "decision": decision, "schedule": schedule}),
+            )
+            .await;
+            // Its card goes where the fleet's standing instructions live, with Pause and Delete.
+            if let Ok(Some(row)) =
+                sqlx::query_as::<_, crate::model::HabitRow>("select * from habits where id = $1")
+                    .bind(id)
+                    .fetch_optional(&o.db)
+                    .await
+            {
+                crate::habits::show(o, &row).await;
+            }
+            Ok(format!("habit H-{id} is on; /habits lists it"))
+        }
+        A::HabitPause { habit } => {
+            crate::habits::pause(o, *habit, "you asked me to pause it").await?;
+            Ok(format!("habit H-{habit} paused"))
+        }
+        A::HabitRemove { habit } => {
+            let row: Option<crate::model::HabitRow> =
+                sqlx::query_as("delete from habits where id = $1 returning *")
+                    .bind(habit)
+                    .fetch_optional(&o.db)
+                    .await?;
+            ensure!(row.is_some(), "no habit H-{habit}");
+            o.audit(actor.audit_name(), "habit.delete", json!({"habit": habit}))
+                .await;
+            Ok(format!("habit H-{habit} deleted"))
         }
     }
 }
@@ -1839,7 +1921,143 @@ pub async fn prepare(o: &Orchestrator, action: AdminAction) -> Result<(AdminActi
                 summary,
             )
         }
+        // A habit answers for the owner from now on, so this is the summary that matters most:
+        // it says exactly what will happen without them, and what it was learned from.
+        A::HabitAdd {
+            kind,
+            why,
+            project,
+            title_like,
+            decision,
+            schedule,
+            brief,
+        } => {
+            let living: i64 = sqlx::query_scalar("select count(*) from habits where active")
+                .fetch_one(&o.db)
+                .await?;
+            ensure!(
+                living < crate::habits::MAX_HABITS,
+                "there are already {living} habits; the owner can remove one with /habits"
+            );
+            let why = why.trim().to_owned();
+            ensure!(
+                !why.is_empty(),
+                "why is required: say what of the owner's own doing this was learned from"
+            );
+            check_len("why", &why, MAX_PROPOSED_DESCRIPTION)?;
+            match kind.as_str() {
+                "decide" => {
+                    let project = project.context("project required for a decide habit")?;
+                    let slug = tasks::project(o, &project).await?.slug;
+                    let pattern = title_like
+                        .context("title_like required: which tasks this covers")?
+                        .trim()
+                        .to_owned();
+                    crate::habits::validate_title_like(&pattern)?;
+                    ensure!(
+                        decision.as_deref() == Some("approve"),
+                        "the only decision a habit may make is \"approve\""
+                    );
+                    // It must match work the owner has really approved: a habit is learned from
+                    // what they did, so a pattern matching nothing they ever saw is a mistake.
+                    let seen: i64 = sqlx::query_scalar(&format!(
+                        "select count(*) from human_items h join tasks t on t.id = h.task_id
+                          where h.kind = 'plan' and h.state = 'answered'
+                            and coalesce((h.answer->>'approved')::bool, false)
+                            and t.project = $1 and {shape} like $2",
+                        shape = crate::habits::SHAPE_SQL.replace("{}", "t.title"),
+                    ))
+                    .bind(&slug)
+                    .bind(&pattern)
+                    .fetch_one(&o.db)
+                    .await?;
+                    ensure!(
+                        seen > 0,
+                        "no plan the owner approved in {slug} has a title like {pattern:?}; \
+                         a habit may only cover work they have already decided themselves"
+                    );
+                    let summary = format!(
+                        "From now on, approve the plan of tasks in project {slug} whose title \
+                         looks like {} — {seen} such plans were approved by hand. Nothing else \
+                         changes: a plan that names a blocker, an open question or an unclear \
+                         acceptance criterion still waits for you, and so does any task you have \
+                         ever sent back for changes. At most 10 a day, every one posted in the \
+                         task's topic with a button that stops the task and pauses this. \
+                         Learned from: {}.",
+                        q(&pattern),
+                        q(&why)
+                    );
+                    (
+                        A::HabitAdd {
+                            kind: "decide".into(),
+                            why,
+                            project: Some(slug),
+                            title_like: Some(pattern),
+                            decision: Some("approve".into()),
+                            schedule: None,
+                            brief: None,
+                        },
+                        summary,
+                    )
+                }
+                "do" => {
+                    let schedule = schedule.context("schedule required for a do habit")?;
+                    crate::habits::validate_schedule(&schedule)?;
+                    let brief = brief
+                        .context("brief required: what to ask for, in the owner's words")?
+                        .trim()
+                        .to_owned();
+                    ensure!(!brief.is_empty(), "brief required");
+                    check_len("brief", &brief, MAX_PROPOSED_DESCRIPTION)?;
+                    let summary = format!(
+                        "From now on, {schedule}, do this without being asked: {}. It reaches me \
+                         as if you had just asked for it, and you can pause it any time with \
+                         /habits. Learned from: {}.",
+                        q(&brief),
+                        q(&why)
+                    );
+                    (
+                        A::HabitAdd {
+                            kind: "do".into(),
+                            why,
+                            project: None,
+                            title_like: None,
+                            decision: None,
+                            schedule: Some(schedule),
+                            brief: Some(brief),
+                        },
+                        summary,
+                    )
+                }
+                other => bail!("a habit is \"decide\" or \"do\", not {other:?}"),
+            }
+        }
+        A::HabitPause { habit } => {
+            let row = habit_row(o, habit).await?;
+            ensure!(row.active, "habit H-{habit} is already paused");
+            let summary = format!(
+                "Pause habit H-{habit} ({}), so I ask you again instead.",
+                q(&crate::habits::describe(&row))
+            );
+            (A::HabitPause { habit }, summary)
+        }
+        A::HabitRemove { habit } => {
+            let row = habit_row(o, habit).await?;
+            let summary = format!(
+                "Delete habit H-{habit} ({}).",
+                q(&crate::habits::describe(&row))
+            );
+            (A::HabitRemove { habit }, summary)
+        }
     })
+}
+
+async fn habit_row(o: &Orchestrator, id: i64) -> Result<crate::model::HabitRow> {
+    sqlx::query_as("select * from habits where id = $1")
+        .bind(id)
+        .fetch_optional(&o.db)
+        .await?
+        .with_context(|| format!("no habit H-{id}"))
 }
 
 fn short_id(id: &str) -> &str {
@@ -2010,6 +2228,26 @@ async fn snapshot(o: &Orchestrator, action: &AdminAction) -> Result<Value> {
                 None => Value::Null,
             }
         }
+        // Two habits that answer the same plans would both act, so a proposal goes stale when
+        // the habits change under it. For pause and remove, what that habit is now.
+        A::HabitAdd { project, .. } => {
+            let rows: Vec<(i64, Option<String>)> = sqlx::query_as(
+                "select id, title_like from habits where active and kind = 'decide'
+                 and project is not distinct from $1 order by id",
+            )
+            .bind(project)
+            .fetch_all(&o.db)
+            .await?;
+            json!(rows)
+        }
+        A::HabitPause { habit } | A::HabitRemove { habit } => {
+            let row: Option<(bool, String)> =
+                sqlx::query_as("select active, why from habits where id = $1")
+                    .bind(habit)
+                    .fetch_optional(&o.db)
+                    .await?;
+            json!(row)
+        }
     })
 }
 
@@ -2169,7 +2407,8 @@ fn link_allowed(page: &str) -> bool {
     }
     match (first, second) {
         (
-            "" | "projects" | "secrets" | "nodes" | "agents" | "tasks" | "sessions" | "inbox",
+            "" | "projects" | "secrets" | "nodes" | "agents" | "tasks" | "sessions" | "inbox"
+            | "habits",
             None,
         ) => true,
         ("projects" | "secrets" | "nodes" | "items" | "tasks", Some(s)) => {
@@ -2281,8 +2520,9 @@ pub async fn read(o: &Orchestrator, what: &str, target: Option<&str>) -> Result<
                     .collect(),
             )
         }
+        "habits" => crate::habits::json(o).await?,
         other => bail!(
-            "unknown read {other:?}; use projects, project <slug>, agents [project], bots, nodes, node <id|name>, secrets, secret <folder>, status or items"
+            "unknown read {other:?}; use projects, project <slug>, agents [project], bots, nodes, node <id|name>, secrets, secret <folder>, status, items or habits"
         ),
     };
     Ok(serde_json::to_string_pretty(&v)?)
