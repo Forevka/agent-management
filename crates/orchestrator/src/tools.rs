@@ -12,7 +12,7 @@ use crate::{
     chat::{From, Notify, clip, esc},
     core::Orchestrator,
     human::{self, NewItem},
-    model::{AgentRow, BRAIN_AGENT, NewAgent, SECRETARY_AGENT, TaskRow},
+    model::{AgentRow, BRAIN_AGENT, NewAgent, RETRO_AGENT, SECRETARY_AGENT, TaskRow},
     secretary, tasks, wakeups, workflows,
 };
 
@@ -48,23 +48,35 @@ pub async fn handle(
         .await?;
     let is_brain = agent.id == BRAIN_AGENT;
     let is_secretary = agent.id == SECRETARY_AGENT;
-    // The secretary reads third parties' messages all day: it gets its own tools, the read-only
-    // feed and memory tools and nothing else (no tasks, replies, messages to agents, admin).
-    if is_secretary
-        && !secretary::TOOLS.contains(&call.tool.as_str())
-        && !matches!(
-            call.tool.as_str(),
-            "permission"
-                | "feed_read"
-                | "feed_search"
-                | "workflow_list"
-                | "memory_retain"
-                | "memory_recall"
-                | "memory_reflect"
-                | "memory_banks"
-        )
-    {
+    let is_retro = agent.id == RETRO_AGENT;
+    // The secretary reads third parties' messages all day, and the retrospective reads a whole
+    // day of them: each gets its own tools, the read-only feed and memory tools and nothing else
+    // (no tasks, replies, messages to agents, admin). The retrospective additionally reads the
+    // fleet's own setup, which is what it is reasoning about.
+    let read_only = matches!(
+        call.tool.as_str(),
+        "permission"
+            | "feed_read"
+            | "feed_search"
+            | "workflow_list"
+            | "memory_retain"
+            | "memory_recall"
+            | "memory_reflect"
+            | "memory_banks"
+    );
+    if is_secretary && !secretary::TOOLS.contains(&call.tool.as_str()) && !read_only {
         bail!("{} is not available to the secretary", call.tool);
+    }
+    if is_retro
+        && !crate::retro::TOOLS.contains(&call.tool.as_str())
+        && !read_only
+        && call.tool != "admin_read"
+    {
+        bail!(
+            "{} is not available to the retrospective: it reads and proposes, and the owner \
+             decides",
+            call.tool
+        );
     }
     // Everything an agent sends on (questions, posts, milestones, summaries, messages to other
     // agents, memories, proposals) loses the values of its project's secrets first, whichever
@@ -469,6 +481,20 @@ pub async fn handle(
             }
             ok(secretary::tool(o, name, &args).await?)
         }
+        name if crate::retro::TOOLS.contains(&name) => {
+            if !is_retro {
+                bail!("{name} is only available to the retrospective");
+            }
+            ok(crate::retro::tool(o, name, &args).await?)
+        }
+        // The retrospective reasons about the fleet, so it reads the fleet's own setup — the
+        // same free read the brain has, and the only orchestration tool it gets.
+        "admin_read" if is_retro => ok(admin::read(
+            o,
+            args["what"].as_str().context("what required")?,
+            args["target"].as_str(),
+        )
+        .await?),
         // Orchestration tools: the brain only. Administration is refused by name, so an agent
         // that learned of it gets a clear answer instead of "unknown tool".
         "admin_read" | "admin_propose" | "web_link" | "secretary_note" if !is_brain => {

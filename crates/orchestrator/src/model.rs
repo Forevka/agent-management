@@ -152,14 +152,17 @@ pub const BRAIN_AGENT: &str = "orchestrator";
 /// The secretary's (see `secretary`).
 pub const SECRETARY_TASK: &str = "secretary";
 pub const SECRETARY_AGENT: &str = "secretary";
+/// The daily retrospective's (see `retro`).
+pub const RETRO_TASK: &str = "retro";
+pub const RETRO_AGENT: &str = "retro";
 
-/// The fleet's own long-lived sessions (the brain, the secretary): never planned, never
-/// "finished", not listed or administered as ordinary tasks and agents.
+/// The fleet's own long-lived sessions (the brain, the secretary, the retrospective): never
+/// planned, never "finished", not listed or administered as ordinary tasks and agents.
 pub fn is_builtin_task(id: &str) -> bool {
-    id == BRAIN_TASK || id == SECRETARY_TASK
+    id == BRAIN_TASK || id == SECRETARY_TASK || id == RETRO_TASK
 }
 pub fn is_builtin_agent(id: &str) -> bool {
-    id == BRAIN_AGENT || id == SECRETARY_AGENT
+    id == BRAIN_AGENT || id == SECRETARY_AGENT || id == RETRO_AGENT
 }
 
 #[derive(Debug, Clone, FromRow)]

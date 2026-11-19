@@ -77,6 +77,9 @@ pub enum AgentCmd {
     /// The project's Jira, through the orchestrator (it holds the credential, you never do).
     #[command(subcommand)]
     Jira(JiraCmd),
+    /// The daily retrospective's own commands (the retrospective only).
+    #[command(subcommand)]
+    Retro(RetroCmd),
     // Orchestrator (brain) only.
     /// List projects, their nodes and open tasks.
     Projects,
@@ -532,6 +535,30 @@ pub enum WorkflowCmd {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum RetroCmd {
+    /// Propose one improvement to the fleet itself. The owner decides whether it becomes a task.
+    Propose {
+        /// harness, agents, flows, features or other.
+        #[arg(long, default_value = "other")]
+        area: String,
+        /// Short and concrete.
+        #[arg(long)]
+        title: String,
+        /// What you saw, why it matters, what you would change ("-" reads it from stdin).
+        #[arg(long)]
+        detail: String,
+    },
+    /// Close the day: one or two lines on what you looked at and what you concluded. Always
+    /// last, whether you proposed anything or not ("-" reads it from stdin).
+    Finish {
+        #[arg(long)]
+        verdict: String,
+    },
+    /// One task's own transcript, when the day's summary raises a question about it.
+    Task { id: String },
+}
+
+#[derive(Debug, Subcommand)]
 pub enum FeedCmd {
     /// Recent messages, or the messages given with --ref.
     Read {
@@ -644,6 +671,18 @@ pub fn to_call(cmd: AgentCmd) -> Result<(&'static str, Value)> {
             ("feed_search", json!({"query": query, "limit": limit}))
         }
         AgentCmd::Workflow(WorkflowCmd::List) => ("workflow_list", json!({})),
+        AgentCmd::Retro(RetroCmd::Propose {
+            area,
+            title,
+            detail,
+        }) => (
+            "retro_propose",
+            json!({"area": area, "title": title, "detail": stdin_if_dash(detail)?}),
+        ),
+        AgentCmd::Retro(RetroCmd::Finish { verdict }) => {
+            ("retro_finish", json!({"verdict": stdin_if_dash(verdict)?}))
+        }
+        AgentCmd::Retro(RetroCmd::Task { id }) => ("retro_task", json!({"task": id})),
         AgentCmd::Wake(WakeCmd::Set {
             note,
             in_,

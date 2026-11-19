@@ -163,6 +163,27 @@ for line in sys.stdin:
             tool("reply_draft", {"ref": ref, "text": "Yes, Friday works for the ship date."})
         tool("digest_post", {"text": "Since you asked: one todo is open."})
         out({"type": "result", "subtype": "success", "total_cost_usd": 0.0})
+    elif text.startswith("[Retrospective"):
+        # The fleet's own day, handed over by the orchestrator. Look at one task more closely,
+        # propose, hit the daily limit, and always close with a verdict.
+        tool("retro_task", {"task": "demo-BS-1"})
+        tool("admin_read", {"what": "status"})
+        tool("retro_propose", {"area": "harness", "title": "Agents re-ask the same question",
+                               "detail": "demo-BS-1 asked twice because the first ask was abandoned."})
+        tool("retro_propose", {"area": "agents", "title": "Handovers lose the ticket",
+                               "detail": "Robin got no ticket reference in its brief."})
+        # One past the limit: the orchestrator must refuse it.
+        tool("retro_propose", {"area": "flows", "title": "Third one", "detail": "Over the cap."})
+        # And the things it may never do, whatever the day looked like.
+        for name, a in [("create_task", {"project": "fleet-src", "title": "x", "brief": "x"}),
+                        ("reply_owner", {"text": "hi"}),
+                        ("ask_human", {"question": "really?"}),
+                        ("admin_propose", {"action": "project_create",
+                                           "params": {"slug": "retro-overreach"}}),
+                        ("send_to_task", {"task_id": "demo-BS-1", "text": "x"})]:
+            tool(name, a)
+        tool("retro_finish", {"verdict": "Read 6 tasks and the day's failures. Two things worth fixing."})
+        out({"type": "result", "subtype": "success", "total_cost_usd": 0.0})
     elif text.startswith("[Daily digest"):
         tool("digest_post", {"text": "Daily digest: " + text[:40]})
         out({"type": "result", "subtype": "success", "total_cost_usd": 0.0})

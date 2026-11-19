@@ -28,6 +28,8 @@ pub struct Config {
     pub delete_topics_after_minutes: i64,
     /// The secretary's settings (see `secretary`).
     pub secretary: SecretaryConfig,
+    /// The daily retrospective's settings (see `retro`).
+    pub retro: RetroConfig,
     /// Models and effort levels the brain may choose for a task (the owner's own settings on
     /// the web may use any valid value).
     pub allowed_models: Vec<String>,
@@ -146,6 +148,53 @@ impl SecretaryConfig {
     }
 }
 
+/// The daily retrospective (see `retro`): one careful run a day, so this is where a strong model
+/// and a high effort are worth their price.
+#[derive(Debug, Clone)]
+pub struct RetroConfig {
+    /// The hour (0-23) in `secretary.timezone` at which the day is reviewed. A negative hour
+    /// turns the retrospective off, which is the default: it does nothing until the owner asks
+    /// for it and has somewhere for its tasks to run.
+    pub hour: i64,
+    /// Its Claude model and effort.
+    pub model: String,
+    pub effort: String,
+    /// At most this many proposals per run: a day's improvements the owner will actually read.
+    pub max_proposals: i64,
+    /// The project a proposal becomes a task in — the fleet's own source, never a product
+    /// project. "Make task" refuses when it does not exist.
+    pub project: String,
+}
+
+impl RetroConfig {
+    fn from_env(fleet_model: &str) -> Self {
+        let text = |name: &str, default: &str| {
+            std::env::var(name)
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| default.into())
+        };
+        Self {
+            hour: env_num("FLEET_RETRO_HOUR", -1),
+            model: text("FLEET_RETRO_MODEL", fleet_model),
+            effort: text("FLEET_RETRO_EFFORT", "high"),
+            max_proposals: env_num("FLEET_RETRO_MAX_PROPOSALS", 3),
+            project: text("FLEET_RETRO_PROJECT", "fleet-src"),
+        }
+    }
+
+    pub fn test() -> Self {
+        Self {
+            // Off: the e2e forces a run itself, so no clock makes the test flaky.
+            hour: -1,
+            model: "opus".into(),
+            effort: "high".into(),
+            max_proposals: 2,
+            project: "fleet-src".into(),
+        }
+    }
+}
+
 impl Config {
     pub fn from_env() -> Result<Self> {
         let model = std::env::var("FLEET_MODEL").unwrap_or_else(|_| "opus".into());
@@ -164,6 +213,8 @@ impl Config {
         for e in &allowed_efforts {
             crate::model::check_effort(e).context("FLEET_ALLOWED_EFFORTS")?;
         }
+        // The retrospective's default model is the fleet's own.
+        let model_for_retro = model.clone();
         Ok(Self {
             public_url: std::env::var("FLEET_PUBLIC_URL")
                 .context("FLEET_PUBLIC_URL is required")?
@@ -187,6 +238,7 @@ impl Config {
             remind_after_minutes: env_num("FLEET_REMIND_AFTER_MINUTES", 120),
             delete_topics_after_minutes: env_num("FLEET_TOPIC_DELETE_AFTER_MINUTES", 60),
             secretary: SecretaryConfig::from_env(),
+            retro: RetroConfig::from_env(&model_for_retro),
             allowed_models,
             allowed_efforts,
         })
@@ -207,6 +259,7 @@ impl Config {
             // Off by default in tests: the one test that wants it sets its own value.
             delete_topics_after_minutes: 0,
             secretary: SecretaryConfig::test(),
+            retro: RetroConfig::test(),
             allowed_models: default_allowed_models("opus"),
             allowed_efforts: DEFAULT_ALLOWED_EFFORTS.map(str::to_owned).to_vec(),
         }

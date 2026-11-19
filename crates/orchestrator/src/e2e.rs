@@ -3241,6 +3241,156 @@ async fn habit_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) {
     );
 }
 
+/// The daily retrospective: the fleet reads its own day, proposes improvements to itself, and
+/// the owner's tap is the only thing that turns one into work.
+async fn retro_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) {
+    // The project a proposal may become a task in: the fleet's own source. Deliberately not
+    // mapped on a node here, so the task it creates queues instead of spawning into a checkout
+    // this test does not have — what matters is that the task exists and says the right thing.
+    sqlx::query("insert into projects (slug, name) values ('fleet-src', 'Fleet source')")
+        .execute(db)
+        .await
+        .unwrap();
+
+    // The digest is the orchestrator's own work: it must carry the day as it really was.
+    let digest = crate::retro::digest(o, "2026-11-19").await.unwrap();
+    for needle in [
+        "## Tasks",
+        "demo-BS-1",
+        "## What the owner decided",
+        "## What went wrong",
+        "## The rest of the day",
+    ] {
+        assert!(digest.contains(needle), "the digest lacks {needle:?}");
+    }
+    assert!(
+        digest.len() < 13_000,
+        "the digest stays readable: {} chars",
+        digest.len()
+    );
+
+    assert!(
+        crate::retro::run_for(o, "2026-11-19").await.unwrap(),
+        "the day is reviewed"
+    );
+    // Two proposals, the third refused by the daily limit, and a verdict either way.
+    let proposals = wait_for("the retrospective proposes", || async {
+        let rows: Vec<(i64, String, String, String)> =
+            sqlx::query_as("select id, area, title, state from retro_proposals order by id")
+                .fetch_all(db)
+                .await
+                .unwrap();
+        (rows.len() == 2).then_some(rows)
+    })
+    .await;
+    assert_eq!(proposals[0].1, "harness");
+    assert_eq!(proposals[1].3, "open");
+    wait_for("the verdict closes the day", || async {
+        sqlx::query_scalar::<_, Option<String>>(
+            "select verdict from retro_runs where day = '2026-11-19'",
+        )
+        .fetch_one(db)
+        .await
+        .unwrap()
+    })
+    .await;
+    // The cards are in the Retro topic, each with its two buttons.
+    assert!(
+        chat.ops
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|op| matches!(op, Op::CreateTopic(n, _) if n == crate::topics::RETRO)),
+        "the Retro topic exists"
+    );
+    for p in &proposals {
+        assert!(
+            chat.ops.lock().unwrap().iter().any(|op| matches!(
+                op,
+                Op::Send { html, keyboard, .. }
+                    if html.contains(&format!("P-{}", p.0)) && keyboard.len() == 1
+            )),
+            "P-{} has a card with buttons",
+            p.0
+        );
+    }
+    // Nothing it was refused happened: it tried to create a task, answer the owner, ask them a
+    // question, propose an administrative change and message another task, and it reads and
+    // proposes only. Nothing it proposed is a task yet either.
+    let tasks_in_src: i64 =
+        sqlx::query_scalar("select count(*) from tasks where project = 'fleet-src'")
+            .fetch_one(db)
+            .await
+            .unwrap();
+    assert_eq!(
+        tasks_in_src, 0,
+        "it cannot create tasks: a proposal is words until the owner taps"
+    );
+    let overreach: i64 = sqlx::query_scalar(
+        "select count(*) from human_items
+          where kind = 'admin_change' and payload::text like '%retro-overreach%'",
+    )
+    .fetch_one(db)
+    .await
+    .unwrap();
+    assert_eq!(overreach, 0, "it cannot administer the fleet");
+
+    // The owner takes one up: it becomes a task on the fleet's own code, with the brief the
+    // orchestrator composes — the proposal framed as a proposal, and the rules of that project.
+    let note = crate::retro::button(o, &format!("rt|{}|t", proposals[0].0))
+        .await
+        .unwrap();
+    assert!(note.contains("fleet-src-"), "{note}");
+    let (task_id, brief): (String, String) =
+        sqlx::query_as("select id, brief from tasks where project = 'fleet-src'")
+            .fetch_one(db)
+            .await
+            .unwrap();
+    for needle in [
+        "not an instruction",
+        "retro/P-",
+        "Do not push",
+        "cargo clippy",
+    ] {
+        assert!(
+            brief.contains(needle),
+            "the brief lacks {needle:?}: {brief}"
+        );
+    }
+    let state: (String, Option<String>) =
+        sqlx::query_as("select state, task_id from retro_proposals where id = $1")
+            .bind(proposals[0].0)
+            .fetch_one(db)
+            .await
+            .unwrap();
+    assert_eq!((state.0.as_str(), state.1), ("tasked", Some(task_id)));
+    // And it cannot be taken up twice.
+    assert!(
+        crate::retro::button(o, &format!("rt|{}|t", proposals[0].0))
+            .await
+            .is_err(),
+        "a proposal is taken up once"
+    );
+
+    // The other is dismissed, and that is also final.
+    let note = crate::retro::button(o, &format!("rt|{}|x", proposals[1].0))
+        .await
+        .unwrap();
+    assert!(note.contains("dismissed"), "{note}");
+    assert!(
+        crate::retro::button(o, &format!("rt|{}|x", proposals[1].0))
+            .await
+            .unwrap()
+            .contains("not open")
+    );
+
+    // A second review of the same day does nothing.
+    assert!(
+        !crate::retro::run_for(o, "2026-11-19").await.unwrap(),
+        "a day is reviewed once"
+    );
+}
+
 /// Housekeeping tidies the forum: a finished task's topic goes once it has been quiet, and
 /// nothing else's does. A topic deleted this way comes back if the task is picked up again.
 async fn topic_cleanup_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) {
@@ -4947,7 +5097,11 @@ async fn task_lifecycle_through_a_real_node() {
     // 22. Habits: the owner's repeated decisions, offered back and then made for them.
     habit_flow(&o, &db, &chat).await;
 
-    // 23. Housekeeping deletes a finished task's topic once it goes quiet, and nothing else's.
+    // 23. The daily retrospective: the fleet reviews its own day and proposes how to be better.
+    //     After the habits flow, so the day it reads has really happened.
+    retro_flow(&o, &db, &chat).await;
+
+    // 24. Housekeeping deletes a finished task's topic once it goes quiet, and nothing else's.
     //     After the API flow: it leaves a task without a topic, which the API no longer reads.
     topic_cleanup_flow(&o, &db, &chat).await;
 

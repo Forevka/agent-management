@@ -11,8 +11,8 @@ use crate::{
     chat::{From, Notify, clip, esc},
     core::Orchestrator,
     model::{
-        AgentRow, BRAIN_AGENT, BRAIN_TASK, NewAgent, NodeRow, ProjectRow, SECRETARY_AGENT, TaskRow,
-        status,
+        AgentRow, BRAIN_AGENT, BRAIN_TASK, NewAgent, NodeRow, ProjectRow, RETRO_AGENT,
+        SECRETARY_AGENT, TaskRow, status,
     },
     prompts,
 };
@@ -710,11 +710,14 @@ async fn build_spawn(
 ) -> Result<SpawnAgent> {
     let is_brain = task.id == BRAIN_TASK;
     // By the agent, not the task: whatever task the secretary's agent were ever given, its
-    // restrictions come with it.
+    // restrictions come with it. The retrospective is held the same way, for the same reason —
+    // it reads a whole day of other people's and other agents' words.
     let is_secretary = agent.id == SECRETARY_AGENT;
-    // The secretary reads third parties' messages all day: it gets no secrets at all, so a
-    // message that talks it into something has nothing to leak.
-    let secret_files = if is_secretary {
+    let is_retro = agent.id == RETRO_AGENT;
+    let is_reader = is_secretary || is_retro;
+    // They read third parties' messages all day: no secrets at all, so a message that talks one
+    // of them into something has nothing to leak.
+    let secret_files = if is_reader {
         vec![]
     } else {
         secret_files(o, &task.project).await?
@@ -727,6 +730,8 @@ async fn build_spawn(
         prompts::brain_system_prompt(o.memory.is_some())
     } else if is_secretary {
         prompts::secretary_system_prompt(o.memory.is_some())
+    } else if is_retro {
+        prompts::retro_system_prompt(o.memory.is_some())
     } else {
         prompts::agent_system_prompt(agent, task, &names, o.memory.is_some())
     };
@@ -743,7 +748,7 @@ async fn build_spawn(
     // there is nothing else to say (a queued task starting). The secretary has no brief at all.
     let fresh = resume.is_none() && !is_brain;
     let mut parts = Vec::new();
-    if (fresh || texts.is_empty()) && !is_secretary {
+    if (fresh || texts.is_empty()) && !is_reader {
         parts.push(prompts::task_prompt(task));
     }
     // The secretary's queued texts (batches, notes) could pile up while it cannot run: its first
@@ -761,25 +766,30 @@ async fn build_spawn(
     // `fleet agent` pre-approved: anything else is refused without asking anyone, so
     // third-party text can never get it to run other commands (checked against the real CLI;
     // see `docs/plan.md`). It runs in an empty directory of its own (the node sees its role).
-    let (permission_mode, model, extra_args) = if is_secretary {
+    let (permission_mode, model, extra_args) = if is_reader {
         refuse_widening(&node.claude_command.0)?;
-        (
-            "dontAsk".to_owned(),
-            None,
-            [
-                "--model",
-                &o.cfg.secretary.model,
-                "--tools",
-                "Bash,Skill",
-                "--allowedTools",
-                "Bash(fleet agent:*)",
-                "--strict-mcp-config",
-                "--setting-sources",
-                "",
-            ]
-            .map(str::to_owned)
-            .to_vec(),
-        )
+        let mut args = [
+            "--model",
+            if is_retro {
+                &o.cfg.retro.model
+            } else {
+                &o.cfg.secretary.model
+            },
+            "--tools",
+            "Bash,Skill",
+            "--allowedTools",
+            "Bash(fleet agent:*)",
+            "--strict-mcp-config",
+            "--setting-sources",
+            "",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        // The retrospective is one careful run a day, so it is worth the effort the owner set.
+        if is_retro {
+            args.extend(["--effort".to_owned(), o.cfg.retro.effort.clone()]);
+        }
+        ("dontAsk".to_owned(), None, args)
     } else {
         // The task's own model and effort, else its agent's, else the fleet's model. The model
         // goes as `model`, which the node leaves out when its own command sets `--model`;

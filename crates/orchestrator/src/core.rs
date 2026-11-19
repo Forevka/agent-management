@@ -909,6 +909,10 @@ impl Orchestrator {
             if let Err(e) = crate::habits::reflect_if_due(&self).await {
                 tracing::warn!("reflecting on the owner's decisions failed: {e:#}");
             }
+            // And once a day, the fleet's own retrospective on the whole day.
+            if let Err(e) = crate::retro::run_if_due(&self).await {
+                tracing::warn!("the daily retrospective failed to start: {e:#}");
+            }
             if let Err(e) = self.prune().await {
                 tracing::warn!("retention pruning failed: {e:#}");
             }

@@ -21,6 +21,7 @@ pub mod jira;
 pub mod memory;
 pub mod model;
 pub mod prompts;
+pub mod retro;
 pub mod secretary;
 pub mod tasks;
 pub mod tg;

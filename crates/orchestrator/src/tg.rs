@@ -384,6 +384,16 @@ async fn handle_update(o: &Arc<Orchestrator>, bot: &Bot, chat_id: i64, u: Update
                 .await;
             return;
         }
+        // A retrospective's proposal: make it a task, or dismiss it.
+        if let Some(data) = cb.data.as_deref().filter(|d| crate::retro::is_button(d)) {
+            let reply = crate::retro::button(o, data)
+                .await
+                .unwrap_or_else(|e| format!("Failed: {e:#}"));
+            let _ = bot
+                .answer_callback_query(&cb.id, Some(&clip(&reply, 190)))
+                .await;
+            return;
+        }
         // Taking back something a habit did, or paused it, must always work.
         if let Some(data) = cb.data.as_deref().filter(|d| crate::habits::is_button(d)) {
             let reply = crate::habits::button(o, data)
@@ -690,7 +700,59 @@ async fn command(
             tasks::reset_builtin(o, crate::model::SECRETARY_TASK).await?;
             "The secretary will start a fresh session with its next batch or your next message in the Inbox (its todos and rules stay).".into()
         }
-        "/help" | "/start" => "Write in General to talk to the orchestrator, or in 📋 Inbox to talk to the secretary. Reply in a task topic to talk to its agent; reply to a question to answer it.\n/status /queue /tasks /habits /wakeups /stop [task] /web /invite /brain_reset /secretary_reset".into(),
+        "/retro_reset" => {
+            tasks::reset_builtin(o, crate::model::RETRO_TASK).await?;
+            "The retrospective will start a fresh session at its next run (its proposals stay)."
+                .into()
+        }
+        // What the fleet concluded about its own days, and what came of it.
+        "/retro" => {
+            let rows: Vec<(i64, String, String, String, Option<String>)> = sqlx::query_as(
+                "select id, area, title, state, task_id from retro_proposals
+                  order by (state = 'open') desc, id desc limit 20",
+            )
+            .fetch_all(&o.db)
+            .await?;
+            let last: Option<(String, Option<String>, i32)> = sqlx::query_as(
+                "select day, verdict, proposals from retro_runs order by day desc limit 1",
+            )
+            .fetch_optional(&o.db)
+            .await?;
+            let mut s = String::new();
+            match last {
+                Some((day, verdict, n)) => s.push_str(&format!(
+                    "<b>Last retrospective · {}</b> ({n} proposal(s))\n{}\n\n",
+                    esc(&day),
+                    esc(verdict.as_deref().unwrap_or("still thinking…"))
+                )),
+                None => s.push_str(
+                    "No retrospective has run yet. It runs daily once FLEET_RETRO_HOUR is set.\n\n",
+                ),
+            }
+            if rows.is_empty() {
+                s.push_str("No proposals.");
+            } else {
+                s.push_str("<b>Proposals</b>\n");
+                for (id, area, title, state, task) in &rows {
+                    s.push_str(&format!(
+                        "{} P-{id} · {} · {}{}\n",
+                        match state.as_str() {
+                            "open" => "💡",
+                            "tasked" => "🛠",
+                            _ => "✖",
+                        },
+                        esc(area),
+                        esc(&clip(title, 90)),
+                        task.as_deref()
+                            .map(|t| format!(" → {}", esc(t)))
+                            .unwrap_or_default()
+                    ));
+                }
+                s.push_str("<i>The cards in 📈 Retro have Make task and Dismiss.</i>");
+            }
+            s
+        }
+        "/help" | "/start" => "Write in General to talk to the orchestrator, or in 📋 Inbox to talk to the secretary. Reply in a task topic to talk to its agent; reply to a question to answer it.\n/status /queue /tasks /habits /retro /wakeups /stop [task] /web /invite /brain_reset /secretary_reset /retro_reset".into(),
         _ => format!("Unknown command {}. Try /help.", esc(cmd)),
     };
     o.chat

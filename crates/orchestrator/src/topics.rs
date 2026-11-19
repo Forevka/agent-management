@@ -6,7 +6,9 @@
 //! messages, reply drafts, and what was passed to the orchestrator about them);
 //! **agent-communication** is the fleet talking to itself (the brain's notes to the secretary,
 //! agents' messages to each other), which the owner can read but never has to;
-//! **Rules** is the log of the secretary's triage rules, so they are searchable in one place.
+//! **Rules** is the log of the secretary's triage rules and the owner's habits, so everything
+//! standing is searchable in one place; **Retro** is the daily retrospective's: what the fleet
+//! concluded about its own day and what it proposes to do better.
 //! A task's own topic stays that agent's work, and General stays what needs the owner.
 
 use anyhow::Result;
@@ -17,10 +19,12 @@ use crate::core::Orchestrator;
 pub const INBOX: &str = "📋 Inbox";
 pub const AGENTS: &str = "🤖 agent-communication";
 pub const RULES: &str = "📜 Rules";
+pub const RETRO: &str = "📈 Retro";
 
 const INBOX_KEY: &str = "inbox_topic";
 const AGENTS_KEY: &str = "agents_topic";
 const RULES_KEY: &str = "rules_topic";
+const RETRO_KEY: &str = "retro_topic";
 
 /// The topic id remembered under `key`, if it was created already.
 async fn topic_if_any(o: &Orchestrator, key: &str) -> Result<Option<i64>> {
@@ -58,4 +62,9 @@ pub async fn agents(o: &Orchestrator) -> Result<i64> {
 
 pub async fn rules(o: &Orchestrator) -> Result<i64> {
     topic(o, RULES_KEY, RULES).await
+}
+
+/// Where the daily retrospective puts its verdict and its proposals.
+pub async fn retro(o: &Orchestrator) -> Result<i64> {
+    topic(o, RETRO_KEY, RETRO).await
 }
