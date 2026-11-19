@@ -119,6 +119,52 @@ pub async fn run_if_due(o: &Arc<Orchestrator>) -> Result<bool> {
     run_for(o, &day).await
 }
 
+/// A review the owner asked for now, over the last `days` days rather than the last one. Its own
+/// row, marked as asked for, so it neither collides with the scheduled run of the same day nor
+/// stops it happening.
+pub async fn run_now(o: &Arc<Orchestrator>, days: i64) -> Result<String> {
+    let days = days.clamp(1, 14);
+    let stamp: String =
+        sqlx::query_scalar("select to_char(now() at time zone $1, 'YYYY-MM-DD HH24:MI')")
+            .bind(&o.cfg.secretary.timezone)
+            .fetch_one(&o.db)
+            .await?;
+    let key = format!("{stamp} on request");
+    let run: i64 = sqlx::query_scalar(
+        "insert into retro_runs (day) values ($1) on conflict (day) do nothing returning id",
+    )
+    .bind(&key)
+    .fetch_optional(&o.db)
+    .await?
+    .context("a review started this minute is already running")?;
+    // An older run that never closed would otherwise collect this one's proposals.
+    sqlx::query(
+        "update retro_runs set verdict = 'not finished' where verdict is null and id <> $1",
+    )
+    .bind(run)
+    .execute(&o.db)
+    .await?;
+    let digest = digest_over(o, &key, days).await?;
+    let task = ensure(o).await?;
+    if let Err(e) = tasks::deliver_as(o, &task, digest, tasks::Origin::Other).await {
+        let _ = sqlx::query("delete from retro_runs where id = $1 and verdict is null")
+            .bind(run)
+            .execute(&o.db)
+            .await;
+        return Err(e.context("the retrospective could not be started"));
+    }
+    o.audit(
+        "owner",
+        "retro.run",
+        json!({"run": run, "days": days, "on_request": true}),
+    )
+    .await;
+    Ok(format!(
+        "Reviewing the last {days} day(s); it posts what it concludes in {}.",
+        topics::RETRO
+    ))
+}
+
 /// Reviews `day` unless it has been reviewed already. The insert is the lock: two of these at
 /// once (or a restart mid-run) leave one run, not two.
 pub async fn run_for(o: &Arc<Orchestrator>, day: &str) -> Result<bool> {
@@ -289,6 +335,11 @@ pub fn remember_task_outcome(o: &Arc<Orchestrator>, task_id: &str, outcome: &str
 /// numbers are the orchestrator's own, and a prepared digest cannot be talked out of mentioning
 /// something awkward. Bounded per section and in total.
 pub async fn digest(o: &Orchestrator, day: &str) -> Result<String> {
+    digest_over(o, day, 1).await
+}
+
+/// The same over a window of `days`, which is what a review the owner asks for uses.
+pub async fn digest_over(o: &Orchestrator, day: &str, days: i64) -> Result<String> {
     let mut s = format!(
         "{PROMPT_PREFIX} {day}] Your day's material follows. Read it, think about what would \
          make this fleet better tomorrow, and propose at most {} improvements with \
@@ -313,16 +364,17 @@ pub async fn digest(o: &Orchestrator, day: &str) -> Result<String> {
     // What the fleet did, and what it cost in the owner's attention.
     let tasks_today: Vec<(String, String, String, i64, i64, i64)> = sqlx::query_as(
         "select t.id, t.title, t.status,
-                (select count(*) from runs r where r.task_id = t.id and r.started_at > now() - interval '1 day'),
-                (select count(*) from human_items h where h.task_id = t.id and h.created_at > now() - interval '1 day'),
+                (select count(*) from runs r where r.task_id = t.id and r.started_at > now() - make_interval(days => $2::int)),
+                (select count(*) from human_items h where h.task_id = t.id and h.created_at > now() - make_interval(days => $2::int)),
                 coalesce((select extract(epoch from (max(coalesce(r.ended_at, now())) - min(r.started_at)))::int8
                             from runs r where r.task_id = t.id), 0)
            from tasks t
-          where t.updated_at > now() - interval '1 day' and t.id not in ('brain', 'secretary', 'retro')
+          where t.updated_at > now() - make_interval(days => $2::int) and t.id not in ('brain', 'secretary', 'retro')
           order by t.updated_at desc
           limit $1",
     )
     .bind(SECTION_ROWS)
+    .bind(days as i32)
     .fetch_all(&o.db)
     .await?;
     if tasks_today.is_empty() {
@@ -342,11 +394,12 @@ pub async fn digest(o: &Orchestrator, day: &str) -> Result<String> {
     // is about what the fleet gets wrong.
     let decisions: Vec<(String, String, Value)> = sqlx::query_as(
         "select actor, action, detail from audit_log
-          where at > now() - interval '1 day'
+          where at > now() - make_interval(days => $2::int)
             and action in ('item.answer', 'habit.apply', 'todo.make_task', 'task.stop')
           order by at desc limit $1",
     )
     .bind(SECTION_ROWS * 2)
+    .bind(days as i32)
     .fetch_all(&o.db)
     .await?;
     if !decisions.is_empty() {
@@ -363,10 +416,11 @@ pub async fn digest(o: &Orchestrator, day: &str) -> Result<String> {
     // fleet does without being asked is where most improvements live.
     let asked: Vec<String> = sqlx::query_scalar(
         "select data from task_events
-          where task_id = 'brain' and kind = 'owner' and at > now() - interval '1 day'
+          where task_id = 'brain' and kind = 'owner' and at > now() - make_interval(days => $2::int)
           order by at desc limit $1",
     )
     .bind(SECTION_ROWS)
+    .bind(days as i32)
     .fetch_all(&o.db)
     .await?;
     if !asked.is_empty() {
@@ -379,20 +433,22 @@ pub async fn digest(o: &Orchestrator, day: &str) -> Result<String> {
     // What went wrong. Deliberately generous: this is the section worth the money.
     let trouble: Vec<(String, String, String)> = sqlx::query_as(
         "select task_id, kind, data from task_events
-          where at > now() - interval '1 day'
+          where at > now() - make_interval(days => $2::int)
             and kind in ('err', 'spawn_failed', 'undelivered')
           order by at desc limit $1",
     )
     .bind(SECTION_ROWS * 2)
+    .bind(days as i32)
     .fetch_all(&o.db)
     .await?;
     let lost: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
         "select task_id, outcome, node_id from runs
-          where started_at > now() - interval '1 day' and outcome is not null
+          where started_at > now() - make_interval(days => $2::int) and outcome is not null
             and outcome not like 'exit Some(0)%'
           order by started_at desc limit $1",
     )
     .bind(SECTION_ROWS)
+    .bind(days as i32)
     .fetch_all(&o.db)
     .await?;
     if trouble.is_empty() && lost.is_empty() {
@@ -415,10 +471,11 @@ pub async fn digest(o: &Orchestrator, day: &str) -> Result<String> {
     // retrospective ever looks at.
     let chatter: Vec<(Option<String>, String, String)> = sqlx::query_as(
         "select from_agent, to_agent, text from messages
-          where created_at > now() - interval '1 day' and from_agent is not null
+          where created_at > now() - make_interval(days => $2::int) and from_agent is not null
           order by id desc limit $1",
     )
     .bind(SECTION_ROWS)
+    .bind(days as i32)
     .fetch_all(&o.db)
     .await?;
     if !chatter.is_empty() {
@@ -434,18 +491,20 @@ pub async fn digest(o: &Orchestrator, day: &str) -> Result<String> {
 
     // The secretary's day, and the standing automation's.
     let (batches, messages, triaged, todos): (i64, i64, i64, i64) = sqlx::query_as(
-        "select (select count(*) from secretary_batches where at > now() - interval '1 day'),
-                (select coalesce(sum(messages), 0)::int8 from secretary_batches where at > now() - interval '1 day'),
-                (select count(*) from secretary_triage where at > now() - interval '1 day'),
-                (select count(*) from todos where created_at > now() - interval '1 day')",
+        "select (select count(*) from secretary_batches where at > now() - make_interval(days => $1::int)),
+                (select coalesce(sum(messages), 0)::int8 from secretary_batches where at > now() - make_interval(days => $1::int)),
+                (select count(*) from secretary_triage where at > now() - make_interval(days => $1::int)),
+                (select count(*) from todos where created_at > now() - make_interval(days => $1::int))",
     )
+    .bind(days as i32)
     .fetch_one(&o.db)
     .await?;
     let (habit_uses, wakeups, workflows): (i64, i64, i64) = sqlx::query_as(
-        "select (select count(*) from habit_uses where at > now() - interval '1 day'),
-                (select count(*) from wakeups where last_at > now() - interval '1 day'),
-                (select count(*) from workflows where last_run_at > now() - interval '1 day')",
+        "select (select count(*) from habit_uses where at > now() - make_interval(days => $1::int)),
+                (select count(*) from wakeups where last_at > now() - make_interval(days => $1::int)),
+                (select count(*) from workflows where last_run_at > now() - make_interval(days => $1::int))",
     )
+    .bind(days as i32)
     .fetch_one(&o.db)
     .await?;
     s.push_str(&format!(

@@ -1130,6 +1130,12 @@ async fn retro(State(o): State<O>, h: HeaderMap) -> Api {
 /// The same two decisions the cards offer, by the same code path.
 async fn retro_act(State(o): State<O>, h: HeaderMap, Json(a): Json<Act>) -> Api {
     guard!(o, h, write);
+    // A review on demand, over as many days as asked for; the scheduled one covers the last day.
+    if a.op == "run" {
+        let days = a.body["days"].as_i64().unwrap_or(1);
+        let note = crate::retro::run_now(&o, days).await?;
+        return Ok(Json(json!({"done": note})));
+    }
     let id = a.body["id"].as_i64().context("id is required")?;
     let action = match a.op.as_str() {
         "make_task" => "t",

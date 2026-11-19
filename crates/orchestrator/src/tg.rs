@@ -705,7 +705,17 @@ async fn command(
             "The retrospective will start a fresh session at its next run (its proposals stay)."
                 .into()
         }
-        // What the fleet concluded about its own days, and what came of it.
+        // What the fleet concluded about its own days, and what came of it. `/retro now [days]`
+        // asks for a review right away, over as many days as you say (the scheduled one covers
+        // the last day).
+        "/retro" if arg.split_whitespace().next() == Some("now") => {
+            let days = arg
+                .split_whitespace()
+                .nth(1)
+                .and_then(|d| d.parse::<i64>().ok())
+                .unwrap_or(1);
+            crate::retro::run_now(o, days).await?
+        }
         "/retro" => {
             let rows: Vec<(i64, String, String, String, Option<String>)> = sqlx::query_as(
                 "select id, area, title, state, task_id from retro_proposals

@@ -3429,6 +3429,16 @@ async fn retro_flow(
         !crate::retro::run_for(o, "2026-11-19").await.unwrap(),
         "a day is reviewed once"
     );
+    // But the owner can ask for one at any time, over as many days as they like, and that is a
+    // run of its own rather than a day's.
+    let note = crate::retro::run_now(o, 2).await.unwrap();
+    assert!(note.contains("last 2 day(s)"), "{note}");
+    let on_request: i64 =
+        sqlx::query_scalar("select count(*) from retro_runs where day like '%on request'")
+            .fetch_one(db)
+            .await
+            .unwrap();
+    assert_eq!(on_request, 1, "the review asked for has its own row");
 
     // What closes the loop: the verdict, the owner's decisions and what became of the work are
     // all retained in the fleet's own bank, and the standing document is asked to take them in.
