@@ -129,6 +129,11 @@ pub async fn decide(
     item: &HumanItemRow,
     task: &TaskRow,
 ) -> Result<Option<String>> {
+    // The fleet's own sessions are not a job that repeats, and nothing of theirs should ever be
+    // answered by a pattern.
+    if crate::model::is_builtin_task(&task.id) {
+        return Ok(None);
+    }
     let Some(habit) = covering(o, item, task).await? else {
         return Ok(None);
     };
@@ -221,8 +226,13 @@ async fn told_the_owner(o: &Arc<Orchestrator>, habit: &HabitRow, task: &TaskRow,
         esc(habit.why.as_str()),
         esc(&clip(plan, 2500))
     );
+    // The task is named in the button, not looked up later: this is the control that takes back
+    // what the habit just did, and it must act on this task even if the habit acts again first.
     let keyboard = vec![vec![
-        Button::callback("⏹ Stop & ask me next time", format!("hb|{}|s", habit.id)),
+        Button::callback(
+            "⏹ Stop & ask me next time",
+            format!("hb|{}|s|{}", habit.id, task.id),
+        ),
         Button::callback("⏸ Pause this habit", format!("hb|{}|p", habit.id)),
     ]];
     if let Some(topic) = task.topic_id
@@ -541,11 +551,12 @@ pub fn is_button(data: &str) -> bool {
 
 /// The buttons on a habit's card and on the note a habit leaves in a task's topic.
 pub async fn button(o: &Arc<Orchestrator>, data: &str) -> Result<String> {
-    let mut parts = data.splitn(3, '|');
-    let (_, id, action) = (
+    let mut parts = data.splitn(4, '|');
+    let (_, id, action, which) = (
         parts.next().unwrap_or_default(),
         parts.next().unwrap_or_default(),
         parts.next().unwrap_or_default(),
+        parts.next().filter(|t| !t.is_empty()).map(str::to_owned),
     );
     let id: i64 = id.parse().context("bad habit id")?;
     match action {
@@ -556,14 +567,20 @@ pub async fn button(o: &Arc<Orchestrator>, data: &str) -> Result<String> {
         // The one that matters: take back what the habit just did, and do not do it again.
         "s" => {
             let habit = pause(o, id, "you stopped a task it had approved").await?;
-            let task: Option<String> = sqlx::query_scalar(
-                "select task_id from habit_uses where habit_id = $1 and task_id is not null
-                 order by at desc limit 1",
-            )
-            .bind(habit.id)
-            .fetch_optional(&o.db)
-            .await?;
-            let Some(task_id) = task else {
+            // The task the button named; older cards carry none, so fall back to the last one it
+            // acted on, which is what such a card was about.
+            let task_id =
+                match which {
+                    Some(t) => Some(t),
+                    None => sqlx::query_scalar(
+                        "select task_id from habit_uses where habit_id = $1 and task_id is not null
+                     order by at desc limit 1",
+                    )
+                    .bind(habit.id)
+                    .fetch_optional(&o.db)
+                    .await?,
+                };
+            let Some(task_id) = task_id else {
                 return Ok(format!("H-{id} paused; nothing of it was running."));
             };
             let Some(task) = o.task(&task_id).await? else {

@@ -3136,7 +3136,8 @@ async fn habit_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) {
     done(unclear.id).await;
 
     // 6. One tap takes it back: the habit pauses, and the next plan of that shape waits again.
-    crate::habits::button(o, &format!("hb|{}|s", habit.id))
+    //    The button names the task it was posted about, so it cannot stop a later one.
+    crate::habits::button(o, &format!("hb|{}|s|{}", habit.id, fourth.id))
         .await
         .unwrap();
     let paused: crate::model::HabitRow = sqlx::query_as("select * from habits where id = $1")
