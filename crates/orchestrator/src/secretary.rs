@@ -1181,7 +1181,7 @@ fn cites(said: &str, because: &str) -> bool {
     !b.is_empty() && said.contains(&b) && (words >= 3 || words * 2 > total)
 }
 /// `12`, `"12"` or `"T-12"`.
-fn item_id(v: &Value, prefix: &str) -> Result<i64> {
+pub(crate) fn item_id(v: &Value, prefix: &str) -> Result<i64> {
     if let Some(n) = v.as_i64() {
         return Ok(n);
     }

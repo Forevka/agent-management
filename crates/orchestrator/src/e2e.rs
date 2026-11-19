@@ -1868,6 +1868,200 @@ async fn workflow_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat
     wait_retired(chat, &[card_msg], "deleted").await;
 }
 
+/// Waiting without a session (CLAUDE.md: new tool/flow needs e2e coverage): an agent asks the
+/// orchestrator to wake it, and is woken by the same delivery a follow-up uses. A condition in
+/// plain words goes to the brain, which writes the Rhai for it.
+async fn wakeup_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool) {
+    let worker = o.task("demo-BS-1").await.unwrap().unwrap();
+    let agent = worker.agent_id.clone().unwrap();
+    let set = |args: Value| {
+        let agent = agent.clone();
+        let id = worker.id.clone();
+        async move { call_as(o, &agent, &id, "wake_set", args).await }
+    };
+    // A note is what the agent tells its own future self: without it there is nothing to wake up to.
+    let e = set(json!({"in": "30m"})).await.unwrap_err();
+    assert!(e.to_string().contains("--note is required"), "{e}");
+    let e = set(json!({"note": "n", "in": "10s"})).await.unwrap_err();
+    assert!(e.to_string().contains("shortest nap"), "{e}");
+    let e = set(json!({"note": "n", "every": "1m"})).await.unwrap_err();
+    assert!(e.to_string().contains("faster than every"), "{e}");
+    let e = set(json!({"note": "n"})).await.unwrap_err();
+    assert!(e.to_string().contains("say when"), "{e}");
+
+    // A nap: nothing happens until it is due, then the agent is woken once with its own words.
+    set(json!({"note": "check MR !3746 for new commits", "in": "30m"}))
+        .await
+        .unwrap();
+    let w: crate::model::WakeupRow =
+        sqlx::query_as("select * from wakeups order by id desc limit 1")
+            .fetch_one(db)
+            .await
+            .unwrap();
+    assert_eq!((w.kind.as_str(), w.state.as_str()), ("timer", "armed"));
+    crate::wakeups::run_due(o).await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i32>("select fires from wakeups where id = $1")
+            .bind(w.id)
+            .fetch_one(db)
+            .await
+            .unwrap(),
+        0,
+        "not due yet, so nobody was woken"
+    );
+    sqlx::query("update wakeups set fires_at = now() - interval '1 minute' where id = $1")
+        .bind(w.id)
+        .execute(db)
+        .await
+        .unwrap();
+    crate::wakeups::run_due(o).await.unwrap();
+    wait_for("the agent is woken with its own note", || async {
+        events(db, &worker.id).await.into_iter().find(|e| {
+            e["type"] == "assistant"
+                && e["message"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("check MR !3746 for new commits")
+        })
+    })
+    .await;
+    let (state, fires): (String, i32) =
+        sqlx::query_as("select state, fires from wakeups where id = $1")
+            .bind(w.id)
+            .fetch_one(db)
+            .await
+            .unwrap();
+    assert_eq!(
+        (state.as_str(), fires),
+        ("fired", 1),
+        "one-shot, woken once"
+    );
+
+    // A condition in plain words: the brain is asked for the Rhai, and nothing fires until it
+    // is armed. A script that does not compile is refused, with the reason.
+    set(json!({"note": "re-review it", "when": "when GitLab posts about !3746 again"}))
+        .await
+        .unwrap();
+    let w: crate::model::WakeupRow =
+        sqlx::query_as("select * from wakeups order by id desc limit 1")
+            .fetch_one(db)
+            .await
+            .unwrap();
+    assert_eq!((w.kind.as_str(), w.state.as_str()), ("script", "drafting"));
+    wait_for("the brain is asked for the condition", || async {
+        (brain_heard(db, &format!("[Wakeup W-{} needs a condition]", w.id)).await == 1)
+            .then_some(())
+    })
+    .await;
+    crate::wakeups::run_due(o).await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i32>("select fires from wakeups where id = $1")
+            .bind(w.id)
+            .fetch_one(db)
+            .await
+            .unwrap(),
+        0,
+        "a condition nobody wrote yet never fires"
+    );
+    let arm = |script: &'static str| async move {
+        call_as(
+            o,
+            "orchestrator",
+            "brain",
+            "wake_arm",
+            json!({"id": format!("W-{}", w.id), "script": script}),
+        )
+        .await
+    };
+    let e = arm("ctx.messages.some(").await.unwrap_err();
+    assert!(e.to_string().contains("does not compile"), "{e}");
+    arm(r#"#{ wake: ctx.messages.some(|m| m.text.contains("!3746")), memo: #{ seen: true }, why: "GitLab posted again" }"#)
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("select state from wakeups where id = $1")
+            .bind(w.id)
+            .fetch_one(db)
+            .await
+            .unwrap(),
+        "armed"
+    );
+    // The messages this flow's own feed already carries do not mention it, so it keeps waiting.
+    crate::wakeups::run_due(o).await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i32>("select fires from wakeups where id = $1")
+            .bind(w.id)
+            .fetch_one(db)
+            .await
+            .unwrap(),
+        0,
+        "the condition does not hold yet"
+    );
+    // One arrives: the condition holds, the agent is woken with the reason, and what the script
+    // remembered is kept for next time.
+    deliver_feed(
+        o,
+        vec![fleet_feeds::FeedEvent::Message(incoming(
+            "C-rev",
+            "code-reviews",
+            fleet_feeds::ConversationKind::Channel,
+            "wk-1",
+            "GitLab",
+            "Bob pushed to !3746",
+        ))],
+    )
+    .await;
+    crate::wakeups::run_due(o).await.unwrap();
+    wait_for("the condition fires with its reason", || async {
+        events(db, &worker.id).await.into_iter().find(|e| {
+            e["type"] == "assistant"
+                && e["message"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("GitLab posted again")
+        })
+    })
+    .await;
+    let memo: Value = sqlx::query_scalar("select memo from wakeups where id = $1")
+        .bind(w.id)
+        .fetch_one(db)
+        .await
+        .unwrap();
+    assert_eq!(
+        memo,
+        json!({"seen": true}),
+        "the script's own scratch is kept"
+    );
+
+    // Cancelling stops one, and the cap refuses an eleventh.
+    set(json!({"note": "n", "in": "30m"})).await.unwrap();
+    let last: i64 = sqlx::query_scalar("select max(id) from wakeups")
+        .fetch_one(db)
+        .await
+        .unwrap();
+    let r = call_as(
+        o,
+        &agent,
+        &worker.id,
+        "wake_cancel",
+        json!({"id": format!("W-{last}")}),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(r.result.contains("cancelled"), "{}", r.result);
+    for _ in 0..10 {
+        set(json!({"note": "n", "in": "30m"})).await.unwrap();
+    }
+    let e = set(json!({"note": "n", "in": "30m"})).await.unwrap_err();
+    assert!(e.to_string().contains("already armed"), "{e}");
+    sqlx::query("update wakeups set state = 'cancelled' where task_id = $1 and state = 'armed'")
+        .bind(&worker.id)
+        .execute(db)
+        .await
+        .unwrap();
+}
+
 /// Agents messaging each other is the fleet's own chatter: the copy the owner can read goes to
 /// agent-communication, not into the sending task's topic (which stays that agent's work).
 async fn agent_chatter_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) {
@@ -3670,8 +3864,9 @@ async fn task_lifecycle_through_a_real_node() {
     // 19. Workflows: `workflow_finish` keeps the topic open and posts a control card.
     workflow_flow(&o, &db, &chat).await;
 
-    // 20. Fleet chatter has its own topic; a Slack channel can be mapped by name; and a todo
-    //     can nudge an existing workflow.
+    // 20. Waiting without a session; fleet chatter has its own topic; a Slack channel can be
+    //     mapped by name; and a todo can nudge an existing workflow.
+    wakeup_flow(&o, &db).await;
     agent_chatter_flow(&o, &db, &chat).await;
     channel_by_name_flow(&o, &db).await;
     workflow_linked_todo_flow(&o, &db).await;

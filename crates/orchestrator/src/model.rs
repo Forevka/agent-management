@@ -192,6 +192,33 @@ pub struct RuleRow {
     pub tg_msg: Option<i64>,
 }
 
+/// What an agent asked to be woken for (see `wakeups.rs`), so it needs no session while it
+/// waits.
+#[derive(Debug, Clone, FromRow)]
+pub struct WakeupRow {
+    pub id: i64,
+    pub task_id: String,
+    /// The agent's own words, handed back when it wakes.
+    pub note: String,
+    /// `timer` or `script`.
+    pub kind: String,
+    pub fires_at: Option<DateTime<Utc>>,
+    /// `None`: one-shot. Otherwise the interval to re-arm with (`30m`).
+    pub every: Option<String>,
+    /// The plain-text condition, and the Rhai the brain wrote for it.
+    pub wish: Option<String>,
+    pub script: Option<String>,
+    pub state: String,
+    pub fires: i32,
+    pub errors: i32,
+    /// The script's own scratch between evaluations.
+    pub memo: sqlx::types::Json<serde_json::Value>,
+    pub created_by: String,
+    pub expires_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub last_at: Option<DateTime<Utc>>,
+}
+
 /// A task that was turned into a workflow (see `workflows.rs`): its topic stays open, and this
 /// row says whether and when it triggers again on its own.
 #[derive(Debug, Clone, FromRow)]

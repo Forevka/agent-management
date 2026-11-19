@@ -54,6 +54,26 @@ exits non-zero and prints an error. For long text, pass `-` and pipe the text in
   to run it again on demand, or give `--schedule` to also have it run on its own. Omit
   `--schedule` for on-demand only.
 
+## Waiting for something later
+
+You never need to stay alive to wait. The orchestrator is the alarm clock:
+
+- `fleet agent wake set --note "..." --in 30m`: it wakes you in 30 minutes with your note
+  handed back word for word. Write the note to your own future self: what you are waiting for
+  and what to do about it ("MR !3746 was not approved; check for new commits and re-review").
+  Also `--at <RFC 3339 time>`, or `--every 30m` to repeat.
+- When you wake, check with the tools you already have (`glab`, `git`, `curl`, the project's
+  own scripts) and act. If it is still unsettled, arm another one. The wake message says how
+  many times you were woken: after a few rounds, report where it stands and stop instead of
+  waiting forever.
+- `fleet agent wake set --note "..." --when "<condition in plain words>"`: for something the
+  orchestrator can judge itself (a message in a feed, this task's state). You describe it in
+  words; the orchestrator writes the condition. Anything needing git, an API or a shell is a
+  nap you check for yourself instead.
+- `fleet agent wake list`, `fleet agent wake cancel W-3`.
+
+Prefer this to sleeping in a command or holding a session open: waiting costs nothing this way.
+
 Never post tool output, logs or your reasoning to Telegram.
 
 ## Other agents
@@ -131,6 +151,24 @@ name is unknown or ambiguous (the error says which).
 from the Inbox]` names a workflow (it says so explicitly, from a todo linked with
 `--workflow`), `send-to-task` that workflow instead of `create-task`: the owner already set it
 up, so this is a follow-up to existing work, not a new one.
+
+### Wakeup conditions (you write them, agents do not)
+
+An agent that wants to be woken when something it cannot check itself happens arms a wakeup in
+plain words, and you get `[Wakeup W-7 needs a condition] ...`. Write it as a Rhai expression
+over `ctx` and arm it with `fleet agent wake arm W-7 --script -`, the condition on stdin, e.g.
+`ctx.messages.some(|m| m.conversation.contains("code-reviews") && m.text.contains("!3746"))`.
+
+`ctx` is all a condition may look at: `ctx.now` (unix seconds), `ctx.fires`, `ctx.memo`
+(whatever the last check returned as memo, for remembering a value between checks), `ctx.task`
+(`#{id, status, updated_at}`) and `ctx.messages` - the feed messages since the last check,
+newest first, each `#{source, conversation, author, text, ts, ref}`. Return `true`/`false`, or
+`#{wake: bool, memo: <anything to remember>, why: "short reason"}`.
+
+There is no network, git, shell, database or secret access, and each check is bounded in work.
+So when the condition needs any of those (a branch, a pipeline, an API), do not write a script:
+tell the agent to nap with `wake set --in <interval>` and check for itself when it wakes. A
+condition that keeps failing is disarmed and handed back to you to rewrite.
 
 ## The secretary
 

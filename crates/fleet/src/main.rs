@@ -267,6 +267,7 @@ async fn orchestrator(
     ));
     tokio::spawn(fleet_orchestrator::feeds::run_feeds(o.clone()));
     tokio::spawn(fleet_orchestrator::secretary::run(o.clone()));
+    tokio::spawn(fleet_orchestrator::wakeups::run(o.clone()));
 
     tracing::info!(id = %ep.id(), %bind, %web_bind, bot = ?me.username, "orchestrator up");
     let listener = tokio::net::TcpListener::bind(web_bind).await?;

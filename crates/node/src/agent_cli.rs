@@ -71,6 +71,9 @@ pub enum AgentCmd {
     /// Existing workflows (a task turned into a standing automation).
     #[command(subcommand)]
     Workflow(WorkflowCmd),
+    /// Be woken later without keeping this session alive: the orchestrator is the alarm clock.
+    #[command(subcommand)]
+    Wake(WakeCmd),
     // Orchestrator (brain) only.
     /// List projects, their nodes and open tasks.
     Projects,
@@ -373,6 +376,45 @@ pub enum RuleCmd {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum WakeCmd {
+    /// Ask to be woken: --in 30m, --at <time>, --every 30m, or --when "<condition in words>".
+    Set {
+        /// What you are waiting for and what to do when you wake ("-" reads it from stdin).
+        /// It is handed back to you verbatim, so write it to your own future self.
+        #[arg(long)]
+        note: String,
+        /// A nap: 30m, 2h, 1d (at least 60s).
+        #[arg(long = "in")]
+        in_: Option<String>,
+        /// A time (RFC 3339).
+        #[arg(long)]
+        at: Option<String>,
+        /// Repeat instead of waking once (at least 5m).
+        #[arg(long)]
+        every: Option<String>,
+        /// The condition in plain words; the orchestrator writes it for you. Only for what it
+        /// can judge itself (messages in a feed, task state): anything needing git, an API or a
+        /// shell is a nap you check for yourself.
+        #[arg(long)]
+        when: Option<String>,
+        /// Give up waiting after this time (RFC 3339; 30 days by default).
+        #[arg(long)]
+        until: Option<String>,
+    },
+    /// What is armed for your task.
+    List,
+    /// Stop waiting for one.
+    Cancel { id: String },
+    /// Orchestrator only: supply the Rhai condition for a wakeup asked for in plain words.
+    Arm {
+        id: String,
+        /// The condition ("-" reads it from stdin).
+        #[arg(long)]
+        script: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 pub enum WorkflowCmd {
     /// Existing workflows, newest first: task id, title, schedule, enabled.
     List,
@@ -491,6 +533,24 @@ pub fn to_call(cmd: AgentCmd) -> Result<(&'static str, Value)> {
             ("feed_search", json!({"query": query, "limit": limit}))
         }
         AgentCmd::Workflow(WorkflowCmd::List) => ("workflow_list", json!({})),
+        AgentCmd::Wake(WakeCmd::Set {
+            note,
+            in_,
+            at,
+            every,
+            when,
+            until,
+        }) => (
+            "wake_set",
+            json!({"note": stdin_if_dash(note)?, "in": in_, "at": at, "every": every,
+                   "when": when.map(stdin_if_dash).transpose()?, "until": until}),
+        ),
+        AgentCmd::Wake(WakeCmd::List) => ("wake_list", json!({})),
+        AgentCmd::Wake(WakeCmd::Cancel { id }) => ("wake_cancel", json!({"id": id})),
+        AgentCmd::Wake(WakeCmd::Arm { id, script }) => (
+            "wake_arm",
+            json!({"id": id, "script": stdin_if_dash(script)?}),
+        ),
         AgentCmd::Memory(MemoryCmd::Retain {
             text,
             context,
@@ -885,6 +945,26 @@ mod tests {
             json!("wf-1")
         );
         assert_eq!(call(&["workflow", "list"]), ("workflow_list", json!({})));
+        assert_eq!(
+            call(&["wake", "set", "--note", "check !3746", "--in", "30m"]),
+            (
+                "wake_set",
+                json!({"note": "check !3746", "in": "30m", "at": null, "every": null,
+                       "when": null, "until": null})
+            )
+        );
+        assert_eq!(
+            call(&["wake", "set", "--note", "n", "--when", "when Bob pushes"]).1["when"],
+            json!("when Bob pushes")
+        );
+        assert_eq!(
+            call(&["wake", "cancel", "W-3"]),
+            ("wake_cancel", json!({"id": "W-3"}))
+        );
+        assert_eq!(
+            call(&["wake", "arm", "W-3", "--script", "true"]),
+            ("wake_arm", json!({"id": "W-3", "script": "true"}))
+        );
         assert_eq!(
             call(&["todo", "update", "T-3", "--status", "done"]),
             ("todo_update", json!({"id": "T-3", "status": "done"}))

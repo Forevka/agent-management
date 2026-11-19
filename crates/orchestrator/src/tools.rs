@@ -13,7 +13,7 @@ use crate::{
     core::Orchestrator,
     human::{self, NewItem},
     model::{AgentRow, BRAIN_AGENT, NewAgent, SECRETARY_AGENT, TaskRow},
-    secretary, tasks, workflows,
+    secretary, tasks, wakeups, workflows,
 };
 
 /// Agent-to-agent messages allowed per sender and recipient in ten minutes. Two agents stuck
@@ -421,6 +421,14 @@ pub async fn handle(
         // Read-only, so the brain and the secretary can both find a workflow by id: the brain
         // to `send-to-task` one instead of creating a new task, the secretary to link a todo.
         "workflow_list" => ok(workflows::list(o).await?),
+        // Waiting without a session: the orchestrator wakes the task when the time comes (or
+        // when the condition the brain wrote for it holds). See `wakeups`.
+        "wake_set" => ok(wakeups::set(o, &task.id, &agent.id, &args).await?),
+        "wake_list" => ok(wakeups::list(o, (!is_brain).then_some(task.id.as_str())).await?),
+        "wake_cancel" => {
+            let id = secretary::item_id(&args["id"], "W")?;
+            ok(wakeups::cancel(o, id, (!is_brain).then_some(task.id.as_str())).await?)
+        }
         name if secretary::TOOLS.contains(&name) => {
             if !is_secretary {
                 bail!("{name} is only available to the secretary");
@@ -557,6 +565,13 @@ pub async fn handle(
             let t = o.task(id).await?.with_context(|| format!("no task {id}"))?;
             tasks::stop(o, &t, false).await?;
             ok(format!("Stopping {id}."))
+        }
+        // The condition for a wakeup an agent asked for in plain words: only the orchestrator
+        // writes these, and it is compiled before it is stored (see `wakeups`).
+        "wake_arm" => {
+            let id = secretary::item_id(&args["id"], "W")?;
+            let script = args["script"].as_str().context("script required")?;
+            ok(wakeups::arm_script(o, id, script).await?)
         }
         "propose_task" | "propose_slack_reply" => {
             let kind = if call.tool == "propose_task" {

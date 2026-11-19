@@ -560,6 +560,36 @@ async fn command(
                 s
             }
         }
+        // Wakeups are scheduled behaviour that would otherwise be invisible.
+        "/wakeups" => {
+            let rows: Vec<crate::model::WakeupRow> = sqlx::query_as(
+                "select * from wakeups where state in ('armed', 'drafting') order by fires_at nulls last, id limit 30",
+            )
+            .fetch_all(&o.db)
+            .await?;
+            if rows.is_empty() {
+                "Nothing is waiting to be woken.".into()
+            } else {
+                let mut s = String::from("<b>Armed wakeups</b>\n");
+                for w in &rows {
+                    s.push_str(&format!(
+                        "W-{} · {} · {}{} · {}\n",
+                        w.id,
+                        esc(&w.task_id),
+                        match w.fires_at {
+                            Some(f) => f.format("%Y-%m-%d %H:%M UTC").to_string(),
+                            None => "when it holds".into(),
+                        },
+                        w.every
+                            .as_deref()
+                            .map(|e| format!(" (every {})", esc(e)))
+                            .unwrap_or_default(),
+                        esc(&clip(w.wish.as_deref().unwrap_or(&w.note), 120))
+                    ));
+                }
+                s
+            }
+        }
         "/tasks" => {
             let rows: Vec<(String, String, String)> =
                 sqlx::query_as("select id, title, status from tasks where id not in ('brain', 'secretary') and status not in ('done') order by updated_at desc limit 30")

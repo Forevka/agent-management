@@ -24,6 +24,7 @@ pub mod tg;
 pub mod tools;
 pub mod topics;
 pub mod vault;
+pub mod wakeups;
 pub mod web;
 pub mod workflows;
 pub mod working;
