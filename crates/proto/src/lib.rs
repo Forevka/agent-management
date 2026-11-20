@@ -231,6 +231,27 @@ pub fn reads_v0_2_4_messages(app_version: &str) -> bool {
         || release_version(app_version).is_some_and(|v| v > LAST_RELEASE_WITHOUT_V0_2_4)
 }
 
+/// Whether a node on `app_version` reads every message this build sends: it is this very build,
+/// or a release at least as new as this one.
+///
+/// **The gate for every orchestrator -> node message added after v0.2.4.** A node behind the
+/// orchestrator is offered the orchestrator's release first ([`Body::UpdateAvailable`]) and
+/// updates itself within minutes; once it reconnects level, it gets the new messages too. So a
+/// feature never needs to know which release it will ship in, and no node is ever sent a variant
+/// it cannot decode (an undecodable frame drops the link). A node newer than its orchestrator
+/// (a rollback) reads everything it is sent. The other direction needs no gate of its own: a node
+/// sends a new message only in answer to one of these, which only an orchestrator that reads the
+/// answer sends.
+pub fn node_is_current(app_version: &str) -> bool {
+    if app_version == BUILD_VERSION {
+        return true;
+    }
+    match (release_version(app_version), release_version(BUILD_VERSION)) {
+        (Some(node), Some(this)) => node >= this,
+        _ => false,
+    }
+}
+
 /// Finds an [`update_hint`] line in a refusal's reason.
 pub fn parse_update_hint(reason: &str) -> Option<UpdateAvailable> {
     reason.lines().find_map(|l| {
@@ -293,6 +314,33 @@ mod tests {
         ] {
             assert_eq!(parse_update_hint(reason), None, "{reason:?}");
         }
+    }
+
+    #[test]
+    fn new_messages_wait_until_a_node_is_level_with_this_build() {
+        // The same build always reads its own messages.
+        assert!(node_is_current(BUILD_VERSION));
+        match release_version(BUILD_VERSION) {
+            Some((a, b, c)) => {
+                assert!(node_is_current(&format!("v{a}.{b}.{c}")));
+                assert!(
+                    node_is_current(&format!("v{a}.{b}.{}", c + 1)),
+                    "newer reads all"
+                );
+                if c > 0 {
+                    assert!(
+                        !node_is_current(&format!("v{a}.{b}.{}", c - 1)),
+                        "behind: not yet"
+                    );
+                }
+            }
+            // A hand build: only itself, never a release or another hand build.
+            None => {
+                assert!(!node_is_current("v0.2.5"));
+                assert!(!node_is_current("0.0.1-dev"));
+            }
+        }
+        assert!(!node_is_current(""));
     }
 
     #[test]
