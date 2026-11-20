@@ -3080,7 +3080,8 @@ async fn plan_gate_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeCha
     })
     .await;
 
-    // 2. It becomes a workflow, which starts out `auto`, and its card says so with the way back.
+    // 2. It becomes a workflow. The agent did that itself, so its plans still wait for the owner,
+    //    and the card says so, with the one tap that hands them to the orchestrator.
     call_as(
         o,
         "pat-gate",
@@ -3095,7 +3096,10 @@ async fn plan_gate_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeCha
         .fetch_one(db)
         .await
         .unwrap();
-    assert_eq!(gate, "auto");
+    assert_eq!(
+        gate, "owner",
+        "setting a workflow up, which the agent does itself, does not open the gate"
+    );
     let gate_button = |action: &str| {
         let data = format!("wf|{id}|{action}");
         move |kb: &crate::chat::Keyboard| {
@@ -3105,14 +3109,20 @@ async fn plan_gate_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeCha
         }
     };
     let has_ask_me = gate_button("gate_owner");
+    let has_auto = gate_button("gate_auto");
     assert!(
         chat.ops.lock().unwrap().iter().any(|op| matches!(
             op,
             Op::Send { html, keyboard, .. }
-                if html.contains("Plans: approved automatically") && has_ask_me(keyboard)
+                if html.contains("Plans: wait for your approval") && has_auto(keyboard)
         )),
         "the workflow card says who approves its plans, with the button to change it"
     );
+    // The owner's tap on 🔓 is what makes it `auto`.
+    let reply = crate::workflows::button(o, &format!("wf|{id}|gate_auto"))
+        .await
+        .unwrap();
+    assert!(reply.contains("approved automatically"), "{reply}");
     rest().await;
 
     // 3. Its next run plans again, and that plan is approved without the owner: no card asks

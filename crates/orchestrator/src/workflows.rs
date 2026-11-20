@@ -105,6 +105,8 @@ pub async fn start(o: &Arc<Orchestrator>, task: &TaskRow, schedule: Option<&str>
     if let Some(s) = schedule {
         validate_schedule(s)?;
     }
+    // A new workflow's plans wait for the owner (the column's default) until they tap 🔓 on the
+    // card: the agent calls `workflow_finish` itself, so setting one up must not open the gate.
     // Set up again (a second `workflow_finish`), it keeps the plan gate the owner chose: only
     // the owner changes that, never the agent finishing.
     let gate: String = sqlx::query_scalar(

@@ -7,10 +7,13 @@
 //! property of the workflow (or of a project) rather than of a prompt, which a new session or a
 //! lost follow-up would forget.
 //!
-//! - `owner` (the default for projects): the plan is a card the owner approves, as always.
-//! - `auto` (the default for workflows): the agent still plans, and the plan is still recorded,
-//!   but the orchestrator approves it through the very path the owner's tap takes and posts it
-//!   silently in the task's topic, with the way back.
+//! - `owner` (the default for projects and for new workflows): the plan is a card the owner
+//!   approves, as always.
+//! - `auto` (one tap on a workflow's card; the workflows that existed before the gate): the agent
+//!   still plans, and the plan is still recorded, but the orchestrator approves it through the
+//!   very path the owner's tap takes and posts it silently in the task's topic, with the way back.
+//!   A new workflow is not `auto` by default because the agent sets it up itself
+//!   (`workflow_finish`), unasked as far as the orchestrator can tell.
 //!
 //! **Who sets it.** Only the owner: the workflow card's button, the project page in the web UI.
 //! Nothing the brain or an agent can call changes it — no flag on `create_task`, `send_to_task`
