@@ -10,7 +10,14 @@ create sequence task_key_seq;
 -- by some later path cannot quietly end up without a handle. Explicit null still means none.
 alter table tasks add column key_no bigint default nextval('task_key_seq');
 
--- The fleet's own standing sessions are not work and get no key.
+-- The fleet's own standing sessions are not work and get no key. Cleared explicitly, because
+-- the column default above has already given them one: leaving those numbers in place would let
+-- a builtin hold a number the backfill below is about to hand to a real task, and the unique
+-- index would then refuse to be built. (It did, in production, on the first deploy of this
+-- migration: a fresh database has no rows for the default to fire on, so only a database with
+-- history shows it.)
+update tasks set key_no = null where id in ('brain', 'secretary', 'retro');
+
 with ordered as (
     select id, row_number() over (order by created_at, id) as n
     from tasks
