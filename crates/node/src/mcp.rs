@@ -80,7 +80,7 @@ where
                 let result = json!({
                     "protocolVersion": version,
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "fleet", "version": env!("CARGO_PKG_VERSION")}
+                    "serverInfo": {"name": "fleet", "version": fleet_proto::BUILD_VERSION}
                 });
                 write(&out, json!({"jsonrpc":"2.0","id":id,"result":result})).await?;
             }

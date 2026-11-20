@@ -17,6 +17,21 @@ use serde::{Deserialize, Serialize};
 /// the link, so it must be refused at the handshake instead.
 pub const PROTOCOL_VERSION: u32 = 3;
 
+/// The build this binary is: the release that produced it (`v0.2.7`), or the workspace version
+/// with `-dev` for a binary built by hand.
+///
+/// This, not `CARGO_PKG_VERSION`, is what a node reports and what the fleet compares against the
+/// newest release to decide that an update is due. The workspace version never changes between
+/// releases, so a fleet that compared it would see every machine as up to date for ever. The
+/// release workflow sets `FLEET_VERSION` from the tag; rustc records the variable as a build
+/// input, so a new value recompiles this crate rather than reusing a stale one.
+pub const BUILD_VERSION: &str = match option_env!("FLEET_VERSION") {
+    // Set but empty is not a version: a Docker `ARG` declared with no value arrives that way,
+    // and a binary reporting "" would look up to date with nothing and behind everything.
+    Some(v) if !v.is_empty() => v,
+    _ => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
+};
+
 /// ALPN for the control protocol. The version is part of it so a future protocol can be
 /// served next to this one during a rolling upgrade.
 pub const ALPN: &[u8] = b"agent-fleet/control/1";

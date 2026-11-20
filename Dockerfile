@@ -27,6 +27,11 @@ RUN npm run build
 FROM rust:${RUST_VERSION}-bookworm AS builder
 WORKDIR /src
 
+# The release this image is (`v0.2.7`), baked into the binary as `fleet_proto::BUILD_VERSION`.
+# Unset or empty, the binary reports `<workspace version>-dev`, which is what a hand build is.
+ARG FLEET_VERSION=""
+ENV FLEET_VERSION=${FLEET_VERSION}
+
 ENV CARGO_TERM_COLOR=always \
     CARGO_INCREMENTAL=0 \
     # sqlx's query! macros check against .sqlx/ instead of a live database

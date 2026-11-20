@@ -2,8 +2,10 @@ name: CI
 
 on:
   push:
-    # Work branches too, so a pushed branch is checked before it has a pull request.
-    branches: [main, 'fix/**', 'feat/**']
+    # Work branches too, so a pushed branch is checked before it has a pull request. `fleet/**`
+    # and `retro/**` are the fleet's own agents' branches: until they were listed here, no agent
+    # branch was checked before it reached main, and a merge to main is now a deploy.
+    branches: [main, 'fix/**', 'feat/**', 'fleet/**', 'retro/**']
   pull_request:
   workflow_dispatch:
 
@@ -143,3 +145,63 @@ jobs:
         # bash: PowerShell's npm wrapper drops the `--` separators.
         shell: bash
         run: npm run tauri build -- --no-bundle -- --locked
+
+  # A green main is a release, and a release is rolled out to every machine (deploy/README.md).
+  # The owner's merge is the one gate, so every check above must pass first, on the exact commit
+  # that gets tagged.
+  release:
+    name: Tag and release
+    needs: [fmt, clippy, web, test-linux, test-windows]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # push the tag
+      actions: write # dispatch release.yml
+    # Two merges in quick succession must not both read the same latest tag and mint the same
+    # next one: releases are cut one at a time, in order.
+    concurrency:
+      group: release-main
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # every tag, to find the latest
+      - name: Next version
+        id: next
+        run: |
+          set -euo pipefail
+          # A re-run of this job on a commit that is already a release releases it again rather
+          # than minting a second version of the same code.
+          existing=$(git tag --points-at "$GITHUB_SHA" --list 'v*' | head -n1)
+          if [ -n "$existing" ]; then
+            echo "tag=$existing" >> "$GITHUB_OUTPUT"
+            echo "new=false" >> "$GITHUB_OUTPUT"
+            echo "$GITHUB_SHA is already $existing"
+            exit 0
+          fi
+          # Stable versions only: a hand-made prerelease (v0.3.0-rc.1) is not the line to count from.
+          last=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | grep -v -- '-' | head -n1 || true)
+          if [ -z "$last" ]; then
+            next=v0.2.0
+          else
+            IFS=. read -r maj min pat <<<"${last#v}"
+            next="v${maj}.${min}.$((pat + 1))"
+          fi
+          echo "tag=$next" >> "$GITHUB_OUTPUT"
+          echo "new=true" >> "$GITHUB_OUTPUT"
+          echo "latest ${last:-none}, next $next"
+      - name: Tag the commit CI just checked
+        if: steps.next.outputs.new == 'true'
+        env:
+          TAG: ${{ steps.next.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git tag "$TAG" "$GITHUB_SHA"
+          git push origin "refs/tags/$TAG"
+      # A tag pushed with GITHUB_TOKEN starts no workflow, so the release is dispatched at the tag
+      # explicitly; `workflow_dispatch` is the documented exception to that rule.
+      - name: Dispatch the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.next.outputs.tag }}
+        run: gh workflow run release.yml --ref "$TAG"

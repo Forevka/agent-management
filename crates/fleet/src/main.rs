@@ -22,7 +22,9 @@ use fleet_proto::ALPN;
 use iroh::protocol::Router;
 
 #[derive(Parser)]
-#[command(name = "fleet", version, about = "Claude Code agent fleet")]
+// `version = BUILD_VERSION` rather than clap's default (the package version): `fleet --version` is how
+// an updater asks a binary which release it is, and the package version never changes.
+#[command(name = "fleet", version = fleet_proto::BUILD_VERSION, about = "Claude Code agent fleet")]
 struct Cli {
     /// Where this host keeps its identity key and state.
     #[arg(long, global = true, env = "FLEET_DATA_DIR")]
@@ -110,7 +112,23 @@ enum SecretCmd {
     },
 }
 
+/// Runs the real `main` on a thread with room to spare.
+///
+/// clap's derive builds this whole command tree — every `fleet agent` subcommand and its
+/// arguments — on the stack before it looks at a single argument. The tree outgrew Windows' 1 MiB
+/// main-thread stack in debug builds, where frames are large: `fleet --version` overflowed before
+/// printing anything. Release builds fit, which is why nodes never showed it, but a binary that
+/// cannot be built and run locally is one nobody can debug.
 fn main() -> Result<()> {
+    std::thread::Builder::new()
+        .name("main".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(real_main)?
+        .join()
+        .map_err(|_| anyhow::anyhow!("the main thread panicked"))?
+}
+
+fn real_main() -> Result<()> {
     let cli = Cli::parse();
     // Logs go to stderr: for `fleet mcp`, stdout is the protocol channel.
     tracing_subscriber::fmt()
@@ -342,7 +360,8 @@ async fn node(
     let cfg = ClientConfig {
         orchestrator,
         node_name: name.unwrap_or_else(default_node_name),
-        app_version: env!("CARGO_PKG_VERSION").into(),
+        // The release this binary came from, so the fleet can tell which machines are behind.
+        app_version: fleet_proto::BUILD_VERSION.into(),
         os: std::env::consts::OS.into(),
         join_secret,
     };

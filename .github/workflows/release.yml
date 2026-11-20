@@ -8,6 +8,11 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # How every release actually starts: CI tags a green main and dispatches this at the tag (see
+  # the `release` job in ci.yml). A tag pushed with GITHUB_TOKEN starts no workflow on its own —
+  # GitHub's guard against recursive runs — and `workflow_dispatch` is the documented exception.
+  # The `push` trigger stays for a tag pushed by hand.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -19,9 +24,28 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
+  # Baked into every binary (`fleet_proto::BUILD_VERSION`) so a machine can say which release it
+  # runs and the fleet can tell which ones are behind. Without it every build reports 0.1.0.
+  FLEET_VERSION: ${{ github.ref_name }}
 
 jobs:
+  # A dispatch from a branch would publish a "release" named after the branch, with binaries
+  # from wherever that branch happened to be. Only a tag is a release.
+  guard:
+    name: Only a v* tag is a release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the ref
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          case "$REF" in
+            refs/tags/v*) echo "releasing $REF" ;;
+            *) echo "::error::release.yml runs on a v* tag, not on $REF"; exit 1 ;;
+          esac
+
   build-linux:
+    needs: guard
     name: build x86_64-unknown-linux-gnu
     runs-on: ubuntu-latest
     # Built on Debian bookworm (glibc 2.36), the same base as the Docker image,
@@ -59,6 +83,7 @@ jobs:
 
   build-windows:
     name: build x86_64-pc-windows-msvc
+    needs: guard
     runs-on: windows-latest
     env:
       # Static CRT: the exe runs without the Visual C++ redistributable.
@@ -141,6 +166,8 @@ jobs:
           cat SHA256SUMS
       - uses: softprops/action-gh-release@v3
         with:
+          # Explicit, since a dispatched run is not a tag push and the action would otherwise guess.
+          tag_name: ${{ github.ref_name }}
           files: dist/*
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}
@@ -148,6 +175,7 @@ jobs:
 
   docker:
     name: Docker image (ghcr.io)
+    needs: guard
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -181,6 +209,8 @@ jobs:
           context: .
           file: Dockerfile
           platforms: linux/amd64
+          build-args: |
+            FLEET_VERSION=${{ github.ref_name }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

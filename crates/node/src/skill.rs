@@ -430,7 +430,7 @@ pub fn write_plugin(data_dir: &Path, role: &str) -> Result<PathBuf> {
     std::fs::create_dir_all(dir.join("skills").join("fleet"))?;
     let manifest = serde_json::json!({
         "name": "fleet",
-        "version": env!("CARGO_PKG_VERSION"),
+        "version": fleet_proto::BUILD_VERSION,
         "description": "Fleet agent commands (milestones, human questions, agent messages, feeds, memory)."
     });
     std::fs::write(
