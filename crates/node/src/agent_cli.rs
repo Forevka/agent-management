@@ -438,6 +438,11 @@ pub enum JiraCmd {
         #[arg(long)]
         project: Option<String>,
     },
+    /// Where this project's Jira points, who the fleet is there, and whether it can see it.
+    Check {
+        #[arg(long)]
+        project: Option<String>,
+    },
     /// Comment on an issue. Happens at once, and is audited.
     Comment {
         issue: String,
@@ -709,6 +714,7 @@ pub fn to_call(cmd: AgentCmd) -> Result<(&'static str, Value)> {
         AgentCmd::Jira(JiraCmd::Sprint { limit, project }) => {
             ("jira_sprint", json!({"limit": limit, "project": project}))
         }
+        AgentCmd::Jira(JiraCmd::Check { project }) => ("jira_check", json!({"project": project})),
         AgentCmd::Jira(JiraCmd::Comment {
             issue,
             body,

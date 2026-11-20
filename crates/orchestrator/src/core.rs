@@ -112,8 +112,10 @@ impl Orchestrator {
         self.working.show(Some(message_id), from, topic, task_id);
     }
 
-    /// Stops "typing…" for the task: the agent replied, or waits on the owner.
+    /// Stops "typing…" for the task: the agent replied, or waits on the owner. Either way the
+    /// owner has something to read, so their message counts as answered (see `working`).
     pub fn stop_working(&self, task_id: &str) {
+        self.working.answered(task_id);
         self.working.stop(task_id);
     }
 
@@ -428,13 +430,35 @@ impl Orchestrator {
                 }
             }
             AgentEventKind::Output { json } => {
+                // What the agent says in its own words, kept while the owner waits for an
+                // answer (cheap checks first: most lines are tool traffic, not speech).
+                // Cheap checks first, and no exact punctuation: whether a line is written
+                // compactly or with spaces after its colons is not ours to rely on.
+                if current
+                    && json.contains("assistant")
+                    && json.contains("\"text\"")
+                    && let Some(text) = assistant_text(&json)
+                {
+                    self.working.said(&task_id, &run_id, &text);
+                }
                 // The end of a turn ends "typing…" (a cheap check first: most lines are not).
                 if current
                     && json.contains("\"result\"")
                     && serde_json::from_str::<serde_json::Value>(&json)
                         .is_ok_and(|v| v["type"] == "result")
                 {
-                    self.working.turn_ended(&task_id, &run_id);
+                    // A turn that ended without a word reaching the owner: they wrote into the
+                    // topic and would be looking at silence, while the answer sits in a
+                    // transcript only the web UI shows. Post what the agent said. The agents
+                    // are told to use `fleet agent post` (see `prompts`); this is for when they
+                    // forget, which costs the owner a question they think was ignored.
+                    if let Some(text) = self.working.turn_ended(&task_id, &run_id)
+                        && let Some(task) = task.as_ref()
+                        && !crate::model::is_builtin_task(&task.id)
+                    {
+                        self.post_task(task, &esc(&crate::chat::clip(&text, 1500)), Notify::Sound)
+                            .await;
+                    }
                     if task_id == crate::model::SECRETARY_TASK {
                         crate::secretary::turn_ended(self, &run_id);
                     }
@@ -972,5 +996,50 @@ impl Orchestrator {
             .execute(&self.db)
             .await?;
         Ok(())
+    }
+}
+
+/// What an assistant line says in words, if it says anything: a stream-json `assistant` message
+/// carries thinking, tool calls and text in one `content` array, and only the text was meant
+/// for a reader.
+fn assistant_text(line: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    if v["type"] != "assistant" {
+        return None;
+    }
+    let said: Vec<&str> = v["message"]["content"]
+        .as_array()?
+        .iter()
+        .filter(|b| b["type"] == "text")
+        .filter_map(|b| b["text"].as_str())
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .collect();
+    (!said.is_empty()).then(|| said.join("\n\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::assistant_text;
+
+    #[test]
+    fn only_the_words_of_an_assistant_line_are_taken() {
+        // Written with spaces after the colons, as a stand-in agent's `json.dumps` does: what a
+        // line says cannot depend on how it was spelled.
+        let thinking_and_text = r#"{"type": "assistant", "message": {"content": [
+            {"type": "thinking", "thinking": "not for the owner"},
+            {"type": "text", "text": "  I could not read the ticket.  "}]}}"#;
+        assert_eq!(
+            assistant_text(thinking_and_text).as_deref(),
+            Some("I could not read the ticket.")
+        );
+        // A tool call says nothing, and neither does anything that is not an assistant line.
+        let tool_use = r#"{"type":"assistant","message":{"content":[
+            {"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}"#;
+        assert_eq!(assistant_text(tool_use), None);
+        let tool_result = r#"{"type":"user","message":{"content":[
+            {"type":"tool_result","content":"text"}]}}"#;
+        assert_eq!(assistant_text(tool_result), None);
+        assert_eq!(assistant_text("not json"), None);
     }
 }

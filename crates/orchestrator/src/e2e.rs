@@ -2152,11 +2152,43 @@ async fn jira_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool) {
     );
     let r = human::answer(o, item.id, Answer::Accept).await.unwrap();
     assert!(r.contains("BIOINS-9000"), "{r}");
-    // Only Alice's own project is reachable from her task: the tools are the brain's.
-    let e = call_as(o, &agent, &worker.id, "jira_sprint", json!({}))
+    // An ordinary agent reads its own project's tracker: a task named after a ticket is the
+    // normal case, and a reviewer that cannot read the ticket reviews against a summary of it.
+    // The project it names is ignored — only its own task's project is reachable from it.
+    let out = call_as(
+        o,
+        &agent,
+        &worker.id,
+        "jira_issue",
+        json!({"project": "other", "issue": "BIOINS-5702"}),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        out.result.contains("of project demo")
+            && out.result.contains("untrusted data")
+            && out.result.contains("another user's files"),
+        "{}",
+        out.result
+    );
+    // Writing to the tracker stays the brain's, and is refused by name rather than as an
+    // unknown tool: an agent that tries learns what to do instead.
+    for tool in ["jira_comment", "jira_transition"] {
+        let e = call_as(
+            o,
+            &agent,
+            &worker.id,
+            tool,
+            json!({"issue": "BIOINS-5702", "body": "x", "to": "Done"}),
+        )
         .await
         .unwrap_err();
-    assert!(e.to_string().contains("unknown tool"), "{e}");
+        assert!(
+            e.to_string().contains("only available to the orchestrator"),
+            "{tool}: {e}"
+        );
+    }
 }
 
 /// A read of the web API as the owner, for flows that want to check what the UI is shown.
@@ -4231,6 +4263,26 @@ async fn task_lifecycle_through_a_real_node() {
             .any(|op| matches!(op, Op::Reopen(t) if Some(*t) == task.topic_id)),
         "topic reopened"
     );
+    // The agent answered the owner in its own session and called nothing: text like that never
+    // leaves the session, so the orchestrator posts it in the topic. Otherwise the owner writes
+    // into a topic and watches nothing happen, while the answer sits in a transcript.
+    wait_for("the agent's answer reached the topic", || async {
+        chat.ops
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|op| {
+                matches!(
+                    op,
+                    Op::Send { topic, html, notify, .. }
+                        if *topic == task.topic_id
+                            && html.contains("one more coat")
+                            && *notify == Notify::Sound
+                )
+            })
+            .then_some(())
+    })
+    .await;
 
     // 6. A late "exited" from the first run must not touch the new one.
     let node_key: fleet_net::EndpointId = node_id.parse().unwrap();

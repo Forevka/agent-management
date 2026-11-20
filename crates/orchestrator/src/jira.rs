@@ -165,6 +165,48 @@ impl Jira {
         &self.key
     }
 
+    /// Enough of the account to tell which one it is, without handing out the value itself. The
+    /// email is a secret-folder item like any other, so it never reaches an agent whole; the
+    /// domain is what tells a wrong account from a wrong site anyway.
+    fn masked(email: &str) -> String {
+        match email.split_once('@') {
+            Some((user, domain)) => format!(
+                "{}…@{domain}",
+                user.chars().take(2).collect::<String>().trim()
+            ),
+            None => "…".to_owned(),
+        }
+    }
+
+    /// The site's host, for saying where a call went without repeating the whole URL.
+    pub fn site(&self) -> &str {
+        self.base
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+    }
+
+    /// Where this project's Jira points, who the fleet is there, and whether that account can
+    /// actually see the project. The answer to "why did it say 404": a wrong site, an account
+    /// without access and a mistyped key all look alike from a single failed read.
+    pub async fn whoami(&self) -> Result<Value> {
+        let me = self.call(reqwest::Method::GET, "myself", None).await?;
+        // A search the project scope makes safe: it either returns issues, or says why not.
+        let visible = match self.search("", 1).await {
+            Ok(v) => json!({"can_see_the_project": true, "read": v["read"].clone()}),
+            Err(e) => json!({"can_see_the_project": false, "why": e.to_string()}),
+        };
+        Ok(json!({
+            "site": self.site(),
+            // Who the site says we are, by name, plus the configured address masked: the name
+            // is Jira's own answer and identifies the account, the address is a vault value.
+            "account": Self::masked(me["emailAddress"].as_str().unwrap_or(&self.email)),
+            "account_name": me["displayName"].clone(),
+            "project_key": self.key,
+            "board": self.board,
+            "project": visible,
+        }))
+    }
+
     /// Issues, comments and transitions go through **v2**: Cloud still serves it, and it reads
     /// and writes descriptions and comment bodies as plain strings instead of Atlassian
     /// Document Format trees, which is what an agent can actually read and write.
@@ -200,8 +242,19 @@ impl Jira {
             status.is_success(),
             // Jira's own words, which say what is wrong far better than a status alone. No
             // credential is ever part of a response.
-            "Jira answered {}: {}",
+            //
+            // For the three statuses that mean "not you": which site and which account, because
+            // Jira's own answer to both a wrong site and an account without access is the same
+            // 404 ("Issue does not exist or you do not have permission to see it"), and without
+            // this the reader cannot tell a typo in the folder's URL from a missing permission.
+            // The token never appears; the email is the owner's own, in the owner's own fleet.
+            "Jira answered {}{}: {}",
             status.as_u16(),
+            if matches!(status.as_u16(), 401 | 403 | 404) {
+                format!(" (site {}, as {})", self.site(), Self::masked(&self.email))
+            } else {
+                String::new()
+            },
             clip(text.trim(), 600)
         );
         if text.trim().is_empty() {
@@ -708,6 +761,15 @@ mod tests {
             scoped_jql("DAP", &sprint_jql(Some(42))),
             "project = DAP AND (sprint = 42 AND assignee = currentUser()) ORDER BY status, priority DESC"
         );
+    }
+
+    #[test]
+    fn an_account_is_named_without_being_handed_over() {
+        // Enough to tell a wrong account from a wrong site; not the value itself, which is a
+        // secret-folder item.
+        assert_eq!(Jira::masked("bohdan.lushchyk@devcom.com"), "bo…@devcom.com");
+        assert_eq!(Jira::masked("a@x.test"), "a…@x.test");
+        assert_eq!(Jira::masked("nonsense"), "…");
     }
 
     #[test]

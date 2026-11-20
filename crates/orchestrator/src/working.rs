@@ -37,9 +37,29 @@ struct State {
     /// Task -> the generation of the "typing…" loop shown for it. A newer message takes over
     /// (its loop has a newer generation, and the older loop ends).
     typing: HashMap<String, u64>,
-    /// Task -> its current run and the user messages handed to that run without a `result`
-    /// yet.
-    in_flight: HashMap<String, (String, u32)>,
+    /// Task -> the run the owner's messages went to, and how they are going.
+    in_flight: HashMap<String, Flight>,
+}
+
+/// What a run owes the owner: one `result` per message it was handed, and at least one word
+/// back. The last thing it said is kept so that a turn which ends with nothing said can be
+/// answered with it (see [`Working::turn_ended`]).
+struct Flight {
+    run: String,
+    pending: u32,
+    answered: bool,
+    last_text: Option<String>,
+}
+
+impl Flight {
+    fn new(run: &str) -> Self {
+        Self {
+            run: run.to_owned(),
+            pending: 0,
+            answered: false,
+            last_text: None,
+        }
+    }
 }
 
 impl Working {
@@ -105,40 +125,70 @@ impl Working {
         let entry = st
             .in_flight
             .entry(task_id.to_owned())
-            .or_insert_with(|| (run_id.to_owned(), 0));
-        if entry.0 != run_id {
-            *entry = (run_id.to_owned(), 0);
+            .or_insert_with(|| Flight::new(run_id));
+        if entry.run != run_id {
+            *entry = Flight::new(run_id);
         }
-        entry.1 += 1;
+        entry.pending += 1;
+        // A new message is a new thing to answer, whatever was said about the last one.
+        entry.answered = false;
+        entry.last_text = None;
+    }
+
+    /// Something reached the owner: a post, a reply, a card of their own to answer. They are no
+    /// longer owed one (see [`Self::turn_ended`]).
+    pub fn answered(&self, task_id: &str) {
+        if let Some(f) = self.state.lock().unwrap().in_flight.get_mut(task_id) {
+            f.answered = true;
+        }
+    }
+
+    /// The last thing the run said in its own session. Kept only while the owner is waiting for
+    /// an answer, and only the newest: nothing else needs it.
+    pub fn said(&self, task_id: &str, run_id: &str, text: &str) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        if let Some(f) = self.state.lock().unwrap().in_flight.get_mut(task_id)
+            && f.run == run_id
+            && !f.answered
+        {
+            f.last_text = Some(text.to_owned());
+        }
     }
 
     /// The run `run_id` finished a turn. Once it has answered every message it was given,
     /// "typing…" stops.
-    pub fn turn_ended(&self, task_id: &str, run_id: &str) {
+    ///
+    /// Returns what the agent last said *if* the owner's message was never answered through the
+    /// fleet: an agent that writes its answer only in its own session leaves the owner looking
+    /// at a silent topic, and the caller posts this instead of nothing.
+    pub fn turn_ended(&self, task_id: &str, run_id: &str) -> Option<String> {
         let mut st = self.state.lock().unwrap();
         let done = match st.in_flight.get_mut(task_id) {
-            Some((run, n)) if run == run_id => {
-                *n = n.saturating_sub(1);
-                *n == 0
+            Some(f) if f.run == run_id => {
+                f.pending = f.pending.saturating_sub(1);
+                f.pending == 0
             }
             // A run we did not count (sent before this process started): nothing to wait for.
             _ => true,
         };
-        if done {
-            st.in_flight.remove(task_id);
-            st.typing.remove(task_id);
+        if !done {
+            return None;
         }
+        st.typing.remove(task_id);
+        st.in_flight
+            .remove(task_id)
+            .filter(|f| !f.answered)
+            .and_then(|f| f.last_text)
     }
 
     /// The task's run `run_id` is gone (exited, lost, failed to start): nothing more will be
     /// answered from it. A late report about an older run leaves a newer run's count alone.
     pub fn run_ended(&self, task_id: &str, run_id: &str) {
         let mut st = self.state.lock().unwrap();
-        if st
-            .in_flight
-            .get(task_id)
-            .is_some_and(|(run, _)| run != run_id)
-        {
+        if st.in_flight.get(task_id).is_some_and(|f| f.run != run_id) {
             return;
         }
         st.in_flight.remove(task_id);

@@ -94,11 +94,14 @@ pub async fn create(o: &Orchestrator, item: NewItem<'_>) -> Result<HumanItemRow>
     .bind(&item.call_id)
     .fetch_one(&o.db)
     .await?;
-    // The agent now waits on the owner: "typing…" would say the opposite.
-    if item.blocking
-        && let Some(task) = item.task
-    {
-        o.stop_working(&task.id);
+    // The agent now waits on the owner: "typing…" would say the opposite. Either way they have
+    // something of the agent's to read, so their own message counts as answered (`working`).
+    if let Some(task) = item.task {
+        if item.blocking {
+            o.stop_working(&task.id);
+        } else {
+            o.working.answered(&task.id);
+        }
     }
     if let Err(e) = announce(o, &row, item.task).await {
         tracing::warn!("announcing Q-{} failed: {e:#}", row.id);
