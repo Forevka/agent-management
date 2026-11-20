@@ -5,7 +5,7 @@
 use serde::{Deserialize, Serialize};
 
 /// One incoming update from `getUpdates`. Only the kinds the fleet asks for are modelled; an
-/// update of any other kind decodes with all three fields `None`.
+/// update of any other kind decodes with every payload field `None`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Update {
     pub update_id: i64,
@@ -15,6 +15,10 @@ pub struct Update {
     pub edited_message: Option<Message>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub callback_query: Option<CallbackQuery>,
+    /// A bot the owner created for this bot to manage. Asking for it needs a non-empty
+    /// `allowed_updates` to name `managed_bot`, or Telegram never sends this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_bot: Option<ManagedBotUpdated>,
 }
 
 /// A message in a chat.
@@ -171,4 +175,86 @@ impl InlineKeyboardButton {
             url: Some(url.into()),
         }
     }
+}
+
+/// A bot the owner created for this bot to manage, as the `managed_bot` update reports it.
+///
+/// Telegram sends this only to the manager bot, and only the manager bot can then fetch the new
+/// bot's token with [`crate::Bot::get_managed_bot_token`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ManagedBotUpdated {
+    /// The user who owns the bot: the person who tapped the button.
+    pub user: User,
+    /// The bot that was created, or whose token or owner changed.
+    pub bot: User,
+}
+
+/// A custom reply keyboard, shown in place of the user's keyboard.
+///
+/// The fleet uses this for one thing only: the button that asks the owner to create a managed
+/// bot, which Telegram allows on a reply keyboard in a private chat and nowhere else.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ReplyKeyboardMarkup {
+    pub keyboard: Vec<Vec<KeyboardButton>>,
+    /// Shrinks the keyboard to the height its buttons need.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub resize_keyboard: bool,
+    /// Hides the keyboard once a button has been pressed; it can be reopened from the input
+    /// field. The ask is a one-off, so it should not sit over the owner's keyboard for ever.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub one_time_keyboard: bool,
+}
+
+impl ReplyKeyboardMarkup {
+    /// A one-time keyboard holding a single button.
+    pub fn one_button(button: KeyboardButton) -> Self {
+        Self {
+            keyboard: vec![vec![button]],
+            resize_keyboard: true,
+            one_time_keyboard: true,
+        }
+    }
+}
+
+/// One button of a reply keyboard. A plain button just sends its `text` as a message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyboardButton {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_managed_bot: Option<KeyboardButtonRequestManagedBot>,
+}
+
+impl KeyboardButton {
+    /// A button that opens Telegram's own "create a bot" flow, pre-filled with `name` and
+    /// `username`, and gives the new bot to this bot to manage.
+    ///
+    /// Only works in a private chat, and only for a bot whose `can_manage_bots` is set (toggled
+    /// by the owner in @BotFather). The press itself is the owner's: a bot cannot create a bot.
+    pub fn request_managed_bot(
+        text: impl Into<String>,
+        request_id: i64,
+        name: impl Into<String>,
+        username: impl Into<String>,
+    ) -> Self {
+        Self {
+            text: text.into(),
+            request_managed_bot: Some(KeyboardButtonRequestManagedBot {
+                request_id,
+                suggested_name: Some(name.into()),
+                suggested_username: Some(username.into()),
+            }),
+        }
+    }
+}
+
+/// What to pre-fill Telegram's managed-bot creation flow with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyboardButtonRequestManagedBot {
+    /// Echoed back to the bot, to tell one outstanding ask from another.
+    pub request_id: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggested_name: Option<String>,
+    /// Telegram requires a bot username to end in `bot`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggested_username: Option<String>,
 }

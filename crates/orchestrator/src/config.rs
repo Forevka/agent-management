@@ -23,6 +23,13 @@ pub struct Config {
     pub retention_days: i64,
     /// Remind about unanswered blocking items after this many minutes.
     pub remind_after_minutes: i64,
+    /// How many agents **of one role** a project may have, so its tasks run side by side
+    /// instead of queueing behind a single specialist. The orchestrator adds one when a task
+    /// would otherwise wait and a node has room; `1` keeps a project's work strictly serial.
+    ///
+    /// Per role, not per project, because the roles do different jobs: a project is still free
+    /// to have an implementor, a reviewer and a tester without any of them crowding out another.
+    pub max_agents_per_project: i64,
     /// Delete a finished task's topic once it has been quiet this long, so the forum does not
     /// fill up with work that is over. `0` keeps every topic for ever.
     pub delete_topics_after_minutes: i64,
@@ -236,6 +243,7 @@ impl Config {
             magic_link_minutes: env_num("FLEET_MAGIC_LINK_MINUTES", 60 * 24),
             retention_days: env_num("FLEET_RETENTION_DAYS", 90),
             remind_after_minutes: env_num("FLEET_REMIND_AFTER_MINUTES", 120),
+            max_agents_per_project: env_num("FLEET_MAX_AGENTS_PER_PROJECT", 3).max(1),
             delete_topics_after_minutes: env_num("FLEET_TOPIC_DELETE_AFTER_MINUTES", 60),
             secretary: SecretaryConfig::from_env(),
             retro: RetroConfig::from_env(&model_for_retro),
@@ -256,6 +264,7 @@ impl Config {
             magic_link_minutes: 60,
             retention_days: 90,
             remind_after_minutes: 120,
+            max_agents_per_project: 3,
             // Off by default in tests: the one test that wants it sets its own value.
             delete_topics_after_minutes: 0,
             secretary: SecretaryConfig::test(),

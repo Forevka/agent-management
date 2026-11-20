@@ -165,11 +165,15 @@ pub const RETRO_AGENT: &str = "retro";
 /// The fleet's own long-lived sessions (the brain, the secretary, the retrospective): never
 /// planned, never "finished", not listed or administered as ordinary tasks and agents.
 pub fn is_builtin_task(id: &str) -> bool {
-    id == BRAIN_TASK || id == SECRETARY_TASK || id == RETRO_TASK
+    BUILTIN_TASKS.contains(&id)
 }
 pub fn is_builtin_agent(id: &str) -> bool {
-    id == BRAIN_AGENT || id == SECRETARY_AGENT || id == RETRO_AGENT
+    BUILTIN_AGENTS.contains(&id)
 }
+
+/// The same ids as slices, for the queries that have to exclude them in SQL.
+pub const BUILTIN_AGENTS: &[&str] = &[BRAIN_AGENT, SECRETARY_AGENT, RETRO_AGENT];
+pub const BUILTIN_TASKS: &[&str] = &[BRAIN_TASK, SECRETARY_TASK, RETRO_TASK];
 
 #[derive(Debug, Clone, FromRow)]
 pub struct TodoRow {

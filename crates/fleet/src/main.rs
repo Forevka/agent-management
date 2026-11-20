@@ -252,7 +252,12 @@ async fn orchestrator(
         .get_me()
         .await
         .context("the orchestrator bot token is invalid")?;
-    let chat = Arc::new(TelegramChat::new(bot.clone(), chat_id, api_url));
+    let chat = Arc::new(TelegramChat::new(
+        bot.clone(),
+        chat_id,
+        cfg.owner_id,
+        api_url,
+    ));
     let o = Orchestrator::new(db, vault, server, chat.clone(), cfg, auth);
     *o.invite_addr.write().unwrap() = Some(invite_addr);
     o.load_bots().await?;

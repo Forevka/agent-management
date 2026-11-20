@@ -156,6 +156,13 @@ impl Orchestrator {
         self.lock(format!("agent:{agent_id}"))
     }
 
+    /// Held while a project is given one more agent, so two tasks dispatched at the same moment
+    /// cannot both read "one below the cap" and both grow it. Taken inside a task's lock and
+    /// before any agent's, so it joins the existing order: task, project, agent.
+    pub(crate) fn project_lock(&self, project: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.lock(format!("project:{project}"))
+    }
+
     /// Locks nobody else holds are dropped as new ones are made, so the map stays as small as
     /// the set of busy tasks and agents.
     fn lock(&self, key: String) -> Arc<tokio::sync::Mutex<()>> {

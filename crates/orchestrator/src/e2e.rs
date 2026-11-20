@@ -4029,6 +4029,350 @@ async fn retro_flow(
 
 /// Housekeeping tidies the forum: a finished task's topic goes once it has been quiet, and
 /// nothing else's does. A topic deleted this way comes back if the task is picked up again.
+/// A project whose only agent is busy grows another instead of queueing, up to the configured
+/// cap, and the bot the new agent has no pool entry for is asked of the owner — not typed by
+/// them. `Config::test()` allows three agents per project.
+async fn growth_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) {
+    let alice: String = sqlx::query_scalar("select id from agents where name = 'Alice'")
+        .fetch_one(db)
+        .await
+        .unwrap();
+    // Busy work for an agent, with no node of its own so the node keeps every slot free: this
+    // flow is about agents being scarce, not nodes.
+    let occupy = |id: &'static str, agent: String| async move {
+        sqlx::query(
+            "insert into tasks (id, project, title, brief, agent_id, status, running, run_id)
+             values ($1, 'demo', 'Busy', 'nothing to do', $2, 'running', true, $1)",
+        )
+        .bind(id)
+        .bind(&agent)
+        .execute(db)
+        .await
+        .unwrap();
+    };
+    // Alice runs with settings of her own, so a grown copy of her must inherit them: a task must
+    // not change model, effort or node preference merely because its specialist was busy.
+    sqlx::query("update agents set model = 'haiku', effort = 'low' where id = $1")
+        .bind(&alice)
+        .execute(db)
+        .await
+        .unwrap();
+    occupy("growth-busy-1", alice.clone()).await;
+    // An earlier flow may already have spent today's one ask — the retrospective's own agent
+    // gets no bot either, this fleet's pool having a single one. Release the day so step 1 can
+    // watch an ask happen and step 2 can watch the next be held back, and count from here:
+    // how many asks another flow made is not this flow's business to assert.
+    sqlx::query("delete from kv where key = 'bot_pool_asked_on'")
+        .execute(db)
+        .await
+        .unwrap();
+    let before = chat.bots_asked_for().len();
+
+    // 1. Alice is busy, so the task goes to a second agent rather than into the queue. The
+    //    title keeps the fake agent on its short path (plan, then wait for approval).
+    let first = tasks::create_task(
+        o,
+        CreateTask {
+            project: "demo".into(),
+            title: "Review MR !51".into(),
+            brief: "Two tasks at once.".into(),
+            ticket: Some("GROW-1".into()),
+            agent: Some("Alice".into()),
+            new_agent: None,
+            model: None,
+            effort: None,
+        },
+    )
+    .await
+    .unwrap();
+    let (agent2, name2): (String, String) = sqlx::query_as(
+        "select a.id, a.name from tasks t join agents a on a.id = t.agent_id where t.id = $1",
+    )
+    .bind(&first.id)
+    .fetch_one(db)
+    .await
+    .unwrap();
+    assert_ne!(agent2, alice, "a busy agent's task is given a new one");
+    assert_eq!(name2, "Alice 2", "the new agent is numbered from the first");
+    let settings: (Option<String>, Option<String>, Option<String>) =
+        sqlx::query_as("select model, effort, preferred_node from agents where id = $1")
+            .bind(&agent2)
+            .fetch_one(db)
+            .await
+            .unwrap();
+    assert_eq!(
+        (settings.0.as_deref(), settings.1.as_deref()),
+        (Some("haiku"), Some("low")),
+        "a grown agent runs the way the one it was cloned from does"
+    );
+    assert!(
+        first.running && first.run_id.is_some(),
+        "the grown agent's task really started: {first:?}"
+    );
+    // The topic says who took it, because its intro named Alice.
+    assert!(
+        chat.sent()
+            .iter()
+            .any(|(_, topic, html, _)| *topic == first.topic_id
+                && html.contains("Alice 2")
+                && html.contains("Alice is busy")),
+        "the topic is told the task changed hands"
+    );
+    // The pool's one bot is Alice's, so the second agent has none and the owner is asked for
+    // one. Nothing was typed or pasted: the ask is a button.
+    assert!(
+        sqlx::query_scalar::<_, Option<i64>>("select bot_id from agents where id = $1")
+            .bind(&agent2)
+            .fetch_one(db)
+            .await
+            .unwrap()
+            .is_none(),
+        "the grown agent has no bot yet, and works anyway"
+    );
+    let asked = chat.bots_asked_for();
+    assert_eq!(
+        asked.len(),
+        before + 1,
+        "the owner was asked once: {asked:?}"
+    );
+    let (ask_name, ask_username) = asked.last().unwrap();
+    assert_eq!(ask_name, "Alice 2");
+    assert!(
+        ask_username.ends_with("bot") && ask_username == &ask_username.to_lowercase(),
+        "Telegram only accepts a lowercase username ending in `bot`: {ask_username}"
+    );
+
+    // 2. Asked again the same day, the fleet stays quiet: the owner may simply be at Telegram's
+    //    cap on bots one account can own, and a nag per task would be worse than no face.
+    occupy("growth-busy-2", agent2.clone()).await;
+    let second = tasks::create_task(
+        o,
+        CreateTask {
+            project: "demo".into(),
+            title: "Review MR !52".into(),
+            brief: "A third at once.".into(),
+            ticket: Some("GROW-2".into()),
+            agent: Some("Alice".into()),
+            new_agent: None,
+            model: None,
+            effort: None,
+        },
+    )
+    .await
+    .unwrap();
+    let name3: String = sqlx::query_scalar(
+        "select a.name from tasks t join agents a on a.id = t.agent_id where t.id = $1",
+    )
+    .bind(&second.id)
+    .fetch_one(db)
+    .await
+    .unwrap();
+    assert_eq!(name3, "Alice 3", "a project grows a third agent");
+    assert_eq!(
+        chat.bots_asked_for().len(),
+        before + 1,
+        "the owner is asked for a bot once a day, not once an agent"
+    );
+
+    // 3. At the cap, the fourth task queues and says why, naming the agent it waits for.
+    let agent3: String = sqlx::query_scalar("select id from agents where name = 'Alice 3'")
+        .fetch_one(db)
+        .await
+        .unwrap();
+    occupy("growth-busy-3", agent3).await;
+    let third = tasks::create_task(
+        o,
+        CreateTask {
+            project: "demo".into(),
+            title: "Review MR !53".into(),
+            brief: "One too many.".into(),
+            ticket: Some("GROW-3".into()),
+            agent: Some("Alice".into()),
+            new_agent: None,
+            model: None,
+            effort: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(third.status, "queued", "the cap holds: {third:?}");
+    assert!(!third.running);
+    // Three implementors, the cap. The project's other roles are untouched: the ceiling is on
+    // how many of a kind work at once, not on how many agents a project may have.
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "select count(*) from agents where project = 'demo' and role = 'implementor'"
+        )
+        .fetch_one(db)
+        .await
+        .unwrap(),
+        3,
+        "FLEET_MAX_AGENTS_PER_PROJECT is the ceiling, per role"
+    );
+    assert!(
+        sqlx::query_scalar::<_, i64>(
+            "select count(*) from agents where project = 'demo' and role <> 'implementor'"
+        )
+        .fetch_one(db)
+        .await
+        .unwrap()
+            > 0,
+        "the other roles this test made along the way are still there"
+    );
+    assert!(
+        chat.sent()
+            .iter()
+            .any(|(_, topic, html, _)| *topic == third.topic_id && html.contains("is busy with")),
+        "a queued task says which agent it waits for"
+    );
+
+    // 4. The owner taps the button: Telegram creates the bot, hands the orchestrator the token,
+    //    and the oldest agent that had no face gets one. The owner never sees the token.
+    let (bot_user_id, _) = o.chat.inspect_bot("424242:new-managed-bot").await.unwrap();
+    let told = crate::admin::adopt_managed_bot(o, bot_user_id, "424242:new-managed-bot")
+        .await
+        .unwrap();
+    assert!(told.contains("Alice 2"), "it says whose face it is: {told}");
+    let bound: Option<i64> = sqlx::query_scalar("select bot_id from agents where id = $1")
+        .bind(&agent2)
+        .fetch_one(db)
+        .await
+        .unwrap();
+    assert!(bound.is_some(), "the adopted bot belongs to Alice 2 now");
+    assert!(
+        chat.bot_profiles()
+            .iter()
+            .any(|(_, name)| name.starts_with("Alice 2")),
+        "the new bot is renamed to the agent it speaks for: {:?}",
+        chat.bot_profiles()
+    );
+    // A second bot, with no ask outstanding for anyone, falls back to the oldest agent that is
+    // still speaking as the orchestrator — here the tester made earlier in this test.
+    let (second_bot, _) = o
+        .chat
+        .inspect_bot("535353:spare-managed-bot")
+        .await
+        .unwrap();
+    let told2 = crate::admin::adopt_managed_bot(o, second_bot, "535353:spare-managed-bot")
+        .await
+        .unwrap();
+    assert!(
+        told2.contains("Bob"),
+        "with nobody asked for, the longest-waiting agent gets it: {told2}"
+    );
+
+    // The token is in the vault, encrypted, and nowhere else.
+    let stored: Vec<u8> = sqlx::query_scalar("select token from bots where tg_user_id = $1")
+        .bind(bot_user_id)
+        .fetch_one(db)
+        .await
+        .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&stored).contains("424242"),
+        "a bot token is encrypted at rest"
+    );
+
+    // 5. A task that already has a session stays with the agent that opened it, however busy:
+    //    resuming someone else's transcript would hand an agent another name's work.
+    sqlx::query(
+        "update tasks set status = 'queued', running = false, session_id = 's-grow' where id = $1",
+    )
+    .bind(&first.id)
+    .execute(db)
+    .await
+    .unwrap();
+    occupy("growth-busy-4", agent2.clone()).await;
+    tasks::dispatch(o, &o.task(&first.id).await.unwrap().unwrap(), None, None)
+        .await
+        .unwrap();
+    let still: String = sqlx::query_scalar("select agent_id from tasks where id = $1")
+        .bind(&first.id)
+        .fetch_one(db)
+        .await
+        .unwrap();
+    assert_eq!(
+        still, agent2,
+        "a task with a session waits for its own agent instead of being handed over"
+    );
+
+    // 6. A follow-up queued while a *candidate* agent was in hand stays addressed to the agent
+    //    the task actually has. The candidate only becomes real at the claim, so a message
+    //    addressed to one that never got the task would sit in the queue for ever: nothing
+    //    re-points it, and a run claims its messages by `to_agent`.
+    sqlx::query(
+        "update tasks set status = 'queued', running = false, run_id = null, session_id = null,
+                agent_id = $2 where id = $1",
+    )
+    .bind(&third.id)
+    .bind(&alice)
+    .execute(db)
+    .await
+    .unwrap();
+    // Exactly one sibling free, so `agent_for` really does pick a candidate: everything of
+    // this project stops, then Alice alone is made busy again. (Without this the earlier
+    // steps leave every agent busy, `agent_for` gives up, and the queue note comes from the
+    // branch that never had a candidate in hand — which would prove nothing.)
+    sqlx::query(
+        "update tasks set running = false
+         where project = 'demo' and agent_id in (select id from agents where project = 'demo')",
+    )
+    .execute(db)
+    .await
+    .unwrap();
+    sqlx::query("update tasks set running = true where id = 'growth-busy-1'")
+        .execute(db)
+        .await
+        .unwrap();
+    // With every node offline nothing can start, so the task is queued *after* the candidate
+    // was chosen — the moment the owner's words could be addressed to the wrong agent.
+    sqlx::query("update nodes set online = false")
+        .execute(db)
+        .await
+        .unwrap();
+    tasks::deliver_as(
+        o,
+        &o.task(&third.id).await.unwrap().unwrap(),
+        "and please rebase it".into(),
+        tasks::Origin::Owner("and please rebase it".into()),
+    )
+    .await
+    .unwrap();
+    sqlx::query("update nodes set online = true")
+        .execute(db)
+        .await
+        .unwrap();
+    let held: Vec<(String, Option<String>)> =
+        sqlx::query_as("select to_agent, run_id from messages where task_id = $1")
+            .bind(&third.id)
+            .fetch_all(db)
+            .await
+            .unwrap();
+    let owner_of: String = sqlx::query_scalar("select agent_id from tasks where id = $1")
+        .bind(&third.id)
+        .fetch_one(db)
+        .await
+        .unwrap();
+    assert!(!held.is_empty(), "the owner's words were kept");
+    assert!(
+        held.iter().all(|(to, _)| *to == owner_of),
+        "a queued follow-up belongs to the agent the task has ({owner_of}), not to a candidate \
+         it may never be given: {held:?}"
+    );
+
+    for id in [
+        "growth-busy-1",
+        "growth-busy-2",
+        "growth-busy-3",
+        "growth-busy-4",
+    ] {
+        sqlx::query("update tasks set running = false, status = 'done' where id = $1")
+            .bind(id)
+            .execute(db)
+            .await
+            .unwrap();
+    }
+}
+
 async fn topic_cleanup_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) {
     let agent: String = sqlx::query_scalar("select id from agents where name = 'Alice'")
         .fetch_one(db)
@@ -5760,28 +6104,32 @@ async fn task_lifecycle_through_a_real_node() {
     // 17. The secretary, on a source that is not Slack (an in-memory one, through the same
     //     ingest path): messages arrive, it gets a framed batch, adds todos, escalates, and
     //     cannot use task, reply, agent or admin tools.
-    secretary_flow(&o, &db, &chat).await;
+    // Every flow from here on is `Box::pin`ned. An `.await` on an `async fn` holds that
+    // function's locals inside *this* future, so one future carries all of them at once; by the
+    // time there were a dozen flows it overflowed the test thread's 2 MiB stack before the first
+    // assertion ran. Boxing puts each flow's frame on the heap instead. Keep new flows boxed.
+    Box::pin(secretary_flow(&o, &db, &chat)).await;
 
     // 18. Model and effort: a task's own, an agent's defaults, and the owner's allow-list.
-    model_effort_flow(&o, &db, &chat).await;
+    Box::pin(model_effort_flow(&o, &db, &chat)).await;
 
     // 19. Workflows: `workflow_finish` keeps the topic open and posts a control card.
-    workflow_flow(&o, &db, &chat).await;
+    Box::pin(workflow_flow(&o, &db, &chat)).await;
 
     // 20. Jira per project; waiting without a session; fleet chatter has its own topic; a Slack
     //     channel can be mapped by name; and a todo can nudge an existing workflow.
-    jira_flow(&o, &db).await;
-    wakeup_flow(&o, &db).await;
-    agent_chatter_flow(&o, &db, &chat).await;
-    channel_by_name_flow(&o, &db).await;
-    workflow_linked_todo_flow(&o, &db).await;
+    Box::pin(jira_flow(&o, &db)).await;
+    Box::pin(wakeup_flow(&o, &db)).await;
+    Box::pin(agent_chatter_flow(&o, &db, &chat)).await;
+    Box::pin(channel_by_name_flow(&o, &db)).await;
+    Box::pin(workflow_linked_todo_flow(&o, &db)).await;
 
     // 21. The JSON API the web UI runs on, including the session history the UI now shows.
     //     Last, so it reads a fleet that has really done work.
-    api_flow(&o, &db).await;
+    Box::pin(api_flow(&o, &db)).await;
 
     // 22. Habits: the owner's repeated decisions, offered back and then made for them.
-    habit_flow(&o, &db, &chat).await;
+    Box::pin(habit_flow(&o, &db, &chat)).await;
 
     // 22b. A run lost while its plan waited on the owner resumes in plan mode, not auto.
     lost_plan_flow(&o, &db).await;
@@ -5792,11 +6140,16 @@ async fn task_lifecycle_through_a_real_node() {
 
     // 23. The daily retrospective: the fleet reviews its own day and proposes how to be better.
     //     After the habits flow, so the day it reads has really happened.
-    retro_flow(&o, &db, &chat, &hindsight_calls).await;
+    Box::pin(retro_flow(&o, &db, &chat, &hindsight_calls)).await;
 
-    // 24. Housekeeping deletes a finished task's topic once it goes quiet, and nothing else's.
+    // 24. A project grows a second and third agent rather than let its tasks queue behind one,
+    //     and the bot each new agent needs is asked of the owner with a button, not a token.
+    //     After the retrospective, whose digest reads the day's tasks.
+    Box::pin(growth_flow(&o, &db, &chat)).await;
+
+    // 25. Housekeeping deletes a finished task's topic once it goes quiet, and nothing else's.
     //     After the API flow: it leaves a task without a topic, which the API no longer reads.
-    topic_cleanup_flow(&o, &db, &chat).await;
+    Box::pin(topic_cleanup_flow(&o, &db, &chat)).await;
 
     stop_brain().await;
     let _ = std::fs::remove_dir_all(&data_dir);

@@ -1189,6 +1189,69 @@ pub async fn add_bot(o: &Orchestrator, token: &str) -> Result<()> {
     Ok(())
 }
 
+/// Takes a bot the owner just created for the orchestrator to manage into the pool, and gives it
+/// to an agent that has none.
+///
+/// Returns what to tell the owner. The token is fetched from Telegram rather than typed by
+/// anyone, so it never passes through a chat message, a log line or the clipboard.
+pub async fn adopt_managed_bot(o: &Orchestrator, bot_user_id: i64, token: &str) -> Result<String> {
+    add_bot(o, token).await?;
+    let bot: (i64, String) =
+        sqlx::query_as("select id, username from bots where tg_user_id = $1 and agent_id is null")
+            .bind(bot_user_id)
+            .fetch_optional(&o.db)
+            .await?
+            .context("the new bot is not in the pool, or is already an agent's")?;
+    let (bot_id, username) = bot;
+    // The agent the ask was raised for comes first: the owner tapped a button that named it, so
+    // handing the bot to a different one would not match what they were told. Failing that, the
+    // oldest agent still speaking as the orchestrator. Builtin agents are skipped — the brain,
+    // the secretary and the retrospective are the fleet's own voice and have no separate face.
+    let asked_for: Option<String> = sqlx::query_scalar("select value->>0 from kv where key = $1")
+        .bind(crate::tasks::ASKED_FOR)
+        .fetch_optional(&o.db)
+        .await?
+        .flatten();
+    let agent: Option<(String, String, String, Option<String>)> = sqlx::query_as(
+        "select id, name, role, project from agents
+         where bot_id is null and id <> all($1)
+         order by (id = $2) desc, created_at limit 1",
+    )
+    .bind(crate::model::BUILTIN_AGENTS)
+    .bind(asked_for.unwrap_or_default())
+    .fetch_optional(&o.db)
+    .await?;
+    let Some((id, name, role, project)) = agent else {
+        return Ok(format!(
+            "Thanks — @{username} is in the pool and waiting for the next agent that needs one."
+        ));
+    };
+    sqlx::query("update bots set agent_id = $2 where id = $1")
+        .bind(bot_id)
+        .bind(&id)
+        .execute(&o.db)
+        .await?;
+    sqlx::query("update agents set bot_id = $2 where id = $1")
+        .bind(&id)
+        .bind(bot_id)
+        .execute(&o.db)
+        .await?;
+    let proj = project.unwrap_or_else(|| "-".into());
+    let (display, description) = crate::tasks::bot_profile(&name, &role, &proj);
+    if let Err(e) = o.chat.set_bot_profile(bot_id, &display, &description).await {
+        tracing::warn!("renaming bot @{username} failed: {e:#}");
+    }
+    o.audit(
+        "owner",
+        "bot.adopt",
+        json!({"bot": username, "agent": id, "project": proj}),
+    )
+    .await;
+    Ok(format!(
+        "Thanks — @{username} is now {name}, the {role} on {proj}. It will speak for itself from its next run."
+    ))
+}
+
 // ---------------------------------------------------------------- proposals
 
 /// The warning on every proposal that gives a project's agents secret values.

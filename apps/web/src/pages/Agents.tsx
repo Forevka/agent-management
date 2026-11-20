@@ -126,7 +126,12 @@ export default function Agents() {
                   header: 'Agent',
                   cell: (a) => (
                     <Stack gap="1">
-                      <Text weight="medium">{a.name}</Text>
+                      <Row gap="2" align="center">
+                        <Text weight="medium">{a.name}</Text>
+                        {/* An agent without a bot works; it just has no face of its own, which
+                            is worth seeing here because the pool is where that is fixed. */}
+                        {a.bot === null && <Badge>speaks as the fleet</Badge>}
+                      </Row>
                       <Text size="1" tone="muted" mono>
                         {a.id}
                       </Text>
@@ -200,7 +205,10 @@ export default function Agents() {
                   </Stack>
                 )}
                 <Card>
-                  <CardHeader title="Add a bot" description="Paste the token BotFather gave you." />
+                  <CardHeader
+                    title="Add a bot"
+                    description="Paste the token BotFather gave you. You can also wait: when an agent needs a bot and the pool is empty, the orchestrator asks you in Telegram with a button that creates one and hands over the token itself."
+                  />
                   <CardContent>
                     <form
                       onSubmit={(e) => {

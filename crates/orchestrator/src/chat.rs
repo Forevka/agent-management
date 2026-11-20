@@ -105,6 +105,17 @@ pub trait Chat: Send + Sync + 'static {
     async fn set_bot_profile(&self, bot_id: i64, name: &str, description: &str) -> Result<()>;
     /// Forgets a bot removed from the pool: nothing is sent as it or polled for it any more.
     async fn remove_bot(&self, bot_id: i64);
+    /// Asks the owner, in a private chat, to create one more agent bot.
+    ///
+    /// A bot cannot create a bot: Telegram's `bots.createBot` is a user-only method. What it can
+    /// do is offer the button that opens Telegram's own creation flow, pre-filled with `name`
+    /// and `username`, and be handed the result to manage — so the owner taps once and never
+    /// handles a token. The new bot arrives later as a `managed_bot` update, not as a reply to
+    /// this call, so returning `Ok` means the ask was delivered and nothing more.
+    ///
+    /// Fails when the owner has never opened a private chat with the orchestrator's bot, or when
+    /// the bot was not granted bot management in @BotFather.
+    async fn request_bot(&self, name: &str, username: &str) -> Result<()>;
 }
 
 /// Escapes text for HTML, in Telegram messages and on the web UI. Quotes are escaped too, so the
@@ -163,6 +174,8 @@ pub mod fake {
         },
         BotProfile(i64, String),
         RemoveBot(i64),
+        /// The owner was asked to create one more agent bot: (suggested name, suggested username).
+        RequestBot(String, String),
     }
 
     pub struct FakeChat {
@@ -201,6 +214,32 @@ pub mod fake {
                         keyboard,
                         ..
                     } => Some((*id, *topic, html.clone(), keyboard.clone())),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// The (name, username) of every bot the owner was asked to create.
+        pub fn bots_asked_for(&self) -> Vec<(String, String)> {
+            self.ops
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|o| match o {
+                    Op::RequestBot(name, username) => Some((name.clone(), username.clone())),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// The display names bots in the pool were renamed to, newest last.
+        pub fn bot_profiles(&self) -> Vec<(i64, String)> {
+            self.ops
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|o| match o {
+                    Op::BotProfile(id, name) => Some((*id, name.clone())),
                     _ => None,
                 })
                 .collect()
@@ -319,6 +358,13 @@ pub mod fake {
         }
         async fn remove_bot(&self, bot_id: i64) {
             self.ops.lock().unwrap().push(Op::RemoveBot(bot_id));
+        }
+        async fn request_bot(&self, name: &str, username: &str) -> Result<()> {
+            self.ops
+                .lock()
+                .unwrap()
+                .push(Op::RequestBot(name.into(), username.into()));
+            Ok(())
         }
     }
 }

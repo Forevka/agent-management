@@ -7,7 +7,9 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 use crate::error::TgError;
-use crate::types::{ForumTopic, InlineKeyboardMarkup, Message, ParseMode, Update, User};
+use crate::types::{
+    ForumTopic, InlineKeyboardMarkup, Message, ParseMode, ReplyKeyboardMarkup, Update, User,
+};
 
 const DEFAULT_BASE_URL: &str = "https://api.telegram.org";
 
@@ -142,6 +144,16 @@ impl Bot {
     /// `getMe`: the bot's own user.
     pub async fn get_me(&self) -> Result<User, TgError> {
         self.call("getMe", &json!({})).await
+    }
+
+    /// The Bot API token of a bot this bot manages, by the managed bot's user id.
+    ///
+    /// Reading it does not rotate it (`replaceManagedBotToken` does that), so calling this twice
+    /// gives the same token. Only the manager bot may ask, and only for a bot the owner created
+    /// for it through the `request_managed_bot` button.
+    pub async fn get_managed_bot_token(&self, user_id: i64) -> Result<String, TgError> {
+        self.call("getManagedBotToken", &json!({ "user_id": user_id }))
+            .await
     }
 
     /// `getUpdates`: long-polls for up to `timeout_secs`. Pass the last seen `update_id + 1` as
@@ -452,6 +464,9 @@ pub struct SendMessage {
     pub text: String,
     pub parse_mode: Option<ParseMode>,
     pub reply_markup: Option<InlineKeyboardMarkup>,
+    /// A reply keyboard instead of an inline one. Telegram takes one `reply_markup`, so setting
+    /// both is a programming error; the reply keyboard wins.
+    pub reply_keyboard: Option<ReplyKeyboardMarkup>,
     pub reply_to_message_id: Option<i64>,
     pub disable_notification: bool,
     /// Off by default: agent output is full of URLs, and a preview card for each one buries
@@ -468,6 +483,7 @@ impl SendMessage {
             text: text.into(),
             parse_mode: None,
             reply_markup: None,
+            reply_keyboard: None,
             reply_to_message_id: None,
             disable_notification: false,
             link_preview: false,
@@ -489,6 +505,12 @@ impl SendMessage {
     /// Attaches an inline keyboard.
     pub fn keyboard(mut self, markup: InlineKeyboardMarkup) -> Self {
         self.reply_markup = Some(markup);
+        self
+    }
+
+    /// Attaches a reply keyboard, which stands in for the user's own keyboard until used.
+    pub fn reply_keyboard(mut self, markup: ReplyKeyboardMarkup) -> Self {
+        self.reply_keyboard = Some(markup);
         self
     }
 
@@ -523,6 +545,10 @@ impl SendMessage {
             params["parse_mode"] = json!(mode);
         }
         if let Some(markup) = &self.reply_markup {
+            params["reply_markup"] = json!(markup);
+        }
+        // Last, so a reply keyboard wins if both were set by mistake: Telegram takes one.
+        if let Some(markup) = &self.reply_keyboard {
             params["reply_markup"] = json!(markup);
         }
         if let Some(message_id) = self.reply_to_message_id {

@@ -21,8 +21,9 @@ pub use bot::{Bot, SendMessage};
 pub use error::TgError;
 pub use ratelimit::{Bucket, RateLimiter, Throttled, call_with_retry};
 pub use types::{
-    CallbackQuery, Chat, ForumTopic, InlineKeyboardButton, InlineKeyboardMarkup, Message,
-    ParseMode, Update, User,
+    CallbackQuery, Chat, ForumTopic, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton,
+    KeyboardButtonRequestManagedBot, ManagedBotUpdated, Message, ParseMode, ReplyKeyboardMarkup,
+    Update, User,
 };
 
 /// Telegram's limit on a message's text, in UTF-16 code units.

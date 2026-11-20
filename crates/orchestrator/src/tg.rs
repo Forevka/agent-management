@@ -6,8 +6,8 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use fleet_telegram::{
-    Bot, InlineKeyboardButton, InlineKeyboardMarkup, Message, ParseMode, SendMessage, Throttled,
-    Update,
+    Bot, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, Message, ParseMode,
+    ReplyKeyboardMarkup, SendMessage, Throttled, Update,
 };
 use tokio::sync::RwLock;
 
@@ -21,6 +21,9 @@ use crate::{
 
 pub struct TelegramChat {
     chat_id: i64,
+    /// The owner's own user id, for the one thing that cannot happen in the forum group: the
+    /// managed-bot button, which Telegram allows in a private chat only.
+    owner_id: i64,
     /// Bot API base URL when not api.telegram.org (a self-hosted Bot API server).
     api_url: Option<String>,
     orchestrator: Throttled,
@@ -28,9 +31,10 @@ pub struct TelegramChat {
 }
 
 impl TelegramChat {
-    pub fn new(orchestrator: Bot, chat_id: i64, api_url: Option<String>) -> Self {
+    pub fn new(orchestrator: Bot, chat_id: i64, owner_id: i64, api_url: Option<String>) -> Self {
         Self {
             chat_id,
+            owner_id,
             api_url,
             orchestrator: Throttled::new(orchestrator),
             bots: RwLock::new(HashMap::new()),
@@ -256,6 +260,26 @@ impl Chat for TelegramChat {
             .await?;
         Ok(())
     }
+    async fn request_bot(&self, name: &str, username: &str) -> Result<()> {
+        // A reply keyboard in the owner's private chat: `request_managed_bot` is refused in
+        // groups, so this is the one message the fleet does not send into its forum.
+        let text = format!(
+            "The fleet needs one more agent bot, so {} can work while the others are busy.\n\n\
+             Tap below and Telegram will create it — name and username are filled in, and I get \
+             the token myself. Nothing to copy.",
+            esc(name)
+        );
+        let msg = SendMessage::new(self.owner_id, text).html().reply_keyboard(
+            ReplyKeyboardMarkup::one_button(KeyboardButton::request_managed_bot(
+                "🤖 Create the bot",
+                1,
+                name,
+                username,
+            )),
+        );
+        self.orchestrator.send_message(&msg).await?;
+        Ok(())
+    }
     async fn remove_bot(&self, bot_id: i64) {
         self.bots.write().await.remove(&bot_id);
     }
@@ -272,11 +296,16 @@ pub async fn run_updates(o: Arc<Orchestrator>, bot: Bot, chat_id: i64) {
             .ok()
             .flatten()
             .and_then(|v| v.as_i64());
+    // `managed_bot` has to be named: Telegram sends every kind only for an *empty*
+    // allowed_updates, and this list is not empty. An older Bot API server — which
+    // `TELEGRAM_API_URL` is there to allow — rejects a value it does not know, and that would
+    // fail every poll rather than just this feature, so the first rejection drops it for good
+    // and the fleet carries on without the one-tap bot flow.
+    const WITH_BOTS: &[&str] = &["message", "callback_query", "managed_bot"];
+    const PLAIN: &[&str] = &["message", "callback_query"];
+    let mut kinds = WITH_BOTS;
     loop {
-        match bot
-            .get_updates(offset, 50, &["message", "callback_query"])
-            .await
-        {
+        match bot.get_updates(offset, 50, kinds).await {
             Ok(updates) => {
                 for u in updates {
                     offset = Some(u.update_id + 1);
@@ -291,6 +320,18 @@ pub async fn run_updates(o: Arc<Orchestrator>, bot: Bot, chat_id: i64) {
                 }
             }
             Err(e) => {
+                // Only a 400 means the request itself was wrong; a 409 (another poller) or a
+                // network error says nothing about whether the server knows `managed_bot`.
+                if kinds == WITH_BOTS
+                    && matches!(&e, fleet_telegram::TgError::Api { code: 400, .. })
+                {
+                    tracing::warn!(
+                        "this Bot API server does not accept the `managed_bot` update ({e}); \
+                         polling without it, so a new agent bot has to be added by hand"
+                    );
+                    kinds = PLAIN;
+                    continue;
+                }
                 tracing::warn!("telegram getUpdates failed: {e}");
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
@@ -349,6 +390,49 @@ pub async fn run_agent_bot_callbacks(o: Arc<Orchestrator>, chat: Arc<TelegramCha
 }
 
 async fn handle_update(o: &Arc<Orchestrator>, bot: &Bot, chat_id: i64, u: Update) {
+    if let Some(mb) = u.managed_bot {
+        // Only the owner's own bots: the update names who created it, and nobody else may add to
+        // the fleet's pool.
+        if mb.user.id != o.cfg.owner_id {
+            tracing::warn!("ignoring a managed bot created by {}", mb.user.id);
+            return;
+        }
+        // The token goes straight from Telegram into the vault; it is never logged and never
+        // shown, not even to the owner who caused it to exist.
+        let taken = match bot.get_managed_bot_token(mb.bot.id).await {
+            Ok(token) => crate::admin::adopt_managed_bot(o, mb.bot.id, &token).await,
+            Err(e) => Err(anyhow::anyhow!("Telegram would not give me its token: {e}")),
+        };
+        let reply = match taken {
+            Ok(said) => said,
+            Err(e) => {
+                // The owner has really made a bot, and it is now in their account counting
+                // against Telegram's cap on how many they may own. Releasing today's ask lets
+                // the fleet offer again rather than leave them with a bot it never took, and
+                // the message says the one thing they can do with it in the meantime.
+                crate::tasks::release_bot_ask(o).await;
+                tracing::warn!("adopting managed bot {} failed: {e:#}", mb.bot.id);
+                format!(
+                    "@{} was created but I could not take it into the pool: {e:#}\n\nIt is yours \
+                     either way. Either wait for me to offer again, or get its token from \
+                     @BotFather and paste it on the Agents page.",
+                    mb.bot.username.as_deref().unwrap_or("the new bot")
+                )
+            }
+        };
+        let _ = o
+            .chat
+            .send(
+                From::Orchestrator,
+                None,
+                &esc(&reply),
+                vec![],
+                None,
+                Notify::Silent,
+            )
+            .await;
+        return;
+    }
     if let Some(cb) = u.callback_query {
         if cb.from.id != o.cfg.owner_id {
             let _ = bot

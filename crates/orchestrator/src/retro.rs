@@ -966,8 +966,9 @@ pub async fn make_task(o: &Arc<Orchestrator>, id: i64) -> Result<String> {
 /// reused, so it keeps what it has learned about this codebase; otherwise one is made.
 ///
 /// It takes a pool bot when one is free, and does without when none is — the owner's tap must not
-/// fail because every bot is taken. An agent without a bot speaks as the orchestrator, which for
-/// the fleet's own housekeeping is no loss.
+/// fail because every bot is taken. That fallback now lives in [`tasks::create_agent`], which
+/// every grown agent shares: an agent with no bot speaks as the orchestrator, and the owner is
+/// asked for one more bot in the background.
 async fn mechanic(o: &Arc<Orchestrator>, project: &str) -> Result<String> {
     let existing: Option<String> = sqlx::query_scalar(
         "select name from agents where project = $1 and role = 'implementor' order by id limit 1",
@@ -982,24 +983,7 @@ async fn mechanic(o: &Arc<Orchestrator>, project: &str) -> Result<String> {
         name: "Mechanic".into(),
         role: "implementor".into(),
     };
-    match tasks::create_agent(o, project, &new).await {
-        Ok(a) => Ok(a.name),
-        Err(e) => {
-            tracing::info!("the fleet's own agent gets no bot ({e:#}); it speaks as the fleet");
-            let id = format!(
-                "mechanic-{}",
-                crate::web::random_token()[..6].to_lowercase()
-            );
-            sqlx::query(
-                "insert into agents (id, name, role, project) values ($1, 'Mechanic', 'implementor', $2)",
-            )
-            .bind(&id)
-            .bind(project)
-            .execute(&o.db)
-            .await?;
-            Ok("Mechanic".into())
-        }
-    }
+    Ok(tasks::create_agent(o, project, &new).await?.name)
 }
 
 /// What the owner sees on `/retro` and on the web page.

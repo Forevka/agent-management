@@ -92,7 +92,13 @@ Do the same in your provider's cloud firewall if it has one.
    a 409 conflict) while another client is polling the same bot. If the result
    is empty, send another message and retry.
 5. Agent bots (the bot pool) are created the same way and added to the group;
-   their tokens are entered in the web UI later, not in `.env`.
+   their tokens are entered in the web UI later, not in `.env`. One is enough to
+   start: when the fleet needs another and the pool is empty, it asks you in a
+   private chat with a button that creates the bot and hands it over, so you
+   never copy a token (see "Bot pool" in `docs/plan.md`). For that to work, open
+   a private chat with the orchestrator bot once (`/start`), and leave **bot
+   management** enabled for it in the @BotFather Mini App — `getMe` shows it as
+   `can_manage_bots`. Without either, agents simply speak as the orchestrator.
 
 ## 5. Configure and start the stack
 

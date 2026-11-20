@@ -100,8 +100,16 @@ pub async fn create_agent(o: &Orchestrator, project: &str, new: &NewAgent) -> Re
         sqlx::query_as("select id, username from bots where agent_id is null order by id limit 1 for update skip locked")
             .fetch_optional(&mut *tx)
             .await?;
+    // An agent with no bot still works: it speaks as the orchestrator (`task_sender`), and its
+    // buttons are the orchestrator's, so they are even answered more reliably. A missing bot is
+    // therefore a cosmetic shortfall, not a reason to refuse the agent the fleet needs — so the
+    // agent is created either way, and the owner is asked for one more bot (at most daily, so
+    // the one send here costs a growing project a moment at most, and only once a day).
     let Some((bot_id, username)) = bot else {
-        bail!("no free agent bots in the pool; add a bot token in the web UI (Agents page)");
+        tx.rollback().await?;
+        let agent = create_agent_without_bot(o, project, name, &new.role).await?;
+        ask_for_bot(o, &agent.id, name).await;
+        return Ok(agent);
     };
     let id = format!(
         "{}-{}",
@@ -136,6 +144,286 @@ pub async fn create_agent(o: &Orchestrator, project: &str, new: &NewAgent) -> Re
         .bind(&id)
         .fetch_one(&o.db)
         .await?)
+}
+
+/// The agent that should run `task` now: the one it is assigned to, a free sibling, or a new
+/// one, growing the project up to `FLEET_MAX_AGENTS_PER_PROJECT`.
+///
+/// `None` means every agent of the project is busy and it may not grow, so the task waits.
+///
+/// Two rules shape this:
+/// - **A session belongs to the agent that opened it.** Resuming someone else's session would
+///   hand an agent a transcript addressed to another name, so a task that has already run stays
+///   with its agent however long that takes.
+/// - **An agent is only worth adding if something can run it.** Growing the pool while no node
+///   has a free slot for the project would leave a permanent agent behind for nothing.
+async fn agent_for(
+    o: &Orchestrator,
+    task: &TaskRow,
+    resume: Option<&str>,
+    grow: bool,
+) -> Result<Option<AgentRow>> {
+    let assigned: AgentRow = match &task.agent_id {
+        Some(a) => {
+            sqlx::query_as("select * from agents where id = $1")
+                .bind(a)
+                .fetch_one(&o.db)
+                .await?
+        }
+        None => bail!("task {} has no agent", task.id),
+    };
+    if is_free(o, &assigned.id, &task.id).await? {
+        return Ok(Some(assigned));
+    }
+    // The fleet's own standing sessions are one of a kind, and a task that has already run is
+    // bound to the agent that opened its session: in both cases the only answer is to wait.
+    if resume.is_some() || crate::model::is_builtin_task(&task.id) {
+        return Ok(None);
+    }
+    let siblings: Vec<AgentRow> = sqlx::query_as(
+        "select * from agents where project = $1 and role = $2 and id <> $3 order by created_at",
+    )
+    .bind(&task.project)
+    .bind(&assigned.role)
+    .bind(&assigned.id)
+    .fetch_all(&o.db)
+    .await?;
+    for a in &siblings {
+        if is_free(o, &a.id, &task.id).await? {
+            return Ok(Some(a.clone()));
+        }
+    }
+    if !grow {
+        return Ok(None);
+    }
+    // One grower per project at a time, or two tasks dispatched together both read "one below
+    // the cap" and the project ends up one agent over it. Counted again inside the lock, since
+    // the count above was taken outside it. (Lock order: task, project, agent.)
+    let project_lock = o.project_lock(&task.project);
+    let _project_held = project_lock.lock().await;
+    let have: i64 =
+        sqlx::query_scalar("select count(*) from agents where project = $1 and role = $2")
+            .bind(&task.project)
+            .bind(&assigned.role)
+            .fetch_one(&o.db)
+            .await?;
+    if have >= o.cfg.max_agents_per_project {
+        return Ok(None);
+    }
+    if !project_has_room(o, &task.project).await? {
+        return Ok(None);
+    }
+    // Named after the project's first agent, so a reader can see they are the same role on the
+    // same code: `bioins-dev`, then `bioins-dev 2`. The number is the first one free rather than
+    // the count, because an agent removed earlier would otherwise collide on the unique name.
+    let Some(name) = free_agent_name(o, &assigned.name).await? else {
+        return Ok(None);
+    };
+    let new = crate::model::NewAgent {
+        name,
+        role: assigned.role.clone(),
+    };
+    match create_agent(o, &task.project, &new).await {
+        Ok(a) => {
+            // A grown agent is a second copy of the one it was cloned from, so it must run the
+            // same way. Without this it would have no model or effort of its own and fall back
+            // to the fleet default — a task would quietly change model (and cost) just because
+            // its own specialist happened to be busy. The node preference comes along too: the
+            // project is checked out there, and it stays a preference, not a pin.
+            let a: AgentRow = sqlx::query_as(
+                "update agents set model = $2, effort = $3, preferred_node = $4
+                 where id = $1 returning *",
+            )
+            .bind(&a.id)
+            .bind(&assigned.model)
+            .bind(&assigned.effort)
+            .bind(&assigned.preferred_node)
+            .fetch_one(&o.db)
+            .await?;
+            tracing::info!(
+                "project {} grew to {} agents so {} need not wait",
+                task.project,
+                have + 1,
+                task.id
+            );
+            Ok(Some(a))
+        }
+        // Growing is an optimisation; if it fails the task simply waits for its own agent.
+        Err(e) => {
+            tracing::warn!("growing project {} failed: {e:#}", task.project);
+            Ok(None)
+        }
+    }
+}
+
+/// The name a project's agents are numbered from: `bioins-dev 2` grows into `bioins-dev 3`,
+/// not `bioins-dev 2 2`. A name that merely ends in a word is left alone.
+fn agent_name_base(like: &str) -> &str {
+    like.rsplit_once(' ')
+        .filter(|(_, n)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+        .map_or(like, |(base, _)| base)
+        .trim()
+}
+
+/// `"<base> 2"`, or the next number up if that name is taken. `None` when even a generous range
+/// is used up, which means something is wrong rather than that the fleet should keep counting.
+async fn free_agent_name(o: &Orchestrator, like: &str) -> Result<Option<String>> {
+    let base = agent_name_base(like);
+    for n in 2..=20 {
+        let name = format!("{base} {n}");
+        if check_agent_name(&name).is_err() {
+            return Ok(None);
+        }
+        if find_agent(o, &name).await?.is_none() {
+            return Ok(Some(name));
+        }
+    }
+    Ok(None)
+}
+
+/// Whether `agent` has no live run other than `except_task`'s.
+async fn is_free(o: &Orchestrator, agent: &str, except_task: &str) -> Result<bool> {
+    Ok(!sqlx::query_scalar::<_, bool>(
+        "select exists(select 1 from tasks where agent_id = $1 and running and id <> $2)",
+    )
+    .bind(agent)
+    .bind(except_task)
+    .fetch_one(&o.db)
+    .await?)
+}
+
+/// Whether this task's project may still be given another agent, so that a dispatch attempt is
+/// worth making even though every agent it has is busy.
+async fn can_grow(o: &Orchestrator, task: &TaskRow) -> bool {
+    if task.session_id.is_some() || crate::model::is_builtin_task(&task.id) {
+        return false;
+    }
+    // Counted per role, exactly as `agent_for` does it: the cap is on how many of a kind work
+    // side by side, so a project may still have an implementor, a reviewer and a tester.
+    let have: i64 = sqlx::query_scalar(
+        "select count(*) from agents
+         where project = $1 and role = (select role from agents where id = $2)",
+    )
+    .bind(&task.project)
+    .bind(task.agent_id.as_deref().unwrap_or_default())
+    .fetch_one(&o.db)
+    .await
+    .unwrap_or(i64::MAX);
+    have < o.cfg.max_agents_per_project && project_has_room(o, &task.project).await.unwrap_or(false)
+}
+
+/// Whether some online node has this project mapped and a free agent slot.
+async fn project_has_room(o: &Orchestrator, project: &str) -> Result<bool> {
+    Ok(node_load(o).await?.iter().any(|(n, load)| {
+        n.online && n.has_project(project) && *load < i64::from(n.max_agents.max(1))
+    }))
+}
+
+/// Creates an agent with no Telegram identity of its own; it speaks as the orchestrator.
+async fn create_agent_without_bot(
+    o: &Orchestrator,
+    project: &str,
+    name: &str,
+    role: &str,
+) -> Result<AgentRow> {
+    let id = format!(
+        "{}-{}",
+        slugify(name),
+        crate::web::random_token()[..6].to_lowercase()
+    );
+    sqlx::query("insert into agents (id, name, role, project) values ($1, $2, $3, $4)")
+        .bind(&id)
+        .bind(name)
+        .bind(role)
+        .bind(project)
+        .execute(&o.db)
+        .await?;
+    o.audit(
+        "orchestrator",
+        "agent.create",
+        json!({"agent": id, "bot": Value::Null, "project": project}),
+    )
+    .await;
+    Ok(sqlx::query_as("select * from agents where id = $1")
+        .bind(&id)
+        .fetch_one(&o.db)
+        .await?)
+}
+
+/// Asks the owner for one more agent bot, at most once a day.
+///
+/// The ask is a Telegram button that creates the bot and hands it to the orchestrator to manage
+/// (see [`Chat::request_bot`]); the owner never sees a token. It is rate-limited because the
+/// fleet may grow several botless agents in a row, and because the owner may simply have hit
+/// Telegram's cap on how many bots one account can own.
+async fn ask_for_bot(o: &Orchestrator, agent_id: &str, for_agent: &str) {
+    const KEY: &str = "bot_pool_asked_on";
+    // Claiming the day and reading it back is one statement, so two agents created at once ask
+    // once between them. The day is claimed even if the send then fails, because the usual
+    // reason it fails (no private chat with the bot, or Telegram's cap on owned bots) will not
+    // have changed by the next task.
+    let claimed: Option<String> = sqlx::query_scalar(
+        "insert into kv (key, value)
+         values ($1, to_jsonb(to_char(now() at time zone $2, 'YYYY-MM-DD')))
+         on conflict (key) do update set value = excluded.value
+           where kv.value <> excluded.value
+         returning value->>0",
+    )
+    .bind(KEY)
+    .bind(&o.cfg.secretary.timezone)
+    .fetch_optional(&o.db)
+    .await
+    .unwrap_or(None);
+    if claimed.is_none() {
+        return;
+    }
+    let username = suggested_bot_username(for_agent, &crate::web::random_token()[..4]);
+    // Remembered so the bot that arrives goes to the agent the owner was told about, rather
+    // than to whichever botless agent happens to be oldest (see `admin::adopt_managed_bot`).
+    let _ = sqlx::query(
+        "insert into kv (key, value) values ($1, $2)
+         on conflict (key) do update set value = $2",
+    )
+    .bind(ASKED_FOR)
+    .bind(json!(agent_id))
+    .execute(&o.db)
+    .await;
+    // Not fatal: the agent works without a bot, so a failed ask only costs it its own face.
+    if let Err(e) = o.chat.request_bot(for_agent, &username).await {
+        tracing::info!("asking the owner for an agent bot failed: {e:#}");
+    }
+}
+
+/// A username Telegram will accept for a new bot: lowercase, ending in `bot`, and unlikely to be
+/// taken. `salt` keeps a second attempt for the same agent from colliding with the first.
+///
+/// **At most 32 characters**, which Telegram enforces. An agent name may be 40 on its own
+/// (`check_agent_name`), so the name is the part that gets truncated — the `fleet_` prefix, the
+/// salt and the `bot` suffix all have to survive or the name is unusable.
+fn suggested_bot_username(for_agent: &str, salt: &str) -> String {
+    const MAX: usize = 32;
+    let salt = salt.to_lowercase();
+    let fixed = "fleet_".len() + 1 + salt.len() + "bot".len();
+    let mut name = slugify(for_agent).replace('-', "_");
+    name.truncate(MAX.saturating_sub(fixed));
+    // A trailing `_` would leave `fleet_alice__ab12bot`; harmless, but ugly in a message the
+    // owner reads.
+    let name = name.trim_end_matches('_');
+    format!("fleet_{name}_{salt}bot")
+}
+
+/// `kv` key holding the id of the agent the owner's outstanding bot ask was made for.
+pub const ASKED_FOR: &str = "bot_pool_asked_for";
+
+/// Gives back today's bot ask, so the fleet may offer again before tomorrow.
+///
+/// Used when the owner did tap the button and a bot really was created, but the fleet could not
+/// take it in: holding the day then would leave them with a bot nothing uses and no second
+/// chance until the next one.
+pub async fn release_bot_ask(o: &Orchestrator) {
+    let _ = sqlx::query("delete from kv where key = 'bot_pool_asked_on'")
+        .execute(&o.db)
+        .await;
 }
 
 /// The Telegram name and description of an agent's bot.
@@ -281,39 +569,52 @@ async fn dispatch_locked(
     resume: Option<String>,
     origin: &Origin,
 ) -> Result<Dispatched> {
-    let agent = match &task.agent_id {
-        Some(a) => {
-            sqlx::query_as::<_, AgentRow>("select * from agents where id = $1")
-                .bind(a)
-                .fetch_one(&o.db)
-                .await?
-        }
-        None => bail!("task {} has no agent", task.id),
+    // One agent runs one session at a time (the node would otherwise kill the running session),
+    // so a task whose agent is busy is given a free sibling, or a new one if the project may
+    // still grow. Only when none of that is possible does it wait.
+    let Some(agent) = agent_for(o, task, resume.as_deref(), true).await? else {
+        let assigned = task.agent_id.clone().unwrap_or_default();
+        let name: String = sqlx::query_scalar("select name from agents where id = $1")
+            .bind(&assigned)
+            .fetch_optional(&o.db)
+            .await?
+            .unwrap_or_else(|| assigned.clone());
+        let busy: Option<String> =
+            sqlx::query_scalar("select id from tasks where agent_id = $1 and running limit 1")
+                .bind(&assigned)
+                .fetch_optional(&o.db)
+                .await?;
+        let note = match busy {
+            Some(other) => format!(
+                "⏳ Queued: {} is busy with <b>{}</b>.",
+                esc(&name),
+                esc(&other)
+            ),
+            None => format!("⏳ Queued: {} cannot start it yet.", esc(&name)),
+        };
+        return queue(o, task, &assigned, prompt.as_deref(), origin, Some(note)).await;
     };
-    // Held from the busy check to the claim: two tasks of the agent dispatched at once must not
-    // both find it free. (Lock order: task, then agent.)
+    // `agent` is only a candidate until the claim below rewrites `tasks.agent_id`, so every
+    // bail-out from here on must queue the owner's follow-up against the agent the task
+    // actually has. Addressing it to a candidate the task never gets would leave the message in
+    // the queue for an agent that is not on it: `release_run_messages` only clears `run_id`, and
+    // the claim below takes messages by `to_agent`, so nothing would ever deliver it.
+    let holder = task.agent_id.clone().unwrap_or_else(|| agent.id.clone());
+    // Held from here to the claim: two tasks given this agent at once must not both find it
+    // free. (Lock order: task, then agent.) `agent_for` read the same flag a moment ago, so a
+    // race only costs this task a turn in the queue, never a killed session.
     let agent_lock = o.agent_lock(&agent.id);
     let _agent_held = agent_lock.lock().await;
-    // One agent runs one session at a time: a specialist busy with another task takes this one
-    // when it is done (the node would otherwise kill the running session).
-    let busy: Option<String> = sqlx::query_scalar(
-        "select id from tasks where agent_id = $1 and running and id <> $2 limit 1",
-    )
-    .bind(&agent.id)
-    .bind(&task.id)
-    .fetch_optional(&o.db)
-    .await?;
-    if let Some(other) = busy {
+    if !is_free(o, &agent.id, &task.id).await? {
         return queue(
             o,
             task,
-            &agent.id,
+            &holder,
             prompt.as_deref(),
             origin,
             Some(format!(
-                "⏳ Queued: {} is busy with <b>{}</b>.",
-                esc(&agent.name),
-                esc(&other)
+                "⏳ Queued: {} just took other work.",
+                esc(&agent.name)
             )),
         )
         .await;
@@ -356,7 +657,7 @@ async fn dispatch_locked(
                 esc(&task.project)
             ))
         };
-        return queue(o, task, &agent.id, prompt.as_deref(), origin, note).await;
+        return queue(o, task, &holder, prompt.as_deref(), origin, note).await;
     }
     // A resumed session only exists on the node that ran it. Once that node is gone (revoked),
     // the session is gone with it: the task starts afresh elsewhere.
@@ -394,7 +695,7 @@ async fn dispatch_locked(
         return queue(
             o,
             task,
-            &agent.id,
+            &holder,
             prompt.as_deref(),
             origin,
             Some(format!(
@@ -418,8 +719,12 @@ async fn dispatch_locked(
     // and none once the agent or the node is gone: the share locks wait for an agent removal or
     // a node revoke in progress, which end or refuse running tasks under their own locks.
     // A run in plan mode opens a planning round, which only the owner's approval closes.
+    //
+    // `agent_id` is set here too, not earlier: a task handed a free sibling or a newly grown
+    // agent only truly changes hands if this claim wins, and from then on its topic, brief and
+    // session all belong to that agent.
     let claimed = sqlx::query(
-        "update tasks set node_id = $2, run_id = $3, running = true, dispatched_at = now(), status = $4, updated_at = now(),
+        "update tasks set node_id = $2, run_id = $3, running = true, dispatched_at = now(), status = $4, agent_id = $5, updated_at = now(),
                           plan_approved = plan_approved and not $6
          where id = $1 and not running
            and exists (select 1 from agents where id = $5 for share)
@@ -451,7 +756,7 @@ async fn dispatch_locked(
         return queue(
             o,
             task,
-            &agent.id,
+            &holder,
             prompt.as_deref(),
             origin,
             Some("⏳ Queued: the chosen node just left the fleet.".into()),
@@ -473,6 +778,46 @@ async fn dispatch_locked(
     .bind(&node.id)
     .execute(&o.db)
     .await?;
+    // A task given a free sibling or a newly grown agent has changed hands. Two things have to
+    // follow the task, or the handover silently loses work:
+    //  - the messages waiting for it, which `queue` addressed to the agent it had then. They are
+    //    claimed by `to_agent` just below, so without this the owner's follow-up would sit in
+    //    the queue for an agent that is no longer on the task.
+    //  - the owner's view of it: the topic's intro named the old agent, and nothing else would
+    //    ever say otherwise.
+    if task.agent_id.as_deref() != Some(agent.id.as_str()) {
+        sqlx::query(
+            "update messages set to_agent = $2
+             where task_id = $1 and from_agent is null and run_id is null",
+        )
+        .bind(&task.id)
+        .bind(&agent.id)
+        .execute(&o.db)
+        .await?;
+        let was: Option<String> = sqlx::query_scalar("select name from agents where id = $1")
+            .bind(task.agent_id.as_deref().unwrap_or_default())
+            .fetch_optional(&o.db)
+            .await?;
+        let note = match was {
+            Some(was) => format!(
+                "🔀 <b>{}</b> is taking this: {} is busy with other work.",
+                esc(&agent.name),
+                esc(&was)
+            ),
+            None => format!("🔀 <b>{}</b> is taking this.", esc(&agent.name)),
+        };
+        let _ = o
+            .chat
+            .send(
+                From::Orchestrator,
+                task.topic_id,
+                &note,
+                vec![],
+                None,
+                Notify::Silent,
+            )
+            .await;
+    }
     // The run takes the task's waiting messages and the new one. They stay in the queue, tagged
     // with the run, until the node reports it started (then they go); a run that never starts
     // gives them back (`release_run_messages`), so the next one gets them.
@@ -674,9 +1019,11 @@ async fn node_load(o: &Orchestrator) -> Result<Vec<(NodeRow, i64)>> {
     let mut out = Vec::with_capacity(nodes.len());
     for n in nodes {
         let load: i64 =
-            // The fleet's own sessions (brain, secretary) mostly wait; they take no slot.
-            sqlx::query_scalar("select count(*) from tasks where node_id = $1 and running and id not in ('brain', 'secretary')")
+            // The fleet's own sessions (brain, secretary, retrospective) mostly wait; they take
+            // no slot, or a node that hosts them would have fewer for real work.
+            sqlx::query_scalar("select count(*) from tasks where node_id = $1 and running and id <> all($2)")
                 .bind(&n.id)
+                .bind(crate::model::BUILTIN_TASKS)
                 .fetch_one(&o.db)
                 .await?;
         out.push((n, load));
@@ -1369,21 +1716,20 @@ pub async fn dispatch_queued(o: &Arc<Orchestrator>) {
         let Ok(nodes) = node_load(o).await else {
             return;
         };
-        let agent_busy: bool = sqlx::query_scalar(
-            "select exists(select 1 from tasks where agent_id = $1 and running and id <> $2)",
-        )
-        .bind(&task.agent_id)
-        .bind(&task.id)
-        .fetch_one(&o.db)
-        .await
-        .unwrap_or(true);
+        // Asked without `grow`, so this only reports whether an agent is free right now: the
+        // dispatch below does the growing. Retrying a task that cannot start would re-post its
+        // queue note every round.
+        let has_agent = matches!(
+            agent_for(o, &task, task.session_id.as_deref(), false).await,
+            Ok(Some(_))
+        ) || can_grow(o, &task).await;
         // A session can only resume on its node, unless that node is gone (see `dispatch`).
         let session_node = task
             .session_id
             .as_ref()
             .and(task.node_id.as_deref())
             .filter(|id| nodes.iter().any(|(n, _)| n.id == *id));
-        let can_run = !agent_busy
+        let can_run = has_agent
             && nodes.iter().any(|(n, load)| {
                 n.online
                     && n.has_project(&task.project)
@@ -1805,5 +2151,48 @@ mod tests {
                 "value {v:?} via {line:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod growth_tests {
+    use super::{agent_name_base, suggested_bot_username};
+
+    #[test]
+    fn a_suggested_bot_username_is_one_telegram_accepts() {
+        // Telegram's rules: at most 32 characters, and it must end in `bot`.
+        let ordinary = suggested_bot_username("Alice 2", "AB12");
+        assert_eq!(ordinary, "fleet_alice_2_ab12bot");
+        // An agent name may be 40 characters on its own, so the name is what gives way. The
+        // prefix, the salt and the suffix must all still be there, or the bot cannot be made.
+        let long = suggested_bot_username(&"a".repeat(40), "CDEF");
+        assert_eq!(long.len(), 32, "{long} must fit Telegram's limit");
+        assert!(
+            long.starts_with("fleet_") && long.ends_with("cdefbot"),
+            "{long}"
+        );
+        for name in ["Alice 2", &"a".repeat(40), "x", "Bob-the-Builder", "r2d2"] {
+            let u = suggested_bot_username(name, "0f9e");
+            assert!(u.len() <= 32, "{u} is {} characters", u.len());
+            assert!(u.ends_with("bot"), "{u}");
+            assert!(
+                u.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
+                "{u} has a character Telegram will not take"
+            );
+        }
+    }
+
+    #[test]
+    fn a_grown_agent_is_numbered_from_the_first_of_its_kind() {
+        // The ordinary case, and growing again from an already numbered agent.
+        assert_eq!(agent_name_base("bioins-dev"), "bioins-dev");
+        assert_eq!(agent_name_base("bioins-dev 2"), "bioins-dev");
+        assert_eq!(agent_name_base("bioins-dev 17"), "bioins-dev");
+        // A name that ends in a word, or in a number that is part of it, is left alone: the
+        // fleet must not read "Mechanic" out of "Mechanic v2" or a digit out of "r2d2".
+        assert_eq!(agent_name_base("Mechanic"), "Mechanic");
+        assert_eq!(agent_name_base("Mechanic v2"), "Mechanic v2");
+        assert_eq!(agent_name_base("r2d2"), "r2d2");
     }
 }
