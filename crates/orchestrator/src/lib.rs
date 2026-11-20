@@ -10,6 +10,8 @@
 
 pub mod admin;
 pub mod api;
+pub mod archive;
+pub mod attachments;
 pub mod auth;
 pub mod chat;
 pub mod config;
@@ -24,6 +26,7 @@ pub mod model;
 pub mod plan_gate;
 pub mod prompts;
 pub mod retro;
+pub mod search;
 pub mod secretary;
 pub mod tasks;
 pub mod tg;

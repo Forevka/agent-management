@@ -115,6 +115,8 @@ const TASK_TONES: Record<string, 'neutral' | 'info' | 'success' | 'warning' | 'd
   done: 'neutral',
   stopped: 'neutral',
   failed: 'danger',
+  // Done and put away by the nightly archive: as quiet as done.
+  archived: 'neutral',
 }
 
 /// A task's status and whether a session is live are two different things, and the orchestrator's

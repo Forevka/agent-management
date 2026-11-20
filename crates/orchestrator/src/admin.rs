@@ -2677,7 +2677,7 @@ pub async fn projects_json(o: &Orchestrator) -> Result<Value> {
             .map(|n| json!({"node": n.name, "online": n.online}))
             .collect();
         let open: i64 = sqlx::query_scalar(
-            "select count(*) from tasks where project = $1 and status not in ('done')",
+            "select count(*) from tasks where project = $1 and status not in ('done', 'archived')",
         )
         .bind(&slug)
         .fetch_one(&o.db)

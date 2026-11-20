@@ -127,6 +127,21 @@ export const SparkIcon = (p: IconProps) => (
   </Icon>
 )
 
+/** Something attached to a task. */
+export const PaperclipIcon = (p: IconProps) => (
+  <Icon {...p}>
+    <path d="m19.2 11.4-7.3 7.3a4.6 4.6 0 0 1-6.5-6.5l7.6-7.6a3.1 3.1 0 0 1 4.4 4.4l-7.5 7.5a1.5 1.5 0 0 1-2.2-2.2l6.9-6.9" />
+  </Icon>
+)
+
+/** A file someone can download. */
+export const FileIcon = (p: IconProps) => (
+  <Icon {...p}>
+    <path d="M13.8 3.5H7.2a1.8 1.8 0 0 0-1.8 1.8v13.4a1.8 1.8 0 0 0 1.8 1.8h9.6a1.8 1.8 0 0 0 1.8-1.8V8.3l-4.8-4.8Z" />
+    <path d="M13.8 3.5v4.8h4.8" />
+  </Icon>
+)
+
 /** How many times a task has run: stacked sessions. */
 export const SessionsIcon = (p: IconProps) => (
   <Icon {...p}>

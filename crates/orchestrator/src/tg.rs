@@ -737,7 +737,7 @@ async fn command(
         }
         "/tasks" => {
             let rows: Vec<(String, String, String, bool)> =
-                sqlx::query_as("select id, title, status, running from tasks where id not in ('brain', 'secretary', 'retro') and status not in ('done') order by updated_at desc limit 30")
+                sqlx::query_as("select id, title, status, running from tasks where id not in ('brain', 'secretary', 'retro') and status not in ('done', 'archived') order by updated_at desc limit 30")
                     .fetch_all(&o.db)
                     .await?;
             if rows.is_empty() {

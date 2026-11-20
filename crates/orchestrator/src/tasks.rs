@@ -918,7 +918,7 @@ async fn dispatch_locked(
 /// back in auto and skip the approval. The fleet's own sessions never plan.
 fn plan_first(task: &TaskRow, resume: Option<&str>) -> bool {
     !crate::model::is_builtin_task(&task.id)
-        && (resume.is_none() || task.status == status::DONE || !task.plan_approved)
+        && (resume.is_none() || status::is_done(&task.status) || !task.plan_approved)
 }
 
 /// Leaves a task queued (keeping a follow-up message for when it starts) and says why.
@@ -1396,7 +1396,7 @@ fn redact_free_text(v: &mut Value, values: &[String]) {
 }
 
 /// The decrypted values of the project's bound secret folders.
-async fn project_secret_values(o: &Orchestrator, project: &str) -> Result<Vec<String>> {
+pub(crate) async fn project_secret_values(o: &Orchestrator, project: &str) -> Result<Vec<String>> {
     let encrypted: Vec<Vec<u8>> = sqlx::query_scalar(
         "select i.value from project_secrets ps join secret_items i on i.folder_id = ps.folder_id where ps.project = $1",
     )
@@ -1473,7 +1473,7 @@ pub async fn prune_topics(o: &Orchestrator) -> Result<()> {
     let stale: Vec<(String, i64)> = sqlx::query_as(
         "select id, topic_id from tasks
          where topic_id is not null and not running
-           and status in ('done', 'stopped', 'failed')
+           and status in ('done', 'archived', 'stopped', 'failed')
            and updated_at < now() - make_interval(mins => $1::int)
            and not exists (select 1 from human_items
                            where task_id = tasks.id and state = 'open' and blocking)
@@ -1598,7 +1598,7 @@ pub async fn deliver_as(
     }
     if matches!(
         task.status.as_str(),
-        status::DONE | status::STOPPED | status::FAILED
+        status::DONE | status::ARCHIVED | status::STOPPED | status::FAILED
     ) {
         match task.topic_id {
             Some(topic) => {
@@ -1666,7 +1666,7 @@ pub async fn stop(o: &Orchestrator, task: &TaskRow, graceful: bool) -> Result<()
     // Recorded before the node is told: the kill's exit event can arrive at once, and it must
     // find the task stopped, not running (which would read as a failure).
     if !graceful {
-        sqlx::query("update tasks set status = 'stopped', updated_at = now() where id = $1 and status <> 'done'").bind(&task.id).execute(&o.db).await?;
+        sqlx::query("update tasks set status = 'stopped', updated_at = now() where id = $1 and status not in ('done', 'archived')").bind(&task.id).execute(&o.db).await?;
     }
     stop_run(o, &task, graceful)
 }

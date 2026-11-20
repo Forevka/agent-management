@@ -71,11 +71,33 @@ export type TaskLink = {
   added_by: string
 }
 
+/** Something a task produced: a titled link, or a file the orchestrator stores and serves. */
+export type Attachment = {
+  id: number
+  /** `A-12`, as agents and the brain name it. */
+  ref: string
+  kind: 'url' | 'file'
+  title: string
+  url: string | null
+  file_name: string | null
+  mime: string | null
+  size: number | null
+  sha256: string | null
+  added_by: string
+  created_at: string
+  /** Where a file downloads from (always as a download, never rendered). */
+  download: string | null
+}
+
 export type Task = {
   /** The fleet's own short handle (`F-41`), which the owner names this task by. */
   key: string
   /** What this task is about outside the fleet: tickets, merge requests, pages. */
   links?: TaskLink[]
+  /** What it produced: links and files, with titles. */
+  attachments?: Attachment[]
+  /** The agent's closing summary, once it finished. */
+  summary?: string | null
   id: string
   project: string
   title: string

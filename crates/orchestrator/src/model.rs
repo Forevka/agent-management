@@ -203,6 +203,15 @@ pub mod status {
     pub const DONE: &str = "done";
     pub const STOPPED: &str = "stopped";
     pub const FAILED: &str = "failed";
+    /// A done task moved out of sight by the nightly archive (see `archive`). It is still done in
+    /// every sense that matters, which is why [`is_done`] says so: anything that treats a done
+    /// task as finished treats an archived one the same way.
+    pub const ARCHIVED: &str = "archived";
+
+    /// Done, archived or not.
+    pub fn is_done(status: &str) -> bool {
+        status == DONE || status == ARCHIVED
+    }
 }
 
 /// The brain's pseudo task and agent ids.

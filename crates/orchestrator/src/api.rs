@@ -48,6 +48,8 @@ pub fn router() -> Router<O> {
         .route("/api/tasks/{id}", get(task))
         .route("/api/tasks/{id}/events", get(task_events))
         .route("/api/tasks/{id}/links", post(task_link))
+        .route("/api/tasks/{id}/attachments", post(task_attach))
+        .route("/api/attachments/{id}/file", get(attachment_file))
         .route("/api/runs", get(runs))
         .route("/api/projects", get(projects).post(projects_act))
         .route("/api/projects/{slug}", get(project).post(project_act))
@@ -230,7 +232,7 @@ async fn overview(State(o): State<O>, h: HeaderMap) -> Api {
     guard!(o, h);
     let items = human::open_items(&o).await?;
     let tasks: Vec<TaskRow> = sqlx::query_as(
-        "select * from tasks where id <> all($1) and status <> 'done' order by updated_at desc limit 50",
+        "select * from tasks where id <> all($1) and status not in ('done', 'archived') order by updated_at desc limit 50",
     )
     .bind(crate::model::BUILTIN_TASKS)
     .fetch_all(&o.db)
@@ -242,7 +244,7 @@ async fn overview(State(o): State<O>, h: HeaderMap) -> Api {
     // opening anything.
     let per_project: Vec<(String, String, i64, i64, i64)> = sqlx::query_as(
         "select p.slug, p.name,
-                count(t.id) filter (where t.status not in ('done','stopped','failed')) as open,
+                count(t.id) filter (where t.status not in ('done','archived','stopped','failed')) as open,
                 count(t.id) filter (where t.running) as running,
                 count(t.id) as total
          from projects p left join tasks t on t.project = p.slug and t.id not in ('brain','secretary','retro')
@@ -275,11 +277,15 @@ async fn overview(State(o): State<O>, h: HeaderMap) -> Api {
 /// would hide the thing the owner most wants to see at a glance, that the fleet got somewhere.
 async fn board(State(o): State<O>, h: HeaderMap) -> Api {
     guard!(o, h);
-    // Open work always, finished work only while it is still news. `limit` is a backstop: a
-    // fleet that somehow has hundreds of open tasks should still render.
+    // Open work always, finished work only while it is still news, and never what the nightly
+    // archive has put away: that is the point of archiving. (The archive leaves `updated_at`
+    // alone, so without the explicit test a task done at 20:59 would stay on the board for a day
+    // after it was archived.) `limit` is a backstop: a fleet that somehow has hundreds of open
+    // tasks should still render.
     let rows: Vec<TaskRow> = sqlx::query_as(
         "select * from tasks
          where id <> all($1)
+           and status <> 'archived'
            and (status not in ('done', 'stopped', 'failed')
                 or updated_at > now() - interval '24 hours')
          order by updated_at desc limit 120",
@@ -307,6 +313,8 @@ async fn board(State(o): State<O>, h: HeaderMap) -> Api {
     let open = human::open_items(&o).await?;
     // What each task is about outside the fleet, for the whole board in one query.
     let links = crate::links::of_tasks(&o, &ids).await?;
+    // And what each has produced, so a card can say there is something to open.
+    let attachments = crate::attachments::of_tasks(&o, &ids).await?;
     let cards: Vec<Value> = rows
         .iter()
         .map(|t| {
@@ -316,6 +324,13 @@ async fn board(State(o): State<O>, h: HeaderMap) -> Api {
                     .iter()
                     .filter(|l| l.task_id == t.id)
                     .map(crate::links::json)
+                    .collect::<Vec<_>>()
+            );
+            v["attachments"] = json!(
+                attachments
+                    .iter()
+                    .filter(|a| a.task_id == t.id)
+                    .map(crate::attachments::json)
                     .collect::<Vec<_>>()
             );
             v["sessions"] = json!(
@@ -360,12 +375,17 @@ struct TaskQuery {
     project: Option<String>,
     status: Option<String>,
     agent: Option<String>,
-    /// A substring of the id or title.
+    /// Words to look for, each anywhere in the task: its id or F-key, title, brief, summary,
+    /// status, agent, links and attachments (see `search`).
     q: Option<String>,
     /// Include the fleet's own standing sessions (the brain and the secretary), which are
     /// hidden by default because they are never "work".
     #[serde(default)]
     builtin: bool,
+    /// Include archived tasks without searching. A query, or `status=archived`, includes them
+    /// anyway: someone looking for a task should find it however old it is.
+    #[serde(default)]
+    archived: bool,
     limit: Option<i64>,
     offset: Option<i64>,
 }
@@ -374,35 +394,21 @@ struct TaskQuery {
 /// what was unfinished and never per project.
 async fn tasks(State(o): State<O>, h: HeaderMap, Query(q): Query<TaskQuery>) -> Api {
     guard!(o, h);
-    let limit = q.limit.unwrap_or(100).clamp(1, 500);
-    let offset = q.offset.unwrap_or(0).max(0);
-    // `$n is null or column = $n` keeps this one prepared statement instead of built SQL: user
-    // text is never formatted into the query.
-    const WHERE: &str = "where ($1::text is null or project = $1)
-           and ($2::text is null or status = $2)
-           and ($3::text is null or agent_id = $3)
-           and ($4::text is null or id ilike '%' || $4 || '%' or title ilike '%' || $4 || '%')
-           and ($5 or id not in ('brain', 'secretary', 'retro'))";
-    let rows: Vec<TaskRow> = sqlx::query_as(&format!(
-        "select * from tasks {WHERE} order by updated_at desc limit $6 offset $7"
-    ))
-    .bind(&q.project)
-    .bind(&q.status)
-    .bind(&q.agent)
-    .bind(&q.q)
-    .bind(q.builtin)
-    .bind(limit)
-    .bind(offset)
-    .fetch_all(&o.db)
+    let blank = |s: Option<String>| s.filter(|s| !s.trim().is_empty());
+    let (rows, total) = crate::search::tasks(
+        &o,
+        &crate::search::Filter {
+            project: blank(q.project),
+            status: blank(q.status),
+            agent: blank(q.agent),
+            q: blank(q.q),
+            builtin: q.builtin,
+            archived: q.archived,
+            limit: q.limit.unwrap_or(100).clamp(1, 500),
+            offset: q.offset.unwrap_or(0).max(0),
+        },
+    )
     .await?;
-    let total: i64 = sqlx::query_scalar(&format!("select count(*) from tasks {WHERE}"))
-        .bind(&q.project)
-        .bind(&q.status)
-        .bind(&q.agent)
-        .bind(&q.q)
-        .bind(q.builtin)
-        .fetch_one(&o.db)
-        .await?;
     // How many sessions each listed task has had, so the list can say so without a query per
     // row.
     let ids: Vec<String> = rows.iter().map(|t| t.id.clone()).collect();
@@ -528,6 +534,21 @@ async fn task(State(o): State<O>, h: HeaderMap, Path(id): Path<String>) -> Api {
             .map(crate::links::json)
             .collect::<Vec<_>>()
     );
+    v["attachments"] = json!(
+        crate::attachments::of_task(&o, &t.id)
+            .await?
+            .iter()
+            .map(crate::attachments::json)
+            .collect::<Vec<_>>()
+    );
+    // The agent's closing words, kept since the archive made "what did that task end up as" a
+    // question asked weeks later.
+    v["summary"] = json!(
+        sqlx::query_scalar::<_, Option<String>>("select summary from tasks where id = $1")
+            .bind(&t.id)
+            .fetch_one(&o.db)
+            .await?
+    );
     Ok(Json(json!({
         "task": v,
         "milestones": milestones.iter().map(|(i, title, done)| json!({"idx": i, "title": title, "done": done})).collect::<Vec<_>>(),
@@ -555,6 +576,165 @@ async fn task_link(
     }
     let l = crate::links::add(&o, &id, &reference, "owner").await?;
     Ok(Json(json!({"link": crate::links::json(&l)})))
+}
+
+/// The owner attaching to a task by hand: a link (`url`), a file in pieces (`begin`, one `chunk`
+/// per piece of at most 1 MiB as base64, `finish`), or taking one away (`remove`). The same
+/// checks as an agent's upload, in `attachments`.
+async fn task_attach(
+    State(o): State<O>,
+    h: HeaderMap,
+    Path(id): Path<String>,
+    Json(a): Json<Act>,
+) -> Api {
+    guard!(o, h, write);
+    let b = &a.body;
+    match a.op.as_str() {
+        "url" => {
+            let row = crate::attachments::add_url(
+                &o,
+                &id,
+                &need(b, "url")?,
+                &need(b, "title")?,
+                "owner",
+                None,
+            )
+            .await?;
+            Ok(Json(json!({"attachment": crate::attachments::json(&row)})))
+        }
+        "begin" => {
+            let upload = crate::attachments::begin(
+                &o,
+                &id,
+                &need(b, "title")?,
+                &need(b, "file_name")?,
+                b["size"].as_i64().context("size is required")?,
+                &need(b, "sha256")?,
+                "owner",
+                None,
+            )
+            .await?;
+            Ok(Json(
+                json!({"upload": upload, "chunk_size": crate::attachments::CHUNK}),
+            ))
+        }
+        "chunk" => {
+            let data = data_encoding::BASE64
+                .decode(need(b, "data")?.as_bytes())
+                .context("data must be base64")?;
+            crate::attachments::chunk(
+                &o,
+                b["upload"].as_i64().context("upload is required")?,
+                &id,
+                "owner",
+                b["index"].as_i64().context("index is required")?,
+                &data,
+            )
+            .await?;
+            Ok(Json(json!({"ok": true})))
+        }
+        "finish" => {
+            let row = crate::attachments::finish(
+                &o,
+                b["upload"].as_i64().context("upload is required")?,
+                &id,
+                "owner",
+                None,
+            )
+            .await?;
+            Ok(Json(json!({"attachment": crate::attachments::json(&row)})))
+        }
+        "remove" => {
+            let n = b["id"]
+                .as_i64()
+                .map(Ok)
+                .unwrap_or_else(|| crate::attachments::parse_id(&need(b, "id")?))?;
+            let gone = crate::attachments::remove(&o, &id, n, "owner", None).await?;
+            Ok(Json(json!({"removed": gone})))
+        }
+        other => Err(anyhow::anyhow!("unknown op {other:?}").into()),
+    }
+}
+
+/// A file attachment, streamed out of its stored pieces.
+///
+/// Always a download, except for the raster images a page may preview: whatever name or type
+/// an agent gave a file, the owner's browser never renders it as a page (`nosniff`, and a
+/// sandboxing CSP in case anything tries).
+async fn attachment_file(
+    State(o): State<O>,
+    h: HeaderMap,
+    Path(id): Path<String>,
+) -> std::result::Result<axum::response::Response, ApiError> {
+    guard!(o, h);
+    let n = crate::attachments::parse_id(&id)?;
+    let a = crate::attachments::get(&o, n)
+        .await?
+        .filter(|a| a.kind == "file")
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no file A-{n}")))?;
+    let name = a.file_name.clone().unwrap_or_else(|| format!("A-{n}"));
+    let inline = a.inline();
+    let mime = if inline {
+        a.mime.clone().unwrap_or_default()
+    } else {
+        "application/octet-stream".into()
+    };
+    let count = crate::attachments::chunk_count(&a);
+    let db = o.clone();
+    let stream = futures_util::stream::unfold(0i64, move |idx| {
+        let o = db.clone();
+        async move {
+            if idx >= count {
+                return None;
+            }
+            let piece = crate::attachments::read_chunk(&o, n, idx)
+                .await
+                .map(axum::body::Bytes::from)
+                .map_err(std::io::Error::other);
+            Some((piece, idx + 1))
+        }
+    });
+    let disposition = format!(
+        "{}; filename=\"{}\"; filename*=UTF-8''{}",
+        if inline { "inline" } else { "attachment" },
+        name.replace(|c: char| !c.is_ascii() || c == '"' || c == '\\', "_"),
+        utf8_percent(&name)
+    );
+    let mut r = axum::response::Response::new(axum::body::Body::from_stream(stream));
+    let hs = r.headers_mut();
+    let hv = |s: &str| {
+        header::HeaderValue::from_str(s)
+            .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+    };
+    hs.insert(header::CONTENT_TYPE, hv(&mime)?);
+    hs.insert(header::CONTENT_DISPOSITION, hv(&disposition)?);
+    hs.insert(
+        header::CONTENT_LENGTH,
+        hv(&a.size.unwrap_or(0).to_string())?,
+    );
+    hs.insert(header::X_CONTENT_TYPE_OPTIONS, hv("nosniff")?);
+    hs.insert(
+        header::CONTENT_SECURITY_POLICY,
+        hv("sandbox; default-src 'none'")?,
+    );
+    hs.insert(header::CACHE_CONTROL, hv("private, no-cache")?);
+    if let Some(sha) = &a.sha256 {
+        hs.insert(header::ETAG, hv(&format!("\"{sha}\""))?);
+    }
+    Ok(r)
+}
+
+/// RFC 5987 encoding of a file name, for `filename*`.
+fn utf8_percent(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 #[derive(Deserialize)]
@@ -774,7 +954,7 @@ async fn project(State(o): State<O>, h: HeaderMap, Path(slug): Path<String>) -> 
     .await?;
     let (sessions, open): (i64, i64) = sqlx::query_as(
         "select (select count(*) from runs where project = $1),
-                (select count(*) from tasks where project = $1 and status not in ('done','stopped','failed') and id not in ('brain','secretary','retro'))",
+                (select count(*) from tasks where project = $1 and status not in ('done','archived','stopped','failed') and id not in ('brain','secretary','retro'))",
     )
     .bind(&slug)
     .fetch_one(&o.db)
