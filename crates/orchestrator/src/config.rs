@@ -33,6 +33,8 @@ pub struct Config {
     /// Delete a finished task's topic once it has been quiet this long, so the forum does not
     /// fill up with work that is over. `0` keeps every topic for ever.
     pub delete_topics_after_minutes: i64,
+    /// When a node's free disk space warns the owner and when it holds new runs (see `disk`).
+    pub disk: DiskLimits,
     /// The secretary's settings (see `secretary`).
     pub secretary: SecretaryConfig,
     /// The daily retrospective's settings (see `retro`).
@@ -249,6 +251,7 @@ impl Config {
             remind_after_minutes: env_num("FLEET_REMIND_AFTER_MINUTES", 120),
             max_agents_per_project: env_num("FLEET_MAX_AGENTS_PER_PROJECT", 3).max(1),
             delete_topics_after_minutes: env_num("FLEET_TOPIC_DELETE_AFTER_MINUTES", 60),
+            disk: DiskLimits::from_env(),
             secretary: SecretaryConfig::from_env(),
             retro: RetroConfig::from_env(&model_for_retro),
             allowed_models,
@@ -271,10 +274,47 @@ impl Config {
             max_agents_per_project: 3,
             // Off by default in tests: the one test that wants it sets its own value.
             delete_topics_after_minutes: 0,
+            // Tiny, so the real nodes of the end-to-end test never hold anything on whatever disk
+            // the test runs on; the disk flow reports sizes around these on purpose.
+            disk: DiskLimits {
+                low_bytes: 2 << 20,
+                floor_bytes: 1 << 20,
+            },
             secretary: SecretaryConfig::test(),
             retro: RetroConfig::test(),
             allowed_models: default_allowed_models("opus"),
             allowed_efforts: DEFAULT_ALLOWED_EFFORTS.map(str::to_owned).to_vec(),
+        }
+    }
+}
+
+/// Free disk space on a node below which the owner is warned (`low`) and below which no new task
+/// run starts there (`floor`). Absolute sizes, not percentages: a percentage that suits a small
+/// laptop disk would warn about a 2 TB disk with 100 GB free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiskLimits {
+    pub low_bytes: u64,
+    pub floor_bytes: u64,
+}
+
+impl Default for DiskLimits {
+    fn default() -> Self {
+        Self {
+            low_bytes: 5 << 30,
+            floor_bytes: 1 << 30,
+        }
+    }
+}
+
+impl DiskLimits {
+    fn from_env() -> Self {
+        // `0` turns a limit off. Clamped so the shift cannot overflow (a petabyte is plenty).
+        let gb = |name: &str, default: i64| (env_num(name, default).clamp(0, 1 << 20) as u64) << 30;
+        let floor_bytes = gb("FLEET_DISK_FLOOR_GB", 1);
+        Self {
+            // A warning that comes after the hold would warn about nothing new.
+            low_bytes: gb("FLEET_DISK_LOW_GB", 5).max(floor_bytes),
+            floor_bytes,
         }
     }
 }

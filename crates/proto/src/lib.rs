@@ -15,7 +15,9 @@ use serde::{Deserialize, Serialize};
 /// older node could not tell apart from a message for its current run.
 /// 3: [`Body::ProjectList`]. A version 2 node cannot decode it, and an undecodable frame drops
 /// the link, so it must be refused at the handshake instead.
-pub const PROTOCOL_VERSION: u32 = 3;
+/// 4: [`Body::DiskReport`]. An older orchestrator cannot decode it, so a node that sends it must
+/// not reach one.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// The build this binary is: the release that produced it (`v0.2.7`), or the workspace version
 /// with `-dev` for a binary built by hand.
@@ -48,7 +50,8 @@ pub use agent::{
     AgentEvent, AgentEventKind, SecretFile, SpawnAgent, StopAgent, ToolCall, ToolResult,
 };
 pub use node::{
-    ClaudeAuth, Hello, NodeInfo, NodeSettings, ProjectMapping, ProjectSummary, Rejected, Welcome,
+    ClaudeAuth, DiskReport, DiskVolume, FolderSize, Hello, NodeInfo, NodeSettings, ProjectMapping,
+    ProjectSummary, Rejected, Welcome,
 };
 
 /// One frame on the wire.
@@ -138,6 +141,12 @@ pub enum Body {
     /// Orchestrator -> node: every project, so the node's tray app can offer them for mapping.
     /// Sent on every connect (after [`Body::NodeSettings`]) and after any project change.
     ProjectList(Vec<ProjectSummary>),
+
+    // Appended in protocol version 4.
+    /// Node -> orchestrator: free space where Claude Code and the projects write. Sent on every
+    /// connect and every few minutes, so the orchestrator can warn the owner and stop starting
+    /// runs on a node whose disk is about to fill up.
+    DiskReport(DiskReport),
 }
 
 impl Body {
@@ -325,6 +334,24 @@ mod tests {
             seq: 10,
             ack: 0,
             body: Body::ProjectList(vec![]),
+        });
+        roundtrip(Envelope {
+            seq: 11,
+            ack: 0,
+            body: Body::DiskReport(DiskReport {
+                claude_dir: "C:/Users/me/.claude".into(),
+                volumes: vec![DiskVolume {
+                    volume: "C:\\".into(),
+                    free: 3 << 30,
+                    total: 512 << 30,
+                    claude_dir: true,
+                    projects: vec!["fleet-src".into()],
+                }],
+                biggest: vec![FolderSize {
+                    name: "C--repos-fleet-src".into(),
+                    bytes: 7 << 30,
+                }],
+            }),
         });
     }
 

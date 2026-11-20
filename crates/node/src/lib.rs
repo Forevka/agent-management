@@ -5,6 +5,7 @@
 //! `fleet mcp` shim inside each agent uses to reach the orchestrator.
 
 pub mod agent_cli;
+pub mod disk;
 /// `node.json` and `status.json` live in their own crate so the tray app can use them without
 /// compiling the network stack; re-exported here so `fleet_node::config` keeps working.
 pub use fleet_node_config as config;
@@ -20,7 +21,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -41,6 +42,12 @@ use crate::{
 /// Ordinary tool calls answer within seconds; one that does not is reported as failed so the
 /// agent's command returns instead of hanging. Permission prompts wait for the human instead.
 const TOOL_CALL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How often the node reports its free disk space (besides on every connect). A busy session
+/// writes transcripts fast, but not gigabytes in minutes, so this sees a disk filling up in time.
+const DISK_REPORT_EVERY: Duration = Duration::from_secs(300);
+/// How long one measurement may take before the node stops waiting for it.
+const DISK_MEASURE_LIMIT: Duration = Duration::from_secs(120);
 
 /// A tool call waiting for the orchestrator's answer.
 struct PendingCall {
@@ -80,6 +87,10 @@ pub struct Node {
     /// Makes call ids unique across node restarts, so a stale answer can never match a new call.
     call_prefix: String,
     ipc_addr: Mutex<Option<std::net::SocketAddr>>,
+    /// Set while a disk report is being measured, so a slow walk is never started twice.
+    measuring_disk: AtomicBool,
+    /// A report was asked for while one was being measured: measure again when it is done.
+    disk_again: AtomicBool,
 }
 
 impl Node {
@@ -103,6 +114,8 @@ impl Node {
             next_call: AtomicU64::new(1),
             call_prefix: runner::random_token()[..8].to_owned(),
             ipc_addr: Mutex::new(None),
+            measuring_disk: AtomicBool::new(false),
+            disk_again: AtomicBool::new(false),
         });
         // Replaces whatever a previous node process left, so the tray sees this pid at once.
         node.update_status(|_| {});
@@ -148,6 +161,7 @@ impl Node {
         let addr = ipc::serve(self.clone()).await?;
         *self.ipc_addr.lock().unwrap() = Some(addr);
         tokio::spawn(self.clone().watch_config());
+        tokio::spawn(self.clone().report_disk_periodically());
 
         while let Some(ev) = events.recv().await {
             match ev {
@@ -155,6 +169,7 @@ impl Node {
                     self.update_status(|s| s.connected = true);
                     self.send_info();
                     self.resend_pending_permissions();
+                    self.report_disk();
                 }
                 Inbound::Disconnected { .. } => self.update_status(|s| s.connected = false),
                 Inbound::Message { body, .. } => self.handle(body),
@@ -384,6 +399,58 @@ impl Node {
         }));
     }
 
+    async fn report_disk_periodically(self: Arc<Self>) {
+        let mut tick = tokio::time::interval(DISK_REPORT_EVERY);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The first tick is immediate; every connect reports anyway.
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            self.report_disk();
+        }
+    }
+
+    /// Measures free disk space (off the async runtime: sizing the session folders walks a
+    /// tree) and sends it. Only while connected: messages queue while the link is down, and a
+    /// pile of stale reports is worth less than the fresh one every connect sends.
+    fn report_disk(self: &Arc<Self>) {
+        if !self.status.lock().unwrap().connected {
+            return;
+        }
+        let Some(claude_dir) = disk::claude_dir() else {
+            tracing::warn!("cannot tell where Claude Code keeps its sessions; no disk report");
+            return;
+        };
+        if self.measuring_disk.swap(true, Ordering::AcqRel) {
+            // One is under way, maybe with mappings from before a change: measure again after.
+            self.disk_again.store(true, Ordering::Release);
+            return;
+        }
+        self.disk_again.store(false, Ordering::Release);
+        let projects = self.config.lock().unwrap().projects.clone();
+        let this = self.clone();
+        tokio::spawn(async move {
+            let measuring =
+                tokio::task::spawn_blocking(move || disk::report(&claude_dir, &projects));
+            // A dead network drive or a hard NFS mount can block a probe for ever. Give up on
+            // this one (its thread stays blocked) so the next report can still be tried; the
+            // orchestrator stops holding on a report that has gone stale meanwhile.
+            let measured = tokio::time::timeout(DISK_MEASURE_LIMIT, measuring).await;
+            this.measuring_disk.store(false, Ordering::Release);
+            match measured {
+                Ok(Ok(report)) => this.client.send(Body::DiskReport(report)),
+                Ok(Err(e)) => tracing::warn!("measuring free disk space failed: {e}"),
+                Err(_) => tracing::warn!(
+                    "measuring free disk space took over {}s; a mapped drive may be hung",
+                    DISK_MEASURE_LIMIT.as_secs()
+                ),
+            }
+            if this.disk_again.swap(false, Ordering::AcqRel) {
+                this.report_disk();
+            }
+        });
+    }
+
     /// Forwards an agent's tool call to the orchestrator and waits for the answer.
     pub(crate) async fn call_tool(
         &self,
@@ -498,6 +565,8 @@ impl Node {
             };
             if changed {
                 self.send_info();
+                // A newly mapped project may sit on a disk the last report did not cover.
+                self.report_disk();
             }
         }
     }

@@ -49,6 +49,39 @@ pub struct NodeInfo {
     pub running_runs: Vec<String>,
 }
 
+/// Free space on the disks a node's sessions write to. Claude Code keeps every session, subagent
+/// and transcript under its config dir (`~/.claude`) and fails mid-run when that disk is full,
+/// so the orchestrator needs to see it coming rather than learn it from failed tasks.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiskReport {
+    /// Where Claude Code keeps its sessions on this node, for the owner to read.
+    pub claude_dir: String,
+    /// One entry per volume, so a disk holding `~/.claude` and three repositories shows once.
+    pub volumes: Vec<DiskVolume>,
+    /// The largest folders under `<claude_dir>/projects` (one per project directory Claude Code
+    /// has worked in), largest first: where to look when space runs out.
+    pub biggest: Vec<FolderSize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiskVolume {
+    /// The volume's root as the node's OS names it (`C:\`, or a device id on unix).
+    pub volume: String,
+    /// Bytes this user may still write.
+    pub free: u64,
+    pub total: u64,
+    /// Whether the Claude Code config dir is on this volume.
+    pub claude_dir: bool,
+    /// Slugs of the mapped projects whose directories are on this volume.
+    pub projects: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FolderSize {
+    pub name: String,
+    pub bytes: u64,
+}
+
 /// A server-side project (by slug) mapped to a local directory on the node.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProjectMapping {

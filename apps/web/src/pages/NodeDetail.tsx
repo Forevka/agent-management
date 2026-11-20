@@ -12,10 +12,103 @@ import { Note } from '@/components/fx/note'
 import { Table } from '@/components/fx/table'
 import { ArrowLeftIcon } from '@/components/fx/icons'
 import * as api from '../api'
-import type { Node } from '../api'
+import type { Node, NodeDisk } from '../api'
+import { DiskBadge } from '../disk'
 import { ActionButton, ErrorNote, Loaded, When, useApi } from '../ui'
 
 const AUTH_MODES = ['default', 'oauth_token', 'api_key']
+
+/** Free space on each volume the node's sessions and projects write to, and where it went. */
+function DiskSection({ disk }: { disk: NodeDisk | null }) {
+  if (!disk) {
+    return (
+      <EmptyState
+        title="Not reported yet"
+        text="The node reports its free disk space when it connects and every few minutes."
+      />
+    )
+  }
+  return (
+    <Stack gap="2">
+      {disk.state === 'full' && (
+        <Note tone="danger" title="New task runs are held here">
+          The disk is almost full. Tasks wait in the queue until space is freed; the fleet&apos;s
+          own sessions keep running.
+        </Note>
+      )}
+      {disk.state === 'low' && (
+        <Note tone="warning" title="Running low on disk space">
+          Below the floor, new task runs on this node will be held.
+        </Note>
+      )}
+      <Table
+        rows={disk.volumes}
+        rowKey={(v) => v.volume}
+        empty="No volume measured"
+        columns={[
+          {
+            key: 'volume',
+            header: 'Volume',
+            cell: (v) => (
+              <Text size="1" mono breakAll>
+                {v.volume}
+              </Text>
+            ),
+          },
+          {
+            key: 'free',
+            header: 'Free',
+            cell: (v) => (
+              <Text size="1">
+                {api.formatBytes(v.free)} of {api.formatBytes(v.total)}
+              </Text>
+            ),
+          },
+          {
+            key: 'what',
+            header: 'Holds',
+            cell: (v) => (
+              <Row gap="1">
+                {v.claude_dir && <Badge tone="info">Claude sessions</Badge>}
+                {v.projects.map((p) => (
+                  <Badge key={p}>{p}</Badge>
+                ))}
+              </Row>
+            ),
+          },
+        ]}
+      />
+      {disk.biggest.length > 0 && (
+        <Card>
+          <CardHeader
+            title="Biggest session folders"
+            description={`Under ${disk.claude_dir}, one folder per project directory Claude Code has worked in.`}
+          />
+          <CardContent>
+            <Stack gap="1">
+              {disk.biggest.map((f) => (
+                <Row key={f.name} gap="3" justify="between">
+                  <Text size="1" mono breakAll>
+                    {f.name}
+                  </Text>
+                  <Text size="1" tone="muted">
+                    {api.formatBytes(f.bytes)}
+                  </Text>
+                </Row>
+              ))}
+            </Stack>
+          </CardContent>
+        </Card>
+      )}
+      <Row gap="2">
+        <DiskBadge disk={disk} />
+        <Text size="1" tone="muted">
+          reported <When at={disk.at} />
+        </Text>
+      </Row>
+    </Stack>
+  )
+}
 
 export default function NodeDetail() {
   const { id = '' } = useParams()
@@ -106,6 +199,10 @@ export default function NodeDetail() {
                   ))}
                 </Stack>
               )}
+            </Section>
+
+            <Section title="Disk">
+              <DiskSection disk={n.disk} />
             </Section>
 
             <Section title="Settings">

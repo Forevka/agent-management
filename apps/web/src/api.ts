@@ -123,8 +123,29 @@ export type Node = {
   max_agents: number
   running: string[]
   projects: { project: string; path: string }[]
+  /** Free space where its sessions write; `null` before the node's first report. */
+  disk: NodeDisk | null
   known_projects?: { slug: string; name: string }[]
   sessions?: { run_id: string; task: string; started_at: string; status: string }[]
+}
+
+/** `low` warned the owner; `full` holds new task runs on the node until space is freed. */
+export type DiskState = 'ok' | 'low' | 'full'
+
+export type NodeDisk = {
+  state: DiskState
+  at: string | null
+  claude_dir: string
+  /** Bytes free on the fullest volume the fleet writes to. */
+  least_free: number | null
+  volumes: { volume: string; free: number; total: number; claude_dir: boolean; projects: string[] }[]
+  biggest: { name: string; bytes: number }[]
+}
+
+/** `3.2 GB`, `512 MB`, as the orchestrator writes sizes. */
+export function formatBytes(n: number): string {
+  const gb = 1024 ** 3
+  return n >= gb ? `${(n / gb).toFixed(1)} GB` : `${Math.round(n / 1024 ** 2)} MB`
 }
 
 /** One card on the board: a task, plus what the card shows, so the page runs no query itself. */

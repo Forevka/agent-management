@@ -573,7 +573,8 @@ subcommand".
 - A release that raises the protocol version (`PROTOCOL_VERSION` in
   `crates/proto`) refuses nodes on the old version with "protocol version N is
   not supported": update the orchestrator and every node together. Version 3
-  added the project list for the tray app.
+  added the project list for the tray app; version 4 added the nodes' disk
+  reports (free space under `~/.claude` and the project directories).
 
 ## Troubleshooting
 
