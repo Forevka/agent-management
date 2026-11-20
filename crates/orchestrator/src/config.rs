@@ -204,7 +204,11 @@ impl RetroConfig {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
-        let model = std::env::var("FLEET_MODEL").unwrap_or_else(|_| "opus".into());
+        // A full model id, not the `opus` alias: an alias is resolved by whichever Claude CLI a
+        // node happens to have, so the same task could run on different models on two machines,
+        // and the fleet would have no way to say which. Pinned here, overridable per agent and
+        // per task as before.
+        let model = std::env::var("FLEET_MODEL").unwrap_or_else(|_| "claude-opus-5-5".into());
         crate::model::check_model_value("FLEET_MODEL", model.trim()).context(
             "FLEET_MODEL must be a Claude model name (an alias, an id, a Vertex or Bedrock id)",
         )?;
