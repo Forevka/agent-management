@@ -93,5 +93,6 @@ cargo fmt --all
 
 - **Comments** explain *why* in full sentences. Match the density of the file you edit.
 - **Commits.** Conventional Commits (`feat(net): ...`, `fix(orchestrator): ...`). Keep the tree building and tests green at every commit.
+- **`main` is what runs.** Since 2026-11-20, work lands on `main` and **the deploy comes from `main`** — the VPS's `/opt/fleet` tracks `origin/main` and moves with `git fetch origin && git merge --ff-only origin/main`, instead of the `git format-patch`/`git am` of the earlier `deploy` branch, so the commit that runs in production has the same hash as the commit here. Before deploying anything: CI green on `main`. Deployment itself (the image, the two node binaries, the database backup) is in `deploy/README.md`.
 - **Review.** Non-trivial changes get an independent review pass before they are called done. Fix what it finds, then re-run fmt, clippy and the tests.
 - **Docs.** Update `docs/plan.md` when a product decision changes, and `deploy/README.md` and `deploy/.env.example` when configuration changes.

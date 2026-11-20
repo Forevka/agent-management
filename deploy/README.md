@@ -466,10 +466,13 @@ did not run (it recreates the `fleet` and `hindsight` roles).
 
 ## 8. Updating
 
-**The stack:**
+**The stack** — from `main`, which is the branch that runs. `/opt/fleet` tracks
+`origin/main`, so the commit in production has the same hash as the commit in the
+repository, and `git log -1` there answers "what is running" with no translation.
+Deploy only what CI called green.
 
 ```sh
-cd /opt/fleet && git pull
+cd /opt/fleet && git fetch origin && git merge --ff-only origin/main
 cd deploy
 docker compose build orchestrator      # or set FLEET_IMAGE=ghcr.io/<owner>/fleet:<version> and: docker compose pull orchestrator
 docker compose pull postgres hindsight iroh-relay caddy
