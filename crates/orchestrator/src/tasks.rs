@@ -312,13 +312,13 @@ async fn can_grow(o: &Orchestrator, task: &TaskRow) -> bool {
     have < o.cfg.max_agents_per_project && project_has_room(o, &task.project).await.unwrap_or(false)
 }
 
-/// Whether some online node has this project mapped, a free agent slot, and disk space for the
-/// run. Only asked for the owner's tasks (the fleet's own sessions never grow), so a node held
-/// for its disk counts as full.
+/// Whether some online node can run this project (mapped, or assigned to clone), has a free
+/// agent slot, and disk space for the run. Only asked for the owner's tasks (the fleet's own
+/// sessions never grow), so a node held for its disk counts as full.
 async fn project_has_room(o: &Orchestrator, project: &str) -> Result<bool> {
     Ok(node_load(o).await?.iter().any(|(n, load)| {
         n.online
-            && n.has_project(project)
+            && n.can_run(project)
             && *load < i64::from(n.max_agents.max(1))
             && !crate::disk::held(n, project)
     }))
@@ -637,9 +637,10 @@ async fn dispatch_locked(
         .await;
     }
     let nodes = node_load(o).await?;
+    // Nodes with the project mapped, and nodes that would clone it first.
     let candidates: Vec<&(NodeRow, i64)> = nodes
         .iter()
-        .filter(|(n, _)| n.has_project(&task.project))
+        .filter(|(n, _)| n.can_run(&task.project))
         .collect();
     if candidates.is_empty() {
         // The task waits (with the message kept) until a node with the project connects; the
@@ -669,7 +670,9 @@ async fn dispatch_locked(
                 .await?;
             }
             Some(format!(
-                "⏳ Waiting for a node with project <b>{}</b>: run <code>fleet project map {} &lt;dir&gt;</code> on a host.",
+                "⏳ Waiting for a node with project <b>{}</b>: assign it to a node on the node's page \
+                 in the web UI (with the project's repository URL set, the node clones it), or run \
+                 <code>fleet project map {} &lt;dir&gt;</code> on a host.",
                 esc(&task.project),
                 esc(&task.project)
             ))
@@ -699,9 +702,17 @@ async fn dispatch_locked(
             .copied()
             .filter(free),
         None => {
+            // A node that already has the project beats one that would have to clone it (minutes,
+            // and a second copy of the code), then the agent's own node, then the least busy.
             let preferred = agent.preferred_node.as_deref();
             let mut ok: Vec<&(NodeRow, i64)> = candidates.iter().copied().filter(free).collect();
-            ok.sort_by_key(|(n, load)| (Some(n.id.as_str()) != preferred, *load));
+            ok.sort_by_key(|(n, load)| {
+                (
+                    !n.has_project(&task.project),
+                    Some(n.id.as_str()) != preferred,
+                    *load,
+                )
+            });
             ok.first().copied()
         }
     };
@@ -1051,13 +1062,16 @@ pub(crate) fn stable_reason(reason: &str) -> String {
         .join(" ")
 }
 /// Every node with the number of agent runs it is assigned (from our own bookkeeping, which is
-/// current even before the node reports back).
+/// current even before the node reports back), and the projects it would clone for a task
+/// (`NodeRow::clonable`), which is what lets placement ask `NodeRow::can_run`.
 async fn node_load(o: &Orchestrator) -> Result<Vec<(NodeRow, i64)>> {
     let nodes: Vec<NodeRow> = sqlx::query_as("select * from nodes")
         .fetch_all(&o.db)
         .await?;
+    let mut clonable = crate::node_projects::clonable(o).await?;
     let mut out = Vec::with_capacity(nodes.len());
-    for n in nodes {
+    for mut n in nodes {
+        n.clonable = clonable.remove(&n.id).unwrap_or_default();
         let load: i64 =
             // The fleet's own sessions (brain, secretary, retrospective) mostly wait; they take
             // no slot, or a node that hosts them would have fewer for real work.
@@ -1772,7 +1786,7 @@ pub async fn dispatch_queued(o: &Arc<Orchestrator>) {
         let can_run = has_agent
             && nodes.iter().any(|(n, load)| {
                 n.online
-                    && n.has_project(&task.project)
+                    && n.can_run(&task.project)
                     && *load < i64::from(n.max_agents.max(1))
                     && session_node.is_none_or(|id| id == n.id)
                     && (crate::model::is_builtin_task(&task.id)

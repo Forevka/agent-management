@@ -194,6 +194,8 @@ fn node_json(n: &NodeRow) -> Value {
         "running": n.running.0,
         "projects": n.projects.0.iter().map(|p| json!({"project": p.project, "path": p.path})).collect::<Vec<_>>(),
         "disk": crate::disk::json(n),
+        // Where it clones assigned projects (null: its default, ~/fleet-projects).
+        "projects_root": n.projects_root,
     })
 }
 
@@ -812,6 +814,12 @@ async fn project_act(
         let done = crate::plan_gate::set_project(&o, &slug, gate).await?;
         return Ok(Json(json!({"done": done})));
     }
+    // Where its code lives, for the nodes that clone it. The owner's alone, for the same reason.
+    if a.op == "repo_url" {
+        let done =
+            admin::set_repo_url(&o, Actor::Owner, &slug, s(&a.body, "url").as_deref()).await?;
+        return Ok(Json(json!({"done": done})));
+    }
     let action = match a.op.as_str() {
         "edit" => AdminAction::ProjectEdit {
             slug,
@@ -1003,8 +1011,8 @@ async fn invite(State(o): State<O>, h: HeaderMap) -> Api {
 async fn node(State(o): State<O>, h: HeaderMap, Path(id): Path<String>) -> Api {
     guard!(o, h);
     let n = o.node(&id).await?.context("no such node")?;
-    let projects: Vec<(String, String)> =
-        sqlx::query_as("select slug, name from projects order by slug")
+    let projects: Vec<(String, String, Option<String>)> =
+        sqlx::query_as("select slug, name, repo_url from projects order by slug")
             .fetch_all(&o.db)
             .await?;
     let sessions: Vec<(String, String, chrono::DateTime<chrono::Utc>, String)> = sqlx::query_as(
@@ -1017,9 +1025,13 @@ async fn node(State(o): State<O>, h: HeaderMap, Path(id): Path<String>) -> Api {
     v["known_projects"] = json!(
         projects
             .iter()
-            .map(|(slug, name)| json!({"slug": slug, "name": name}))
+            .map(|(slug, name, repo_url)| json!({"slug": slug, "name": name, "repo_url": repo_url}))
             .collect::<Vec<_>>()
     );
+    // The projects the owner assigned to it, and how each stands there.
+    v["assignments"] = json!(crate::node_projects::node_json(&o, &n).await?);
+    // Whether it reads assignments at all: an older node has to update before it clones.
+    v["reads_assignments"] = json!(fleet_proto::node_is_current(&n.app_version));
     v["sessions"] = json!(
         sessions
             .iter()
@@ -1063,6 +1075,24 @@ async fn node_act(
         "revoke" => {
             admin::execute(&o, Actor::Owner, &AdminAction::NodeRevoke { node: id }).await?;
             Ok(Json(json!({"done": "the node is revoked"})))
+        }
+        // Which projects this node clones, and where: the owner's alone (see `node_projects`).
+        "projects_root" => {
+            let done =
+                admin::set_projects_root(&o, Actor::Owner, &id, s(&a.body, "root").as_deref())
+                    .await?;
+            Ok(Json(json!({"done": done})))
+        }
+        "assign" | "unassign" => {
+            let done = admin::assign_project(
+                &o,
+                Actor::Owner,
+                &id,
+                &need(&a.body, "project")?,
+                a.op == "assign",
+            )
+            .await?;
+            Ok(Json(json!({"done": done})))
         }
         other => Err(ApiError(
             StatusCode::BAD_REQUEST,

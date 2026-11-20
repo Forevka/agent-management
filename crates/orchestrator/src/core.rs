@@ -221,6 +221,9 @@ impl Orchestrator {
             Inbound::Message { peer, body } => match body {
                 Body::NodeInfo(info) => self.node_info(peer, info).await?,
                 Body::DiskReport(report) => crate::disk::reported(self, peer, report).await?,
+                Body::ProjectSetupReport(report) => {
+                    crate::node_projects::reported(self, peer, report).await?
+                }
                 Body::AgentEvent(ev) => self.agent_event(peer, ev).await?,
                 Body::ToolCall(call) => {
                     let this = self.clone();
@@ -296,6 +299,9 @@ impl Orchestrator {
         .await?;
         self.push_node_settings(&id).await?;
         self.push_project_list(Some(peer)).await?;
+        // The projects it may clone, before anything is placed on it (a node reports its
+        // projects after this, and that report is what starts queued work).
+        crate::node_projects::on_connect(self, peer, &hello.app_version).await?;
         // This orchestrator reads disk reports; a node that can read the request starts sending
         // them (one now, then every few minutes). An older node is never asked: it could not
         // decode the request.

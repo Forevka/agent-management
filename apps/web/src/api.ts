@@ -125,8 +125,32 @@ export type Node = {
   projects: { project: string; path: string }[]
   /** Free space where its sessions write; `null` before the node's first report. */
   disk: NodeDisk | null
-  known_projects?: { slug: string; name: string }[]
+  /** Where it clones assigned projects; `null` for its default, `~/fleet-projects`. */
+  projects_root: string | null
+  known_projects?: { slug: string; name: string; repo_url: string | null }[]
+  /** The projects the owner assigned to it, and how each stands there. */
+  assignments?: NodeAssignment[]
+  /** Whether it reads assignments: an older node clones nothing until it has updated. */
+  reads_assignments?: boolean
   sessions?: { run_id: string; task: string; started_at: string; status: string }[]
+}
+
+/**
+ * How an assigned project stands on its node: mapped (`path`), being cloned, failed (`detail`
+ * says why), waiting for a task to need it, without a repository URL, or on a node that must
+ * update before it clones anything.
+ */
+export type AssignmentStatus = 'mapped' | 'cloning' | 'failed' | 'waiting' | 'no_url' | 'node_behind'
+
+export type NodeAssignment = {
+  project: string
+  name: string
+  repo_url: string | null
+  status: AssignmentStatus
+  path: string | null
+  state: string | null
+  detail: string | null
+  assigned_at: string
 }
 
 /** `low` warned the owner; `full` holds new task runs on the node until space is freed. */
@@ -178,6 +202,8 @@ export type Project = {
   jira?: { key: string | null; board: number | null; credential_folder: string | null }
   /// Who approves plans of its tasks that are not workflows (a workflow has its own, on its card).
   plan_gate?: 'owner' | 'auto'
+  /// Where its code lives, for the nodes it is assigned to that clone it.
+  repo_url?: string | null
 }
 
 /// A row of the project list, which is the brain's `admin_read` shape: here `jira` is just the

@@ -513,6 +513,8 @@ mod tests {
             disk_at: Some(chrono::Utc::now() - chrono::Duration::minutes(age_minutes)),
             disk_state: state.as_str().into(),
             disk_levels: sqlx::types::Json(stored(&levels)),
+            projects_root: None,
+            clonable: vec![],
         }
     }
 

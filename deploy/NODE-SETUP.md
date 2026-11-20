@@ -202,18 +202,28 @@ Open `/etc/fleet/node.env` and check `FLEET_RELAY` is `https://relay.agents.fore
 
 ## 6. Projects
 
-The node only works on projects mapped to a folder here. Show the owner the projects listed in
-`status.json` (step 5), then **ASK THE OWNER**, in one message:
+The node only works on projects mapped to a folder here — or assigned to it in the web UI, which
+it then clones by itself the first time a task needs one. Either way it clones with **this
+machine's own git login**: the fleet holds no git credentials.
 
-> Which of these projects should this machine work on? For each one: is the repository already
-> cloned here (and where), or should I clone it — and from which URL into which folder?
+First, git access. **ASK THE OWNER** to log in to git on this machine once (e.g. `gh auth login`,
+or a first `git clone` of one of their private repositories through the Git credential manager,
+or an ssh key they add) — never handle a password or token yourself. Check it worked with
+`git ls-remote <one of the repository URLs>`, which must list refs without asking anything.
 
-For each project the owner picks:
+Then show the owner the projects listed in `status.json` (step 5), and **ASK THE OWNER**, in one
+message:
 
-1. If it needs cloning, clone it where the owner said. A private repository needs the owner's own
-   git access on this machine; if the clone asks for credentials, **ASK THE OWNER** to sign in
-   (e.g. `gh auth login`, or their Git credential manager) rather than handling a password or
-   token yourself.
+> Which of these projects should this machine work on? For each one: should the fleet clone it on
+> demand (you assign it to this node on the node's page in the web UI, and set the project's
+> repository URL on its page if it has none), or is it already cloned here (and where)?
+
+Projects the owner assigns in the web UI need nothing more here: the first task for one clones it
+into `~/fleet-projects/<slug>` (or the node's projects root, set on its page) and maps it. For each
+project the owner wants mapped by hand instead:
+
+1. If it is not cloned yet, clone it where the owner said. If the clone asks for credentials,
+   **ASK THE OWNER** to sign in rather than handling a password or token yourself.
 2. Map it:
 
    ```powershell
@@ -237,7 +247,8 @@ Finish with a short report for the owner — and no ticket in it:
 
 - the node's name (`status.json` → `node_name`) and `fleet --version`;
 - `connected: true`, and how the node starts (scheduled task / systemd service);
-- the projects mapped, and their folders;
+- the projects mapped, and their folders; whether git is logged in (for the projects the owner
+  assigns to clone on demand);
 - anything left for the owner. Usually: on the web UI's **Nodes** page
   (`https://agents.forevka.dev/nodes`), check this node's **max agents** (how many sessions it may
   run at once) suits this machine — the default is 4, a lot for a laptop.

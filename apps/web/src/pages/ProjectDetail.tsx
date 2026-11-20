@@ -148,6 +148,40 @@ export default function ProjectDetail() {
               </Card>
             </Section>
 
+            <Section title="Repository">
+              <Card>
+                <CardHeader
+                  title="Where this project's code lives"
+                  description="Nodes this project is assigned to (on each node's page) clone it from here when a task first needs it, with that machine's own git login. Never put a token in the URL: log in to git on the node once instead."
+                />
+                <CardContent>
+                  <form
+                    onSubmit={(e) => {
+                      e.preventDefault()
+                      const f = new FormData(e.currentTarget)
+                      void save('repo_url', { url: f.get('url') })
+                    }}
+                  >
+                    <Row gap="3" align="end">
+                      <div style={{ flexGrow: 1, minWidth: '14rem' }}>
+                        <TextField
+                          name="url"
+                          label="Git URL"
+                          placeholder="git@github.com:owner/repo.git"
+                          defaultValue={d.project.repo_url ?? ''}
+                          size="sm"
+                          optional
+                        />
+                      </div>
+                      <Button type="submit" loading={saving === 'repo_url'} variant="secondary">
+                        Save
+                      </Button>
+                    </Row>
+                  </form>
+                </CardContent>
+              </Card>
+            </Section>
+
             <Section title="Plan approval">
               <Card>
                 <CardHeader

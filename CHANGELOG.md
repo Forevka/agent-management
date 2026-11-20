@@ -1,10 +1,23 @@
-# Changelog
+log
 
 Every merge to `main` is a release (CI tags it with the next patch version and publishes it; the
 VPS rolls it out), so each section below is one merge. How to add to this file is in `CLAUDE.md`
 (*Conventions*). Newest first.
 
 ## Unreleased
+
+- **Projects assigned to a node, cloned on demand.** A project records its git URL (one with
+  credentials in it is refused), and on a node's page the owner assigns projects to it and may
+  set where clones go (default `~/fleet-projects`). A task for an assigned project can be placed
+  on that node, after nodes that already have it mapped; the node clones it with the machine's own
+  git login (non-interactive, one clone per project at a time, at most 20 minutes), maps it and
+  starts the run. A checkout of the same repository already there is adopted; anything else is
+  left alone, and nothing is ever deleted, unassigning included. A clone that fails fails the run
+  with what to do, and the node's page shows each assignment as ready, cloning, failed (why) or
+  not cloned yet. Only the owner sets URLs, roots and assignments; the brain reads them. Nodes
+  clone only once they run this release. Migration `0024_node_projects` (add-only).
+
+## v0.2.6 — 2026-11-21
 
 - **People network.** The fleet keeps records of your colleagues (position, what they work on,
   the company's projects, how to reach them, language, observations, and tags for anything else).

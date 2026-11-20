@@ -51,13 +51,14 @@ pub const MAX_FRAME_LEN: usize = 4 * 1024 * 1024;
 pub mod agent;
 pub mod node;
 pub mod redact;
+pub mod repo;
 
 pub use agent::{
     AgentEvent, AgentEventKind, SecretFile, SpawnAgent, StopAgent, ToolCall, ToolResult,
 };
 pub use node::{
-    ClaudeAuth, DiskReport, DiskVolume, FolderSize, Hello, NodeInfo, NodeSettings, ProjectMapping,
-    ProjectSummary, Rejected, Welcome,
+    AssignedProject, ClaudeAuth, DiskReport, DiskVolume, FolderSize, Hello, NodeInfo, NodeSettings,
+    ProjectAssignments, ProjectMapping, ProjectSetupReport, ProjectSummary, Rejected, Welcome,
 };
 
 /// One frame on the wire.
@@ -166,6 +167,18 @@ pub enum Body {
     // [`reads_v0_2_4_messages`].
     /// Orchestrator -> node, on connect: this orchestrator reads [`Body::DiskReport`]; send them.
     DiskReportWanted,
+
+    // Appended after release v0.2.4. Never sent to a node that is not [`node_is_current`].
+    /// Orchestrator -> node: the projects the owner assigned to it, which it clones on demand.
+    /// Sent on connect and whenever the assignments, a project's repository URL or the node's
+    /// projects root change. See [`ProjectAssignments`].
+    ProjectAssignments(ProjectAssignments),
+
+    // Appended after release v0.2.4. A node sends it only for a project assigned in the last
+    // [`Body::ProjectAssignments`] it received on the current connection, so only to an
+    // orchestrator that reads it.
+    /// Node -> orchestrator: cloning an assigned project started, finished or failed.
+    ProjectSetupReport(ProjectSetupReport),
 }
 
 /// Which release a node should move to, and where to fetch it.
@@ -565,6 +578,46 @@ mod tests {
                     name: "C--repos-fleet-src".into(),
                     bytes: 7 << 30,
                 }],
+            }),
+        });
+    }
+
+    #[test]
+    fn project_assignments_roundtrip() {
+        roundtrip(Envelope {
+            seq: 13,
+            ack: 0,
+            body: Body::ProjectAssignments(ProjectAssignments {
+                root: Some(r"C:\work".into()),
+                projects: vec![
+                    AssignedProject {
+                        slug: "demo".into(),
+                        name: "Demo".into(),
+                        repo_url: Some("git@github.com:o/demo.git".into()),
+                    },
+                    AssignedProject {
+                        slug: "web".into(),
+                        name: String::new(),
+                        repo_url: None,
+                    },
+                ],
+            }),
+        });
+        roundtrip(Envelope {
+            seq: 14,
+            ack: 0,
+            body: Body::ProjectAssignments(ProjectAssignments {
+                root: None,
+                projects: vec![],
+            }),
+        });
+        roundtrip(Envelope {
+            seq: 15,
+            ack: 3,
+            body: Body::ProjectSetupReport(ProjectSetupReport {
+                project: "demo".into(),
+                state: node::SETUP_FAILED.into(),
+                detail: "git could not clone".into(),
             }),
         });
     }

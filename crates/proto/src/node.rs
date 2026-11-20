@@ -96,6 +96,41 @@ pub struct ProjectSummary {
     pub name: String,
 }
 
+/// The projects the owner assigned to a node in the web UI: what it may clone, and where.
+///
+/// A node clones an assigned project only when a task for it arrives and the project is not
+/// mapped there yet; nothing assigned means nothing is ever cloned. It clones with the machine's
+/// own git login: the fleet never holds git credentials, and refuses URLs that carry them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectAssignments {
+    /// Where clones go (`<root>/<slug>`); `None` for the node's default (`~/fleet-projects`).
+    pub root: Option<String>,
+    pub projects: Vec<AssignedProject>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AssignedProject {
+    pub slug: String,
+    pub name: String,
+    /// `None` until the owner sets one: such a project is assigned but cannot be cloned.
+    pub repo_url: Option<String>,
+}
+
+/// How setting up an assigned project on a node went, as the node last saw it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectSetupReport {
+    pub project: String,
+    /// One of [`SETUP_CLONING`], [`SETUP_CLONED`], [`SETUP_FAILED`]. Text rather than an enum, so
+    /// a state added later reads as unknown instead of breaking the frame.
+    pub state: String,
+    /// Where it was cloned to, or why it failed.
+    pub detail: String,
+}
+
+pub const SETUP_CLONING: &str = "cloning";
+pub const SETUP_CLONED: &str = "cloned";
+pub const SETUP_FAILED: &str = "failed";
+
 /// How a node runs Claude Code, configured per node in the orchestrator's web UI.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NodeSettings {

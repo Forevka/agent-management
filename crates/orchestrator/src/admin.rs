@@ -1171,6 +1171,158 @@ pub async fn save_node_settings(
     })
 }
 
+// ------------------------------------------------- projects assigned to nodes (owner only)
+
+/// Which code is cloned onto which machine is the owner's call alone: these are not
+/// `AdminAction`s, so the brain cannot even propose them, and a call made for it is refused.
+fn owner_only(actor: Actor) -> Result<()> {
+    ensure!(
+        actor == Actor::Owner,
+        "only the owner decides which projects a node clones (its repository URL, the node's \
+         projects root, the assignments), on the web UI; the orchestrator cannot change them"
+    );
+    Ok(())
+}
+
+/// Sets (or with `None` or blank, clears) where a project's code lives. Refuses a URL with
+/// credentials in it: nodes clone with their own machine's git login. The nodes it is assigned
+/// to hear of it at once.
+pub async fn set_repo_url(
+    o: &Arc<Orchestrator>,
+    actor: Actor,
+    slug: &str,
+    url: Option<&str>,
+) -> Result<String> {
+    owner_only(actor)?;
+    let p = tasks::project(o, slug).await?;
+    let url = url.map(str::trim).filter(|u| !u.is_empty());
+    if let Some(u) = url {
+        fleet_proto::repo::check_repo_url(u).map_err(anyhow::Error::msg)?;
+    }
+    sqlx::query("update projects set repo_url = $2 where slug = $1")
+        .bind(&p.slug)
+        .bind(url)
+        .execute(&o.db)
+        .await?;
+    o.audit(
+        actor.audit_name(),
+        "project.repo_url",
+        json!({"project": p.slug, "repo_url": url}),
+    )
+    .await;
+    crate::node_projects::push_project(o, &p.slug).await?;
+    // A task waiting for a node may now have one that can clone it.
+    if url.is_some() {
+        dispatch_queued_soon(o);
+    }
+    Ok(match url {
+        Some(u) => format!(
+            "{} is cloned from {u} on the nodes it is assigned to.",
+            p.slug
+        ),
+        None => format!("{} has no repository URL; no node clones it.", p.slug),
+    })
+}
+
+/// Sets (or with `None` or blank, clears) where a node puts the projects it clones. Must be an
+/// absolute path; the node checks it again against its own OS.
+pub async fn set_projects_root(
+    o: &Orchestrator,
+    actor: Actor,
+    node_ref: &str,
+    root: Option<&str>,
+) -> Result<String> {
+    owner_only(actor)?;
+    let n = node(o, node_ref).await?;
+    let root = root.map(str::trim).filter(|r| !r.is_empty());
+    if let Some(r) = root {
+        fleet_proto::repo::check_projects_root(r).map_err(anyhow::Error::msg)?;
+    }
+    sqlx::query("update nodes set projects_root = $2 where id = $1")
+        .bind(&n.id)
+        .bind(root)
+        .execute(&o.db)
+        .await?;
+    o.audit(
+        actor.audit_name(),
+        "node.projects_root",
+        json!({"node": n.id, "projects_root": root}),
+    )
+    .await;
+    crate::node_projects::push(o, &n.id).await?;
+    Ok(match root {
+        Some(r) => format!("{} clones projects into {r}.", n.name),
+        None => format!(
+            "{} clones projects into its default, ~/fleet-projects.",
+            n.name
+        ),
+    })
+}
+
+/// Assigns a project to a node (`assign`), or takes it back. An assigned project with a
+/// repository URL is cloned there when a task for it is placed on that node; taking it back
+/// stops that and never deletes anything the node already cloned.
+pub async fn assign_project(
+    o: &Arc<Orchestrator>,
+    actor: Actor,
+    node_ref: &str,
+    slug: &str,
+    assign: bool,
+) -> Result<String> {
+    owner_only(actor)?;
+    let n = node(o, node_ref).await?;
+    let p = tasks::project(o, slug).await?;
+    let changed = if assign {
+        sqlx::query(
+            "insert into node_projects (node_id, project) values ($1, $2) on conflict do nothing",
+        )
+    } else {
+        sqlx::query("delete from node_projects where node_id = $1 and project = $2")
+    }
+    .bind(&n.id)
+    .bind(&p.slug)
+    .execute(&o.db)
+    .await?
+    .rows_affected()
+        == 1;
+    if changed {
+        o.audit(
+            actor.audit_name(),
+            if assign {
+                "node.assign_project"
+            } else {
+                "node.unassign_project"
+            },
+            json!({"node": n.id, "project": p.slug}),
+        )
+        .await;
+        crate::node_projects::push(o, &n.id).await?;
+        if assign {
+            dispatch_queued_soon(o);
+        }
+    }
+    Ok(match (assign, p.repo_url.is_some()) {
+        (true, true) => format!(
+            "{} is assigned to {}: it clones it when a task needs it there.",
+            p.slug, n.name
+        ),
+        (true, false) => format!(
+            "{} is assigned to {}, but has no repository URL yet: set one on the project's page.",
+            p.slug, n.name
+        ),
+        (false, _) => format!(
+            "{} is no longer assigned to {}. Nothing on the node was deleted.",
+            p.slug, n.name
+        ),
+    })
+}
+
+/// Tries queued work in the background: a change just made a node able to run more of it.
+fn dispatch_queued_soon(o: &Arc<Orchestrator>) {
+    let o = o.clone();
+    tokio::spawn(async move { tasks::dispatch_queued(&o).await });
+}
+
 /// Registers an agent bot token in the pool.
 pub async fn add_bot(o: &Orchestrator, token: &str) -> Result<()> {
     let token = token.trim();
@@ -2669,9 +2821,13 @@ pub async fn read(o: &Orchestrator, what: &str, target: Option<&str>) -> Result<
             let nodes: Vec<NodeRow> = sqlx::query_as("select * from nodes order by name")
                 .fetch_all(&o.db)
                 .await?;
-            Value::Array(nodes.iter().map(node_json).collect())
+            let mut out = Vec::with_capacity(nodes.len());
+            for n in &nodes {
+                out.push(node_read_json(o, n).await?);
+            }
+            Value::Array(out)
         }
-        "node" => node_json(&node(o, need()?).await?),
+        "node" => node_read_json(o, &node(o, need()?).await?).await?,
         "secrets" => folders_json(o, None).await?,
         "secret" | "folder" => {
             let (id, _) = folder(o, &Ref::Name(need()?.to_owned())).await?;
@@ -2783,6 +2939,8 @@ pub(crate) async fn project_json(o: &Orchestrator, slug: &str) -> Result<Value> 
         // Who approves plans of its tasks (`plan_gate`); only the owner sets it, on the project
         // page.
         "plan_gate": p.plan_gate,
+        // Where its code lives, for nodes it is assigned to that clone it; only the owner sets it.
+        "repo_url": p.repo_url,
         "secret_folders": folders,
         "slack_channels": channels.iter().map(|(s, id, n, t)| json!({"source": s, "channel_id": id, "name": n, "triage": t})).collect::<Vec<_>>(),
         "nodes": on,
@@ -2842,6 +3000,15 @@ fn node_json(n: &NodeRow) -> Value {
         // or in the queue until space is freed.
         "disk": crate::disk::json(n),
     })
+}
+
+/// [`node_json`] with the projects assigned to the node and how each stands there (mapped,
+/// cloning, failed and why, or waiting for a task to need it).
+async fn node_read_json(o: &Orchestrator, n: &NodeRow) -> Result<Value> {
+    let mut v = node_json(n);
+    v["projects_root"] = json!(n.projects_root);
+    v["assigned_projects"] = json!(crate::node_projects::node_json(o, n).await?);
+    Ok(v)
 }
 
 /// Secret folders with their key names and the projects using them. Never values.

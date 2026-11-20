@@ -26,11 +26,29 @@ pub struct NodeRow {
     pub disk_state: String,
     /// The same per volume (`{volume: state}`), which is what holds a run (see `crate::disk`).
     pub disk_levels: sqlx::types::Json<std::collections::HashMap<String, String>>,
+    /// Where the node clones assigned projects (null: its default, `~/fleet-projects`).
+    pub projects_root: Option<String>,
+    /// Projects assigned to this node that have a repository URL, so it would clone them for a
+    /// task (see `crate::node_projects`). Filled only by `tasks::node_load`, for placement;
+    /// empty wherever else a node is read.
+    #[sqlx(skip)]
+    pub clonable: Vec<String>,
 }
 
 impl NodeRow {
+    /// Whether the project is checked out and mapped on this node.
     pub fn has_project(&self, slug: &str) -> bool {
         self.projects.0.iter().any(|p| p.project == slug)
+    }
+
+    /// Whether a task of `slug` may be placed here: the project is mapped, or the node would
+    /// clone it first (assigned with a repository URL, and the node reads its assignments). The
+    /// one rule for every placement decision; [`NodeRow::has_project`] is the stronger "already
+    /// there", which placement prefers.
+    pub fn can_run(&self, slug: &str) -> bool {
+        self.has_project(slug)
+            || (self.clonable.iter().any(|p| p == slug)
+                && fleet_proto::node_is_current(&self.app_version))
     }
 }
 
@@ -44,6 +62,8 @@ pub struct ProjectRow {
     pub fyi_topic: Option<i64>,
     /// Who approves plans of its tasks that are not workflows: `owner` or `auto` (`plan_gate`).
     pub plan_gate: String,
+    /// Where its code lives, for nodes it is assigned to that have to clone it (null: none set).
+    pub repo_url: Option<String>,
 }
 
 #[derive(Debug, Clone, FromRow)]

@@ -284,9 +284,24 @@ a restart.
    `FLEET_ALLOWED_EFFORTS` (see `deploy/.env.example`); a node whose Claude command
    sets `--model` or `--effort` keeps its own.
 3. **Projects** page: create each project (its slug is what nodes map), bind
-   secret folders, add Slack channels.
-4. On each host, map the project: `fleet project map <slug> <directory>`, or
-   on Windows, from the tray app.
+   secret folders, add Slack channels, and set its **repository URL** (a plain
+   `https://`, `ssh://` or `git@host:path` URL — never one with a token in it).
+4. Give each host its projects, either way:
+   - **Assign** them on the node's page (**Nodes** → the node → *Assigned
+     projects*). The first task for an assigned project placed there clones it
+     into the node's projects root (default `~/fleet-projects/<slug>`, settable
+     on the same page), maps it and starts. The node clones with **its own
+     machine's git login**, so log in to git there once (`gh auth login`, the
+     Git credential manager, or an ssh key); the fleet never holds git
+     credentials. A directory already at the target is used if it is a checkout
+     of the same repository and refused otherwise; nothing is ever deleted,
+     unassigning included. Nothing assigned is never cloned. A node must run the
+     orchestrator's release to clone (it updates itself).
+   - Or **map** a checkout by hand: `fleet project map <slug> <directory>`, or
+     on Windows, from the tray app.
+
+   A task goes to a node that has its project mapped before one that would
+   have to clone it.
 5. **Nodes** page: per node, set the Claude command (e.g. a full path to
    `claude.exe`) and authentication (the host's own login, a
    `claude setup-token` token, or an API key).

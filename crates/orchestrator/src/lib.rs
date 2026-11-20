@@ -22,6 +22,7 @@ pub mod jira;
 pub mod links;
 pub mod memory;
 pub mod model;
+pub mod node_projects;
 pub mod people;
 pub mod plan_gate;
 pub mod preflight;

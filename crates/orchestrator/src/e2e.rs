@@ -4190,6 +4190,353 @@ async fn disk_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) {
         .unwrap();
 }
 
+/// Runs git for the test's own repositories, failing loudly: the flow needs it, as nodes do.
+fn git(dir: &std::path::Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .expect("git is needed by the e2e (nodes clone assigned projects with it)");
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Projects assigned to a node: the owner records where a project's code lives and assigns it to
+/// a node, and the first task for it there clones it (with the machine's own git login), maps it
+/// and starts in the clone. A project nobody assigned is never placed on a node that lacks it,
+/// a clone that fails fails the run with what to do, and the brain cannot assign anything.
+async fn node_projects_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) {
+    use crate::admin::{self, Actor};
+
+    // 1. A real repository to clone: a bare one with one commit, in a temp dir. Never the
+    //    developer's home: the node's projects root is set to another temp dir below.
+    let base = std::env::temp_dir().join(format!("fleet-e2e-git-{}", crate::web::random_token()));
+    let (bare, work, root) = (
+        base.join("origin.git"),
+        base.join("work"),
+        base.join("clones"),
+    );
+    std::fs::create_dir_all(&work).unwrap();
+    git(&base, &["init", "-q", "--bare", "origin.git"]);
+    git(&work, &["init", "-q"]);
+    // No line ending: a machine with `core.autocrlf` would check one out differently.
+    std::fs::write(work.join("README.md"), "the assigned project").unwrap();
+    git(&work, &["add", "README.md"]);
+    git(
+        &work,
+        &[
+            "-c",
+            "user.name=e2e",
+            "-c",
+            "user.email=e2e@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ],
+    );
+    git(
+        &work,
+        &[
+            "push",
+            "-q",
+            &bare.display().to_string(),
+            "HEAD:refs/heads/main",
+        ],
+    );
+    git(&bare, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+
+    let node: (String,) = sqlx::query_as("select id from nodes where name = 'e2e-node-3'")
+        .fetch_one(db)
+        .await
+        .unwrap();
+    let node = node.0;
+    for (slug, name) in [
+        ("clone-me", "Clone me"),
+        ("not-mine", "Not mine"),
+        ("bad-url", "Bad URL"),
+    ] {
+        sqlx::query("insert into projects (slug, name) values ($1, $2)")
+            .bind(slug)
+            .bind(name)
+            .execute(db)
+            .await
+            .unwrap();
+    }
+
+    // 2. What the owner may not enter, and what only the owner may do.
+    let e = admin::set_repo_url(
+        o,
+        Actor::Owner,
+        "clone-me",
+        Some("https://someone:ghp_tok3n@github.com/o/r.git"),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("log in to git on the node"), "{e}");
+    assert!(!e.contains("ghp_tok3n"), "the token is not repeated: {e}");
+    let e = admin::set_projects_root(o, Actor::Owner, &node, Some("relative/dir"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("absolute path"), "{e}");
+    for refused in [
+        admin::assign_project(o, Actor::Brain, &node, "clone-me", true).await,
+        admin::set_repo_url(o, Actor::Brain, "clone-me", Some("git@github.com:o/r.git")).await,
+        admin::set_projects_root(o, Actor::Brain, &node, Some("/srv/x")).await,
+    ] {
+        let e = refused.unwrap_err().to_string();
+        assert!(e.contains("only the owner"), "{e}");
+    }
+    let assigned_by_brain: i64 = sqlx::query_scalar("select count(*) from node_projects")
+        .fetch_one(db)
+        .await
+        .unwrap();
+    assert_eq!(assigned_by_brain, 0, "the brain changed nothing");
+
+    // 3. The owner, on the web UI: repository URLs (a missing repository passes the check and
+    //    fails at the clone), the node's projects root, and two of the three assigned.
+    let missing = base.join("no-such-repo.git");
+    for (slug, url) in [
+        ("clone-me", bare.display().to_string()),
+        ("not-mine", bare.display().to_string()),
+        ("bad-url", missing.display().to_string()),
+    ] {
+        api_post(
+            o,
+            &format!("/api/projects/{slug}"),
+            json!({"op": "repo_url", "body": {"url": url}}),
+        )
+        .await;
+    }
+    api_post(
+        o,
+        &format!("/api/nodes/{node}"),
+        json!({"op": "projects_root", "body": {"root": root.display().to_string()}}),
+    )
+    .await;
+    for slug in ["clone-me", "bad-url"] {
+        api_post(
+            o,
+            &format!("/api/nodes/{node}"),
+            json!({"op": "assign", "body": {"project": slug}}),
+        )
+        .await;
+    }
+    let audited: i64 = sqlx::query_scalar(
+        "select count(*) from audit_log where actor = 'owner'
+         and action in ('project.repo_url', 'node.projects_root', 'node.assign_project')",
+    )
+    .fetch_one(db)
+    .await
+    .unwrap();
+    assert_eq!(audited, 6, "every change is audited");
+    let page = api_get(o, &format!("/api/nodes/{node}")).await;
+    assert_eq!(
+        page["projects_root"],
+        root.display().to_string(),
+        "{page:#}"
+    );
+    assert_eq!(page["reads_assignments"], true);
+    let status_of = |page: &Value, slug: &str| {
+        page["assignments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["project"] == slug)
+            .map(|a| a["status"].as_str().unwrap().to_owned())
+    };
+    assert_eq!(status_of(&page, "clone-me").as_deref(), Some("waiting"));
+    assert_eq!(status_of(&page, "not-mine"), None, "not assigned");
+
+    let new_task = |project: &str, ticket: &str, agent: &str| {
+        let (project, ticket, agent) = (project.to_owned(), ticket.to_owned(), agent.to_owned());
+        async move {
+            tasks::create_task(
+                o,
+                CreateTask {
+                    project,
+                    title: "Work in a fresh clone".into(),
+                    brief: "Start where the node cloned the project.".into(),
+                    ticket: Some(ticket),
+                    agent: None,
+                    new_agent: Some(NewAgent {
+                        name: agent,
+                        role: "implementor".into(),
+                    }),
+                    model: None,
+                    effort: None,
+                },
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    // 4. A project with a repository but assigned to no node is not placed anywhere: no node
+    //    has it, and none may clone it.
+    let unplaced = new_task("not-mine", "NM-1", "Stranger").await;
+    let unplaced = o.task(&unplaced.id).await.unwrap().unwrap();
+    assert!(
+        unplaced.status == "queued" && !unplaced.running && unplaced.node_id.is_none(),
+        "not placed: {unplaced:?}"
+    );
+    assert!(
+        chat.sent()
+            .iter()
+            .any(|(_, topic, html, _)| *topic == unplaced.topic_id
+                && html.contains("Waiting for a node with project <b>not-mine</b>")
+                && html.contains("assign it to a node")),
+        "the topic says how to get it a node"
+    );
+
+    // 5. The assigned one is placed on the node, which clones it into the root, maps it, says
+    //    so, and starts the run in the clone.
+    let task = new_task("clone-me", "CM-1", "Cloner").await;
+    let placed = wait_for("the cloned project's run starts", || async {
+        o.task(&task.id).await.unwrap().filter(|t| t.running)
+    })
+    .await;
+    assert_eq!(placed.node_id.as_deref(), Some(node.as_str()));
+    let (state, detail): (Option<String>, Option<String>) =
+        wait_for("the node reports the clone", || async {
+            sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            "select state, detail from node_projects where node_id = $1 and project = 'clone-me'",
+        )
+        .bind(&node)
+        .fetch_one(db)
+        .await
+        .ok()
+        .filter(|(s, _)| s.as_deref() == Some("cloned"))
+        })
+        .await;
+    assert_eq!(state.as_deref(), Some("cloned"));
+    let clone = root.join("clone-me");
+    assert_eq!(
+        std::fs::read_to_string(clone.join("README.md")).unwrap(),
+        "the assigned project",
+        "the clone has the repository's files"
+    );
+    let mapped = wait_for("the node maps the clone", || async {
+        o.node(&node).await.unwrap().and_then(|n| {
+            n.projects
+                .0
+                .iter()
+                .find(|m| m.project == "clone-me")
+                .map(|m| m.path.clone())
+        })
+    })
+    .await;
+    let same = |a: &str, b: &std::path::Path| {
+        std::path::Path::new(a).canonicalize().unwrap() == b.canonicalize().unwrap()
+    };
+    assert!(same(&mapped, &clone), "{mapped} is {}", clone.display());
+    assert!(same(detail.as_deref().unwrap(), &clone), "{detail:?}");
+    let cwd = wait_for("the run reports where it works", || async {
+        events(db, &task.id)
+            .await
+            .into_iter()
+            .find(|e| e["type"] == "skill")
+            .and_then(|e| e["cwd"].as_str().map(str::to_owned))
+    })
+    .await;
+    assert!(same(&cwd, &clone), "the run works in the clone, not {cwd}");
+    let page = api_get(o, &format!("/api/nodes/{node}")).await;
+    assert_eq!(
+        status_of(&page, "clone-me").as_deref(),
+        Some("mapped"),
+        "{page:#}"
+    );
+    tasks::stop(o, &placed, false).await.unwrap();
+    wait_for("the cloned project's run ends", || async {
+        o.task(&task.id).await.unwrap().filter(|t| !t.running)
+    })
+    .await;
+
+    // 6. A clone that fails fails the run with what to do about it, and the node's page says so.
+    let bad = new_task("bad-url", "BU-1", "Unlucky").await;
+    let failed = wait_for("the failed clone fails the run", || async {
+        o.task(&bad.id)
+            .await
+            .unwrap()
+            .filter(|t| t.status == "failed" && !t.running)
+    })
+    .await;
+    assert_eq!(failed.node_id.as_deref(), Some(node.as_str()));
+    let reason: String = sqlx::query_scalar(
+        "select data from task_events where task_id = $1 and kind = 'spawn_failed' order by id desc limit 1",
+    )
+    .bind(&bad.id)
+    .fetch_one(db)
+    .await
+    .unwrap();
+    assert!(reason.contains("git could not clone"), "{reason}");
+    assert!(
+        reason.contains("Log in to git on this machine") && reason.contains("git clone"),
+        "{reason}"
+    );
+    let (state, detail): (Option<String>, Option<String>) =
+        wait_for("the node reports the failure", || async {
+            sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            "select state, detail from node_projects where node_id = $1 and project = 'bad-url'",
+        )
+        .bind(&node)
+        .fetch_one(db)
+        .await
+        .ok()
+        .filter(|(s, _)| s.as_deref() == Some("failed"))
+        })
+        .await;
+    assert_eq!(state.as_deref(), Some("failed"));
+    assert!(detail.unwrap().contains("git could not clone"));
+    assert!(
+        !root.join("bad-url").exists(),
+        "a failed clone leaves nothing"
+    );
+
+    // 7. What the brain reads of the node: the assignments and how each stands.
+    let shown = admin::read(o, "node", Some("e2e-node-3")).await.unwrap();
+    let shown: Value = serde_json::from_str(&shown).unwrap();
+    let assigned = shown["assigned_projects"].as_array().unwrap();
+    let status = |slug: &str| {
+        assigned
+            .iter()
+            .find(|a| a["project"] == slug)
+            .map(|a| a["status"].clone())
+    };
+    assert_eq!(status("clone-me"), Some(json!("mapped")), "{shown:#}");
+    assert_eq!(status("bad-url"), Some(json!("failed")), "{shown:#}");
+    assert_eq!(status("not-mine"), None);
+
+    // 8. Unassigning deletes nothing on the node.
+    api_post(
+        o,
+        &format!("/api/nodes/{node}"),
+        json!({"op": "unassign", "body": {"project": "clone-me"}}),
+    )
+    .await;
+    assert!(
+        clone.join("README.md").exists(),
+        "unassigning never deletes"
+    );
+    let still: Vec<String> =
+        sqlx::query_scalar("select project from node_projects where node_id = $1 order by project")
+            .bind(&node)
+            .fetch_all(db)
+            .await
+            .unwrap();
+    assert_eq!(still, ["bad-url"]);
+
+    // The waiting task would otherwise be retried by later node events; stop it.
+    tasks::stop(o, &unplaced, false).await.unwrap();
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 /// The daily retrospective: the fleet reads its own day, proposes improvements to itself, and
 /// the owner's tap is the only thing that turns one into work. Its memory is the loop: what it
 /// concluded, what the owner decided and what came of the work are retained, and Hindsight keeps
@@ -7233,6 +7580,11 @@ async fn lifecycle() {
     // 26. Free disk space: the real node reports it, and a node about to fill up warns the owner
     //     and holds new task runs until space is freed. Last: it adds a node and a project.
     Box::pin(disk_flow(&o, &db, &chat)).await;
+
+    // 27. Projects assigned to a node are cloned there when a task first needs them; nothing
+    //     unassigned is placed there, a clone that fails says what to do, and only the owner
+    //     assigns.
+    Box::pin(node_projects_flow(&o, &db, &chat)).await;
 
     stop_brain().await;
     let _ = std::fs::remove_dir_all(&data_dir);
