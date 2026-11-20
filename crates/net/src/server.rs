@@ -49,6 +49,9 @@ struct Inner {
     sessions: Mutex<HashMap<EndpointId, Session>>,
     auth: Arc<dyn Authorizer>,
     events: mpsc::UnboundedSender<Inbound>,
+    /// The release a node refused for its protocol version should update to, if this server is
+    /// one (see [`Server::set_update_hint`]).
+    update: Mutex<Option<fleet_proto::UpdateAvailable>>,
 }
 
 impl std::fmt::Debug for Server {
@@ -68,9 +71,16 @@ impl Server {
                 sessions: Mutex::new(HashMap::new()),
                 auth: Arc::new(auth),
                 events: tx,
+                update: Mutex::new(None),
             }),
         };
         (server, rx)
+    }
+
+    /// Tells nodes refused for their protocol version which release to update to. Without it
+    /// (a hand-built orchestrator, which is no release) they are only told to update.
+    pub fn set_update_hint(&self, update: Option<fleet_proto::UpdateAvailable>) {
+        *self.inner.update.lock().unwrap() = update;
     }
 
     /// Queues a message for a node. If the node is offline it is delivered on reconnect.
@@ -129,10 +139,17 @@ impl Server {
         .map_err(|_| anyhow!("handshake timed out"))??;
 
         if hello.protocol_version != PROTOCOL_VERSION {
-            let reason = format!(
+            let mut reason = format!(
                 "protocol version {} is not supported (orchestrator speaks {PROTOCOL_VERSION}); update the node",
                 hello.protocol_version
             );
+            // The one message an old node can always decode is this refusal, so the release to
+            // update to travels in its text (see `fleet_proto::update_hint`). Releases
+            // before v0.2.4 just show it; later ones act on it.
+            if let Some(u) = self.inner.update.lock().unwrap().clone() {
+                reason.push('\n');
+                reason.push_str(&fleet_proto::update_hint(&u));
+            }
             return reject(&conn, &mut send, reason).await;
         }
         if let Err(reason) = self.inner.auth.authorize(node, &hello).await {

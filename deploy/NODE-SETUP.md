@@ -244,10 +244,17 @@ Finish with a short report for the owner — and no ticket in it:
 
 ## Updating an existing node
 
-Windows nodes do not update themselves yet. To move one to the newest release: steps 3 and 5 as
-above, and in step 4 run the installer **without `-Ticket`** — it stops the node and the tray,
-replaces the binaries and starts the task again, keeping the node's identity. Linux: replace
-`/usr/local/bin/fleet` (**sudo**) and `sudo systemctl restart fleet-node`.
+Windows nodes (v0.2.4 or later, installed with the current installer) update themselves: when
+the orchestrator moves to a new release, it tells the node, which downloads and checks the new
+`fleet.exe`, waits for its agents to finish (two hours at most, a day while one waits on the
+owner's approval), swaps it in and restarts — and goes back to the previous binary by itself if the new one
+will not start or connect. `%LOCALAPPDATA%\fleet\logs\node.log` shows it happening
+(`updating v… -> v…`), and `fleet --version` says where it landed. Nothing to do — except for the
+tray app, which only the installer replaces: steps 3 and 5 as above, and in step 4 run the
+installer **without `-Ticket`** (it stops the node and the tray, replaces both binaries and starts
+the task again, keeping the node's identity). Do the same if a node is older than v0.2.4, which
+cannot update itself. Linux: replace `/usr/local/bin/fleet` (**sudo**) and
+`sudo systemctl restart fleet-node`.
 
 ## When something goes wrong
 

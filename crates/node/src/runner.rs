@@ -288,6 +288,9 @@ pub fn start(
         // No console window per agent when the node runs in the background.
         cmd.creation_flags(0x0800_0000);
     }
+    // The launcher's permission to replace the node's binary is the node's alone: a `fleet node`
+    // an agent starts while working on the fleet's own code must not overwrite itself.
+    cmd.env_remove(crate::update::SELF_UPDATE_ENV);
     let mut child = cmd
         .spawn()
         .with_context(|| format!("starting {}", program.display()))?;

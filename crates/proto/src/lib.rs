@@ -15,6 +15,12 @@ use serde::{Deserialize, Serialize};
 /// older node could not tell apart from a message for its current run.
 /// 3: [`Body::ProjectList`]. A version 2 node cannot decode it, and an undecodable frame drops
 /// the link, so it must be refused at the handshake instead.
+///
+/// [`Body::UpdateAvailable`] was appended *without* a bump: the orchestrator sends it only to
+/// nodes whose release understands it ([`understands_update_notices`]), so the nodes already out
+/// there keep their link instead of all being refused at once. From the release that added it on,
+/// a refusal for a protocol mismatch also carries an [`update_hint`], so a node can update itself
+/// across later bumps instead of waiting for a person.
 pub const PROTOCOL_VERSION: u32 = 3;
 
 /// The build this binary is: the release that produced it (`v0.2.7`), or the workspace version
@@ -138,6 +144,85 @@ pub enum Body {
     /// Orchestrator -> node: every project, so the node's tray app can offer them for mapping.
     /// Sent on every connect (after [`Body::NodeSettings`]) and after any project change.
     ProjectList(Vec<ProjectSummary>),
+
+    // Appended in protocol version 3, after release v0.2.3. Never sent to a node that does not
+    // [`understands_update_notices`]: an older node cannot decode it, and an undecodable frame
+    // drops its link.
+    /// Orchestrator -> node: a newer release is running here; update to it. Sent on connect to a
+    /// node whose version is behind. See [`UpdateAvailable`].
+    UpdateAvailable(UpdateAvailable),
+}
+
+/// Which release a node should move to, and where to fetch it.
+///
+/// The node downloads `<base_url>/fleet-<version without v>-<target>`, checks it against
+/// `<base_url>/SHA256SUMS`, checks the binary itself says it is `version`, and swaps it in once no
+/// run is active. Both values come from the orchestrator over the authenticated link, and
+/// `release.yml` only publishes tags that are on `main`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UpdateAvailable {
+    /// The release tag, e.g. `v0.2.7`.
+    pub version: String,
+    /// Where that release's assets are, e.g.
+    /// `https://github.com/<owner>/<repo>/releases/download/v0.2.7`.
+    pub base_url: String,
+}
+
+/// The line a refusal for a protocol mismatch ends with, telling the node what to update to.
+///
+/// A node on an older protocol is refused at the handshake, before any [`Body::UpdateAvailable`]
+/// could reach it, and the only thing it is guaranteed to decode is [`Rejected`]'s free-text
+/// `reason`. So the instruction travels inside that text, in a form that must never change:
+/// every node from release v0.2.4 on looks for exactly this. (It is also why [`Hello`] must never
+/// change: the orchestrator has to be able to read an old node's hello to refuse it this way.)
+pub const UPDATE_HINT_PREFIX: &str = "update: ";
+
+/// `update: v0.2.7 https://…/releases/download/v0.2.7`, appended to a refusal's reason.
+pub fn update_hint(u: &UpdateAvailable) -> String {
+    format!("{UPDATE_HINT_PREFIX}{} {}", u.version, u.base_url)
+}
+
+/// The GitHub repository (`owner/repo`) this build's releases are published from. Fixed at build
+/// time (`FLEET_RELEASE_REPO`), so a node only ever downloads its replacement from the place its
+/// own binary came from — not from wherever an orchestrator, or anyone who took one over, names.
+pub const RELEASE_REPO: &str = match option_env!("FLEET_RELEASE_REPO") {
+    Some(r) if !r.is_empty() => r,
+    _ => "Forevka/agent-management",
+};
+
+/// Where release `version`'s assets are: the only `base_url` a node accepts.
+pub fn release_base_url(version: &str) -> String {
+    format!("https://github.com/{RELEASE_REPO}/releases/download/{version}")
+}
+
+/// `v0.2.7` -> (0, 2, 7). Anything else (a hand build's `0.1.0-dev`, a pre-release, garbage) is
+/// not a release.
+pub fn release_version(v: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = v.strip_prefix('v')?.split('.');
+    let n = |p: Option<&str>| p?.parse::<u64>().ok();
+    let version = (n(parts.next())?, n(parts.next())?, n(parts.next())?);
+    parts.next().is_none().then_some(version)
+}
+
+/// The newest release that cannot decode [`Body::UpdateAvailable`].
+const LAST_RELEASE_WITHOUT_UPDATES: (u64, u64, u64) = (0, 2, 3);
+
+/// Whether a node reporting `app_version` can be sent [`Body::UpdateAvailable`]: a release newer
+/// than v0.2.3. A hand build (`-dev`) is never sent one — it may be older than the variant, and
+/// nobody wants a developer's binary replaced under them.
+pub fn understands_update_notices(app_version: &str) -> bool {
+    release_version(app_version).is_some_and(|v| v > LAST_RELEASE_WITHOUT_UPDATES)
+}
+
+/// Finds an [`update_hint`] line in a refusal's reason.
+pub fn parse_update_hint(reason: &str) -> Option<UpdateAvailable> {
+    reason.lines().find_map(|l| {
+        let (version, base_url) = l.trim().strip_prefix(UPDATE_HINT_PREFIX)?.split_once(' ')?;
+        (version.starts_with('v') && base_url.starts_with("https://")).then(|| UpdateAvailable {
+            version: version.to_owned(),
+            base_url: base_url.trim().to_owned(),
+        })
+    })
 }
 
 impl Body {
@@ -165,6 +250,72 @@ mod tests {
     fn roundtrip(env: Envelope) {
         let bytes = env.encode().unwrap();
         assert_eq!(Envelope::decode(&bytes).unwrap(), env);
+    }
+
+    #[test]
+    fn an_update_instruction_survives_the_trip_through_a_refusal() {
+        let u = UpdateAvailable {
+            version: "v0.3.1".into(),
+            base_url: "https://github.com/o/r/releases/download/v0.3.1".into(),
+        };
+        roundtrip(Envelope::control(0, Body::UpdateAvailable(u.clone())));
+        // As the server writes it: a human sentence, then the hint on its own line.
+        let reason = format!(
+            "protocol version 4 is not supported (orchestrator speaks 5); update the node\n{}",
+            update_hint(&u)
+        );
+        assert_eq!(parse_update_hint(&reason), Some(u));
+        // Nothing to act on in an ordinary refusal, or in a hint that is not a release over https:
+        // a node must never fetch a binary from a plain-http or made-up address.
+        for reason in [
+            "unknown node: use an invite",
+            "update: v0.3.1",
+            "update: v0.3.1 http://example.com/x",
+            "update: 0.3.1 https://example.com/x",
+            "please update: v0.3.1 https://example.com/x but not like this",
+        ] {
+            assert_eq!(parse_update_hint(reason), None, "{reason:?}");
+        }
+    }
+
+    #[test]
+    fn only_a_release_tag_is_a_release() {
+        assert_eq!(release_version("v0.2.7"), Some((0, 2, 7)));
+        assert_eq!(release_version("v1.10.0"), Some((1, 10, 0)));
+        for not in [
+            "0.2.7",
+            "0.1.0-dev",
+            "v0.3.0-rc.1",
+            "v0.2",
+            "v0.2.7.1",
+            "vx.y.z",
+            "",
+        ] {
+            assert_eq!(release_version(not), None, "{not:?}");
+        }
+    }
+
+    #[test]
+    fn update_notices_go_only_to_releases_that_can_read_them() {
+        // Every release up to v0.2.3 would drop its link on the unknown variant.
+        for old in ["v0.2.0", "v0.2.3", "v0.1.9"] {
+            assert!(!understands_update_notices(old), "{old}");
+        }
+        for new in ["v0.2.4", "v0.2.10", "v0.3.0", "v1.0.0"] {
+            assert!(understands_update_notices(new), "{new}");
+        }
+        // Hand builds and binaries from before releases existed: never.
+        for other in ["0.1.0", "0.1.0-dev", "v0.3.0-rc.1", ""] {
+            assert!(!understands_update_notices(other), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn the_build_version_is_a_release_or_says_it_is_not_one() {
+        // An empty FLEET_VERSION (how CI passes "not a release") must not make an empty version:
+        // a node would report nothing, and the orchestrator could not tell it from a release.
+        let v = std::hint::black_box(BUILD_VERSION);
+        assert!(v.starts_with('v') || v.ends_with("-dev"), "{v:?}");
     }
 
     #[test]

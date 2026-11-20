@@ -24,6 +24,7 @@ pub mod model;
 pub mod plan_gate;
 pub mod preflight;
 pub mod prompts;
+pub mod releases;
 pub mod retro;
 pub mod secretary;
 pub mod tasks;

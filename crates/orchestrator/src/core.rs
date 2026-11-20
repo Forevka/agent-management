@@ -295,6 +295,18 @@ impl Orchestrator {
         .await?;
         self.push_node_settings(&id).await?;
         self.push_project_list(Some(peer)).await?;
+        // A node behind this orchestrator's release is told to move to it; it updates itself
+        // once no agent is running there (`fleet_node::update`). Every connect, so a node that
+        // was off when the release landed catches up when it comes back.
+        if let Some(target) = crate::releases::this_release()
+            && crate::releases::should_offer(&target.version, &hello.app_version)
+        {
+            tracing::info!(
+                node = %hello.node_name,
+                "node runs {}; offering {}", hello.app_version, target.version
+            );
+            self.server.send(peer, Body::UpdateAvailable(target));
+        }
         Ok(())
     }
 

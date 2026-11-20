@@ -18,6 +18,12 @@ rand.workspace = true
 data-encoding.workspace = true
 which = "8"
 clap.workspace = true
+# Self-update (`update.rs`): fetching a release and checking it against its SHA-256 sums. The same
+# versions the rest of the tree already builds (iroh pulls all three), so this adds nothing to
+# compile. `rustls-no-provider` keeps TLS on ring, installed as the process default before use.
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+sha2 = "0.11"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

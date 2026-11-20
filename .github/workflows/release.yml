@@ -27,6 +27,8 @@ env:
   # Baked into every binary (`fleet_proto::BUILD_VERSION`) so a machine can say which release it
   # runs and the fleet can tell which ones are behind. Without it every build reports 0.1.0.
   FLEET_VERSION: ${{ github.ref_name }}
+  # Baked into every binary: the only repository a node will download its replacement from.
+  FLEET_RELEASE_REPO: ${{ github.repository }}
 
 jobs:
   # A dispatch from a branch would publish a "release" named after the branch, with binaries

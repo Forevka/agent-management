@@ -304,6 +304,9 @@ async fn orchestrator(
     )
     .await?;
     let (server, events) = Server::new(auth.clone());
+    // A node too old for this protocol is refused before any message can reach it; the refusal
+    // itself names the release to update to, so it can bring itself back (see `releases`).
+    server.set_update_hint(fleet_orchestrator::releases::this_release());
     let router = Router::builder(ep.clone())
         .accept(ALPN, server.clone())
         .spawn();
@@ -418,6 +421,15 @@ async fn node(
     if with_tray {
         launch_tray(&exe, data_dir);
     }
+    // Right after an update, this binary has to prove itself: connect, or hand the machine back
+    // to the previous one (see `update::watch_new_binary`).
+    {
+        let node = node.clone();
+        tokio::spawn(fleet_node::update::watch_new_binary(
+            exe.clone(),
+            move || node.is_connected(),
+        ));
+    }
     let link = tokio::spawn(async move { client.run(&ep, cfg).await });
     let agents = node.clone();
     let result = tokio::select! {
@@ -433,6 +445,18 @@ async fn node(
         }
         _ = tokio::signal::ctrl_c() => Ok(()),
     };
+    // Refused for an old protocol: the refusal names the release to move to, and nothing else can
+    // reach a node in that state, so it updates itself from here. Its agents were stopped with the
+    // link, so the update goes ahead at once and ends the process; until then (a download that
+    // keeps failing is retried) the node stays down rather than being refused again every five
+    // seconds. Without this every protocol bump would strand every node until someone
+    // reinstalled it by hand.
+    if let Err(e) = &result
+        && let Some(u) = fleet_proto::parse_update_hint(&format!("{e:#}"))
+        && node.start_update(u, true)
+    {
+        tokio::time::sleep(fleet_node::update::RETRY_MAX).await;
+    }
     node.mark_stopped();
     result
 }

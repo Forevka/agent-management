@@ -14,13 +14,14 @@ pub mod runner;
 pub mod secrets;
 pub mod skill;
 pub mod tools;
+pub mod update;
 
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -80,6 +81,12 @@ pub struct Node {
     /// Makes call ids unique across node restarts, so a stale answer can never match a new call.
     call_prefix: String,
     ipc_addr: Mutex<Option<std::net::SocketAddr>>,
+    /// The release this node should move to. One task (`update_loop`, started by the first
+    /// notice) works towards whatever this holds, so a newer notice redirects it instead of
+    /// starting a second download beside it, and a repeated one (every reconnect sends one) is a
+    /// no-op.
+    update_target: tokio::sync::watch::Sender<Option<fleet_proto::UpdateAvailable>>,
+    update_started: AtomicBool,
 }
 
 impl Node {
@@ -103,6 +110,8 @@ impl Node {
             next_call: AtomicU64::new(1),
             call_prefix: runner::random_token()[..8].to_owned(),
             ipc_addr: Mutex::new(None),
+            update_target: tokio::sync::watch::Sender::new(None),
+            update_started: AtomicBool::new(false),
         });
         // Replaces whatever a previous node process left, so the tray sees this pid at once.
         node.update_status(|_| {});
@@ -111,6 +120,187 @@ impl Node {
 
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    /// Moves this node to the release the orchestrator named, in the background: download and
+    /// check it, swap it in once no agent is running, then exit so the supervisor starts the new
+    /// binary. Returns whether an update is now under way. See `update`.
+    ///
+    /// `allow_downgrade` is for a refusal's hint only: an orchestrator rolled back to an older
+    /// protocol may need its nodes to follow it down. A notice on a live link never moves a node
+    /// backwards — a notice queued while it was off may be older than what was installed since.
+    pub fn start_update(
+        self: &Arc<Self>,
+        u: fleet_proto::UpdateAvailable,
+        allow_downgrade: bool,
+    ) -> bool {
+        use fleet_proto::{BUILD_VERSION, release_version};
+        if u.version == BUILD_VERSION {
+            // The orchestrator runs what this node runs — it may have been rolled back after
+            // offering something newer. Whatever was pending is no longer wanted.
+            self.update_target.send_if_modified(|t| t.take().is_some());
+            return false;
+        }
+        if !update::enabled(&self.exe) {
+            tracing::info!(
+                "{} is available; this node does not replace its own binary (no supervisor asked it to, \
+                 or its directory is not writable), so it is updated by hand or by its host",
+                u.version
+            );
+            return false;
+        }
+        let Some(to) = release_version(&u.version) else {
+            return false;
+        };
+        if !allow_downgrade
+            && let Some(running) = release_version(BUILD_VERSION)
+            && to <= running
+        {
+            return false;
+        }
+        if update::rejected(&self.exe, &u.version) {
+            tracing::warn!(
+                "{} is available, but it was rolled back on this machine before; waiting for the next release",
+                u.version
+            );
+            return false;
+        }
+        self.update_target.send_if_modified(|t| {
+            let changed = t.as_ref() != Some(&u);
+            *t = Some(u);
+            changed
+        });
+        if !self.update_started.swap(true, Ordering::SeqCst) {
+            tokio::spawn(self.clone().update_loop());
+        }
+        true
+    }
+
+    /// Works towards `update_target` until it is installed (the process then exits), retrying a
+    /// failed attempt with backoff — a release's binaries appear minutes after the orchestrator
+    /// starts offering it — and starting over whenever a newer target arrives.
+    async fn update_loop(self: Arc<Self>) {
+        let mut rx = self.update_target.subscribe();
+        let mut backoff = update::RETRY_MIN;
+        loop {
+            let target = rx.borrow_and_update().clone();
+            if let Some(u) = target {
+                match self.update_to(&u, &mut rx).await {
+                    // A newer target arrived while this one waited: go straight to it.
+                    Ok(()) => {
+                        backoff = update::RETRY_MIN;
+                        continue;
+                    }
+                    Err(e) => tracing::warn!(
+                        "update to {} failed: {e:#}; trying again in {} min",
+                        u.version,
+                        backoff.as_secs() / 60
+                    ),
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(backoff) => {
+                        backoff = (backoff * 2).min(update::RETRY_MAX);
+                        continue;
+                    }
+                    changed = rx.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                        backoff = update::RETRY_MIN;
+                        continue;
+                    }
+                }
+            }
+            if rx.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// One attempt at `u`. Exits the process once it is swapped in; returns `Ok` when a newer
+    /// target replaced `u` while it waited, and an error when the attempt failed.
+    async fn update_to(
+        &self,
+        u: &fleet_proto::UpdateAvailable,
+        rx: &mut tokio::sync::watch::Receiver<Option<fleet_proto::UpdateAvailable>>,
+    ) -> Result<()> {
+        use std::time::{Duration, Instant};
+        tracing::info!("updating {} -> {}", fleet_proto::BUILD_VERSION, u.version);
+        let staged = update::prepare(u, &self.exe).await?;
+        let superseded =
+            |rx: &mut tokio::sync::watch::Receiver<_>| rx.has_changed().unwrap_or(true);
+        // Nobody's work is cut off unless it has to be: wait for the agents to finish, up to
+        // the deadline — a day while some run waits on the owner, so an update never throws away
+        // a pending plan or question — after which the runs are stopped. The next message to
+        // their tasks picks them up again from their sessions.
+        let started = Instant::now();
+        let mut last_said = None::<Instant>;
+        loop {
+            if superseded(rx) {
+                let _ = std::fs::remove_file(&staged);
+                return Ok(());
+            }
+            let running = self.agents.lock().unwrap().len();
+            if running == 0 {
+                // What this node still owes the orchestrator (a finished run's last events) is
+                // in memory only; give it a moment to go out before the process ends.
+                let flush_until = Instant::now() + Duration::from_secs(20);
+                while self.client.pending() > 0 && Instant::now() < flush_until {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                if superseded(rx) {
+                    let _ = std::fs::remove_file(&staged);
+                    return Ok(());
+                }
+                // Held across the swap and the exit, so no agent can start in between (see
+                // `spawn_agent`).
+                let agents = self.agents.lock().unwrap();
+                if agents.is_empty() {
+                    update::swap(&self.exe, &staged)?;
+                    tracing::info!("now {}; restarting into it", u.version);
+                    self.mark_stopped();
+                    // The supervisor (the Windows launcher loop) starts the new binary.
+                    std::process::exit(0);
+                }
+                continue;
+            }
+            // A permission prompt (a plan to approve, a question) is a wait on the owner; an
+            // ordinary tool call is not.
+            let waiting_on_owner = self
+                .pending
+                .lock()
+                .unwrap()
+                .values()
+                .any(|p| p.resend.is_some());
+            let deadline = if waiting_on_owner {
+                update::OWNER_DEADLINE
+            } else {
+                update::DEADLINE
+            };
+            if started.elapsed() >= deadline {
+                tracing::info!(
+                    "{running} agent(s) still running after {} h; stopping them to update",
+                    deadline.as_secs() / 3600
+                );
+                self.stop_all(Duration::from_secs(30)).await;
+                // Not straight back to stopping: give the swap its turn first.
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+            if last_said.is_none_or(|t| t.elapsed() >= Duration::from_secs(600)) {
+                tracing::info!(
+                    "{} is ready; waiting for {running} agent(s) to finish",
+                    u.version
+                );
+                last_said = Some(Instant::now());
+            }
+            tokio::time::sleep(Duration::from_secs(15)).await;
+        }
+    }
+
+    /// Whether the link to the orchestrator is up.
+    pub fn is_connected(&self) -> bool {
+        self.client.is_connected()
     }
 
     /// Changes the reported link state and rewrites `status.json`.
@@ -246,16 +436,15 @@ impl Node {
                 }
             }
             Body::ProjectList(projects) => self.update_status(|s| s.projects = Some(projects)),
+            Body::UpdateAvailable(u) => {
+                self.start_update(u, false);
+            }
             other => tracing::warn!("unexpected message for a node: {other:?}"),
         }
     }
 
     fn spawn_agent(self: &Arc<Self>, spawn: SpawnAgent) {
         let (agent_id, task_id) = (spawn.agent_id.clone(), spawn.task_id.clone());
-        if let Some(old) = self.agents.lock().unwrap().remove(&agent_id) {
-            // The orchestrator only respawns an agent it believes is gone; stop a stale process.
-            old.stop(false);
-        }
         let run_id = spawn.run_id.clone();
         let cfg = self.config.lock().unwrap().clone();
         let ipc_addr = self
@@ -263,6 +452,15 @@ impl Node {
             .lock()
             .unwrap()
             .expect("ipc server starts before the link");
+        // Held from before the process starts until it is registered, so a self-update (which
+        // swaps the binary and exits while holding this lock once it finds no agent) can never
+        // exit between the two and kill an agent nobody knew had started. `runner::start` is
+        // synchronous and takes no node lock; what it spawns only waits for this one briefly.
+        let mut agents = self.agents.lock().unwrap();
+        if let Some(old) = agents.remove(&agent_id) {
+            // The orchestrator only respawns an agent it believes is gone; stop a stale process.
+            old.stop(false);
+        }
         match runner::start(
             self.clone(),
             &cfg,
@@ -272,7 +470,8 @@ impl Node {
             spawn,
         ) {
             Ok(handle) => {
-                self.agents.lock().unwrap().insert(agent_id, handle);
+                agents.insert(agent_id, handle);
+                drop(agents);
                 self.send_info();
             }
             Err(e) => self.event(

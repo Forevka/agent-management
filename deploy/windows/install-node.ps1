@@ -205,6 +205,12 @@ function Copy-IfOther($From, $To) {
     }
 }
 Copy-IfOther $FleetExe $ExePath
+# What a self-update leaves beside the binary belongs to the binary that was
+# there before: an older fleet.old.exe the launcher could restore over the one
+# just installed, a download, a rejected release. A fresh install starts clean.
+Get-ChildItem -Path $InstallDir -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -in 'fleet.old.exe', 'fleet.rejected' -or $_.Name -like 'fleet-v*.new.*' } |
+    Remove-Item -Force -ErrorAction SilentlyContinue
 if ($TrayExe) { Copy-IfOther $TrayExe $TrayPath }
 
 [Environment]::SetEnvironmentVariable('FLEET_DATA_DIR', $DataDir, 'User')
@@ -218,21 +224,70 @@ $env:Path = "$InstallDir;$env:Path"
 
 # The launcher: restart `fleet node` whenever it exits, with output appended
 # to a log file that is rotated at 20 MB.
+#
+# It is also what lets the node update itself (FLEET_SELF_UPDATE=1: a node that
+# exits needs something to start the next binary), and its safety net. A node
+# updates itself by moving its running binary aside to fleet.old.exe, putting the
+# new release in its place and exiting; this loop then starts the new one. If the
+# new one keeps dying at startup (three runs of under a minute in a row), the
+# launcher puts fleet.old.exe back and writes the bad release's version to
+# fleet.rejected, so the node does not take that release again (the next one,
+# it does). If it exits with 87 because it never reached the orchestrator, the
+# previous binary goes back too, but the release is not rejected: the machine
+# may only have been offline, and the node tries it again later. The count
+# restarts whenever fleet.exe itself changes: the old binary exiting right after
+# it updated itself is a success, not a strike against the new one.
 $launcherBody = @'
 $ErrorActionPreference = 'Continue'
+$env:FLEET_SELF_UPDATE = '1'
 $exe = Join-Path $PSScriptRoot 'fleet.exe'
+$old = Join-Path $PSScriptRoot 'fleet.old.exe'
+$rejected = Join-Path $PSScriptRoot 'fleet.rejected'
 $logDir = Join-Path $env:LOCALAPPDATA 'fleet\logs'
 $log = Join-Path $logDir 'node.log'
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+# Puts the previous binary back, first noting which release is being rejected
+# (its own --version, given 15 s to answer) so the node will not take it again.
+function Restore-Previous([string]$why, [bool]$reject) {
+    Add-Content -Path $log -Value "=== $(Get-Date -Format o) $why; putting the previous binary back"
+    $out = Join-Path $env:TEMP 'fleet-rejected-version.txt'
+    if ($reject) { try {
+        $p = Start-Process -FilePath $exe -ArgumentList '--version' -NoNewWindow -PassThru -RedirectStandardOutput $out
+        if ($p.WaitForExit(15000)) {
+            $says = (Get-Content $out -Raw -ErrorAction SilentlyContinue)
+            if ($says) { Set-Content -Path $rejected -Value $says.Trim() }
+        } else { $p.Kill() }
+    } catch {} }
+    Move-Item -Force $old $exe
+}
+$quick = 0
+$stamp = $null
 while ($true) {
     if ((Test-Path $log) -and ((Get-Item $log).Length -gt 20MB)) {
         Move-Item -Force $log "$log.1"
     }
+    # An update that failed halfway may leave no fleet.exe at all.
+    if (-not (Test-Path $exe) -and (Test-Path $old)) {
+        Add-Content -Path $log -Value "=== $(Get-Date -Format o) fleet.exe is missing; putting the previous binary back"
+        Move-Item -Force $old $exe
+    }
+    $now = (Get-Item $exe -ErrorAction SilentlyContinue).LastWriteTimeUtc
+    if ($now -ne $stamp) { $quick = 0; $stamp = $now }
     Add-Content -Path $log -Value "=== $(Get-Date -Format o) starting fleet node"
+    $started = Get-Date
     # cmd's redirection appends the node's bytes as is; PowerShell 5.1's *>>
     # would re-encode them as UTF-16 and wrap stderr lines in error records.
     & cmd.exe /d /c "`"$exe`" node >> `"$log`" 2>&1"
-    Add-Content -Path $log -Value "=== $(Get-Date -Format o) fleet node exited with code $LASTEXITCODE; restarting in 5 s"
+    $code = $LASTEXITCODE
+    if (((Get-Date) - $started).TotalSeconds -lt 60) { $quick++ } else { $quick = 0 }
+    if ($code -eq 87 -and (Test-Path $old)) {
+        Restore-Previous 'fleet.exe never reached the orchestrator after an update' $false
+        $quick = 0
+    } elseif ($quick -ge 3 -and (Test-Path $old)) {
+        Restore-Previous 'fleet.exe died within a minute 3 times in a row' $true
+        $quick = 0
+    }
+    Add-Content -Path $log -Value "=== $(Get-Date -Format o) fleet node exited with code $code; restarting in 5 s"
     Start-Sleep -Seconds 5
 }
 '@

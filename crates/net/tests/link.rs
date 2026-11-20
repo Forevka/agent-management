@@ -182,6 +182,56 @@ async fn unknown_node_is_rejected() {
     assert!(format!("{err:#}").contains("unknown node"), "{err:#}");
 }
 
+/// A node from before the current protocol is refused, and the refusal itself names the release
+/// to update to: nothing else can reach a node in that state, so this is its only way back. The
+/// node here speaks the handshake by hand, as an old binary would, since `Client` always sends the
+/// current version.
+#[tokio::test]
+async fn an_old_node_is_refused_with_the_release_to_update_to() {
+    let (_router, server, _orch_rx, orch_addr) = start_orchestrator(TestAuth::default()).await;
+    let update = fleet_proto::UpdateAvailable {
+        version: "v9.9.9".into(),
+        base_url: "https://github.com/o/r/releases/download/v9.9.9".into(),
+    };
+    server.set_update_hint(Some(update.clone()));
+
+    let ep = node_endpoint(&SecretKey::generate()).await;
+    let reply = tokio::time::timeout(Duration::from_secs(20), async {
+        let conn = ep.connect(orch_addr.clone(), ALPN).await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        let hello = Hello {
+            protocol_version: fleet_proto::PROTOCOL_VERSION - 1,
+            node_name: "old".into(),
+            app_version: "v0.2.3".into(),
+            os: "windows".into(),
+            join_secret: None,
+            last_received_seq: 0,
+            incarnation: 1,
+            last_received_from: 0,
+        };
+        let bytes = fleet_proto::Envelope::control(0, Body::Hello(hello))
+            .encode()
+            .unwrap();
+        send.write_all(&(bytes.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
+        send.write_all(&bytes).await.unwrap();
+        let mut len = [0u8; 4];
+        recv.read_exact(&mut len).await.unwrap();
+        let mut buf = vec![0u8; u32::from_be_bytes(len) as usize];
+        recv.read_exact(&mut buf).await.unwrap();
+        fleet_proto::Envelope::decode(&buf).unwrap().body
+    })
+    .await
+    .expect("the orchestrator should answer an old node");
+
+    let Body::Rejected(r) = reply else {
+        panic!("expected a refusal, got {reply:?}");
+    };
+    assert!(r.reason.contains("protocol version"), "{}", r.reason);
+    assert_eq!(fleet_proto::parse_update_hint(&r.reason), Some(update));
+}
+
 #[tokio::test]
 async fn messages_survive_reconnect_exactly_once_in_order() {
     let auth = TestAuth::default();

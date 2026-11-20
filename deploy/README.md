@@ -547,9 +547,37 @@ docker image prune -f
   needs a dump and restore (section 7), not just a new tag.
 - Take a backup first (`deploy/scripts/backup.sh`).
 
-**Nodes:** the VPS's own node follows automatically (above). Other nodes do not yet —
-pushing releases to them over the link is the next step of auto-deploy. Until then, by
-hand — and **update the nodes whenever the
+**Nodes:** the VPS's own node follows automatically (above), and so do Windows nodes on
+release v0.2.4 or later installed with the current `install-node.ps1` (its launcher is what
+lets a node replace itself: `FLEET_SELF_UPDATE=1`). When such a node connects running an older
+release than the orchestrator, the orchestrator tells it which release to move to. The node:
+
+1. downloads its binary from that release — only from the GitHub repository it was itself
+   built from (`FLEET_RELEASE_REPO` at build time, default `Forevka/agent-management`), https
+   only — and refuses it unless it matches the release's `SHA256SUMS` and says
+   `fleet <version>` when run. A release's files appear 10–15 minutes after its tag, usually
+   after the orchestrator already runs it, so a failed attempt is retried (5 minutes, doubling
+   to 2 hours) until it lands or a newer release replaces it;
+2. waits until none of its agents is running — two hours at most, or a day while one waits on
+   you (a plan to approve or a permission to grant), so an update does not throw away a pending
+   approval. After that
+   the runs are stopped; the next message to their tasks picks them up from their sessions;
+3. moves its own exe aside to `fleet.old.exe`, puts the new one in place and exits. The
+   launcher starts the new one five seconds later.
+
+The new binary must then reach the orchestrator within 30 minutes and stay up 10 more before
+`fleet.old.exe` is deleted. If it dies within a minute three times in a row, the launcher puts
+`fleet.old.exe` back and writes the bad release to `fleet.rejected`; that release is not taken
+again, the next one is. If it never connects, the previous binary goes back too, but the
+release is tried again later — the machine may only have been offline. A hand-built orchestrator (`fleet --version` ends
+in `-dev`) offers nothing, and nodes on v0.2.3 or older, or hand builds, are never offered
+anything (they cannot read the notice). `node.log` (`%LOCALAPPDATA%\fleet\logs`) says what a
+node did. The tray app is not part of a self-update: rerun the installer for a new
+`fleet-tray.exe`.
+
+Linux nodes other than the VPS's keep their binary in root's `/usr/local/bin`, which the
+node (running as its own user) cannot write, so they say an update is available and leave it
+to you. Update them by hand — and **whenever the
 `fleet agent` CLI changed**, not only on a protocol bump: that CLI lives in the
 node's binary, so a new agent command (or a changed one) simply does not exist
 for the sessions on a node still running the old one. The orchestrator will
@@ -572,8 +600,10 @@ subcommand".
   restarts the task; the node's key is kept.
 - A release that raises the protocol version (`PROTOCOL_VERSION` in
   `crates/proto`) refuses nodes on the old version with "protocol version N is
-  not supported": update the orchestrator and every node together. Version 3
-  added the project list for the tray app.
+  not supported" — and names the release to update to, which Windows nodes from v0.2.4 on
+  then install by themselves; older nodes are updated by hand. Version 3 added the project
+  list for the tray app. Avoid a bump where you can: the update notice itself was added
+  without one, sent only to nodes whose release can read it.
 
 ## Troubleshooting
 
