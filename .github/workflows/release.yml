@@ -31,18 +31,32 @@ env:
 jobs:
   # A dispatch from a branch would publish a "release" named after the branch, with binaries
   # from wherever that branch happened to be. Only a tag is a release.
+  # And only a tag on main's history: a tag can be pushed by anyone with push access — an agent's
+  # cached git credentials included — onto an unreviewed commit, and a release built from it would
+  # become GitHub's "latest". The VPS updater refuses such a tag too, but a release is also what
+  # nodes and people download, so it must not exist in the first place.
   guard:
-    name: Only a v* tag is a release
+    name: Only a v* tag on main is a release
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
       - name: Check the ref
         env:
           REF: ${{ github.ref }}
         run: |
+          set -euo pipefail
           case "$REF" in
-            refs/tags/v*) echo "releasing $REF" ;;
+            refs/tags/v*) ;;
             *) echo "::error::release.yml runs on a v* tag, not on $REF"; exit 1 ;;
           esac
+          git fetch -q origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$REF ($GITHUB_SHA) is not on main: only merged code is released"
+            exit 1
+          fi
+          echo "releasing $REF ($GITHUB_SHA), which is on main"
 
   build-linux:
     needs: guard
