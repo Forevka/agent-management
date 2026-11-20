@@ -7,6 +7,8 @@ VPS rolls it out), so each section below is one merge. How to add to this file i
 ## Unreleased
 
 - **Changelog.** This file: what changed in each release, written with the change itself.
+- The Windows installer waits for a binary that was just stopped to let go of its file (the tray
+  holds it a few seconds), instead of failing halfway through a reinstall.
 
 ## v0.2.4 — 2026-11-20
 

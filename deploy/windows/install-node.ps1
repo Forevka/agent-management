@@ -197,11 +197,18 @@ Stop-FleetNode
 
 New-Item -ItemType Directory -Force -Path $InstallDir, $DataDir, $LogDir | Out-Null
 # Re-running the installer with the installed files as the source (to re-register the
-# task, say) must not fail on copying a file onto itself.
+# task, say) must not fail on copying a file onto itself. A process that was just stopped
+# can hold its exe for a few seconds more (the tray does), so a locked target is retried
+# for up to 30 s before giving up.
 function Copy-IfOther($From, $To) {
     $src = (Resolve-Path -LiteralPath $From).ProviderPath
-    if (-not ((Test-Path -LiteralPath $To) -and ($src -ieq (Resolve-Path -LiteralPath $To).ProviderPath))) {
-        Copy-Item -Force -LiteralPath $src $To
+    if ((Test-Path -LiteralPath $To) -and ($src -ieq (Resolve-Path -LiteralPath $To).ProviderPath)) { return }
+    for ($i = 1; ; $i++) {
+        try { Copy-Item -Force -LiteralPath $src $To -ErrorAction Stop; return }
+        catch [System.IO.IOException] {
+            if ($i -ge 30) { throw }
+            Start-Sleep -Seconds 1
+        }
     }
 }
 Copy-IfOther $FleetExe $ExePath
