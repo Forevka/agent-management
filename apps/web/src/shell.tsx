@@ -20,6 +20,7 @@ const NAV = [
   ['/people', 'People'],
   ['/agents', 'Agents'],
   ['/nodes', 'Nodes'],
+  ['/kit', 'Kit'],
   ['/secrets', 'Secrets'],
 ] as const
 

@@ -296,6 +296,23 @@ a restart.
    "Google Chat" below).
 7. Write a request in the General topic.
 
+8. **Kit** page (optional): the skills, plugins and MCP servers every node
+   installs, for your own Claude Code there and for the agents. *Import from a
+   node* reads what one machine has (its user-scope MCP servers, the skills in
+   its Claude config dir, its user-scope plugins) and lets you tick what to take;
+   MCP env and header values go into the vault's `kit` secret folder and the kit
+   keeps `${secret:NAME}` placeholders. Every node level with the orchestrator's
+   release then installs the kit — skills next to your own (a skill or user MCP
+   server of the same name that the kit did not install is reported as a
+   conflict and left alone), plugins and MCP servers through the node's `claude`
+   CLI at user scope, so **each machine's `~/.claude.json` then holds those MCP
+   secrets**, as `claude mcp add` would. Agent sessions get exactly the kit's
+   enabled MCP servers plus the fleet's own (`--strict-mcp-config`); nothing else
+   configured on a machine, so **import the MCP servers your agents use** once
+   the nodes run this release. Any session on a node, the orchestrator's own
+   included, runs as the same user and can read that machine's `~/.claude.json`.
+   Each MCP server is a process per session: keep the list short.
+
 Steps 3, 5 and 6 can also be done by asking the orchestrator in General (for
 example "create project web and bind the Jira folder to it"). It proposes each
 change in `fleet · needs you` and applies it only when you tap Approve. Bot

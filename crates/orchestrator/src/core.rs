@@ -55,6 +55,9 @@ pub struct Orchestrator {
     /// Runs of the fleet's own sessions that have not ended, with where their first text came
     /// from: a run that fails on its node tells the owner when it was their message.
     pub builtin_runs: std::sync::Mutex<HashMap<String, crate::tasks::Origin>>,
+    /// Kit captures asked of nodes and not yet imported (see `kit`). In memory only: they hold
+    /// the raw secrets a node reported.
+    pub kit_captures: std::sync::Mutex<crate::kit::Captures>,
 }
 
 /// How often one task may post with a sound (`fleet agent post --notify`).
@@ -93,6 +96,7 @@ impl Orchestrator {
             secretary_turns: Default::default(),
             builtin_retry: Default::default(),
             builtin_runs: Default::default(),
+            kit_captures: Default::default(),
         });
         // Weak, so the consumer does not keep the orchestrator alive; the channel closes with it.
         let weak = Arc::downgrade(&o);
@@ -221,6 +225,8 @@ impl Orchestrator {
             Inbound::Message { peer, body } => match body {
                 Body::NodeInfo(info) => self.node_info(peer, info).await?,
                 Body::DiskReport(report) => crate::disk::reported(self, peer, report).await?,
+                Body::KitCapture(c) => crate::kit::capture_part(self, peer, c),
+                Body::KitStatus(s) => crate::kit::statuses(self, peer, s).await?,
                 Body::AgentEvent(ev) => self.agent_event(peer, ev).await?,
                 Body::ToolCall(call) => {
                     let this = self.clone();
@@ -313,6 +319,13 @@ impl Orchestrator {
                 "node runs {}; offering {}", hello.app_version, target.version
             );
             self.server.send(peer, Body::UpdateAvailable(target));
+        }
+        // The owner's kit, to install there. Only a node level with this build can read it; a
+        // node behind was just offered this release and gets the kit once it runs it.
+        if fleet_proto::node_is_current(&hello.app_version)
+            && let Err(e) = crate::kit::push(self, &id).await
+        {
+            tracing::warn!(node = %hello.node_name, "sending the kit failed: {e:#}");
         }
         Ok(())
     }
@@ -978,6 +991,8 @@ impl Orchestrator {
         let mut tick = tokio::time::interval(Duration::from_secs(300));
         loop {
             tick.tick().await;
+            // A capture nobody imported from goes, with the raw secrets it holds.
+            crate::kit::forget_stale(&self);
             if let Err(e) = crate::human::remind(&self).await {
                 tracing::warn!("reminders failed: {e:#}");
             }

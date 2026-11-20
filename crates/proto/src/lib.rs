@@ -49,11 +49,16 @@ pub const ALPN: &[u8] = b"agent-fleet/control/1";
 pub const MAX_FRAME_LEN: usize = 4 * 1024 * 1024;
 
 pub mod agent;
+pub mod kit;
 pub mod node;
 pub mod redact;
 
 pub use agent::{
     AgentEvent, AgentEventKind, SecretFile, SpawnAgent, StopAgent, ToolCall, ToolResult,
+};
+pub use kit::{
+    Kit, KitCapture, KitCaptureRequest, KitContent, KitFile, KitItemStatus, KitMcp, KitPlugin,
+    KitSkill, KitSkipped,
 };
 pub use node::{
     ClaudeAuth, DiskReport, DiskVolume, FolderSize, Hello, NodeInfo, NodeSettings, ProjectMapping,
@@ -166,6 +171,17 @@ pub enum Body {
     // [`reads_v0_2_4_messages`].
     /// Orchestrator -> node, on connect: this orchestrator reads [`Body::DiskReport`]; send them.
     DiskReportWanted,
+
+    // The kit (see [`kit`]). Appended after release v0.2.4: the orchestrator sends its two only
+    // to a node that [`node_is_current`], and a node sends its two only in answer to them.
+    /// Orchestrator -> node: report the skills, plugins and MCP servers you have.
+    KitCaptureRequest(KitCaptureRequest),
+    /// Node -> orchestrator: one part of the answer to a [`Body::KitCaptureRequest`].
+    KitCapture(KitCapture),
+    /// Orchestrator -> node: one part of the full enabled kit to install.
+    Kit(Kit),
+    /// Node -> orchestrator: how each item of the last complete [`Body::Kit`] fared here.
+    KitStatus(Vec<KitItemStatus>),
 }
 
 /// Which release a node should move to, and where to fetch it.
@@ -566,6 +582,68 @@ mod tests {
                     bytes: 7 << 30,
                 }],
             }),
+        });
+    }
+
+    #[test]
+    fn kit_messages_roundtrip() {
+        let content = KitContent {
+            skills: vec![KitSkill {
+                name: "pdf".into(),
+                files: vec![KitFile {
+                    path: "SKILL.md".into(),
+                    text: "---\nname: pdf\n---\n".into(),
+                }],
+            }],
+            plugins: vec![KitPlugin {
+                plugin: "oh-my-mermaid".into(),
+                marketplace: "oh-my-mermaid".into(),
+                marketplace_source: "oh-my-mermaid/oh-my-mermaid".into(),
+            }],
+            mcp: vec![KitMcp {
+                name: "slack".into(),
+                config: r#"{"command":"npx","env":{"T":"v"}}"#.into(),
+            }],
+        };
+        roundtrip(Envelope {
+            seq: 13,
+            ack: 0,
+            body: Body::KitCaptureRequest(KitCaptureRequest { id: "c1".into() }),
+        });
+        roundtrip(Envelope {
+            seq: 14,
+            ack: 0,
+            body: Body::KitCapture(KitCapture {
+                id: "c1".into(),
+                part: 0,
+                last: true,
+                content: content.clone(),
+                skipped: vec![KitSkipped {
+                    kind: "skill".into(),
+                    name: "big".into(),
+                    reason: "too large".into(),
+                }],
+            }),
+        });
+        roundtrip(Envelope {
+            seq: 15,
+            ack: 0,
+            body: Body::Kit(Kit {
+                revision: "r1".into(),
+                part: 0,
+                last: true,
+                content,
+            }),
+        });
+        roundtrip(Envelope {
+            seq: 16,
+            ack: 0,
+            body: Body::KitStatus(vec![KitItemStatus {
+                kind: "skill".into(),
+                name: "pdf".into(),
+                state: "conflict".into(),
+                detail: "the machine has its own".into(),
+            }]),
         });
     }
 

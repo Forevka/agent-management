@@ -10,6 +10,7 @@ pub mod disk;
 /// compiling the network stack; re-exported here so `fleet_node::config` keeps working.
 pub use fleet_node_config as config;
 pub mod ipc;
+pub mod kit;
 pub mod mcp;
 pub mod runner;
 pub mod secrets;
@@ -30,8 +31,8 @@ use std::{
 use anyhow::Result;
 use fleet_net::{Client, Inbound};
 use fleet_proto::{
-    AgentEvent, AgentEventKind, Body, NodeInfo, NodeSettings, ProjectSummary, SpawnAgent, ToolCall,
-    ToolResult,
+    AgentEvent, AgentEventKind, Body, Kit, KitCapture, KitContent, KitItemStatus, KitSkipped,
+    NodeInfo, NodeSettings, ProjectSummary, SpawnAgent, ToolCall, ToolResult,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -106,6 +107,14 @@ pub struct Node {
     disk_wanted: AtomicBool,
     /// A report was asked for while one was being measured: measure again when it is done.
     disk_again: AtomicBool,
+    /// Where Claude Code's configuration is, when it is not where the environment says (see
+    /// [`Node::use_claude_config_dir`]).
+    claude_config: Mutex<Option<kit::KitPaths>>,
+    /// The parts of the kit arriving now.
+    kit_parts: Mutex<fleet_proto::kit::Parts>,
+    /// The newest complete kit not yet applied, and whether an apply is under way: one at a
+    /// time, and a kit that arrives meanwhile replaces any other still waiting.
+    kit_queue: Mutex<(Option<KitContent>, bool)>,
 }
 
 impl Node {
@@ -116,6 +125,9 @@ impl Node {
         node_name: String,
     ) -> Result<Arc<Self>> {
         let config = NodeConfig::load(&data_dir)?;
+        // A run's MCP config (it holds the kit's secrets) is deleted when the run exits; one a
+        // crashed node process left behind belongs to no run now, so it goes at start.
+        let _ = std::fs::remove_dir_all(data_dir.join("mcp"));
         let node = Arc::new(Self {
             data_dir,
             exe,
@@ -134,6 +146,9 @@ impl Node {
             measuring_disk: AtomicBool::new(false),
             disk_again: AtomicBool::new(false),
             disk_wanted: AtomicBool::new(false),
+            claude_config: Mutex::new(None),
+            kit_parts: Mutex::new(Default::default()),
+            kit_queue: Mutex::new((None, false)),
         });
         // Replaces whatever a previous node process left, so the tray sees this pid at once.
         node.update_status(|_| {});
@@ -142,6 +157,32 @@ impl Node {
 
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    /// Points this node at a Claude Code config dir other than its environment's, as if
+    /// `CLAUDE_CONFIG_DIR` were set to it: the kit reads and installs there, and the `claude`
+    /// processes the node starts (the CLI and the agents) are given it. For a test that must
+    /// never touch the developer's own `~/.claude`.
+    pub fn use_claude_config_dir(&self, dir: PathBuf) {
+        *self.claude_config.lock().unwrap() = Some(kit::KitPaths::at(dir));
+    }
+
+    fn kit_paths(&self) -> Option<kit::KitPaths> {
+        self.claude_config
+            .lock()
+            .unwrap()
+            .clone()
+            .or_else(kit::KitPaths::from_env)
+    }
+
+    /// The `CLAUDE_CONFIG_DIR` the agents must be given, when the node was pointed elsewhere.
+    pub(crate) fn claude_config_env(&self) -> Option<PathBuf> {
+        self.claude_config
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|p| p.set_env)
+            .map(|p| p.config_dir.clone())
     }
 
     /// Moves this node to the release the orchestrator named, in the background: download and
@@ -470,6 +511,8 @@ impl Node {
             Body::UpdateAvailable(u) => {
                 self.start_update(u, false);
             }
+            Body::KitCaptureRequest(r) => self.kit_capture(r.id),
+            Body::Kit(k) => self.kit_received(k),
             other => tracing::warn!("unexpected message for a node: {other:?}"),
         }
     }
@@ -672,6 +715,117 @@ impl Node {
                 this.report_disk();
             }
         });
+    }
+
+    /// Answers a [`Body::KitCaptureRequest`]: what this machine's Claude Code has, read off the
+    /// async runtime (it walks the skill directories), in parts that each fit a frame.
+    fn kit_capture(self: &Arc<Self>, id: String) {
+        let paths = self.kit_paths();
+        let this = self.clone();
+        tokio::spawn(async move {
+            let (content, skipped) = match paths {
+                None => (
+                    KitContent::default(),
+                    vec![KitSkipped {
+                        kind: "config".into(),
+                        name: String::new(),
+                        reason:
+                            "cannot tell where Claude Code keeps its configuration on this machine"
+                                .into(),
+                    }],
+                ),
+                Some(paths) => tokio::task::spawn_blocking(move || kit::capture(&paths))
+                    .await
+                    .unwrap_or_else(|e| {
+                        (
+                            KitContent::default(),
+                            vec![KitSkipped {
+                                kind: "config".into(),
+                                name: String::new(),
+                                reason: format!("reading the configuration failed: {e}"),
+                            }],
+                        )
+                    }),
+            };
+            let parts = content.split(fleet_proto::kit::PART_BUDGET);
+            let n = parts.len();
+            let mut skipped = Some(skipped);
+            for (i, part) in parts.into_iter().enumerate() {
+                this.client.send(Body::KitCapture(KitCapture {
+                    id: id.clone(),
+                    part: i as u32,
+                    last: i + 1 == n,
+                    content: part,
+                    skipped: skipped.take().unwrap_or_default(),
+                }));
+            }
+        });
+    }
+
+    /// Collects a [`Body::Kit`]'s parts; once the kit is whole, it is applied (one apply at a
+    /// time, the newest kit next).
+    fn kit_received(self: &Arc<Self>, k: Kit) {
+        let Some(whole) =
+            self.kit_parts
+                .lock()
+                .unwrap()
+                .add(&k.revision, k.part, k.last, k.content)
+        else {
+            return;
+        };
+        let start = {
+            let mut q = self.kit_queue.lock().unwrap();
+            q.0 = Some(whole);
+            !std::mem::replace(&mut q.1, true)
+        };
+        if start {
+            tokio::spawn(self.clone().kit_apply_loop());
+        }
+    }
+
+    async fn kit_apply_loop(self: Arc<Self>) {
+        loop {
+            let kit = {
+                let mut q = self.kit_queue.lock().unwrap();
+                match q.0.take() {
+                    Some(k) => k,
+                    None => {
+                        q.1 = false;
+                        return;
+                    }
+                }
+            };
+            let statuses = match self.kit_paths() {
+                Some(paths) => {
+                    let command = self
+                        .config
+                        .lock()
+                        .unwrap()
+                        .settings
+                        .as_ref()
+                        .map(|s| s.claude_command.clone())
+                        .unwrap_or_else(|| vec!["claude".into()]);
+                    kit::apply(&paths, &self.data_dir, &command, &kit).await
+                }
+                None => {
+                    let failed = |kind: &str, name: String| KitItemStatus {
+                        kind: kind.into(),
+                        name,
+                        state: "failed".into(),
+                        detail:
+                            "cannot tell where Claude Code keeps its configuration on this machine"
+                                .into(),
+                    };
+                    kit.skills
+                        .iter()
+                        .map(|s| failed("skill", s.name.clone()))
+                        .chain(kit.plugins.iter().map(|p| failed("plugin", p.id())))
+                        .chain(kit.mcp.iter().map(|m| failed("mcp", m.name.clone())))
+                        .collect()
+                }
+            };
+            self.client.send(Body::KitStatus(statuses));
+        }
     }
 
     /// Forwards an agent's tool call to the orchestrator and waits for the answer.

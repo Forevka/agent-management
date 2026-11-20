@@ -34,6 +34,8 @@ const MAX_LINE: usize = 512 * 1024;
 /// MCP tool calls normally time out quickly; the permission tool waits for a human, possibly
 /// for hours, so the agent's MCP client must wait far longer (one week, in ms).
 const MCP_TOOL_TIMEOUT_MS: &str = "604800000";
+/// Claude loads only the servers of `--mcp-config` (see [`build_args`]).
+const STRICT_MCP: &str = "--strict-mcp-config";
 /// After a graceful stop, how long Claude may take to finish its turn before it is killed.
 const GRACEFUL_STOP_LIMIT: Duration = Duration::from_secs(600);
 
@@ -146,6 +148,14 @@ pub fn build_args(
     .iter()
     .map(|s| s.to_string())
     .collect();
+    // The MCP servers a session gets are exactly the ones in its config: the fleet's own, plus
+    // the owner's kit when the orchestrator sent it. Nothing else this machine has configured
+    // (user scope, a project's `.mcp.json`, a plugin's own servers, claude.ai connectors) is
+    // loaded — checked against the real CLI. The secretary's and the retrospective's spawns ask
+    // for it themselves; once is enough.
+    if !spawn.extra_args.iter().any(|a| a == STRICT_MCP) {
+        args.push(STRICT_MCP.into());
+    }
     // A model set in the node's command wins over the fleet's default: the last `--model` would
     // otherwise be ours, and the node's setting would do nothing.
     let node_sets_model = base_args
@@ -198,17 +208,19 @@ pub fn start(
     std::fs::create_dir_all(&agent_dir)?;
     let ipc_token = random_token();
     let role = spawn.role.clone();
-    let mcp_path = agent_dir.join("mcp.json");
-    std::fs::write(
-        &mcp_path,
-        mcp_config(
-            exe,
-            ipc_addr,
-            &ipc_token,
-            &role,
-            spawn.extra_mcp_servers.as_deref(),
-        )?,
+    // Secrets are per run: a replaced run's cleanup must not delete the new run's files.
+    let secrets_key = format!("{}-{}", spawn.task_id, spawn.run_id);
+    // The MCP config holds the kit's resolved secrets, so it is the run's own file, outside the
+    // project, removed with the run's other secrets when the process exits. Like them, it is
+    // written only once nothing else can fail before the process starts.
+    let mcp_text = mcp_config(
+        exe,
+        ipc_addr,
+        &ipc_token,
+        &role,
+        spawn.extra_mcp_servers.as_deref(),
     )?;
+    let mcp_path = secrets::mcp_config_path(data_dir, &secrets_key);
     let system_path = match &spawn.append_system_prompt {
         Some(text) => {
             let p = agent_dir.join("system-prompt.md");
@@ -217,14 +229,14 @@ pub fn start(
         }
         None => None,
     };
-    // Secrets are per run: a replaced run's cleanup must not delete the new run's files.
-    let secrets_key = format!("{}-{}", spawn.task_id, spawn.run_id);
-    secrets::write(data_dir, &secrets_key, &spawn.secret_files)?;
+    // The kit's MCP secrets are scrubbed from the transcript like the project's.
+    let kit_servers = extra_servers(spawn.extra_mcp_servers.as_deref()).unwrap_or_default();
     let redact: Arc<Vec<String>> = Arc::new(
         spawn
             .secret_files
             .iter()
             .flat_map(|f| secrets::parse_env(&f.content).into_values())
+            .chain(crate::kit::mcp_secret_values(&kit_servers))
             .collect(),
     );
     let plugin_dir = crate::skill::write_plugin(data_dir, &role)?;
@@ -265,6 +277,10 @@ pub fn start(
             secrets::task_dir(data_dir, &secrets_key),
         )
         .env("MCP_TOOL_TIMEOUT", MCP_TOOL_TIMEOUT_MS)
+        .envs(
+            node.claude_config_env()
+                .map(|d| ("CLAUDE_CONFIG_DIR", d.into_os_string())),
+        )
         .current_dir(&work_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -291,9 +307,19 @@ pub fn start(
     // The launcher's permission to replace the node's binary is the node's alone: a `fleet node`
     // an agent starts while working on the fleet's own code must not overwrite itself.
     cmd.env_remove(crate::update::SELF_UPDATE_ENV);
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("starting {}", program.display()))?;
+    let started = secrets::write(data_dir, &secrets_key, &spawn.secret_files)
+        .and_then(|_| secrets::write_mcp_config(data_dir, &secrets_key, &mcp_text))
+        .and_then(|()| {
+            cmd.spawn()
+                .with_context(|| format!("starting {}", program.display()))
+        });
+    let mut child = match started {
+        Ok(c) => c,
+        Err(e) => {
+            secrets::remove(data_dir, &secrets_key);
+            return Err(e);
+        }
+    };
     let tree = ProcessTree::adopt(&child);
 
     let (agent_id, task_id, run_id) = (
@@ -502,14 +528,8 @@ pub fn mcp_config(
     role: &str,
     extra: Option<&str>,
 ) -> Result<String> {
-    let mut servers = serde_json::Map::new();
-    if let Some(extra) = extra.filter(|e| !e.trim().is_empty()) {
-        let v: serde_json::Value =
-            serde_json::from_str(extra).context("extra MCP servers are not a JSON object")?;
-        if let serde_json::Value::Object(m) = v {
-            servers.extend(m);
-        }
-    }
+    let mut servers = extra_servers(extra)?;
+    // The fleet's own server last, so nothing sent along can take its name.
     servers.insert(
         "fleet".into(),
         json!({
@@ -522,6 +542,17 @@ pub fn mcp_config(
     Ok(serde_json::to_string_pretty(
         &json!({ "mcpServers": servers }),
     )?)
+}
+
+/// The extra MCP servers of a spawn (the owner's kit), as a JSON object.
+fn extra_servers(extra: Option<&str>) -> Result<serde_json::Map<String, serde_json::Value>> {
+    match extra.filter(|e| !e.trim().is_empty()) {
+        None => Ok(serde_json::Map::new()),
+        Some(extra) => match serde_json::from_str(extra) {
+            Ok(serde_json::Value::Object(m)) => Ok(m),
+            _ => bail!("extra MCP servers are not a JSON object"),
+        },
+    }
 }
 
 fn resolve_program(program: &str) -> Result<PathBuf> {
@@ -645,6 +676,7 @@ mod tests {
             "--append-system-prompt-file /tmp/sys.md",
             "--model opus",
             "--resume s1",
+            "--strict-mcp-config",
         ] {
             assert!(joined.contains(needle), "{needle} missing from {joined}");
         }
@@ -675,6 +707,50 @@ mod tests {
             None,
         );
         assert!(args.join(" ").contains("--model opus"));
+    }
+
+    #[test]
+    fn only_the_configured_mcp_servers_load_and_the_fleet_keeps_its_name() {
+        // Every session is held to its own config, once, even when the spawn asks for it too
+        // (the secretary's does).
+        let mut s = spawn();
+        let count = |args: &[String]| args.iter().filter(|a| *a == STRICT_MCP).count();
+        assert_eq!(
+            count(&build_args(&s, &[], Path::new("/m"), Path::new("/p"), None)),
+            1
+        );
+        s.extra_args = vec![STRICT_MCP.into(), "--setting-sources".into(), String::new()];
+        assert_eq!(
+            count(&build_args(&s, &[], Path::new("/m"), Path::new("/p"), None)),
+            1
+        );
+
+        // The kit's servers come along, secrets resolved; one named `fleet` cannot replace the
+        // fleet's own permission server.
+        let kit = r#"{"slack":{"command":"npx","env":{"SLACK_TOKEN":"xoxp-123456"}},"fleet":{"command":"evil"}}"#;
+        let text = mcp_config(
+            Path::new("/bin/fleet"),
+            "127.0.0.1:9".parse().unwrap(),
+            "tok",
+            "worker",
+            Some(kit),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let servers = v["mcpServers"].as_object().unwrap();
+        assert_eq!(servers.len(), 2, "{servers:?}");
+        assert_eq!(servers["fleet"]["args"], json!(["mcp"]));
+        assert_eq!(servers["slack"]["env"]["SLACK_TOKEN"], "xoxp-123456");
+        assert!(
+            mcp_config(
+                Path::new("/f"),
+                "127.0.0.1:9".parse().unwrap(),
+                "t",
+                "w",
+                Some("[1]")
+            )
+            .is_err()
+        );
     }
 
     #[test]

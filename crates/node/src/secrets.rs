@@ -43,12 +43,41 @@ pub fn write(data_dir: &Path, task_id: &str, files: &[SecretFile]) -> Result<Vec
     Ok(paths)
 }
 
+/// Where a run's MCP config goes: beside its secrets, not among them (an agent's
+/// `FLEET_SECRETS_DIR` holds only its `.env` files), and never inside the project.
+pub fn mcp_config_path(data_dir: &Path, task_id: &str) -> PathBuf {
+    data_dir
+        .join("mcp")
+        .join(format!("{}.json", sanitize(task_id)))
+}
+
+/// Writes a run's MCP config, readable by this user only. It holds the kit's resolved secrets,
+/// so [`remove`] deletes it with the run's other secrets.
+pub fn write_mcp_config(data_dir: &Path, task_id: &str, text: &str) -> Result<()> {
+    let path = mcp_config_path(data_dir, task_id);
+    let dir = path.parent().expect("a file in a directory");
+    std::fs::create_dir_all(dir)?;
+    restrict(dir, true)?;
+    // Created empty and restricted before the secrets go in, so they are never readable by
+    // anyone else, not even for a moment.
+    std::fs::write(&path, "")?;
+    restrict(&path, false)?;
+    std::fs::write(&path, text)?;
+    Ok(())
+}
+
 pub fn remove(data_dir: &Path, task_id: &str) {
     let dir = task_dir(data_dir, task_id);
     if dir.exists()
         && let Err(e) = std::fs::remove_dir_all(&dir)
     {
         tracing::warn!("could not remove secrets for {task_id}: {e}");
+    }
+    let mcp = mcp_config_path(data_dir, task_id);
+    if mcp.exists()
+        && let Err(e) = std::fs::remove_file(&mcp)
+    {
+        tracing::warn!("could not remove the MCP config of {task_id}: {e}");
     }
 }
 
@@ -180,8 +209,14 @@ mod tests {
             )
             .is_err()
         );
+        write_mcp_config(&data, "proj-1", r#"{"mcpServers":{}}"#).unwrap();
+        assert!(mcp_config_path(&data, "proj-1").starts_with(data.join("mcp")));
         remove(&data, "proj-1");
         assert!(!task_dir(&data, "proj-1").exists());
+        assert!(
+            !mcp_config_path(&data, "proj-1").exists(),
+            "the MCP config goes with them"
+        );
         let _ = std::fs::remove_dir_all(&data);
     }
 }
