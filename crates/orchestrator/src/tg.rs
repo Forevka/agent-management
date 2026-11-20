@@ -902,13 +902,29 @@ async fn status(o: &Orchestrator) -> Result<String> {
         .await?;
     let mut s = String::from("<b>Nodes</b>\n");
     for n in &nodes {
+        let disk = match (
+            crate::disk::DiskState::parse(&n.disk_state),
+            crate::disk::least_free(n),
+        ) {
+            (crate::disk::DiskState::Ok, _) | (_, None) => String::new(),
+            (state, Some(free)) => format!(
+                " · {} {} free",
+                if state == crate::disk::DiskState::Full {
+                    "🛑"
+                } else {
+                    "💾"
+                },
+                crate::disk::bytes(free)
+            ),
+        };
         s.push_str(&format!(
-            "{} {} · {}/{} agents · {} projects\n",
+            "{} {} · {}/{} agents · {} projects{}\n",
             if n.online { "🟢" } else { "⚪" },
             esc(&n.name),
             n.running.0.len(),
             n.max_agents,
-            n.projects.0.len()
+            n.projects.0.len(),
+            disk
         ));
     }
     if nodes.is_empty() {

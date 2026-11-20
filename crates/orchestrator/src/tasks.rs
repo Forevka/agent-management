@@ -312,10 +312,15 @@ async fn can_grow(o: &Orchestrator, task: &TaskRow) -> bool {
     have < o.cfg.max_agents_per_project && project_has_room(o, &task.project).await.unwrap_or(false)
 }
 
-/// Whether some online node has this project mapped and a free agent slot.
+/// Whether some online node has this project mapped, a free agent slot, and disk space for the
+/// run. Only asked for the owner's tasks (the fleet's own sessions never grow), so a node held
+/// for its disk counts as full.
 async fn project_has_room(o: &Orchestrator, project: &str) -> Result<bool> {
     Ok(node_load(o).await?.iter().any(|(n, load)| {
-        n.online && n.has_project(project) && *load < i64::from(n.max_agents.max(1))
+        n.online
+            && n.has_project(project)
+            && *load < i64::from(n.max_agents.max(1))
+            && !crate::disk::held(n, project)
     }))
 }
 
@@ -679,7 +684,14 @@ async fn dispatch_locked(
             .is_none_or(|id| nodes.iter().any(|(n, _)| n.id == id))
     });
     let pinned = resume.as_ref().and(task.node_id.as_deref());
-    let free = |(n, load): &&(NodeRow, i64)| n.online && *load < i64::from(n.max_agents.max(1));
+    let has_slot = |(n, load): &&(NodeRow, i64)| n.online && *load < i64::from(n.max_agents.max(1));
+    // A node about to run out of disk starts no new task run: it would fail there and cut its
+    // session's transcript short. The fleet's own sessions are exempt, so the owner can still
+    // reach the fleet while they free space.
+    let disk_held = |n: &NodeRow| {
+        !crate::model::is_builtin_task(&task.id) && crate::disk::held(n, &task.project)
+    };
+    let free = |c: &&(NodeRow, i64)| has_slot(c) && !disk_held(&c.0);
     let chosen = match pinned {
         Some(node_id) => candidates
             .iter()
@@ -704,18 +716,34 @@ async fn dispatch_locked(
                     .collect::<Vec<_>>()
                     .join(", ")
             });
-        return queue(
-            o,
-            task,
-            &holder,
-            prompt.as_deref(),
-            origin,
-            Some(format!(
+        // Say so when it is the disk that holds it: the owner can do something about that, and
+        // "at capacity" would send them looking at the wrong thing.
+        let held_for_disk: Vec<&NodeRow> = candidates
+            .iter()
+            .filter(|(n, _)| pinned.is_none_or(|id| n.id == id))
+            .map(|(n, _)| n)
+            .filter(|n| n.online && disk_held(n))
+            .collect();
+        let note = if held_for_disk.is_empty() {
+            format!(
                 "⏳ Queued: waiting for {} (offline or at capacity).",
                 esc(&waiting_for)
-            )),
-        )
-        .await;
+            )
+        } else {
+            let names = held_for_disk
+                .iter()
+                .map(|n| match crate::disk::least_free(n) {
+                    Some(free) => format!("{} ({} free)", n.name, crate::disk::bytes(free)),
+                    None => n.name.clone(),
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "⏳ Queued: {} almost out of disk space. It starts once space is freed.",
+                esc(&names)
+            )
+        };
+        return queue(o, task, &holder, prompt.as_deref(), origin, Some(note)).await;
     };
 
     let run_id = crate::web::random_token()[..12].to_owned();
@@ -1747,6 +1775,8 @@ pub async fn dispatch_queued(o: &Arc<Orchestrator>) {
                     && n.has_project(&task.project)
                     && *load < i64::from(n.max_agents.max(1))
                     && session_node.is_none_or(|id| id == n.id)
+                    && (crate::model::is_builtin_task(&task.id)
+                        || !crate::disk::held(n, &task.project))
             });
         if !can_run {
             continue;

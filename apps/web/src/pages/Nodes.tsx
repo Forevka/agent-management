@@ -9,6 +9,7 @@ import { Note } from '@/components/fx/note'
 import { Table } from '@/components/fx/table'
 import * as api from '../api'
 import type { Node } from '../api'
+import { DiskBadge } from '../disk'
 import { ErrorNote, Loaded, When, useApi } from '../ui'
 
 export default function Nodes() {
@@ -71,6 +72,11 @@ export default function Nodes() {
                     </Text>
                   </Row>
                 ),
+              },
+              {
+                key: 'disk',
+                header: 'Disk',
+                cell: (n) => <DiskBadge disk={n.disk} />,
               },
               {
                 key: 'projects',

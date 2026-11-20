@@ -19,6 +19,13 @@ pub struct NodeRow {
     pub projects: sqlx::types::Json<Vec<fleet_proto::ProjectMapping>>,
     pub running: sqlx::types::Json<Vec<String>>,
     pub incarnation: Option<String>,
+    /// The node's last disk report, if it has sent one (see `crate::disk`).
+    pub disk: Option<sqlx::types::Json<fleet_proto::DiskReport>>,
+    pub disk_at: Option<DateTime<Utc>>,
+    /// `ok`, `low` or `full`: what the orchestrator made of the last report.
+    pub disk_state: String,
+    /// The same per volume (`{volume: state}`), which is what holds a run (see `crate::disk`).
+    pub disk_levels: sqlx::types::Json<std::collections::HashMap<String, String>>,
 }
 
 impl NodeRow {

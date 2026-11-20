@@ -15,13 +15,15 @@ use serde::{Deserialize, Serialize};
 /// older node could not tell apart from a message for its current run.
 /// 3: [`Body::ProjectList`]. A version 2 node cannot decode it, and an undecodable frame drops
 /// the link, so it must be refused at the handshake instead.
+/// 4: [`Body::DiskReport`]. An older orchestrator cannot decode it, so a node that sends it must
+/// not reach one. (A node cannot tell which release its orchestrator runs, so this one could not
+/// be gated the way [`Body::UpdateAvailable`] is.)
 ///
-/// [`Body::UpdateAvailable`] was appended *without* a bump: the orchestrator sends it only to
-/// nodes whose release understands it ([`understands_update_notices`]), so the nodes already out
-/// there keep their link instead of all being refused at once. From the release that added it on,
-/// a refusal for a protocol mismatch also carries an [`update_hint`], so a node can update itself
-/// across later bumps instead of waiting for a person.
-pub const PROTOCOL_VERSION: u32 = 3;
+/// [`Body::UpdateAvailable`] needed no bump of its own: the orchestrator sends it only to nodes
+/// whose release understands it ([`understands_update_notices`]). From the release that added
+/// it on, a refusal for a protocol mismatch also carries an [`update_hint`], so a node can update
+/// itself across later bumps instead of waiting for a person.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// The build this binary is: the release that produced it (`v0.2.7`), or the workspace version
 /// with `-dev` for a binary built by hand.
@@ -54,7 +56,8 @@ pub use agent::{
     AgentEvent, AgentEventKind, SecretFile, SpawnAgent, StopAgent, ToolCall, ToolResult,
 };
 pub use node::{
-    ClaudeAuth, Hello, NodeInfo, NodeSettings, ProjectMapping, ProjectSummary, Rejected, Welcome,
+    ClaudeAuth, DiskReport, DiskVolume, FolderSize, Hello, NodeInfo, NodeSettings, ProjectMapping,
+    ProjectSummary, Rejected, Welcome,
 };
 
 /// One frame on the wire.
@@ -151,6 +154,12 @@ pub enum Body {
     /// Orchestrator -> node: a newer release is running here; update to it. Sent on connect to a
     /// node whose version is behind. See [`UpdateAvailable`].
     UpdateAvailable(UpdateAvailable),
+
+    // Appended in protocol version 4, after `UpdateAvailable` (both new in v0.2.4).
+    /// Node -> orchestrator: free space where Claude Code and the projects write. Sent on every
+    /// connect and every few minutes, so the orchestrator can warn the owner and stop starting
+    /// runs on a node whose disk is about to fill up.
+    DiskReport(DiskReport),
 }
 
 /// Which release a node should move to, and where to fetch it.
@@ -476,6 +485,24 @@ mod tests {
             seq: 10,
             ack: 0,
             body: Body::ProjectList(vec![]),
+        });
+        roundtrip(Envelope {
+            seq: 11,
+            ack: 0,
+            body: Body::DiskReport(DiskReport {
+                claude_dir: "C:/Users/me/.claude".into(),
+                volumes: vec![DiskVolume {
+                    volume: "C:\\".into(),
+                    free: 3 << 30,
+                    total: 512 << 30,
+                    claude_dir: true,
+                    projects: vec!["fleet-src".into()],
+                }],
+                biggest: vec![FolderSize {
+                    name: "C--repos-fleet-src".into(),
+                    bytes: 7 << 30,
+                }],
+            }),
         });
     }
 

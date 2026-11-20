@@ -1122,6 +1122,7 @@ dependencies = [
  "tracing",
  "which",
  "win32job",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

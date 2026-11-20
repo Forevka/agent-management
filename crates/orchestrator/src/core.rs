@@ -220,6 +220,7 @@ impl Orchestrator {
             }
             Inbound::Message { peer, body } => match body {
                 Body::NodeInfo(info) => self.node_info(peer, info).await?,
+                Body::DiskReport(report) => crate::disk::reported(self, peer, report).await?,
                 Body::AgentEvent(ev) => self.agent_event(peer, ev).await?,
                 Body::ToolCall(call) => {
                     let this = self.clone();

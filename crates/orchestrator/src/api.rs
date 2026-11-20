@@ -191,6 +191,7 @@ fn node_json(n: &NodeRow) -> Value {
         "max_agents": n.max_agents,
         "running": n.running.0,
         "projects": n.projects.0.iter().map(|p| json!({"project": p.project, "path": p.path})).collect::<Vec<_>>(),
+        "disk": crate::disk::json(n),
     })
 }
 

@@ -14,6 +14,7 @@ pub mod auth;
 pub mod chat;
 pub mod config;
 pub mod core;
+pub mod disk;
 pub mod feeds;
 pub mod habits;
 pub mod human;

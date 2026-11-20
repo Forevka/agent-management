@@ -30,3 +30,4 @@ libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 win32job = "2.1"
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }

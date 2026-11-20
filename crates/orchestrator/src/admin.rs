@@ -2812,6 +2812,9 @@ fn node_json(n: &NodeRow) -> Value {
         "max_agents": n.max_agents,
         "running_agents": n.running.0.len(),
         "projects": n.projects.0.iter().map(|m| json!({"project": m.project, "path": m.path})).collect::<Vec<_>>(),
+        // Free space where its sessions write; `state: full` means new task runs wait elsewhere
+        // or in the queue until space is freed.
+        "disk": crate::disk::json(n),
     })
 }
 
@@ -2851,7 +2854,7 @@ async fn status_json(o: &Orchestrator) -> Result<Value> {
         .fetch_one(&o.db)
         .await?;
     Ok(json!({
-        "nodes": nodes.iter().map(|n| json!({"name": n.name, "online": n.online, "running": n.running.0.len(), "max_agents": n.max_agents, "projects": n.projects.0.len()})).collect::<Vec<_>>(),
+        "nodes": nodes.iter().map(|n| json!({"name": n.name, "online": n.online, "running": n.running.0.len(), "max_agents": n.max_agents, "projects": n.projects.0.len(), "disk": n.disk.as_ref().map(|_| n.disk_state.as_str())})).collect::<Vec<_>>(),
         "tasks": {"active": active, "queued": queued},
         "waiting_on_owner": open,
         "free_bots": free_bots,

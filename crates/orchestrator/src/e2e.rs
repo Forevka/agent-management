@@ -4021,6 +4021,165 @@ async fn lost_plan_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool) {
     tasks::stop(o, &resumed, false).await.unwrap();
 }
 
+/// Free disk space: a real node reports it by itself, and a node about to fill up warns the owner
+/// once and holds new task runs until a report shows space again, when the held task starts.
+async fn disk_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) {
+    // 1. A real node measured its own disks on connect: Claude Code's dir and the project. Node
+    //    3, because the first node has been revoked by now.
+    let (state, report): (String, sqlx::types::Json<fleet_proto::DiskReport>) =
+        wait_for("the real node's disk report", || async {
+            sqlx::query_as(
+                "select disk_state, disk from nodes where name = 'e2e-node-3' and disk is not null",
+            )
+            .fetch_optional(db)
+            .await
+            .unwrap()
+        })
+        .await;
+    assert_eq!(state, "ok", "the test's tiny limits never hold a real disk");
+    assert!(
+        report.0.volumes.iter().any(|v| v.claude_dir && v.total > 0),
+        "Claude Code's dir is measured: {:?}",
+        report.0
+    );
+    assert!(
+        report
+            .0
+            .volumes
+            .iter()
+            .any(|v| v.projects.iter().any(|p| p == "demo")),
+        "the mapped project is measured: {:?}",
+        report.0
+    );
+
+    // 2. A node that only has its own project, so nothing else is ever placed on it. It never
+    //    really connects: what it is sent queues, which is all this flow needs.
+    let peer = SecretKey::generate().public();
+    sqlx::query("insert into projects (slug, name) values ('diskproj', 'Disk')")
+        .execute(db)
+        .await
+        .unwrap();
+    sqlx::query(
+        "insert into nodes (id, name, online, projects) values ($1, 'e2e-disk-node', true, $2)",
+    )
+    .bind(peer.to_string())
+    .bind(sqlx::types::Json(vec![fleet_proto::ProjectMapping {
+        project: "diskproj".into(),
+        path: "/srv/diskproj".into(),
+    }]))
+    .execute(db)
+    .await
+    .unwrap();
+    // The limits of `Config::test()`: low below 2 MB, held below 1 MB.
+    let disk = |free: u64| fleet_proto::DiskReport {
+        claude_dir: "/home/me/.claude".into(),
+        volumes: vec![fleet_proto::DiskVolume {
+            volume: "/".into(),
+            free,
+            total: 100 << 30,
+            claude_dir: true,
+            projects: vec!["diskproj".into()],
+        }],
+        biggest: vec![fleet_proto::FolderSize {
+            name: "-srv-diskproj".into(),
+            bytes: 90 << 30,
+        }],
+    };
+    let report = |free: u64| {
+        o.handle_node_event(fleet_net::Inbound::Message {
+            peer,
+            body: fleet_proto::Body::DiskReport(disk(free)),
+        })
+    };
+    let about_node = |chat: &FakeChat| -> Vec<(i64, String)> {
+        chat.sent()
+            .into_iter()
+            .filter(|(_, topic, html, _)| topic.is_none() && html.contains("e2e-disk-node"))
+            .map(|(id, _, html, _)| (id, html))
+            .collect()
+    };
+
+    // 3. Almost full: the owner hears it once, with sound, and with where the space went. The
+    //    same state reported again is not news.
+    report(512 << 10).await.unwrap();
+    report(256 << 10).await.unwrap();
+    let told = about_node(chat);
+    assert_eq!(told.len(), 1, "one warning per episode: {told:?}");
+    let (warn_id, warn) = &told[0];
+    assert!(warn.contains("held"), "{warn}");
+    assert!(warn.contains("-srv-diskproj"), "{warn}");
+    assert_eq!(notify_of_msg(chat, Some(*warn_id)), Some(Notify::Sound));
+
+    // 4. A new task there waits instead of failing, and says why.
+    let task = tasks::create_task(
+        o,
+        CreateTask {
+            project: "diskproj".into(),
+            title: "Fill the disk".into(),
+            brief: "Must not start while the disk is full.".into(),
+            ticket: Some("DISK-1".into()),
+            agent: None,
+            new_agent: Some(NewAgent {
+                name: "Diskworm".into(),
+                role: "implementor".into(),
+            }),
+            model: None,
+            effort: None,
+        },
+    )
+    .await
+    .unwrap();
+    let held = o.task(&task.id).await.unwrap().unwrap();
+    assert!(
+        held.status == "queued" && !held.running,
+        "held on a full disk: {held:?}"
+    );
+    assert!(
+        chat.sent()
+            .iter()
+            .any(|(_, topic, html, _)| *topic == held.topic_id
+                && html.contains("almost out of disk space")),
+        "the task's topic says it is the disk"
+    );
+
+    // 5. What the owner and the brain see of it.
+    let api = api_get(o, &format!("/api/nodes/{peer}")).await;
+    assert_eq!(api["disk"]["state"], "full", "{api:#}");
+    assert_eq!(api["disk"]["least_free"], 256 << 10, "{api:#}");
+    let shown = crate::admin::read(o, "node", Some("e2e-disk-node"))
+        .await
+        .unwrap();
+    assert!(shown.contains("\"state\": \"full\""), "{shown}");
+
+    // 6. Space is freed: the owner hears it quietly, and the held task starts on that node.
+    report(10 << 30).await.unwrap();
+    let told = about_node(chat);
+    assert_eq!(told.len(), 2, "{told:?}");
+    let (back_id, back) = &told[1];
+    assert!(back.contains("start there again"), "{back}");
+    assert_eq!(notify_of_msg(chat, Some(*back_id)), Some(Notify::Silent));
+    let started = wait_for("the held task starts", || async {
+        o.task(&task.id).await.unwrap().filter(|t| t.running)
+    })
+    .await;
+    assert_eq!(started.node_id.as_deref(), Some(peer.to_string().as_str()));
+
+    // Nothing is listening on that node, so the stop it is sent never comes back as an exit: end
+    // the run here, as the exit would, and take the node out of placement, so a flow added after
+    // this one finds no phantom run and no busy agent.
+    tasks::stop(o, &started, false).await.unwrap();
+    sqlx::query("update tasks set running = false where id = $1")
+        .bind(&task.id)
+        .execute(db)
+        .await
+        .unwrap();
+    sqlx::query("update nodes set online = false where id = $1")
+        .bind(peer.to_string())
+        .execute(db)
+        .await
+        .unwrap();
+}
+
 /// The daily retrospective: the fleet reads its own day, proposes improvements to itself, and
 /// the owner's tap is the only thing that turns one into work. Its memory is the loop: what it
 /// concluded, what the owner decided and what came of the work are retained, and Hindsight keeps
@@ -6437,6 +6596,10 @@ async fn lifecycle() {
     // 25. Housekeeping deletes a finished task's topic once it goes quiet, and nothing else's.
     //     After the API flow: it leaves a task without a topic, which the API no longer reads.
     Box::pin(topic_cleanup_flow(&o, &db, &chat)).await;
+
+    // 26. Free disk space: the real node reports it, and a node about to fill up warns the owner
+    //     and holds new task runs until space is freed. Last: it adds a node and a project.
+    Box::pin(disk_flow(&o, &db, &chat)).await;
 
     stop_brain().await;
     let _ = std::fs::remove_dir_all(&data_dir);
