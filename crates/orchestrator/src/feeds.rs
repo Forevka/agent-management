@@ -725,8 +725,8 @@ pub async fn ingest(o: &Arc<Orchestrator>, messages: &[Incoming]) -> Result<()> 
         .fetch_one(&o.db)
         .await?;
         let inserted = sqlx::query(
-            "insert into feed_messages (source, channel_id, msg_id, thread_id, author, text, ts, permalink, author_id, subject, mentions_owner, secretary)
-             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            "insert into feed_messages (source, channel_id, msg_id, thread_id, author, text, ts, permalink, author_id, subject, mentions_owner, secretary, from_owner)
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
              on conflict (source, channel_id, msg_id) do update set
                  text = case when feed_messages.secretary = 'sent' then feed_messages.text else excluded.text end,
                  edited_text = case when feed_messages.secretary = 'sent' then excluded.text else feed_messages.edited_text end,
@@ -745,6 +745,7 @@ pub async fn ingest(o: &Arc<Orchestrator>, messages: &[Incoming]) -> Result<()> 
         .bind(&m.subject)
         .bind(m.mentions_owner)
         .bind((!triage && !m.from_owner).then_some("pending"))
+        .bind(m.from_owner)
         .execute(&o.db)
         .await?;
         // A repeat of a message already stored (a backfill, a redelivery) changes nothing and
@@ -817,6 +818,7 @@ async fn after_stored(
         // proposes a reply to them.
         let authors: Vec<(String, String)> = msgs
             .iter()
+            .filter(|m| !m.from_owner)
             .filter_map(|m| Some((m.source.clone(), m.author_id.clone()?)))
             .collect();
         let note = format!(
@@ -824,7 +826,7 @@ async fn after_stored(
              If something here needs action, use propose_task or propose_slack_reply; otherwise ignore it and do not reply to the owner.]\n{}{}",
             project.as_deref().unwrap_or("none"),
             lines.join("\n"),
-            crate::people::about_authors(o, &authors).await
+            crate::people::about_authors(o, &authors, crate::people::Detail::Line).await
         );
         // Queued, in order with the brain's other reports: a source never waits for it.
         o.tell_brain(note);
@@ -948,7 +950,7 @@ async fn render(o: &Orchestrator, rows: Vec<FeedRow>) -> String {
         .iter()
         .filter_map(|r| Some((r.0.clone(), r.11.clone()?)))
         .collect();
-    let people = crate::people::about_authors(o, &authors).await;
+    let people = crate::people::about_authors(o, &authors, crate::people::Detail::Line).await;
     let out: Vec<Value> = rows
         .into_iter()
         .map(

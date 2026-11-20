@@ -445,8 +445,9 @@ or change a setting — every proposal waits for your tap.
 your colleagues the fleet deals with (position, projects, how to reach them,
 language, observations, tags) from the day's messages and its memories — without
 telling you. The orchestrator and the secretary read a person's card before
-they write to them. Review and correct them on the web UI's People page (your
-edits are marked as yours). How many records one run may write:
+they write to them (for language and tone only). Review and correct them on the
+web UI's People page: a field you set stays yours, and the retrospective can
+only add to it. How many records one run may write:
 
 ```sh
 FLEET_RETRO_MAX_PEOPLE=30

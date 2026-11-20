@@ -287,6 +287,11 @@ export type Person = {
   created_at: string
   updated_at: string
   updated_by: 'retro' | 'owner'
+  /** The fields the owner set themselves: the retrospective may not change them (it may still
+   * add to observations, tags and contacts). */
+  owner_fields: string[]
+  /** When the owner last edited the record; null if they never have. */
+  owner_edited_at: string | null
   contacts: { id: number; source: string; handle: string; native_id: string | null }[]
 }
 

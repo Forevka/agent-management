@@ -287,7 +287,7 @@ async fn replied_context(o: &Orchestrator, msg: i64) -> Result<String> {
          For the conversation around one, `fleet agent feed read --ref <ref>`. \
          If the owner wants an answer sent, draft it with `fleet agent reply-draft --ref <ref>` (the owner approves it before anything is sent).{}",
         lines.join("\n"),
-        crate::people::about_refs(o, &refs).await
+        crate::people::about_refs(o, &refs, crate::people::Detail::Card).await
     ))
 }
 
@@ -580,12 +580,19 @@ async fn batch_text(
             parts.join(", ")
         ));
     }
-    // Who wrote them, for those the fleet has a record of: read before drafting or triaging.
+    // Who wrote them, for those the fleet has a record of, whole cards (the secretary drafts to
+    // these people): the ones who wrote to the owner personally first, then the rest in order.
     let authors: Vec<(String, String)> = shown
         .iter()
+        .filter(|(p, _)| personal(p))
+        .chain(shown.iter().filter(|(p, _)| !personal(p)))
         .filter_map(|(p, _)| Some((p.1.clone(), p.13.clone()?)))
         .collect();
-    s.push_str(crate::people::about_authors(o, &authors).await.trim_start());
+    s.push_str(
+        crate::people::about_authors(o, &authors, crate::people::Detail::Card)
+            .await
+            .trim_start(),
+    );
     s.push_str(
         "Triage every message (see your instructions): todo, escalate, note or ignore. Record notes and ignores with `fleet agent triage`.",
     );
@@ -860,7 +867,7 @@ pub async fn tool(o: &Arc<Orchestrator>, name: &str, args: &Value) -> Result<Str
                      If work or a reply is warranted, propose it (propose-task, propose-reply) and the owner decides; otherwise do nothing.{}",
                     tasks::untrusted(summary, 1500),
                     serde_json::to_string(&refs)?,
-                    crate::people::about_refs(o, &refs).await
+                    crate::people::about_refs(o, &refs, crate::people::Detail::Line).await
                 ),
             )
             .await;
@@ -1655,7 +1662,7 @@ async fn make_task(o: &Arc<Orchestrator>, id: i64) -> Result<String> {
     // Who the todo is about, so a task or reply that goes back to them starts from their card.
     let instruction = format!(
         "{instruction}{}",
-        crate::people::about_refs(o, &t.refs).await
+        crate::people::about_refs(o, &t.refs, crate::people::Detail::Line).await
     );
     let sent = tasks::to_brain(o, instruction).await;
     if let Err(e) = sent {

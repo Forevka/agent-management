@@ -53,10 +53,15 @@ export default function Person() {
                   <Text size="1" tone="muted" mono>
                     #{d.person.id}
                   </Text>
-                  <Badge tone={d.person.updated_by === 'owner' ? 'info' : 'neutral'}>
-                    updated by {WHO[d.person.updated_by] ?? d.person.updated_by}
-                  </Badge>
+                  <Text size="1" tone="muted">
+                    last updated by {WHO[d.person.updated_by] ?? d.person.updated_by}
+                  </Text>
                   <When at={d.person.updated_at} />
+                  {d.person.owner_edited_at && (
+                    <Badge tone="info" title={`Yours: ${d.person.owner_fields.join(', ')}`}>
+                      last edited by you {new Date(d.person.owner_edited_at).toLocaleDateString()}
+                    </Badge>
+                  )}
                 </Row>
               }
             />
@@ -138,7 +143,10 @@ export default function Person() {
               </Section>
             )}
 
-            <Section title="Edit">
+            <Section
+              title="Edit"
+              description="A field you change here stays yours: the retrospective may still add observations, tags and contacts, but never changes or removes what you set. A wrong contact can be removed here, or moved by removing it and adding it to the right person."
+            >
               {/* Keyed by the last update, so a save (or the retrospective's next pass) resets it. */}
               <EditForm
                 key={d.person.updated_at}
@@ -211,9 +219,16 @@ function EditForm({
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
+  const [stale, setStale] = useState(false)
+
+  // A contact typed but not added yet still counts: saving without it would lose it silently.
+  const withDraft = (list: ContactDraft[]) =>
+    draft.handle.trim()
+      ? [...list, { ...draft, handle: draft.handle.trim(), native_id: draft.native_id.trim() }]
+      : list
   const addContact = () => {
     if (!draft.handle.trim()) return
-    setContacts([...contacts, { ...draft, handle: draft.handle.trim(), native_id: draft.native_id.trim() }])
+    setContacts(withDraft(contacts))
     setDraft({ ...draft, handle: '', native_id: '' })
   }
 
@@ -226,8 +241,11 @@ function EditForm({
             const f = new FormData(e.currentTarget)
             setSaving(true)
             setError(null)
+            setStale(false)
             api
               .act(path, 'edit', {
+                // What this form was loaded from: a record that changed since is not overwritten.
+                updated_at: person.updated_at,
                 name: f.get('name'),
                 position: f.get('position'),
                 brief: f.get('brief'),
@@ -239,14 +257,18 @@ function EditForm({
                   .split('\n')
                   .map((l) => l.trim())
                   .filter(Boolean),
-                contacts: contacts.map((c) => ({
+                contacts: withDraft(contacts).map((c) => ({
                   source: c.source,
                   handle: c.handle,
                   native_id: c.native_id || null,
                 })),
               })
               .then(onSaved)
-              .catch((err) => setError(err instanceof Error ? err.message : String(err)))
+              .catch((err) => {
+                const message = err instanceof Error ? err.message : String(err)
+                setStale(message.includes('changed since you opened it'))
+                setError(message)
+              })
               .finally(() => setSaving(false))
           }}
         >
@@ -363,6 +385,14 @@ function EditForm({
               </Row>
             </Stack>
             {error && <ErrorNote>{error}</ErrorNote>}
+            {stale && (
+              <Row>
+                {/* Reloading resets this form to the record as it is now; your changes here go. */}
+                <Button type="button" variant="secondary" onClick={onSaved}>
+                  Reload the record
+                </Button>
+              </Row>
+            )}
             <Row>
               <Button type="submit" loading={saving}>
                 Save

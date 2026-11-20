@@ -613,15 +613,30 @@ pub async fn digest_over(o: &Orchestrator, day: &str, days: i64) -> Result<Strin
             ));
         }
     }
-    // Who the fleet dealt with, for the people records it keeps after its review.
-    s.push_str(&crate::people::digest_section(o, days).await?);
-    s.push_str(
-        "\nYou may look further with your read-only tools before deciding: \
-         `fleet agent retro task <id>` for one task's own transcript, `fleet agent admin show \
-         status|projects|agents|nodes|habits`, `fleet agent feed read`, `fleet agent people`, \
-         and `fleet agent memory recall`/`reflect` for what the fleet has remembered.\n",
-    );
-    Ok(clip(&s, DIGEST_LIMIT))
+    // Who the fleet dealt with, for the people records it keeps after its review: bounded on its
+    // own and kept whole, so a busy day cannot clip away the section the opening line points at.
+    let people = crate::people::digest_section(o, days).await?;
+    Ok(assemble(&s, &people, DIGEST_TAIL))
+}
+
+/// How every digest ends: what else it may read.
+const DIGEST_TAIL: &str = "\nYou may look further with your read-only tools before deciding: \
+     `fleet agent retro task <id>` for one task's own transcript, `fleet agent admin show \
+     status|projects|agents|nodes|habits`, `fleet agent feed read`, `fleet agent people`, \
+     and `fleet agent memory recall`/`reflect` for what the fleet has remembered.\n";
+
+/// The digest within [`DIGEST_LIMIT`]: the day's sections are clipped to what is left once the
+/// People section and the closing lines have their room, so those always arrive whole.
+fn assemble(body: &str, people: &str, tail: &str) -> String {
+    // One more for the line break after a clipped body.
+    let reserved = people.chars().count() + tail.chars().count() + 1;
+    let mut s = clip(body, DIGEST_LIMIT.saturating_sub(reserved));
+    if s.chars().count() < body.chars().count() {
+        s.push('\n');
+    }
+    s.push_str(people);
+    s.push_str(tail);
+    s
 }
 
 // ---------------------------------------------------------------- its two tools
@@ -1033,6 +1048,33 @@ mod tests {
         assert!(AREAS.contains(&"harness") && AREAS.contains(&"other"));
         assert!(!AREAS.contains(&"anything"));
         assert_eq!(AREAS.len(), 5);
+    }
+
+    /// A busy day fills the earlier sections past the limit; the People section and its
+    /// instruction still arrive whole, and the digest stays within the limit.
+    #[test]
+    fn a_busy_day_keeps_the_people_section() {
+        let mut body = String::from("[Retrospective 2026-11-21] material\n## Tasks\n");
+        for i in 0..2000 {
+            body.push_str(&format!(
+                "- task-{i} [failed] \"a long quoted title {i}\"\n"
+            ));
+        }
+        let lines: Vec<String> = (0..40)
+            .map(|i| format!("- slack \"U{i:04}\" \"Someone {i}\" · 2 message(s) · no record\n"))
+            .collect();
+        let people = crate::people::people_section(3, &lines, 30);
+        let d = assemble(&body, &people, DIGEST_TAIL);
+        assert!(d.chars().count() <= DIGEST_LIMIT, "{}", d.chars().count());
+        assert!(d.starts_with("[Retrospective 2026-11-21]"));
+        assert!(d.contains(&people), "the section arrives whole");
+        assert!(d.contains(
+            "keep these records with `fleet agent retro person` (at most 30 writes this run)"
+        ));
+        assert!(d.ends_with(DIGEST_TAIL));
+        // A quiet day is not clipped at all.
+        let quiet = assemble("short body\n", &people, DIGEST_TAIL);
+        assert_eq!(quiet, format!("short body\n{people}{DIGEST_TAIL}"));
     }
 
     /// Its own tools and nothing else: the gate in `tools` allows these plus the read-only set,

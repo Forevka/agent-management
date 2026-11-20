@@ -44,7 +44,7 @@ export default function People() {
     <Page>
       <PageHeader
         title="People"
-        description="Your colleagues the agents come into contact with. The retrospective keeps these records every day from the day’s messages and its memories, without pinging you; the orchestrator and the secretary read a person’s card before writing to them. Correct anything here — your edits are kept as yours."
+        description="Your colleagues the agents come into contact with. The retrospective keeps these records every day from the day’s messages and its memories, without pinging you; the orchestrator and the secretary read a person’s card before writing to them, and use it only for how they write (language, tone, form of address), never for what the fleet does. Correct anything here: a field you set stays yours, and the retrospective can only add to it."
         meta={
           state.data && (
             <Text size="1" tone="muted">
@@ -130,7 +130,7 @@ export default function People() {
                     <Link to={`/people/${p.id}`} className="fx-link">
                       {p.name}
                     </Link>
-                    {p.updated_by === 'owner' && (
+                    {p.owner_edited_at && (
                       <Text size="1" tone="muted">
                         edited by you
                       </Text>

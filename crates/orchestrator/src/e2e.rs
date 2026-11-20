@@ -4694,8 +4694,14 @@ async fn people_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) 
         .unwrap()
     );
 
-    // The brain reading the feed gets the card with the messages, and so do escalations and
-    // Inbox requests, which share the helper.
+    assert!(
+        card.contains("never changes how urgent a message is"),
+        "the card says what it is not for: {card}"
+    );
+
+    // The brain reading the feed gets one line per author pointing at the card, not the card
+    // (its session is long, and reads many messages); so do escalations and Inbox requests,
+    // which share the helper. The secretary's replies in context get the whole card.
     let read = crate::feeds::read(
         o,
         "fleet",
@@ -4705,12 +4711,55 @@ async fn people_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) 
     .await
     .unwrap();
     assert!(
-        read.contains("v2") && read.contains("Zed Example") && read.contains("untrusted data"),
+        read.contains("v2")
+            && read.contains(&format!(
+                "#{zed_id} Zed Example — Backend lead, Ukrainian; full record: fleet agent people --id {zed_id}"
+            ))
+            && read.contains("untrusted data"),
         "{read}"
     );
-    let about =
-        crate::people::about_refs(o, &[crate::feeds::msg_ref("slack", "C-notes", "p1")]).await;
+    assert!(
+        !read.contains("Prefers short"),
+        "one line, not the card: {read}"
+    );
+    let about = crate::people::about_refs(
+        o,
+        &[crate::feeds::msg_ref("slack", "C-notes", "p1")],
+        crate::people::Detail::Card,
+    )
+    .await;
     assert!(about.contains("Works only on backend parts"), "{about}");
+
+    // The owner is never one of the people: their own messages are marked as theirs, touch
+    // nobody, and their account cannot become anyone's contact.
+    deliver_feed(
+        o,
+        vec![FeedEvent::Message(fleet_feeds::FeedMessage {
+            from_owner: true,
+            author_id: Some("U0OWNER".into()),
+            ..zed("p3", "Thanks Zed, will do.", now())
+        })],
+    )
+    .await;
+    let marked: Option<bool> =
+        sqlx::query_scalar("select from_owner from feed_messages where msg_id = 'p3'")
+            .fetch_one(db)
+            .await
+            .unwrap();
+    assert_eq!(marked, Some(true));
+    let refused = crate::people::owner_edit(
+        o,
+        zed_id,
+        &json!({"contacts": [{"source": "slack", "handle": "@me", "native_id": "U0OWNER"}]}),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        refused.to_string().contains("the owner's own account"),
+        "{refused:#}"
+    );
+    let digest = crate::retro::digest(o, "people-check-3").await.unwrap();
+    assert!(!digest.contains("U0OWNER"), "{digest}");
 
     // Any agent may look him up, by a handle or by number; none but the retrospective writes.
     let alice: String = sqlx::query_scalar("select agent_id from tasks where id = 'demo-BS-1'")
@@ -4808,6 +4857,12 @@ async fn people_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) 
         p["brief"], "Owns the notes module.",
         "fields not sent are kept"
     );
+    assert_eq!(
+        p["owner_fields"],
+        json!(["position", "observations", "tags", "contacts"]),
+        "what the owner changed is theirs, and only that"
+    );
+    assert!(p["owner_edited_at"].is_string());
     let history = detail["history"].as_array().unwrap();
     assert!(
         history
@@ -4817,6 +4872,102 @@ async fn people_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) 
                 .iter()
                 .any(|h| h["actor"] == "retro" && h["action"] == "person.upsert"),
         "{detail}"
+    );
+
+    // The owner's corrections stick: the retrospective's next pass may add to the record, never
+    // change or take away what they set.
+    let run: i64 = sqlx::query_scalar(
+        "insert into retro_runs (day, verdict) values ('people-owner', 'test') returning id",
+    )
+    .fetch_one(db)
+    .await
+    .unwrap();
+    for (args, needle) in [
+        (
+            json!({"id": zed_id, "position": "CEO"}),
+            "the owner set position",
+        ),
+        (
+            json!({"id": zed_id, "remove_observations": ["prefers short and quick communication"]}),
+            "observations (only adding to them)",
+        ),
+        (
+            json!({"id": zed_id, "remove_tags": ["reviewer"]}),
+            "tags (only adding to them)",
+        ),
+    ] {
+        let e = crate::people::retro_write(o, run, &args)
+            .await
+            .expect_err("an owner-set field is not the retrospective's to change");
+        assert!(e.to_string().contains(needle), "{e:#}");
+    }
+    let added = crate::people::retro_write(
+        o,
+        run,
+        &json!({"id": zed_id, "add_observations": ["Answers within the hour"],
+                "add_contacts": [{"source": "slack", "handle": "@zed-renamed", "native_id": "U0ZED"}],
+                "brief": "Owns the notes and search modules."}),
+    )
+    .await
+    .unwrap();
+    assert!(added.contains("Updated #"), "{added}");
+    let after: crate::people::Person = sqlx::query_as("select * from people where id = $1")
+        .bind(zed_id)
+        .fetch_one(db)
+        .await
+        .unwrap();
+    assert_eq!(after.position.as_deref(), Some("Tech lead"));
+    assert_eq!(
+        after.observations,
+        [
+            "Prefers short and quick communication",
+            "Answers within the hour"
+        ]
+    );
+    assert_eq!(
+        after.brief.as_deref(),
+        Some("Owns the notes and search modules.")
+    );
+    assert_eq!(after.updated_by, "retro");
+    assert!(after.owner_edited_at.is_some() && after.owner_fields.len() == 4);
+    let handle: String = sqlx::query_scalar(
+        "select handle from person_contacts where person_id = $1 and native_id = 'U0ZED'",
+    )
+    .bind(zed_id)
+    .fetch_one(db)
+    .await
+    .unwrap();
+    assert_eq!(
+        handle, "@zed",
+        "an owner-set contact is left as they set it"
+    );
+    let card = crate::people::tool(o, &json!({"id": zed_id}))
+        .await
+        .unwrap();
+    assert!(card.contains("Last edited by the owner on"), "{card}");
+    // The form the owner opened before that pass is now stale: saving it is refused, not
+    // silently overwriting what the retrospective just added.
+    let stale = crate::people::owner_edit(
+        o,
+        zed_id,
+        &json!({"updated_at": p["updated_at"], "position": "Staff engineer"}),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        stale.to_string().contains("changed since you opened it"),
+        "{stale:#}"
+    );
+    let fresh = api_get(o, &uri).await;
+    let saved = api_post(
+        o,
+        &uri,
+        json!({"op": "edit", "body": {"updated_at": fresh["person"]["updated_at"], "position": "Staff engineer"}}),
+    )
+    .await;
+    assert!(
+        saved["done"].as_str().unwrap().contains("position"),
+        "{saved}"
     );
     // A name another person has is refused in words; so is a second record by name.
     assert!(

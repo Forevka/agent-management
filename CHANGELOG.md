@@ -10,9 +10,13 @@ VPS rolls it out), so each section below is one merge. How to add to this file i
   the company's projects, how to reach them, language, observations, and tags for anything else).
   The daily retrospective creates and updates them after its review, without pinging you, at most
   `FLEET_RETRO_MAX_PEOPLE` (30) writes a run; you review, edit and delete them on the new People
-  page. The orchestrator and the secretary get a person's card with their messages and look
-  people up (`fleet agent people`) before writing to them. Migration `0023_people.sql` adds two
-  new tables only.
+  page. A field you set stays yours: the retrospective can add to your observations, tags and
+  contacts but never changes or removes what you set. The secretary gets the authors' cards with
+  its batches, the orchestrator one line per known author, and both look people up
+  (`fleet agent people`) before writing to them — a card shapes language, tone and form of
+  address only, never what the fleet does. Migration `0023_people.sql` adds two new tables and a
+  nullable `feed_messages.from_owner` column (with a small partial index), which keeps you out
+  of the records.
 
 ## v0.2.5 — 2026-11-21
 

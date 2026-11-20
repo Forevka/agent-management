@@ -2579,10 +2579,10 @@ fn link_allowed(page: &str) -> bool {
     match (first, second) {
         (
             "" | "projects" | "secrets" | "nodes" | "agents" | "tasks" | "sessions" | "inbox"
-            | "habits" | "retro",
+            | "habits" | "retro" | "people",
             None,
         ) => true,
-        ("projects" | "secrets" | "nodes" | "items" | "tasks", Some(s)) => {
+        ("projects" | "secrets" | "nodes" | "items" | "tasks" | "people", Some(s)) => {
             !s.is_empty()
                 && s.chars()
                     .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
@@ -2950,6 +2950,9 @@ mod tests {
             "/sessions?project=dap",
             "/tasks?project=bioins&status=failed",
             "/tasks?q=jira%20token",
+            "/people",
+            "/people/4",
+            "/people?tag=night-owl&language=uk",
         ] {
             assert!(link_allowed(ok), "{ok}");
         }
@@ -2963,6 +2966,8 @@ mod tests {
             "/agents/x",
             "https://evil.example",
             "/items/",
+            "/people/4/edit",
+            "/people/../login",
             // A query is for the UI's filters, not a place to hide a payload.
             "/tasks?",
             "/tasks?q=<script>",
