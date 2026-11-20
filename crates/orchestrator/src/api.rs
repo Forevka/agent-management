@@ -47,6 +47,7 @@ pub fn router() -> Router<O> {
         .route("/api/tasks", get(tasks))
         .route("/api/tasks/{id}", get(task))
         .route("/api/tasks/{id}/events", get(task_events))
+        .route("/api/tasks/{id}/links", post(task_link))
         .route("/api/runs", get(runs))
         .route("/api/projects", get(projects).post(projects_act))
         .route("/api/projects/{slug}", get(project).post(project_act))
@@ -304,10 +305,19 @@ async fn board(State(o): State<O>, h: HeaderMap) -> Api {
     // What each task is waiting on, if anything. The blocking one wins: it is the one that has
     // actually stopped an agent, and a card has room to name one thing.
     let open = human::open_items(&o).await?;
+    // What each task is about outside the fleet, for the whole board in one query.
+    let links = crate::links::of_tasks(&o, &ids).await?;
     let cards: Vec<Value> = rows
         .iter()
         .map(|t| {
             let mut v = task_json(t);
+            v["links"] = json!(
+                links
+                    .iter()
+                    .filter(|l| l.task_id == t.id)
+                    .map(crate::links::json)
+                    .collect::<Vec<_>>()
+            );
             v["sessions"] = json!(
                 sessions
                     .iter()
@@ -511,6 +521,13 @@ async fn task(State(o): State<O>, h: HeaderMap, Path(id): Path<String>) -> Api {
     v["effort"] = json!(t.effort);
     v["run_id"] = json!(t.run_id);
     v["topic_id"] = json!(t.topic_id);
+    v["links"] = json!(
+        crate::links::of_task(&o, &t.id)
+            .await?
+            .iter()
+            .map(crate::links::json)
+            .collect::<Vec<_>>()
+    );
     Ok(Json(json!({
         "task": v,
         "milestones": milestones.iter().map(|(i, title, done)| json!({"idx": i, "title": title, "done": done})).collect::<Vec<_>>(),
@@ -520,6 +537,24 @@ async fn task(State(o): State<O>, h: HeaderMap, Path(id): Path<String>) -> Api {
         })).collect::<Vec<_>>(),
         "items": items.iter().map(item_json).collect::<Vec<_>>(),
     })))
+}
+
+/// Attaches or removes one of a task's outside references. The owner's own hand: an agent does
+/// the same thing through `link_add` (see `tools`), and the brain through the same tool.
+async fn task_link(
+    State(o): State<O>,
+    h: HeaderMap,
+    Path(id): Path<String>,
+    Json(a): Json<Act>,
+) -> Api {
+    guard!(o, h, write);
+    let reference = need(&a.body, "ref")?;
+    if a.op == "remove" {
+        let gone = crate::links::remove(&o, &id, &reference, "owner").await?;
+        return Ok(Json(json!({"removed": gone})));
+    }
+    let l = crate::links::add(&o, &id, &reference, "owner").await?;
+    Ok(Json(json!({"link": crate::links::json(&l)})))
 }
 
 #[derive(Deserialize)]

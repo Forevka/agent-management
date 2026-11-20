@@ -59,9 +59,23 @@ export type Item = {
   related?: Item[]
 }
 
+/** One thing a task belongs to in somebody else's tracker. */
+export type TaskLink = {
+  id: number
+  /** `jira`, `mr`, `pr`, `url`, or something newer the UI shows plainly. */
+  kind: string
+  /** How a person says it: `BIOINS-5068`, `!940`, `#482`, or the URL. */
+  ref: string
+  /** Where it is, when the fleet could work that out. */
+  url: string | null
+  added_by: string
+}
+
 export type Task = {
   /** The fleet's own short handle (`F-41`), which the owner names this task by. */
   key: string
+  /** What this task is about outside the fleet: tickets, merge requests, pages. */
+  links?: TaskLink[]
   id: string
   project: string
   title: string

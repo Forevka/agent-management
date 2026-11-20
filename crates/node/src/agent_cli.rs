@@ -40,6 +40,17 @@ pub enum AgentCmd {
         #[arg(long)]
         fyi: bool,
     },
+    /// Say what this task is about elsewhere: a ticket, a merge request, a pull request, a URL.
+    ///
+    /// Record the merge request you open, so the owner's board shows it without being told.
+    Link {
+        /// `BIOINS-5068`, `!940`, `#482`, or a full URL.
+        #[arg(required = true)]
+        reference: String,
+        /// Remove this link instead of adding it.
+        #[arg(long)]
+        remove: bool,
+    },
     /// Send a message to another agent (by name or id).
     Tell { agent: String, message: String },
     /// Post a short note in the task's topic. Silent unless --notify.
@@ -714,6 +725,10 @@ pub fn to_call(cmd: AgentCmd) -> Result<(&'static str, Value)> {
         AgentCmd::Jira(JiraCmd::Sprint { limit, project }) => {
             ("jira_sprint", json!({"limit": limit, "project": project}))
         }
+        AgentCmd::Link { reference, remove } => (
+            if remove { "link_remove" } else { "link_add" },
+            json!({"ref": reference}),
+        ),
         AgentCmd::Jira(JiraCmd::Check { project }) => ("jira_check", json!({"project": project})),
         AgentCmd::Jira(JiraCmd::Comment {
             issue,

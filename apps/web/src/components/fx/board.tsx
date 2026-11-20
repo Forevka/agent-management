@@ -116,9 +116,26 @@ export type BoardCardProps = {
   tone?: BoardTone
   /** The small counts along the bottom. */
   facts?: { icon: ReactNode; value: ReactNode; title: string }[]
+  /** What this task is about outside the fleet: tickets, merge requests, pages. */
+  links?: { key: string; label: string; title: string; url?: string | null }[]
 }
 
-export function BoardCard({ to, title, badge, mark, text, state, tone = 'default', facts }: BoardCardProps) {
+/** How many chips fit a card before it stops being a card and starts being a list. */
+const CHIPS = 2
+
+export function BoardCard({
+  to,
+  title,
+  badge,
+  mark,
+  text,
+  state,
+  tone = 'default',
+  facts,
+  links,
+}: BoardCardProps) {
+  const chips = links?.slice(0, CHIPS) ?? []
+  const more = (links?.length ?? 0) - chips.length
   return (
     <Link className="fx-card" data-tone={tone} to={to}>
       <span className="fx-card__head">
@@ -129,6 +146,23 @@ export function BoardCard({ to, title, badge, mark, text, state, tone = 'default
         {badge && <span className="fx-card__badge">{badge}</span>}
       </span>
       {text && <span className="fx-card__text">{text}</span>}
+      {chips.length > 0 && (
+        <span className="fx-card__links">
+          {chips.map((l) => (
+            // Not an anchor: this card is already a link to the task, and nesting one inside
+            // another is invalid. Opening the ticket is the task page's job, where there is
+            // room to say what each reference is.
+            <span className="fx-card__chip" key={l.key} data-kind={l.key.split(':')[0]} title={l.title}>
+              {l.label}
+            </span>
+          ))}
+          {more > 0 && (
+            <span className="fx-card__chip" data-more="" title={`${more} more`}>
+              +{more}
+            </span>
+          )}
+        </span>
+      )}
       <span className="fx-card__state">{state}</span>
       {facts && facts.length > 0 && (
         <span className="fx-card__facts">
@@ -431,6 +465,43 @@ const css = /* css */ `
   line-clamp: 2;
   overflow: hidden;
   overflow-wrap: anywhere;
+}
+
+/* What this task is about elsewhere. Quiet by default and tinted only by kind, because a card
+   already spends its colour on saying where the work stands. */
+.fx-card__links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 1px;
+}
+
+.fx-card__chip {
+  font-family: var(--aui-font-mono, ui-monospace, monospace);
+  font-size: 10.5px;
+  line-height: 16px;
+  padding: 0 5px;
+  border-radius: 4px;
+  background: var(--aui-subtle, #f0f0f0);
+  border: 1px solid var(--aui-border, #e5e5e5);
+  color: var(--aui-muted, #737373);
+  white-space: nowrap;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.fx-card__chip[data-kind='jira'] {
+  color: var(--aui-info, #2456d6);
+  background: var(--aui-info-soft, #eaf1ff);
+  border-color: transparent;
+}
+
+.fx-card__chip[data-kind='mr'],
+.fx-card__chip[data-kind='pr'] {
+  color: var(--aui-success, #1e8a4f);
+  background: var(--aui-success-soft, #e6f6ed);
+  border-color: transparent;
 }
 
 .fx-card__state {

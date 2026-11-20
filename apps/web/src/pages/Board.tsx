@@ -149,6 +149,12 @@ export default function BoardPage() {
                       text={t.brief}
                       tone={cardTone(t)}
                       state={<CardState task={t} />}
+                      links={(t.links ?? []).map((l) => ({
+                        key: `${l.kind}:${l.id}`,
+                        label: l.kind === 'url' ? host(l.ref) : l.ref,
+                        title: l.url ?? l.ref,
+                        url: l.url,
+                      }))}
                       facts={[
                         {
                           icon: <SessionsIcon />,
@@ -209,6 +215,16 @@ function CardState({ task: t }: { task: BoardTask }) {
   // free, the agent is asleep until a wakeup fires, or its session is simply between turns.
   const idle = t.status === 'queued' ? 'Queued' : t.status === 'waiting' ? 'Waiting' : 'Idle'
   return <><BoardDot />{idle} · <Elapsed since={t.since} /></>
+}
+
+/** A URL shown as its host, since a whole URL will not fit a chip. */
+function host(url: string): string {
+  try {
+    return new URL(url).host.replace(/^www\./, '')
+  } catch {
+    // Not a URL the browser can parse; show the start of it rather than nothing.
+    return url.slice(0, 24)
+  }
 }
 
 /** A duration that counts up while the page is open, as `6m 17s`. */

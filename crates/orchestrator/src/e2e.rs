@@ -2449,6 +2449,36 @@ async fn api_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool) {
         "a task waiting on the owner says what it waits for and since when: {waiting:?}"
     );
 
+    // What a task is about elsewhere. `demo-BS-1` was created from ticket `BS-1` (the
+    // orchestrator's own link) and its agent recorded the merge request it opened — which is
+    // the point of letting agents link: nobody else knows the number.
+    let links = bs1["links"].as_array().unwrap();
+    assert!(
+        links
+            .iter()
+            .any(|l| l["kind"] == "jira" && l["ref"] == "BS-1" && l["added_by"] == "orchestrator"),
+        "the ticket a task was created from is linked: {links:?}"
+    );
+    let mr = links
+        .iter()
+        .find(|l| l["kind"] == "mr")
+        .unwrap_or_else(|| panic!("the agent's merge request is linked: {links:?}"));
+    assert_eq!(mr["ref"], "!940");
+    assert_ne!(
+        mr["added_by"], "orchestrator",
+        "a link an agent made is recorded as the agent's: {mr}"
+    );
+    // Linking the same thing twice is not an error, and a link taken back is gone.
+    assert_eq!(
+        links.iter().filter(|l| l["ref"] == "!940").count(),
+        1,
+        "a reference is linked once however often it is said: {links:?}"
+    );
+    assert!(
+        !links.iter().any(|l| l["kind"] == "url"),
+        "a link the agent removed is gone: {links:?}"
+    );
+
     // A task answers to its key everywhere its id is taken, so the owner never has to know
     // which they are holding — including the web URL the board's cards link from.
     let key = bs1["key"].as_str().unwrap();

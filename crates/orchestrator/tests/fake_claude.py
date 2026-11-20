@@ -105,6 +105,12 @@ for line in sys.stdin:
         tool("memory_recall", {"query": "paint", "shared": True})
         tool("milestones_set", {"items": ["Paint", "Prime", "Ship"]})
         tool("milestone_done", {"index": 0})
+        # The merge request this task opened: the agent is the only one who knows it exists.
+        tool("link_add", {"ref": "!940"})
+        # Said twice (a retried step), and one that was wrong and is taken back again.
+        tool("link_add", {"ref": "!940"})
+        tool("link_add", {"ref": "https://example.test/notes"})
+        tool("link_remove", {"ref": "https://example.test/notes"})
         # Asked once, then asked again in better words: the fleet must leave one open question,
         # not two cards saying the same thing. The note in between blocks nobody, so asking
         # something else must not take it away.

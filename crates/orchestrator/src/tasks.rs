@@ -518,6 +518,14 @@ pub async fn create_task(o: &Arc<Orchestrator>, req: CreateTask) -> Result<TaskR
         json!({"task": id, "agent": agent.id}),
     )
     .await;
+    // A task made from a ticket is about that ticket: record it as a link so the board can say
+    // so, rather than leaving it buried in the id. A ticket the fleet cannot classify (a bare
+    // word someone typed) is simply not linked; it is still the task's id either way.
+    if let Some(t) = req.ticket.as_deref().filter(|t| !t.trim().is_empty())
+        && let Err(e) = crate::links::add(o, &task.id, t, "orchestrator").await
+    {
+        tracing::debug!("not linking {t:?} to {}: {e:#}", task.id);
+    }
     dispatch(o, &task, None, None).await?;
     Ok(o.task(&id).await?.unwrap_or(task))
 }

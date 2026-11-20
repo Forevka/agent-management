@@ -514,6 +514,36 @@ pub async fn handle(
             bail!("{} is only available to the orchestrator", call.tool)
         }
         // Jira, per project, through the orchestrator: the credential never reaches an agent
+        // What this task is about elsewhere: the ticket it came from, the merge request it just
+        // opened, the page it is working against. Every agent's business, and for its own task
+        // only — the agent is the one that learns the MR number, and the board is where the
+        // owner wants to see it. A link is a claim, not a key: recording `BIOINS-5068` grants
+        // nobody access to it, and whether this agent may *read* that ticket is still decided by
+        // the Jira arm below.
+        "link_add" | "link_remove" => {
+            let reference = args["ref"]
+                .as_str()
+                .context("ref required: a ticket (BIOINS-5068), a merge request (!940), a pull request (#482), or a URL")?;
+            // The brain may say which task; an agent only ever links its own.
+            let target = args["task_id"]
+                .as_str()
+                .filter(|_| is_brain)
+                .unwrap_or(task.id.as_str());
+            let who = if is_brain { "orchestrator" } else { &agent.id };
+            if call.tool == "link_remove" {
+                let gone = crate::links::remove(o, target, reference, who).await?;
+                return ok(if gone {
+                    format!("{reference} is no longer linked to {target}.")
+                } else {
+                    format!("{target} was not linked to {reference}.")
+                });
+            }
+            let l = crate::links::add(o, target, reference, who).await?;
+            ok(match &l.url {
+                Some(u) => format!("{target} is linked to {} ({u}).", l.ref_),
+                None => format!("{target} is linked to {}.", l.ref_),
+            })
+        }
         // (see `jira`). Reading is every agent's business — a task named after a ticket is the
         // normal case, and an agent that cannot read it reviews against a brief instead of the
         // thing the human asked for. Writing stays the brain's, which the owner's approval

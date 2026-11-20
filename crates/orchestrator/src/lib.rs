@@ -18,6 +18,7 @@ pub mod feeds;
 pub mod habits;
 pub mod human;
 pub mod jira;
+pub mod links;
 pub mod memory;
 pub mod model;
 pub mod plan_gate;
