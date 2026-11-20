@@ -523,10 +523,16 @@ async fn apply(o: &Arc<Orchestrator>, row: &HumanItemRow, ans: Answer) -> Result
                 json!({"behavior": "allow", "updatedInput": p["input"]}),
             )?;
             if let Some(t) = &row.task_id {
+                // Approved: from now on a resumed run of this round continues in auto mode. Only
+                // a plan of the task's current run closes its round: a stale card of a lost run
+                // (still open when a newer run started planning) must not approve the newer plan
+                // nobody has read, nor mark the task running while it still plans.
                 sqlx::query(
-                    "update tasks set status = 'running', updated_at = now() where id = $1",
+                    "update tasks set status = 'running', plan_approved = true, updated_at = now()
+                      where id = $1 and (dispatched_at is null or dispatched_at <= $2)",
                 )
                 .bind(t)
+                .bind(row.created_at)
                 .execute(&o.db)
                 .await?;
             }

@@ -70,6 +70,10 @@ pub struct TaskRow {
     /// This task's own Claude model and effort (null: its agent's).
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// Whether the owner approved the plan of the task's current planning round: false from a
+    /// run started in plan mode until the approval, so a run lost meanwhile is resumed in plan
+    /// mode again (see `tasks::plan_first`).
+    pub plan_approved: bool,
 }
 
 /// The effort levels Claude Code accepts (`claude --help`, 2.1.268).
@@ -288,6 +292,7 @@ mod tests {
             dispatched_at: None,
             model: model.map(Into::into),
             effort: effort.map(Into::into),
+            plan_approved: true,
         }
     }
 

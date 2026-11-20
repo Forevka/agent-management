@@ -227,10 +227,30 @@ pub async fn digest(o: &Orchestrator, day: &str) -> Result<String> {
     let trouble: Vec<(String, String, String)> = sqlx::query_as(
         "select task_id, kind, data from task_events
           where at > now() - interval '1 day'
-            and kind in ('err', 'spawn_failed', 'undelivered')
+            and kind in ('err', 'spawn_failed')
           order by at desc limit $1",
     )
     .bind(SECTION_ROWS * 2)
+    .fetch_all(&o.db)
+    .await?;
+    // A text handed back by a run that had ended is redelivered by resuming the session (or
+    // kept for its next run), and its `redelivered` event says which. Listed with that outcome
+    // and apart from the trouble: read bare, an `undelivered` looks like a lost message, and it
+    // is not one. The outcome is the first `redelivered` after it and before the task's next
+    // `undelivered` (node events are handled one at a time, so the pair is adjacent); one whose
+    // handler failed in between shows as not recorded, never with a later text's outcome.
+    let handed_back: Vec<(String, String, Option<String>)> = sqlx::query_as(
+        "select u.task_id, u.data, r.data from task_events u
+           left join lateral (select data from task_events r
+                               where r.task_id = u.task_id and r.kind = 'redelivered' and r.id > u.id
+                                 and not exists (select 1 from task_events n
+                                                  where n.task_id = u.task_id and n.kind = 'undelivered'
+                                                    and n.id > u.id and n.id < r.id)
+                               order by r.id limit 1) r on true
+          where u.at > now() - interval '1 day' and u.kind = 'undelivered'
+          order by u.at desc limit $1",
+    )
+    .bind(SECTION_ROWS)
     .fetch_all(&o.db)
     .await?;
     let lost: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
@@ -254,6 +274,21 @@ pub async fn digest(o: &Orchestrator, day: &str) -> Result<String> {
                 "- {task} run ended: {} (node {})\n",
                 clip(outcome.as_deref().unwrap_or("?"), 120),
                 node.as_deref().unwrap_or("?")
+            ));
+        }
+    }
+    if !handed_back.is_empty() {
+        s.push_str(
+            "\n## Texts handed back by a run that had ended\nRedelivered, not lost: each reached \
+             the session when it resumed, or waits in the task's queue for its next run.\n",
+        );
+        for (task, text, outcome) in &handed_back {
+            s.push_str(&format!(
+                "- {task} [{}] {}\n",
+                outcome
+                    .as_deref()
+                    .unwrap_or("what became of it was not recorded"),
+                clip(text.trim(), 300)
             ));
         }
     }

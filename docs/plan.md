@@ -144,6 +144,8 @@ This is a new project, unrelated to `stoneshard-mod`. It goes in **`Forevka/agen
    - You get a magic link in the task topic and in `needs you`.
    - On the page you answer the questions and approve, or send feedback.
    - The tool returns allow (with the answers in `updatedInput`), and the session switches to `auto` mode.
+   - **An interruption never skips the approval.** A task whose plan has not been approved (`tasks.plan_approved`, cleared when a run starts in plan mode and set on approval) is resumed in plan mode again. That covers a run lost to a node restart, a crash or an idle close, and the task being queued, stopped or failed meanwhile. The agent re-presents its plan, and the owner approves it as before.
+   - **A text for a run that is gone is redelivered, not lost.** The node hands it back (`Undelivered`), and the orchestrator resumes the session with it, or keeps it in the task's queue for its next run. Both events stay in the transcript: `undelivered`, then `redelivered` with the outcome. The retrospective's digest lists these texts with that outcome rather than as failures.
 6. **Execution:**
    - The agent calls `fleet.milestones_set([...])` once and `fleet.milestone_done(i)` as it goes, which edits the checklist message.
    - `fleet.ask_human(question, options?, blocking)` creates an item in `{proj} · needs you` (or `fyi`) with buttons, and accepts a free-text reply to that message. The answer goes back into the session.

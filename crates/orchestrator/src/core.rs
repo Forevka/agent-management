@@ -18,6 +18,12 @@ use crate::{
     vault::Vault,
 };
 
+/// What became of a text a node handed back for a run it no longer had, recorded as a
+/// `redelivered` task event right after its `undelivered` one.
+pub(crate) const REDELIVERED_TO_RUN: &str = "delivered to a resumed or running session";
+pub(crate) const REDELIVERED_QUEUED: &str = "queued for the session's next run";
+pub(crate) const REDELIVERED_KEPT: &str = "kept in the task's queue for its next run";
+
 pub struct Orchestrator {
     pub db: PgPool,
     pub vault: Vault,
@@ -670,38 +676,46 @@ impl Orchestrator {
                         .execute(&self.db)
                         .await?;
                     }
-                    // The brain's own messages go through its queue, in order with the rest,
-                    // and never hold up node events while its session starts.
-                    if task.id == crate::model::BRAIN_TASK {
-                        // The owner's own message is redelivered as theirs (so they hear if it
-                        // cannot be); anything else goes through the brain's queue, in order.
+                    let redelivered = if task.id == crate::model::BRAIN_TASK {
+                        // The brain's own messages go through its queue, in order with the
+                        // rest, and never hold up node events while its session starts. The
+                        // owner's own message is redelivered as theirs (so they hear if it
+                        // cannot be).
                         if let crate::tasks::Origin::Owner(_) = origin {
-                            crate::tasks::to_brain_as(self, text, origin).await?;
+                            crate::tasks::to_brain_as(self, text.clone(), origin).await
                         } else {
-                            self.tell_brain(text);
+                            self.tell_brain(text.clone());
+                            Ok(crate::tasks::Delivered::Queued)
                         }
-                        return Ok(());
-                    }
-                    // The secretary's next run takes it as a turn of nobody's in particular.
-                    let redelivered = if task.id == crate::model::SECRETARY_TASK {
+                    } else if task.id == crate::model::SECRETARY_TASK {
+                        // The secretary's next run takes it as a turn of nobody's in particular.
                         crate::secretary::run_ended(self, &run_id);
                         crate::secretary::redeliver(self, text.clone(), origin).await
                     } else {
                         crate::tasks::deliver(self, &task, text.clone()).await
                     };
-                    if let Err(e) = redelivered {
-                        // Kept rather than lost (say, its agent was removed meanwhile): it is
-                        // in the task's queue for whoever picks the task up.
-                        tracing::warn!("redelivering to {} failed, text kept: {e:#}", task.id);
-                        sqlx::query(
-                            "insert into messages (task_id, to_agent, text) values ($1, $2, $3)",
-                        )
-                        .bind(&task.id)
-                        .bind(&agent_id)
-                        .bind(&text)
-                        .execute(&self.db)
-                        .await?;
-                    }
+                    let outcome = match redelivered {
+                        Ok(crate::tasks::Delivered::ToRun) => REDELIVERED_TO_RUN,
+                        Ok(crate::tasks::Delivered::Queued) => REDELIVERED_QUEUED,
+                        Err(e) => {
+                            // Kept rather than lost (say, its agent was removed meanwhile): it
+                            // is in the task's queue for whoever picks the task up.
+                            tracing::warn!("redelivering to {} failed, text kept: {e:#}", task.id);
+                            sqlx::query(
+                                "insert into messages (task_id, to_agent, text) values ($1, $2, $3)",
+                            )
+                            .bind(&task.id)
+                            .bind(&agent_id)
+                            .bind(&text)
+                            .execute(&self.db)
+                            .await?;
+                            REDELIVERED_KEPT
+                        }
+                    };
+                    // What became of it, next to the `undelivered` above: a handed-back text is
+                    // a routine resume, not a loss, and the transcript and the retrospective
+                    // must be able to tell (see `retro::digest`).
+                    self.record(&task.id, "redelivered", outcome).await?;
                 }
             }
         }
