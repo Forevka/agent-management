@@ -590,7 +590,7 @@ impl Orchestrator {
                 // else that ends a run is worth telling the owner about.
                 let idle_exit = code == Some(0)
                     && matches!(task.status.as_str(), status::RUNNING | status::WAITING);
-                if task.status != status::DONE
+                if !status::is_done(&task.status)
                     && !crate::model::is_builtin_task(&task.id)
                     && !idle_exit
                 {
@@ -708,7 +708,7 @@ impl Orchestrator {
                             .into()
                     });
                 let ours = sqlx::query(
-                    "update tasks set running = false, status = case when status = 'done' then status else 'failed' end, updated_at = now()
+                    "update tasks set running = false, status = case when status in ('done', 'archived') then status else 'failed' end, updated_at = now()
                      where id = $1 and run_id = $2",
                 )
                 .bind(&task_id)
@@ -907,7 +907,7 @@ impl Orchestrator {
                 Ok(0) => {}
                 Ok(_) => {
                     let _ = sqlx::query(
-                        "update tasks set status = 'queued' where id = $1 and not running and status not in ('done','stopped')",
+                        "update tasks set status = 'queued' where id = $1 and not running and status not in ('done','archived','stopped')",
                     )
                     .bind(&task.id)
                     .execute(&self.db)
@@ -916,7 +916,12 @@ impl Orchestrator {
                 Err(e) => tracing::warn!("giving back {}'s messages failed: {e:#}", task.id),
             }
         }
-        let ended_already = [status::DONE, status::STOPPED, status::FAILED];
+        let ended_already = [
+            status::DONE,
+            status::ARCHIVED,
+            status::STOPPED,
+            status::FAILED,
+        ];
         for task in ended
             .iter()
             .filter(|t| !ended_already.contains(&t.status.as_str()))
@@ -1022,6 +1027,8 @@ impl Orchestrator {
 
     /// Periodic housekeeping: reminders and retention.
     pub async fn run_housekeeping(self: Arc<Self>) {
+        // Its time and zone, checked once rather than failing every tick.
+        let archive = crate::archive::schedule(&self).await;
         let mut tick = tokio::time::interval(Duration::from_secs(300));
         loop {
             tick.tick().await;
@@ -1052,6 +1059,16 @@ impl Orchestrator {
             // And once a day, the fleet's own retrospective on the whole day.
             if let Err(e) = crate::retro::run_if_due(&self).await {
                 tracing::warn!("the daily retrospective failed to start: {e:#}");
+            }
+            // Every evening, done work leaves the board (see `archive`).
+            if let Some(s) = &archive
+                && let Err(e) = crate::archive::run_if_due(&self, s).await
+            {
+                tracing::warn!("archiving done tasks failed: {e:#}");
+            }
+            // Uploads an agent began and never finished hold bytes nobody can see.
+            if let Err(e) = crate::attachments::sweep_stale(&self).await {
+                tracing::warn!("removing unfinished uploads failed: {e:#}");
             }
             if let Err(e) = self.prune().await {
                 tracing::warn!("retention pruning failed: {e:#}");

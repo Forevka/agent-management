@@ -9,6 +9,7 @@ import {
   BoardIcon,
   ListIcon,
   MilestoneIcon,
+  PaperclipIcon,
   SessionsIcon,
   SparkIcon,
   WarningIcon,
@@ -169,6 +170,17 @@ export default function BoardPage() {
                               ? `${t.milestones_done} of ${t.milestones} steps done`
                               : 'No checklist yet',
                         },
+                        // What it produced, only once there is something: a count, because the
+                        // titles belong on the task's page.
+                        ...((t.attachments ?? []).length > 0
+                          ? [
+                              {
+                                icon: <PaperclipIcon />,
+                                value: (t.attachments ?? []).length,
+                                title: (t.attachments ?? []).map((a) => a.title).join('\n'),
+                              },
+                            ]
+                          : []),
                       ]}
                     />
                   ))}

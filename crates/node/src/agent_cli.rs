@@ -51,6 +51,39 @@ pub enum AgentCmd {
         #[arg(long)]
         remove: bool,
     },
+    /// Attach a deliverable to the task: a link (an artifact, a doc) or a file of any kind (an
+    /// asset, a migration, a report), kept with the task so it is found later.
+    ///
+    /// A file is uploaded in pieces, up to the fleet's size limit (50 MiB by default). Never
+    /// attach credentials: a file containing one of the project's secrets is refused.
+    Attach {
+        /// A URL (`https://...`) or the path of a file.
+        #[arg(required = true)]
+        target: String,
+        /// What it is, as the owner will look for it ("Maestro prompt comparison").
+        #[arg(long)]
+        title: String,
+        /// The task to attach to, by id or key (F-7). Only the orchestrator may name another
+        /// task; an agent always attaches to its own.
+        #[arg(long)]
+        task: Option<String>,
+        /// The file name to store it under (default: the file's own name).
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Remove an attachment (A-12) from the task.
+    Detach {
+        id: String,
+        /// The task, by id or key (the orchestrator only).
+        #[arg(long)]
+        task: Option<String>,
+    },
+    /// List the task's attachments.
+    Attachments {
+        /// The task, by id or key (the orchestrator only).
+        #[arg(long)]
+        task: Option<String>,
+    },
     /// Send a message to another agent (by name or id).
     Tell { agent: String, message: String },
     /// Post a short note in the task's topic. Silent unless --notify.
@@ -108,12 +141,20 @@ pub enum AgentCmd {
         #[arg(long)]
         project: Option<String>,
     },
-    /// List tasks, newest first.
+    /// List tasks, newest first. Archived tasks are left out unless searched for.
     Tasks {
         #[arg(long)]
         project: Option<String>,
+        /// queued, planning, running, waiting, done, stopped, failed or archived.
         #[arg(long)]
         status: Option<String>,
+        /// Words that must each appear somewhere: title, brief, summary, id or key (F-7),
+        /// agent, status, links or attachments. Archived tasks are searched too.
+        #[arg(long)]
+        search: Option<String>,
+        /// Include archived tasks without searching.
+        #[arg(long)]
+        archived: bool,
         #[arg(long, default_value_t = 20)]
         limit: u32,
     },
@@ -877,11 +918,30 @@ pub fn to_call(cmd: AgentCmd) -> Result<(&'static str, Value)> {
         AgentCmd::Tasks {
             project,
             status,
+            search,
+            archived,
             limit,
         } => (
             "list_tasks",
-            json!({"project": project, "status": status, "limit": limit}),
+            json!({"project": project, "status": status, "search": search, "archived": archived, "limit": limit}),
         ),
+        AgentCmd::Attach {
+            target,
+            title,
+            task,
+            name: _,
+        } => {
+            // A file is uploaded in pieces by `run`, which never gets here with one.
+            if !is_url(&target) {
+                bail!("{target} is not a URL; a file is attached by `run`, in pieces");
+            }
+            (
+                "attach_url",
+                json!({"url": target, "title": title, "task_id": task}),
+            )
+        }
+        AgentCmd::Detach { id, task } => ("attach_remove", json!({"id": id, "task_id": task})),
+        AgentCmd::Attachments { task } => ("attachments", json!({"task_id": task})),
         AgentCmd::CreateTask(a) => {
             let new_agent = match (a.new_agent, a.role) {
                 (Some(name), Some(role)) => json!({"name": name, "role": role}),
@@ -1146,23 +1206,40 @@ fn stdin_if_dash(s: String) -> Result<String> {
     Ok(buf.trim_end().to_owned())
 }
 
+fn is_url(s: &str) -> bool {
+    s.starts_with("https://") || s.starts_with("http://")
+}
+
+/// The most bytes one piece of an upload carries (the orchestrator's own limit; see
+/// `attachments::CHUNK`). 1 MiB is 1.33 MiB as base64, well inside the 4 MiB IPC request.
+const UPLOAD_CHUNK: usize = 1024 * 1024;
+
 /// Runs one command against the node. Returns the process exit code.
 pub async fn run(cmd: AgentCmd) -> Result<i32> {
     let addr = std::env::var("FLEET_IPC_ADDR").context(
         "FLEET_IPC_ADDR is not set: `fleet agent` only works inside a fleet agent session",
     )?;
     let token = std::env::var("FLEET_IPC_TOKEN").context("FLEET_IPC_TOKEN is not set")?;
+    if let AgentCmd::Attach {
+        target,
+        title,
+        task,
+        name,
+    } = &cmd
+        && !is_url(target)
+    {
+        return attach_file(
+            &addr,
+            &token,
+            target,
+            title,
+            task.as_deref(),
+            name.as_deref(),
+        )
+        .await;
+    }
     let (tool, args) = to_call(cmd)?;
-    let resp = ipc::call(
-        &addr,
-        &IpcRequest {
-            token,
-            tool: tool.into(),
-            args: args.to_string(),
-        },
-    )
-    .await
-    .context("the fleet node is unreachable")?;
+    let resp = call(&addr, &token, tool, &args).await?;
     if resp.ok {
         println!("{}", resp.result);
         Ok(0)
@@ -1170,6 +1247,153 @@ pub async fn run(cmd: AgentCmd) -> Result<i32> {
         eprintln!("error: {}", resp.result);
         Ok(1)
     }
+}
+
+async fn call(addr: &str, token: &str, tool: &str, args: &Value) -> Result<ipc::IpcResponse> {
+    ipc::call(
+        addr,
+        &IpcRequest {
+            token: token.to_owned(),
+            tool: tool.into(),
+            args: args.to_string(),
+        },
+    )
+    .await
+    .context("the fleet node is unreachable")
+}
+
+/// Refuses what must never leave the machine as an attachment: a `.env` file, or anything under
+/// the node's secrets directory. The orchestrator also refuses a file that contains a secret
+/// value; this catches the obvious case before a byte is sent.
+fn check_attachable(path: &std::path::Path) -> Result<()> {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if name == ".env" || name.starts_with(".env.") || name.ends_with(".env") {
+        bail!(
+            "{} looks like a secrets file; attach what the work produced, never credentials",
+            path.display()
+        );
+    }
+    if let Ok(dir) = std::env::var("FLEET_SECRETS_DIR") {
+        // The whole `secrets` directory of the node, not only this run's: another task's files
+        // are no more attachable than this one's.
+        let dir = std::path::Path::new(&dir);
+        let root = dir.parent().unwrap_or(dir);
+        if let (Ok(root), Ok(file)) = (root.canonicalize(), path.canonicalize())
+            && file.starts_with(&root)
+        {
+            bail!(
+                "{} is one of the fleet's secret files and cannot be attached",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Uploads a file in pieces: `attach_begin` with its size and SHA-256, one `attach_chunk` per
+/// piece, then `attach_finish`, which makes it visible once the orchestrator has checked it.
+async fn attach_file(
+    addr: &str,
+    token: &str,
+    path: &str,
+    title: &str,
+    task: Option<&str>,
+    name: Option<&str>,
+) -> Result<i32> {
+    use sha2::{Digest, Sha256};
+    use tokio::io::AsyncReadExt;
+
+    let p = std::path::Path::new(path);
+    let meta = std::fs::metadata(p).with_context(|| format!("cannot read {path}"))?;
+    if !meta.is_file() {
+        bail!("{path} is not a file (attach a URL with https://..., or a file's path)");
+    }
+    check_attachable(p)?;
+    let file_name = match name {
+        Some(n) => n.to_owned(),
+        None => p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .context("the file's name is not valid UTF-8; give one with --name")?
+            .to_owned(),
+    };
+    // Hashed first, in a pass of its own, so the orchestrator can tell the pieces arrived whole.
+    let mut hash = Sha256::new();
+    let mut f = tokio::fs::File::open(p).await?;
+    let mut buf = vec![0u8; UPLOAD_CHUNK];
+    loop {
+        let n = f.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        hash.update(&buf[..n]);
+    }
+    let sha = data_encoding::HEXLOWER.encode(&hash.finalize());
+    let size = meta.len();
+    let fail = |r: ipc::IpcResponse| {
+        eprintln!("error: {}", r.result);
+        Ok(1)
+    };
+    let r = call(
+        addr,
+        token,
+        "attach_begin",
+        &json!({"task_id": task, "title": title, "file_name": file_name, "size": size, "sha256": sha}),
+    )
+    .await?;
+    if !r.ok {
+        return fail(r);
+    }
+    let upload = serde_json::from_str::<Value>(&r.result)?["upload"]
+        .as_i64()
+        .context("the orchestrator did not start the upload")?;
+    let mut f = tokio::fs::File::open(p).await?;
+    let mut idx = 0i64;
+    loop {
+        // Fill a whole piece (a read may return less), so every piece but the last is full.
+        let mut n = 0;
+        while n < UPLOAD_CHUNK {
+            let got = f.read(&mut buf[n..]).await?;
+            if got == 0 {
+                break;
+            }
+            n += got;
+        }
+        if n == 0 {
+            break;
+        }
+        let r = call(
+            addr,
+            token,
+            "attach_chunk",
+            &json!({"task_id": task, "upload": upload, "index": idx,
+                    "data": data_encoding::BASE64.encode(&buf[..n])}),
+        )
+        .await?;
+        if !r.ok {
+            return fail(r);
+        }
+        idx += 1;
+        if n < UPLOAD_CHUNK {
+            break;
+        }
+    }
+    let r = call(
+        addr,
+        token,
+        "attach_finish",
+        &json!({"task_id": task, "upload": upload}),
+    )
+    .await?;
+    if !r.ok {
+        return fail(r);
+    }
+    println!("{}", r.result);
+    Ok(0)
 }
 
 #[cfg(test)]
@@ -1187,6 +1411,55 @@ mod tests {
         let mut v = vec!["t"];
         v.extend(args);
         to_call(T::try_parse_from(v).unwrap().cmd).unwrap()
+    }
+
+    #[test]
+    fn attachments_and_search_map_to_tools() {
+        assert_eq!(
+            call(&[
+                "attach",
+                "https://claude.ai/artifact/Q5GfaHwvtR471EHGo8ZVAB",
+                "--title",
+                "Maestro prompt comparison",
+                "--task",
+                "F-7",
+            ]),
+            (
+                "attach_url",
+                json!({"url": "https://claude.ai/artifact/Q5GfaHwvtR471EHGo8ZVAB",
+                       "title": "Maestro prompt comparison", "task_id": "F-7"})
+            )
+        );
+        assert_eq!(
+            call(&["detach", "A-3"]),
+            ("attach_remove", json!({"id": "A-3", "task_id": null}))
+        );
+        assert_eq!(
+            call(&["attachments", "--task", "F-7"]),
+            ("attachments", json!({"task_id": "F-7"}))
+        );
+        assert_eq!(
+            call(&["tasks", "--search", "maestro F-7", "--archived"]),
+            (
+                "list_tasks",
+                json!({"project": null, "status": null, "search": "maestro F-7",
+                       "archived": true, "limit": 20})
+            )
+        );
+        // A path is uploaded in pieces by `run`, never sent as one call.
+        let v = T::try_parse_from(["t", "attach", "out.sql", "--title", "x"]).unwrap();
+        assert!(to_call(v.cmd).is_err());
+    }
+
+    #[test]
+    fn secrets_files_are_not_attachable() {
+        for name in [".env", ".env.local", "prod.env"] {
+            assert!(
+                check_attachable(std::path::Path::new(name)).is_err(),
+                "{name}"
+            );
+        }
+        assert!(check_attachable(std::path::Path::new("0021_add_index.sql")).is_ok());
     }
 
     #[test]

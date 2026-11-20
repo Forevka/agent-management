@@ -8,6 +8,9 @@ import { SegmentedControl } from '@/components/ui/segmented-control'
 import { Page, PageHeader, Row, Section, Stack, Text } from '@/components/fx/layout'
 import { Facts, Table } from '@/components/fx/table'
 import { ArrowLeftIcon, CheckIcon } from '@/components/fx/icons'
+import { AttachForm, AttachmentList } from '@/components/fx/attachments'
+import { Note } from '@/components/fx/note'
+import { act } from '../api'
 import type { Events, Item, TaskDetail as Detail } from '../api'
 import { Duration, Loaded, Pre, StatusBadge, When, useApi } from '../ui'
 
@@ -61,13 +64,14 @@ function Event({ kind, at, data }: { kind: string; at: string; data: string }) {
   )
 }
 
-type Tab = 'sessions' | 'checklist' | 'brief' | 'transcript'
+type Tab = 'sessions' | 'checklist' | 'brief' | 'summary' | 'transcript'
 
 export default function TaskDetail() {
   const { id = '' } = useParams()
   const state = useApi<Detail>(`/api/tasks/${encodeURIComponent(id)}`, 10_000)
   const events = useApi<Events>(`/api/tasks/${encodeURIComponent(id)}/events?limit=200`)
   const [tab, setTab] = useState<Tab>('sessions')
+  const attachPath = `/api/tasks/${encodeURIComponent(id)}/attachments`
 
   return (
     <Page>
@@ -110,6 +114,45 @@ export default function TaskDetail() {
               </CardContent>
             </Card>
 
+            {d.task.status === 'archived' && (
+              <Note tone="info" title="Archived">
+                Done, and put away by the nightly archive: hidden from the board, still here. Writing to
+                the task brings it back.
+              </Note>
+            )}
+
+            {/* What the task produced, where it is found again later: artifact and doc links, and
+                files the orchestrator keeps (an asset, a migration for devops). */}
+            <Section
+              title="Attachments"
+              description="What this task produced: links and files, kept with it."
+            >
+              <Card>
+                <CardContent>
+                  <Stack gap="3">
+                    {(d.task.attachments ?? []).length > 0 ? (
+                      <AttachmentList
+                        items={d.task.attachments ?? []}
+                        onRemove={(a) => {
+                          if (!window.confirm(`Remove ${a.ref} “${a.title}” from this task?`)) return
+                          void act(attachPath, 'remove', { id: a.id })
+                            .then(() => void state.reload())
+                            .catch((e: unknown) =>
+                              window.alert(`Could not remove it: ${e instanceof Error ? e.message : String(e)}`),
+                            )
+                        }}
+                      />
+                    ) : (
+                      <Text size="1" tone="muted">
+                        Nothing yet. Agents attach what they make with <code>fleet agent attach</code>.
+                      </Text>
+                    )}
+                    <AttachForm path={attachPath} onDone={() => void state.reload()} />
+                  </Stack>
+                </CardContent>
+              </Card>
+            </Section>
+
             {/* Open items only: a task keeps its answered questions, and showing those under
                 "Waiting on you" told the owner they were holding up work they had already
                 answered. The rest are listed below, as a record of what was asked. */}
@@ -146,6 +189,7 @@ export default function TaskDetail() {
                   { value: 'sessions', label: 'Sessions', count: d.sessions.length },
                   { value: 'checklist', label: 'Checklist', count: d.milestones.length },
                   { value: 'brief', label: 'Brief' },
+                  ...(d.task.summary ? [{ value: 'summary' as Tab, label: 'Summary' }] : []),
                   { value: 'transcript', label: 'Transcript' },
                 ]}
               />
@@ -225,6 +269,8 @@ export default function TaskDetail() {
                 ))}
 
               {tab === 'brief' && <Pre>{d.task.brief ?? ''}</Pre>}
+
+              {tab === 'summary' && <Pre>{d.task.summary ?? ''}</Pre>}
 
               {tab === 'transcript' && (
                 <Loaded state={events}>

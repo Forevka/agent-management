@@ -6,6 +6,8 @@ init event with a session id, reads user messages and control requests from stdi
 fleet tools through the node's loopback IPC exactly as the `fleet mcp` shim would (the shim
 itself is tested separately).
 """
+import base64
+import hashlib
 import json
 import os
 import socket
@@ -212,6 +214,15 @@ for line in sys.stdin:
         tool("link_add", {"ref": "!940"})
         tool("link_add", {"ref": "https://example.test/notes"})
         tool("link_remove", {"ref": "https://example.test/notes"})
+        # What the task produced, kept with it: a titled link, and a small file sent the way
+        # `fleet agent attach <path>` sends one (begin, its pieces, finish).
+        tool("attach_url", {"url": "https://claude.ai/artifact/e2e-paint", "title": "Paint swatches"})
+        body = b"-- 0021_paint.sql\nupdate shed set color = 'blue';\n"
+        r = tool("attach_begin", {"title": "Migration for devops", "file_name": "0021_paint.sql",
+                                  "size": len(body), "sha256": hashlib.sha256(body).hexdigest()})
+        up = json.loads(r["result"])["upload"]
+        tool("attach_chunk", {"upload": up, "index": 0, "data": base64.b64encode(body).decode()})
+        tool("attach_finish", {"upload": up})
         # Asked once, then asked again in better words: the fleet must leave one open question,
         # not two cards saying the same thing. The note in between blocks nobody, so asking
         # something else must not take it away.

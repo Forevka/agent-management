@@ -506,6 +506,24 @@ only add to it. How many records one run may write:
 FLEET_RETRO_MAX_PEOPLE=30
 ```
 
+### The nightly archive and attachments
+
+Every evening at 21:00 Kyiv time the orchestrator archives done tasks: they
+leave the board and the default lists, and are still found by search, by their
+link and with the `archived` status filter. Workflows are never archived, and a
+task you write to again comes back by itself. Change the time or the zone, or
+turn it off, in `.env`:
+
+```sh
+FLEET_ARCHIVE_AT=21:00            # or off
+FLEET_ARCHIVE_TIMEZONE=Europe/Kyiv
+```
+
+Attachments (links and files a task produced) need nothing set up. Files are
+stored in Postgres in 1 MiB pieces, so the backup below covers them; each may be
+up to `FLEET_ATTACHMENT_MAX_MB` (50). A file containing one of the project's
+secret values is refused.
+
 ## 7. Backups
 
 `deploy/scripts/backup.sh` dumps both databases and the roles, and archives

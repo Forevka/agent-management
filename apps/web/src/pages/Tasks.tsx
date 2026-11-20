@@ -9,7 +9,7 @@ import { SearchIcon } from '@/components/fx/icons'
 import type { Overview, Task } from '../api'
 import { Loaded, StatusBadge, When, useApi } from '../ui'
 
-const STATUSES = ['queued', 'planning', 'running', 'waiting', 'done', 'stopped', 'failed']
+const STATUSES = ['queued', 'planning', 'running', 'waiting', 'done', 'stopped', 'failed', 'archived']
 
 /// Every task the fleet has ever had, filtered. The filters live in the URL, so a view can be
 /// bookmarked and the back button behaves.
@@ -19,6 +19,9 @@ export default function Tasks() {
   const status = params.get('status') ?? ''
   const q = params.get('q') ?? ''
   const builtin = params.get('builtin') === 'true'
+  // Archived tasks are left out of a plain list (that is what archiving is for) and come back as
+  // soon as the owner searches, filters on `archived`, or asks for them here.
+  const archived = params.get('archived') === 'true'
 
   const path = useMemo(() => {
     const u = new URLSearchParams()
@@ -26,9 +29,10 @@ export default function Tasks() {
     if (status) u.set('status', status)
     if (q) u.set('q', q)
     if (builtin) u.set('builtin', 'true')
+    if (archived) u.set('archived', 'true')
     u.set('limit', '200')
     return `/api/tasks?${u}`
-  }, [project, status, q, builtin])
+  }, [project, status, q, builtin, archived])
 
   const state = useApi<{ tasks: Task[]; total: number }>(path)
   // Only for the project dropdown; the task list itself comes from the server filtered.
@@ -45,7 +49,7 @@ export default function Tasks() {
     <Page>
       <PageHeader
         title="Tasks"
-        description="Everything the fleet has worked on. The filters are in the URL, so a view can be shared."
+        description="Everything the fleet has worked on. Every word you search for must match somewhere; archived tasks are searched too. The filters are in the URL, so a view can be shared."
         meta={
           state.data && (
             <Text size="1" tone="muted">
@@ -58,7 +62,7 @@ export default function Tasks() {
       <Row gap="2" align="end">
         <div style={{ minWidth: '15rem', flexGrow: 1 }}>
           <TextField
-            placeholder="Search id or title"
+            placeholder="Search title, brief, F-key, agent, links, attachments"
             defaultValue={q}
             onChange={(e) => set('q', e.currentTarget.value)}
             prefix={<SearchIcon />}
@@ -102,6 +106,18 @@ export default function Tasks() {
             ]}
           />
         </div>
+        <div style={{ minWidth: '11rem' }}>
+          <Select
+            size="sm"
+            aria-label="Include archived tasks"
+            value={archived ? 'true' : 'false'}
+            onChange={(v) => set('archived', v === 'true' ? 'true' : '')}
+            options={[
+              { value: 'false', label: 'Hide archived' },
+              { value: 'true', label: 'Archived too' },
+            ]}
+          />
+        </div>
       </Row>
 
       <Loaded state={state}>
@@ -120,7 +136,7 @@ export default function Tasks() {
                 cell: (t) => (
                   <Stack gap="1">
                     <Link to={`/tasks/${t.id}`} className="fx-link">
-                      {t.id}
+                      {t.key && t.key !== t.id ? `${t.key} · ${t.id}` : t.id}
                     </Link>
                     <Text size="1" tone="muted" breakAll>
                       {t.title}

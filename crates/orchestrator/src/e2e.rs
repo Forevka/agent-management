@@ -6511,6 +6511,571 @@ async fn topic_cleanup_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &Fak
     assert_eq!(deletes(chat).len(), 2, "and it does not ask again today");
 }
 
+/// A file download through the real router, as the owner's browser makes it: status, the
+/// headers that keep it a download, and the bytes.
+async fn api_download(o: &Arc<Orchestrator>, uri: &str) -> (u16, axum::http::HeaderMap, Vec<u8>) {
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let session = crate::web::random_token();
+    sqlx::query(
+        "insert into web_sessions (token, expires_at) values ($1, now() + interval '1 day')",
+    )
+    .bind(&session)
+    .execute(&o.db)
+    .await
+    .unwrap();
+    let req = axum::http::Request::builder()
+        .uri(uri)
+        .header(
+            axum::http::header::COOKIE,
+            format!("fleet_session={session}"),
+        )
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let res = crate::web::router(o.clone()).oneshot(req).await.unwrap();
+    let status = res.status().as_u16();
+    let headers = res.headers().clone();
+    let bytes = res.into_body().collect().await.unwrap().to_bytes().to_vec();
+    (status, headers, bytes)
+}
+
+/// What a task produced, finding a task again, and the nightly archive.
+///
+/// - **Attachments.** The agent of `demo-BS-1` attached a link and a small file through the
+///   node's IPC (see `fake_claude.py`); here it uploads a multi-piece binary the way `fleet
+///   agent attach <path>` does, which downloads byte for byte and only ever as a download. A
+///   file with a project secret inside (even split across two pieces), one over the size limit
+///   and one whose bytes do not match its hash are all refused and leave nothing behind. The
+///   brain attaches to another task by its F-key; an agent naming another task still attaches
+///   to its own.
+/// - **Search.** Every word must match somewhere — title, brief, summary, key, attachments — and
+///   archived tasks are found by a search while a plain list leaves them out.
+/// - **Archive.** At 21:00 Kyiv time, summer (UTC+3), winter (UTC+2) and on the day the clocks
+///   change, done tasks become archived, once a day; a workflow never is; and a task that is
+///   written to again is no longer archived.
+async fn attachments_search_archive_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool) {
+    use sha2::Digest;
+    let bs1 = o.task("demo-BS-1").await.unwrap().unwrap();
+    let agent = bs1.agent_id.clone().unwrap();
+
+    // What the fake agent attached in its first turn, through the real IPC path.
+    let detail = api_get(o, "/api/tasks/demo-BS-1").await;
+    let atts = detail["task"]["attachments"].as_array().unwrap().clone();
+    let swatches = atts
+        .iter()
+        .find(|a| a["title"] == "Paint swatches")
+        .unwrap_or_else(|| panic!("the agent's link is attached: {atts:?}"));
+    assert_eq!(swatches["kind"], "url");
+    assert_eq!(swatches["url"], "https://claude.ai/artifact/e2e-paint");
+    assert_eq!(swatches["added_by"], json!(agent));
+    let migration = atts
+        .iter()
+        .find(|a| a["title"] == "Migration for devops")
+        .unwrap_or_else(|| panic!("the agent's file is attached: {atts:?}"));
+    assert_eq!(migration["file_name"], "0021_paint.sql");
+    let (status, headers, bytes) = api_download(o, migration["download"].as_str().unwrap()).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        bytes,
+        b"-- 0021_paint.sql\nupdate shed set color = 'blue';\n".to_vec(),
+        "the file comes back exactly as the agent sent it"
+    );
+    assert!(
+        headers["content-disposition"]
+            .to_str()
+            .unwrap()
+            .starts_with("attachment;"),
+        "a file the agent made is a download, never a page: {headers:?}"
+    );
+    assert_eq!(headers["x-content-type-options"], "nosniff");
+
+    // A binary of three pieces, as `fleet agent attach <path>` sends it.
+    let mut blob: Vec<u8> = (0..(2 * crate::attachments::CHUNK + 12345))
+        .map(|i| (i * 7 + i / 251) as u8)
+        .collect();
+    blob[0] = 0x89; // not text, whatever a sniffer thinks
+    let sha = |b: &[u8]| data_encoding::HEXLOWER.encode(&sha2::Sha256::digest(b));
+    let upload = |title: &'static str, name: &'static str, data: Vec<u8>, declared_sha: String| {
+        let agent = agent.clone();
+        async move {
+            let r = call_as(
+                o,
+                &agent,
+                "demo-BS-1",
+                "attach_begin",
+                json!({"title": title, "file_name": name, "size": data.len(), "sha256": declared_sha}),
+            )
+            .await?
+            .unwrap();
+            anyhow::ensure!(r.ok, "{}", r.result);
+            let up = serde_json::from_str::<Value>(&r.result)?["upload"]
+                .as_i64()
+                .unwrap();
+            for (i, piece) in data.chunks(crate::attachments::CHUNK).enumerate() {
+                let r = call_as(
+                    o,
+                    &agent,
+                    "demo-BS-1",
+                    "attach_chunk",
+                    json!({"upload": up, "index": i, "data": data_encoding::BASE64.encode(piece)}),
+                )
+                .await?
+                .unwrap();
+                anyhow::ensure!(r.ok, "{}", r.result);
+            }
+            call_as(
+                o,
+                &agent,
+                "demo-BS-1",
+                "attach_finish",
+                json!({"upload": up}),
+            )
+            .await
+        }
+    };
+    let r = upload("Swatch render", "render.bin", blob.clone(), sha(&blob))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(r.ok && r.result.contains("render.bin"), "{}", r.result);
+    // Read by the task's key, as the owner's links name it.
+    let render = api_get(o, &format!("/api/tasks/{}", bs1.key())).await["task"]["attachments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["title"] == "Swatch render")
+        .cloned()
+        .expect("the render is attached");
+    assert_eq!(render["size"], json!(blob.len()));
+    assert_eq!(render["sha256"], json!(sha(&blob)));
+    let (status, headers, bytes) = api_download(o, render["download"].as_str().unwrap()).await;
+    assert_eq!(status, 200);
+    assert_eq!(headers["content-type"], "application/octet-stream");
+    assert_eq!(bytes.len(), blob.len());
+    assert!(
+        bytes == blob,
+        "three pieces come back as one identical file"
+    );
+
+    // A secret inside the file, split across two pieces so neither holds it whole.
+    let secret = b"t0k-jira-secret";
+    let mut leaky = vec![b'x'; crate::attachments::CHUNK + 100];
+    let at = crate::attachments::CHUNK - 5;
+    leaky[at..at + secret.len()].copy_from_slice(secret);
+    let e = upload("Debug dump", "dump.txt", leaky.clone(), sha(&leaky))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("secret"),
+        "a file with a secret in it is refused: {e}"
+    );
+    // Too big for the limit, refused before a byte is stored.
+    let e = call_as(
+        o,
+        &agent,
+        "demo-BS-1",
+        "attach_begin",
+        json!({"title": "Huge", "file_name": "huge.bin",
+               "size": o.cfg.attachment_max_bytes + 1, "sha256": "0".repeat(64)}),
+    )
+    .await;
+    assert!(
+        e.as_ref()
+            .is_err_and(|e| e.to_string().contains("more than")),
+        "{e:?}"
+    );
+    // A secret in the name is refused too: names reach Telegram and the audit log.
+    let e = call_as(
+        o,
+        &agent,
+        "demo-BS-1",
+        "attach_begin",
+        json!({"title": "Dump", "file_name": "dump-t0k-jira-secret.bin",
+               "size": 10, "sha256": "0".repeat(64)}),
+    )
+    .await;
+    assert!(
+        e.as_ref()
+            .is_err_and(|e| e.to_string().contains("file name")),
+        "{e:?}"
+    );
+    // Bytes that do not hash to what was declared.
+    let e = upload(
+        "Torn",
+        "torn.bin",
+        b"half a file".to_vec(),
+        sha(b"another file"),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("SHA-256"), "{e}");
+    let (left, pieces): (i64, i64) = sqlx::query_as(
+        "select (select count(*) from task_attachments where not complete),
+                (select count(*) from task_attachment_chunks c
+                 join task_attachments a on a.id = c.attachment_id where not a.complete)",
+    )
+    .fetch_one(db)
+    .await
+    .unwrap();
+    assert_eq!(
+        (left, pieces),
+        (0, 0),
+        "a refused upload leaves nothing behind"
+    );
+    let titles: Vec<String> = sqlx::query_scalar(
+        "select title from task_attachments where task_id = 'demo-BS-1' order by id",
+    )
+    .fetch_all(db)
+    .await
+    .unwrap();
+    assert_eq!(
+        titles,
+        ["Paint swatches", "Migration for devops", "Swatch render"],
+        "only what passed is attached"
+    );
+
+    // An agent naming another task still attaches to its own: `task_id` is the brain's.
+    let r = call_as(
+        o,
+        &agent,
+        "demo-BS-1",
+        "attach_url",
+        json!({"url": "https://example.test/mine", "title": "Mine", "task_id": "demo-ZZ-1"}),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(r.result.contains("demo-BS-1"), "{}", r.result);
+    let zz1 = o.task("demo-ZZ-1").await.unwrap().unwrap();
+    assert!(
+        crate::attachments::of_task(o, &zz1.id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "nothing landed on the task the agent named"
+    );
+    // The brain attaches to any task, by its key — the owner's F-7 artifact case.
+    let zz1_key = zz1.key();
+    let r = call_as(
+        o,
+        "orchestrator",
+        "brain",
+        "attach_url",
+        json!({"task_id": zz1_key, "url": "https://claude.ai/artifact/Q5GfaHwvtR471EHGo8ZVAB",
+               "title": "Maestro prompt comparison"}),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(r.ok, "{}", r.result);
+    let on_zz1 = crate::attachments::of_task(o, &zz1.id).await.unwrap();
+    assert_eq!(on_zz1.len(), 1);
+    assert_eq!(on_zz1[0].added_by, "orchestrator");
+    // Said again with a better title: one attachment, the newer title.
+    call_as(
+        o,
+        "orchestrator",
+        "brain",
+        "attach_url",
+        json!({"task_id": zz1_key, "url": "https://claude.ai/artifact/Q5GfaHwvtR471EHGo8ZVAB",
+               "title": "Maestro prompts: comparison"}),
+    )
+    .await
+    .unwrap();
+    let on_zz1 = crate::attachments::of_task(o, &zz1.id).await.unwrap();
+    assert_eq!(on_zz1.len(), 1);
+    assert_eq!(on_zz1[0].title, "Maestro prompts: comparison");
+    // The owner, from the task page: a link, then taking it back.
+    let added = api_post(
+        o,
+        &format!("/api/tasks/{zz1_key}/attachments"),
+        json!({"op": "url", "body": {"url": "https://docs.example.test/runbook", "title": "Runbook"}}),
+    )
+    .await;
+    assert_eq!(added["attachment"]["added_by"], "owner");
+    let removed = api_post(
+        o,
+        &format!("/api/tasks/{zz1_key}/attachments"),
+        json!({"op": "remove", "body": {"id": added["attachment"]["id"]}}),
+    )
+    .await;
+    assert_eq!(removed["removed"], true);
+    // An agent takes back what it attached, never what the owner put on its task.
+    let owners = api_post(
+        o,
+        "/api/tasks/demo-BS-1/attachments",
+        json!({"op": "url", "body": {"url": "https://docs.example.test/owner", "title": "Owner's notes"}}),
+    )
+    .await;
+    let owners_id = owners["attachment"]["ref"].as_str().unwrap().to_owned();
+    let r = call_as(
+        o,
+        &agent,
+        "demo-BS-1",
+        "attach_remove",
+        json!({"id": owners_id}),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(r.result.contains("has no attachment"), "{}", r.result);
+    let removed = api_post(
+        o,
+        "/api/tasks/demo-BS-1/attachments",
+        json!({"op": "remove", "body": {"id": owners["attachment"]["id"]}}),
+    )
+    .await;
+    assert_eq!(removed["removed"], true, "the owner removes anything");
+    // The board card carries them, for the count: the three above and the agent's "Mine".
+    let board = api_get(o, "/api/board").await;
+    if let Some(card) = board["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "demo-BS-1")
+    {
+        assert_eq!(card["attachments"].as_array().unwrap().len(), 4);
+    }
+
+    // Search, across every field a task is found by. Every word must match.
+    let ids = |v: &Value| -> Vec<String> {
+        v["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let found = |q: &str| {
+        let q = form_urlencoded::byte_serialize(q.as_bytes()).collect::<String>();
+        async move { ids(&api_get(o, &format!("/api/tasks?q={q}&limit=500")).await) }
+    };
+    assert!(
+        found("swatch render")
+            .await
+            .contains(&"demo-BS-1".to_owned()),
+        "by attachment titles"
+    );
+    assert!(
+        found("0021_paint.sql")
+            .await
+            .contains(&"demo-BS-1".to_owned()),
+        "by a file's name"
+    );
+    assert!(
+        found("maestro comparison").await.contains(&zz1.id),
+        "two words, one attachment"
+    );
+    assert!(found(&zz1_key).await.contains(&zz1.id), "by its F-key");
+    assert!(
+        found("painted shipped")
+            .await
+            .contains(&"demo-BS-1".to_owned()),
+        "by the agent's summary"
+    );
+    assert!(
+        found("!940").await.contains(&"demo-BS-1".to_owned()),
+        "by a link"
+    );
+    assert!(found("Tidy").await.contains(&zz1.id), "by the title");
+    assert!(
+        !found("swatch maestro")
+            .await
+            .contains(&"demo-BS-1".to_owned()),
+        "every word has to match"
+    );
+    assert!(
+        found("100%").await.is_empty(),
+        "a wildcard is just a character"
+    );
+    let summary: Option<String> =
+        sqlx::query_scalar("select summary from tasks where id = 'demo-BS-1'")
+            .fetch_one(db)
+            .await
+            .unwrap();
+    assert!(
+        summary
+            .as_deref()
+            .is_some_and(|s| s.contains("Painted") && !s.contains("t0k-jira-secret")),
+        "the summary is kept, without the secret the agent quoted: {summary:?}"
+    );
+
+    // The nightly archive. A workflow that is done between runs, and two plain done tasks.
+    sqlx::query(
+        "insert into tasks (id, project, title, brief, agent_id, status) values
+           ('demo-AR-1', 'demo', 'Archive me', 'a finished chore', $1, 'done'),
+           ('demo-AR-W', 'demo', 'Nightly report', 'a standing automation', $1, 'done')",
+    )
+    .bind(&agent)
+    .execute(db)
+    .await
+    .unwrap();
+    sqlx::query("insert into workflows (task_id, schedule) values ('demo-AR-W', 'daily:06:00')")
+        .execute(db)
+        .await
+        .unwrap();
+    let ts = |s: &str| {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    };
+    let kyiv = "Europe/Kyiv";
+    let at = 21 * 60;
+    let status_of = |id: &'static str| async move {
+        sqlx::query_scalar::<_, String>("select status from tasks where id = $1")
+            .bind(id)
+            .fetch_one(db)
+            .await
+            .unwrap()
+    };
+    // Summer: Kyiv is UTC+3, so 20:59 there is 17:59Z — not yet.
+    assert_eq!(
+        crate::archive::run_at(o, ts("2026-07-15T17:59:00Z"), at, kyiv)
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(status_of("demo-AR-1").await, "done");
+    let done_before: i64 = sqlx::query_scalar(
+        "select count(*) from tasks t where status = 'done' and not running and id <> all($1)
+         and not exists (select 1 from workflows w where w.task_id = t.id)",
+    )
+    .bind(crate::model::BUILTIN_TASKS)
+    .fetch_one(db)
+    .await
+    .unwrap();
+    let n = crate::archive::run_at(o, ts("2026-07-15T18:00:00Z"), at, kyiv)
+        .await
+        .unwrap()
+        .expect("21:00 sharp is time");
+    // At least the done tasks counted a moment ago (the fleet is still working around this
+    // test, and one may have finished in between).
+    assert!(
+        n >= done_before as u64 && n >= 2,
+        "21:00 sharp archives every done task: {n} of {done_before}"
+    );
+    assert_eq!(status_of("demo-AR-1").await, "archived");
+    assert_eq!(
+        status_of("demo-AR-W").await,
+        "done",
+        "a workflow stays on the board, ready for its next run"
+    );
+    // Once a day, whatever the hour.
+    sqlx::query("update tasks set status = 'done' where id = 'demo-AR-1'")
+        .execute(db)
+        .await
+        .unwrap();
+    assert_eq!(
+        crate::archive::run_at(o, ts("2026-07-15T20:30:00Z"), at, kyiv)
+            .await
+            .unwrap(),
+        None,
+        "not twice on the same evening"
+    );
+    // Winter: UTC+2, so 21:00 is 19:00Z and 18:30Z is still 20:30 there.
+    assert_eq!(
+        crate::archive::run_at(o, ts("2026-12-15T18:30:00Z"), at, kyiv)
+            .await
+            .unwrap(),
+        None,
+        "20:30 in a Kyiv winter is too early, though it would be 21:30 in summer"
+    );
+    // At least demo-AR-1: the fleet around this test may have finished something too.
+    assert!(matches!(
+        crate::archive::run_at(o, ts("2026-12-15T19:00:00Z"), at, kyiv)
+            .await
+            .unwrap(),
+        Some(n) if n >= 1
+    ));
+    assert_eq!(status_of("demo-AR-1").await, "archived");
+    // The day the clocks go back (25 October 2026): 21:00 is already winter time.
+    sqlx::query("update tasks set status = 'done' where id = 'demo-AR-1'")
+        .execute(db)
+        .await
+        .unwrap();
+    assert_eq!(
+        crate::archive::run_at(o, ts("2026-10-25T18:59:00Z"), at, kyiv)
+            .await
+            .unwrap(),
+        None
+    );
+    assert!(matches!(
+        crate::archive::run_at(o, ts("2026-10-25T19:00:00Z"), at, kyiv)
+            .await
+            .unwrap(),
+        Some(n) if n >= 1
+    ));
+    assert_eq!(status_of("demo-AR-1").await, "archived");
+
+    // Hidden from the board and a plain list; found by search, by status, by asking, by link.
+    let board = api_get(o, "/api/board").await;
+    assert!(
+        !ids(&board).contains(&"demo-AR-1".to_owned()),
+        "the board leaves archived work out"
+    );
+    let plain = ids(&api_get(o, "/api/tasks?limit=500").await);
+    assert!(!plain.contains(&"demo-AR-1".to_owned()));
+    assert!(
+        plain.contains(&"demo-AR-W".to_owned()),
+        "a workflow is listed"
+    );
+    assert!(found("Archive me").await.contains(&"demo-AR-1".to_owned()));
+    assert!(
+        ids(&api_get(o, "/api/tasks?status=archived&limit=500").await)
+            .contains(&"demo-AR-1".to_owned())
+    );
+    assert!(
+        ids(&api_get(o, "/api/tasks?archived=true&limit=500").await)
+            .contains(&"demo-AR-1".to_owned())
+    );
+    assert_eq!(
+        api_get(o, "/api/tasks/demo-AR-1").await["task"]["status"],
+        "archived"
+    );
+    // The brain finds it too, by any of its words.
+    let r = call_as(
+        o,
+        "orchestrator",
+        "brain",
+        "list_tasks",
+        json!({"search": "archive chore"}),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(r.result.contains("demo-AR-1"), "{}", r.result);
+    let r = call_as(
+        o,
+        "orchestrator",
+        "brain",
+        "list_tasks",
+        json!({"limit": 100}),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(!r.result.contains("demo-AR-1"), "{}", r.result);
+
+    // Written to again, an archived task is work again. (It may queue behind its busy agent;
+    // either way it is no longer archived.)
+    let task = o.task("demo-AR-1").await.unwrap().unwrap();
+    assert_eq!(task.status, "archived");
+    let _ = tasks::deliver(
+        o,
+        &task,
+        "[Message from the human] one more chore, please".into(),
+    )
+    .await;
+    let now = status_of("demo-AR-1").await;
+    assert!(
+        now != "archived" && now != "done",
+        "a follow-up brings it back: {now}"
+    );
+}
+
 /// The card and the pointer of an item, once both are out and recorded.
 async fn copies(db: &sqlx::PgPool, id: i64) -> (i64, i64) {
     wait_for("the item announced, its pointer recorded", || async {
@@ -8831,6 +9396,10 @@ async fn lifecycle() {
     //     assigns.
     Box::pin(node_projects_flow(&o, &db, &chat)).await;
     Box::pin(clone_waits_flow(&o, &db, &chat)).await;
+
+    // 28. Attachments, search and the nightly archive. Last: the archive puts away every done
+    //     task, which no earlier flow expects.
+    Box::pin(attachments_search_archive_flow(&o, &db)).await;
 
     stop_brain().await;
     let _ = std::fs::remove_dir_all(&data_dir);

@@ -43,7 +43,69 @@ pub struct Config {
     /// the web may use any valid value).
     pub allowed_models: Vec<String>,
     pub allowed_efforts: Vec<String>,
+    /// The nightly archive of finished tasks (see `archive`).
+    pub archive: ArchiveConfig,
+    /// The largest file a task may carry as an attachment (see `attachments`).
+    pub attachment_max_bytes: i64,
 }
+
+/// When finished tasks are moved out of sight (see `archive`).
+#[derive(Debug, Clone)]
+pub struct ArchiveConfig {
+    /// The local time of day, as minutes after midnight in `timezone`. `None` turns the archive
+    /// off.
+    pub at_minute: Option<u32>,
+    /// An IANA zone Postgres knows. Its own setting rather than `FLEET_TIMEZONE`, because the
+    /// owner asked for 21:00 Kyiv time specifically and that must not move when the digest's
+    /// zone does.
+    pub timezone: String,
+}
+
+impl ArchiveConfig {
+    fn from_env() -> Result<Self> {
+        let at = std::env::var("FLEET_ARCHIVE_AT").unwrap_or_else(|_| "21:00".into());
+        let timezone = std::env::var("FLEET_ARCHIVE_TIMEZONE")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "Europe/Kyiv".into());
+        Ok(Self {
+            at_minute: parse_time_of_day(&at).context("FLEET_ARCHIVE_AT")?,
+            timezone: timezone.trim().to_owned(),
+        })
+    }
+
+    pub fn test() -> Self {
+        // Off: the e2e drives the archive with its own clock, so the wall clock of whoever runs
+        // the tests can never archive something a later step expects to find done.
+        Self {
+            at_minute: None,
+            timezone: "Europe/Kyiv".into(),
+        }
+    }
+}
+
+/// `HH:MM` as minutes after midnight; `off` (or empty) is `None`.
+pub fn parse_time_of_day(s: &str) -> Result<Option<u32>> {
+    let s = s.trim();
+    if s.is_empty() || s.eq_ignore_ascii_case("off") {
+        return Ok(None);
+    }
+    let (h, m) = s
+        .split_once(':')
+        .with_context(|| format!("{s:?} is not a time of day: HH:MM, or off"))?;
+    let (h, m): (u32, u32) = (
+        h.parse().with_context(|| format!("{s:?}: bad hour"))?,
+        m.parse().with_context(|| format!("{s:?}: bad minute"))?,
+    );
+    anyhow::ensure!(
+        h < 24 && m < 60,
+        "{s:?} is not a time of day: HH:MM, or off"
+    );
+    Ok(Some(h * 60 + m))
+}
+
+/// 50 MiB unless `FLEET_ATTACHMENT_MAX_MB` says otherwise.
+const DEFAULT_ATTACHMENT_MAX_MB: i64 = 50;
 
 impl Config {
     /// Whether the brain may give a task this model and effort.
@@ -262,6 +324,12 @@ impl Config {
             retro: RetroConfig::from_env(&model_for_retro),
             allowed_models,
             allowed_efforts,
+            archive: ArchiveConfig::from_env()?,
+            // 1 MiB to 4 GiB: past that a file is not something to keep in the database.
+            attachment_max_bytes: env_num("FLEET_ATTACHMENT_MAX_MB", DEFAULT_ATTACHMENT_MAX_MB)
+                .clamp(1, 4096)
+                * 1024
+                * 1024,
         })
     }
 
@@ -290,6 +358,10 @@ impl Config {
             retro: RetroConfig::test(),
             allowed_models: default_allowed_models("opus"),
             allowed_efforts: DEFAULT_ALLOWED_EFFORTS.map(str::to_owned).to_vec(),
+            archive: ArchiveConfig::test(),
+            // Small, so the e2e can show a file over the limit being refused without making one
+            // of 50 MiB.
+            attachment_max_bytes: 4 * 1024 * 1024,
         }
     }
 }
@@ -360,5 +432,16 @@ mod tests {
             ["claude-opus-4-1", "sonnet", "haiku"]
         );
         assert_eq!(default_allowed_models("sonnet"), ["sonnet", "haiku"]);
+    }
+
+    #[test]
+    fn a_time_of_day_is_hh_mm_or_off() {
+        assert_eq!(parse_time_of_day("21:00").unwrap(), Some(21 * 60));
+        assert_eq!(parse_time_of_day(" 07:05 ").unwrap(), Some(7 * 60 + 5));
+        assert_eq!(parse_time_of_day("off").unwrap(), None);
+        assert_eq!(parse_time_of_day("").unwrap(), None);
+        for bad in ["24:00", "21:60", "21", "nine", "-1:00"] {
+            assert!(parse_time_of_day(bad).is_err(), "{bad:?}");
+        }
     }
 }

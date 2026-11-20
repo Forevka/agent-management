@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 use crate::{
     chat::{From, Notify, clip, esc},
     core::Orchestrator,
-    model::WakeupRow,
+    model::{WakeupRow, status},
     tasks, topics,
 };
 
@@ -550,9 +550,17 @@ async fn step(
 /// Adds the task's own state to a context.
 async fn with_task(o: &Orchestrator, mut ctx: Value, task_id: &str) -> Result<Value> {
     if let Some(t) = o.task(task_id).await? {
+        // An archived task is a done one the nightly archive put away. Conditions are written
+        // against `done`, and one waiting for a task to finish must not miss it because the
+        // evening came first.
+        let status = if status::is_done(&t.status) {
+            status::DONE
+        } else {
+            t.status.as_str()
+        };
         ctx["task"] = json!({
             "id": t.id,
-            "status": t.status,
+            "status": status,
             "updated_at": t.updated_at.to_rfc3339(),
         });
     }
