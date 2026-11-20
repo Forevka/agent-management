@@ -994,6 +994,7 @@ impl Orchestrator {
             "secretary_triage",
             "secretary_batches",
             "habit_uses",
+            "habit_log",
         ] {
             sqlx::query(&format!(
                 "delete from {table} where at < now() - make_interval(days => $1::int)"

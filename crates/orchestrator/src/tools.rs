@@ -510,7 +510,9 @@ pub async fn handle(
         .await?),
         // Orchestration tools: the brain only. Administration is refused by name, so an agent
         // that learned of it gets a clear answer instead of "unknown tool".
-        "admin_read" | "admin_propose" | "web_link" | "secretary_note" if !is_brain => {
+        "admin_read" | "admin_propose" | "web_link" | "secretary_note" | "habit_report"
+            if !is_brain =>
+        {
             bail!("{} is only available to the orchestrator", call.tool)
         }
         // Jira, per project, through the orchestrator: the credential never reaches an agent
@@ -631,6 +633,9 @@ pub async fn handle(
         )
         .await?),
         "admin_propose" => ok(admin::propose(o, &args).await?),
+        // What the brain did with a standing request of the owner's, kept in that habit's log
+        // so "did it run?" has an answer to read (see `habits`).
+        "habit_report" => ok(crate::habits::report(o, &args).await?),
         "web_link" => ok(admin::send_link(
             o,
             args["page"].as_str().context("page required")?,

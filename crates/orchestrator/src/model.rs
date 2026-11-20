@@ -320,8 +320,11 @@ pub struct HabitRow {
     pub paused_why: Option<String>,
     pub cap: i32,
     pub created_at: DateTime<Utc>,
+    /// The schedule's anchor: moves when a `do` habit is due, before anything is delivered.
     pub last_used_at: Option<DateTime<Utc>>,
     pub tg_msg: Option<i64>,
+    /// When the orchestrator last evaluated it (what it decided is in `habit_log`).
+    pub last_checked_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
