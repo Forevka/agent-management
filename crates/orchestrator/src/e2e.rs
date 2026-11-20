@@ -6328,6 +6328,387 @@ async fn open_item(db: &sqlx::PgPool, task: &str, kind: &str) -> Option<HumanIte
         .unwrap()
 }
 
+/// A node's install status for one kit item, once it has reported one.
+async fn kit_state(
+    db: &sqlx::PgPool,
+    node: &str,
+    kind: &str,
+    name: &str,
+) -> Option<(String, String)> {
+    sqlx::query_as(
+        "select s.state, s.detail from node_kit s join kit_items i on i.id = s.item_id
+         where s.node_id = $1 and i.kind = $2 and i.name = $3 and s.state <> 'pending'",
+    )
+    .bind(node)
+    .bind(kind)
+    .bind(name)
+    .fetch_optional(db)
+    .await
+    .unwrap()
+}
+
+/// The kit: imported from a node with its MCP secret moved into the vault, installed on the
+/// node without ever touching the owner's own items there, the exact MCP allowlist of a worker's
+/// session (in a per-run file that goes with the run), and the owner's alone to change.
+///
+/// The node was pointed at a temporary Claude config dir when it was made, and the fake `claude`
+/// refuses any `plugin`/`mcp` call without one: nothing here can reach the developer's own
+/// `~/.claude`, `~/.claude.json` or installed plugins.
+async fn kit_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, node_id: &str, cfg: &std::path::Path) {
+    use crate::admin::Actor;
+    const SECRET: &str = "kit-s3cret-value-1";
+    const SECRET2: &str = "kit-s3cret-value-2";
+
+    // 1. What the node has: a skill, a user-scope MCP server holding a secret, a plugin; and the
+    //    account's own state in .claude.json, which must never be read.
+    std::fs::create_dir_all(cfg.join("skills/seeded/ref")).unwrap();
+    std::fs::write(
+        cfg.join("skills/seeded/SKILL.md"),
+        "---\nname: seeded\n---\nThe owner's own.",
+    )
+    .unwrap();
+    std::fs::write(cfg.join("skills/seeded/ref/notes.md"), "notes").unwrap();
+    std::fs::write(
+        cfg.join(".claude.json"),
+        json!({
+            "oauthAccount": {"accessToken": "account-token-never-read"},
+            "mcpServers": {"demo-mcp": {
+                "type": "stdio", "command": "demo-server", "args": ["--x"],
+                "env": {"DEMO_TOKEN": SECRET},
+            }},
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::create_dir_all(cfg.join("plugins")).unwrap();
+    std::fs::write(
+        cfg.join("plugins/installed_plugins.json"),
+        json!({"version": 2, "plugins": {"tool@market": [{"scope": "user"}]}}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        cfg.join("plugins/known_marketplaces.json"),
+        json!({"market": {"source": {"source": "github", "repo": "o/market"}}}).to_string(),
+    )
+    .unwrap();
+
+    // 2. The owner imports from it. What the page shows has placeholders, never a value.
+    let got = api_post(
+        o,
+        "/api/kit",
+        json!({"op": "capture", "body": {"node": node_id}}),
+    )
+    .await;
+    let shown = got.to_string();
+    assert!(!shown.contains(SECRET), "a value reached the page: {shown}");
+    assert!(!shown.contains("account-token-never-read"), "{shown}");
+    assert_eq!(got["skills"][0]["name"], "seeded", "{got:#}");
+    assert_eq!(got["plugins"][0]["name"], "tool@market");
+    assert_eq!(got["mcp"][0]["name"], "demo-mcp");
+    assert_eq!(
+        got["mcp"][0]["config"]["env"]["DEMO_TOKEN"],
+        "${secret:DEMO_MCP_DEMO_TOKEN}"
+    );
+    let capture = got["capture"].as_str().unwrap().to_owned();
+    api_post(
+        o,
+        "/api/kit",
+        json!({"op": "import", "body": {
+            "capture": capture, "skills": ["seeded"], "plugins": ["tool@market"], "mcp": ["demo-mcp"],
+        }}),
+    )
+    .await;
+    // Postgres holds the placeholder; the value is in the vault and nowhere else.
+    let spec: String = sqlx::query_scalar(
+        "select spec::text from kit_items where kind = 'mcp' and name = 'demo-mcp'",
+    )
+    .fetch_one(db)
+    .await
+    .unwrap();
+    assert!(spec.contains("${secret:DEMO_MCP_DEMO_TOKEN}"), "{spec}");
+    let leaks: i64 = sqlx::query_scalar(
+        "select (select count(*) from kit_items where spec::text like $1 or coalesce(files::text, '') like $1)
+              + (select count(*) from audit_log where detail::text like $1)
+              + (select count(*) from node_kit where detail like $1)",
+    )
+    .bind(format!("%{SECRET}%"))
+    .fetch_one(db)
+    .await
+    .unwrap();
+    assert_eq!(leaks, 0, "the raw value is stored nowhere but the vault");
+    let sealed: Vec<u8> = sqlx::query_scalar(
+        "select i.value from secret_items i join secret_folders f on f.id = i.folder_id
+         where f.name = 'kit' and i.key = 'DEMO_MCP_DEMO_TOKEN'",
+    )
+    .fetch_one(db)
+    .await
+    .unwrap();
+    assert_eq!(o.vault.decrypt(&sealed).unwrap(), SECRET);
+    // A capture is imported from once; its raw values are gone after that.
+    assert!(
+        crate::kit::import(o, Actor::Owner, &capture, &Default::default())
+            .await
+            .is_err()
+    );
+
+    // 3. The kit's own additions, and an edit that makes the node's own skill differ from it.
+    api_post(
+        o,
+        "/api/kit",
+        json!({"op": "skill_save", "body": {"name": "kit-only", "files": {
+            "SKILL.md": "---\nname: kit-only\n---\nFrom the kit.", "ref/a.md": "a",
+        }}}),
+    )
+    .await;
+    api_post(
+        o,
+        "/api/kit",
+        json!({"op": "skill_save", "body": {"name": "seeded", "files": {"SKILL.md": "edited in the kit"}}}),
+    )
+    .await;
+    api_post(
+        o,
+        "/api/kit",
+        json!({"op": "plugin_add", "body": {"plugin": "extra", "marketplace": "market2", "source": "o/market2"}}),
+    )
+    .await;
+    api_post(
+        o,
+        "/api/kit",
+        json!({"op": "mcp_save", "body": {"name": "kit-mcp", "config":
+            format!(r#"{{"type": "stdio", "command": "kit-server", "env": {{"KIT_KEY": "{SECRET2}"}}}}"#),
+        }}),
+    )
+    .await;
+
+    // 4. The node installs what it may and reports every item; the owner's own stay as they are.
+    let expected = [
+        ("skill", "kit-only", "installed"),
+        ("skill", "seeded", "conflict"),
+        ("plugin", "tool@market", "installed"),
+        ("plugin", "extra@market2", "installed"),
+        ("mcp", "demo-mcp", "installed"),
+        ("mcp", "kit-mcp", "installed"),
+    ];
+    wait_for("the node's kit statuses", || async {
+        for (kind, name, state) in expected {
+            if kit_state(db, node_id, kind, name)
+                .await
+                .map(|s| s.0)
+                .as_deref()
+                != Some(state)
+            {
+                return None;
+            }
+        }
+        Some(())
+    })
+    .await;
+    let detail = kit_state(db, node_id, "mcp", "demo-mcp").await.unwrap().1;
+    assert!(
+        detail.contains("identical"),
+        "the node's own server, untouched: {detail}"
+    );
+    assert!(
+        cfg.join("skills/kit-only")
+            .join(fleet_proto::kit::SKILL_MARKER)
+            .is_file()
+    );
+    assert_eq!(
+        std::fs::read_to_string(cfg.join("skills/kit-only/ref/a.md")).unwrap(),
+        "a"
+    );
+    assert_eq!(
+        std::fs::read_to_string(cfg.join("skills/seeded/SKILL.md")).unwrap(),
+        "---\nname: seeded\n---\nThe owner's own.",
+        "a conflict leaves the owner's skill alone"
+    );
+    assert!(
+        !cfg.join("skills/seeded")
+            .join(fleet_proto::kit::SKILL_MARKER)
+            .exists()
+    );
+    let user_mcp = |cfg: &std::path::Path| -> Value {
+        serde_json::from_str::<Value>(&std::fs::read_to_string(cfg.join(".claude.json")).unwrap())
+            .unwrap()["mcpServers"]
+            .clone()
+    };
+    assert_eq!(
+        user_mcp(cfg)["kit-mcp"]["env"]["KIT_KEY"],
+        SECRET2,
+        "installed for the owner's own use, secret resolved"
+    );
+    let calls = std::fs::read_to_string(cfg.join("fake-cli.log")).unwrap();
+    for call in [
+        r#"["plugin", "marketplace", "add", "o/market2"]"#,
+        r#"["plugin", "install", "extra@market2", "--scope", "user"]"#,
+        r#"["mcp", "add-json", "--scope", "user", "kit-mcp""#,
+    ] {
+        assert!(calls.contains(call), "{call} missing from {calls}");
+    }
+    assert!(
+        !calls.contains("tool@market"),
+        "an installed plugin is not reinstalled"
+    );
+    assert!(
+        !calls.contains("demo-mcp"),
+        "the owner's server is not touched"
+    );
+
+    // 5. A worker's session gets exactly the fleet's server and the kit's, secrets resolved, in
+    //    a per-run file outside the project that goes with the run; the transcript never shows
+    //    the values.
+    let t = tasks::create_task(
+        o,
+        CreateTask {
+            project: "demo".into(),
+            title: "Check the kit".into(),
+            brief: "Use the kit.".into(),
+            ticket: Some("KIT-1".into()),
+            agent: Some("Alice".into()),
+            new_agent: None,
+            model: None,
+            effort: None,
+        },
+    )
+    .await
+    .unwrap();
+    let started = try_wait_for(Duration::from_secs(30), || async {
+        events(db, &t.id)
+            .await
+            .into_iter()
+            .find(|e| e["subtype"] == "init")
+    })
+    .await;
+    let Some(init) = started else {
+        // What became of it, for the failure message.
+        let trail: Vec<(String, String)> = sqlx::query_as(
+            "select kind, left(data, 300) from task_events where task_id = $1 order by id",
+        )
+        .bind(&t.id)
+        .fetch_all(db)
+        .await
+        .unwrap();
+        let now = o.task(&t.id).await.unwrap();
+        panic!("the kit session did not start: {now:?}\n{trail:#?}");
+    };
+    assert_eq!(init["strict_mcp"], true, "{init}");
+    assert_eq!(init["mcp_servers"], json!(["demo-mcp", "fleet", "kit-mcp"]));
+    let path = PathBuf::from(init["mcp_config"].as_str().unwrap());
+    let run_config: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(
+        run_config["mcpServers"]["demo-mcp"]["env"]["DEMO_TOKEN"],
+        SECRET
+    );
+    assert_eq!(
+        run_config["mcpServers"]["kit-mcp"]["env"]["KIT_KEY"],
+        SECRET2
+    );
+    assert_eq!(path.parent().unwrap().file_name().unwrap(), "mcp");
+    let env = wait_for("the session printed its env", || async {
+        events(db, &t.id)
+            .await
+            .into_iter()
+            .find(|e| e["type"] == "mcp_env")
+    })
+    .await;
+    assert_eq!(env["env"]["demo-mcp"]["DEMO_TOKEN"], "[secret]", "{env}");
+    let transcript = serde_json::to_string(&events(db, &t.id).await).unwrap();
+    assert!(!transcript.contains(SECRET) && !transcript.contains(SECRET2));
+    tasks::stop(o, &t, false).await.unwrap();
+    wait_for("the kit session stops", || async {
+        o.task(&t.id).await.unwrap().filter(|t| !t.running)
+    })
+    .await;
+    assert!(
+        !path.exists(),
+        "the run's MCP config is deleted when it exits"
+    );
+
+    // 6. Off the kit: the kit's own items leave the node; the owner's own stay, even disabled.
+    let id_of = |kind: &'static str, name: &'static str| async move {
+        sqlx::query_scalar::<_, i64>("select id from kit_items where kind = $1 and name = $2")
+            .bind(kind)
+            .bind(name)
+            .fetch_one(db)
+            .await
+            .unwrap()
+    };
+    for (op, kind, name) in [
+        ("disable", "skill", "kit-only"),
+        ("disable", "plugin", "extra@market2"),
+        ("disable", "mcp", "demo-mcp"),
+        ("delete", "mcp", "kit-mcp"),
+    ] {
+        let id = id_of(kind, name).await;
+        api_post(o, "/api/kit", json!({"op": op, "body": {"id": id}})).await;
+    }
+    wait_for("the kit's own items removed", || async {
+        let calls = std::fs::read_to_string(cfg.join("fake-cli.log")).unwrap_or_default();
+        let servers = user_mcp(cfg);
+        (!cfg.join("skills/kit-only").exists()
+            && servers.get("kit-mcp").is_none()
+            && calls.contains(r#"["plugin", "uninstall", "extra@market2", "--scope", "user"]"#)
+            && kit_state(db, node_id, "skill", "kit-only")
+                .await
+                .map(|s| s.0)
+                .as_deref()
+                == Some("removed"))
+        .then_some(())
+    })
+    .await;
+    assert!(
+        user_mcp(cfg).get("demo-mcp").is_some(),
+        "the owner's own server stays"
+    );
+    assert!(
+        cfg.join("skills/seeded/SKILL.md").is_file(),
+        "the owner's own skill stays"
+    );
+
+    // 7. The kit is the owner's alone: the brain can neither change it nor propose a change.
+    let demo = id_of("mcp", "demo-mcp").await;
+    assert!(
+        crate::kit::set_enabled(o, Actor::Brain, demo, true)
+            .await
+            .is_err()
+    );
+    assert!(
+        crate::kit::save_mcp(o, Actor::Brain, "evil", json!({"command": "x"}))
+            .await
+            .is_err()
+    );
+    assert!(
+        crate::kit::set_secret(o, Actor::Brain, "X", "y")
+            .await
+            .is_err()
+    );
+    assert!(crate::kit::delete(o, Actor::Brain, demo).await.is_err());
+    let proposed = call_as(
+        o,
+        "orchestrator",
+        "brain",
+        "admin_propose",
+        json!({"action": "kit_disable", "params": {"id": demo}}),
+    )
+    .await;
+    assert!(
+        matches!(
+            &proposed,
+            Err(_) | Ok(Some(fleet_proto::ToolResult { ok: false, .. }))
+        ),
+        "{proposed:?}"
+    );
+    let (enabled, evil): (bool, i64) = sqlx::query_as(
+        "select (select enabled from kit_items where id = $1), (select count(*) from kit_items where name = 'evil')",
+    )
+    .bind(demo)
+    .fetch_one(db)
+    .await
+    .unwrap();
+    assert!(!enabled && evil == 0, "nothing the brain tried took effect");
+}
+
 async fn events(db: &sqlx::PgPool, task: &str) -> Vec<Value> {
     let rows: Vec<String> = sqlx::query_scalar(
         "select data from task_events where task_id = $1 and kind = 'out' order by id",
@@ -6558,6 +6939,9 @@ async fn lifecycle() {
         "e2e-node".into(),
     )
     .unwrap();
+    // Every node here works on a Claude config dir of its own: the kit installs into it, and
+    // nothing ever reaches the developer's own `~/.claude`.
+    node.use_claude_config_dir(data_dir.join("claude-config"));
     tokio::spawn(node.clone().run(link_events));
     let cfg = ClientConfig {
         orchestrator: orch_addr.clone(),
@@ -7667,6 +8051,7 @@ async fn lifecycle() {
         "e2e-node-2".into(),
     )
     .unwrap();
+    node2.use_claude_config_dir(data_dir2.join("claude-config"));
     tokio::spawn(node2.run(link_events2));
     let cfg2 = ClientConfig {
         orchestrator: orch_addr.clone(),
@@ -7787,8 +8172,9 @@ async fn lifecycle() {
     )
     .await
     .unwrap();
+    let node_ep3_id = node_ep3.id().to_string();
     sqlx::query("insert into nodes (id, name, claude_command) values ($1, 'e2e-node-3', $2)")
-        .bind(node_ep3.id().to_string())
+        .bind(&node_ep3_id)
         .bind(sqlx::types::Json(vec![
             "python3".to_owned(),
             script.display().to_string(),
@@ -7804,6 +8190,7 @@ async fn lifecycle() {
         "e2e-node-3".into(),
     )
     .unwrap();
+    node3.use_claude_config_dir(data_dir3.join("claude-config"));
     tokio::spawn(node3.run(link_events3));
     let cfg3 = ClientConfig {
         orchestrator: orch_addr.clone(),
@@ -7983,6 +8370,17 @@ async fn lifecycle() {
     // 21. The JSON API the web UI runs on, including the session history the UI now shows.
     //     Last, so it reads a fleet that has really done work.
     Box::pin(api_flow(&o, &db)).await;
+
+    // 21b. The kit: imported from a node, installed there without touching the owner's own
+    //      items, the exact MCP allowlist of a worker's session, and the owner's alone. On node
+    //      3, the one that has project demo by now.
+    Box::pin(kit_flow(
+        &o,
+        &db,
+        &node_ep3_id,
+        &data_dir3.join("claude-config"),
+    ))
+    .await;
 
     // 22. Habits: the owner's repeated decisions, offered back and then made for them.
     Box::pin(habit_flow(&o, &db, &chat)).await;

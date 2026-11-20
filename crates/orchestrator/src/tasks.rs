@@ -1186,6 +1186,18 @@ async fn build_spawn(
     };
     parts.extend(texts);
     let first = parts.join("\n\n");
+    // The owner's kit: its enabled MCP servers, and with the node's `--strict-mcp-config` nothing
+    // else, are what a worker's session gets. Not the brain: its tools are the fleet's own, and
+    // an MCP server that can write (Jira, Slack) would go around the approvals its changes wait
+    // for. Not the secretary or the retrospective: they read other people's words all day and
+    // stay as narrow as they are. And only to a node level with this build, which writes the
+    // config as a per-run secret and removes it when the run ends; an older node would keep it.
+    let extra_mcp_servers =
+        if is_reader || is_brain || !fleet_proto::node_is_current(&node.app_version) {
+            None
+        } else {
+            crate::kit::agent_servers(o).await
+        };
     // The secretary runs on its own cheap model, whatever the node's command sets (the last
     // `--model` wins), with only Bash (and Skill, to load its skill) among Claude's tools, no
     // settings files and no MCP servers but the fleet's, in `dontAsk` mode with only
@@ -1247,7 +1259,7 @@ async fn build_spawn(
         after_plan_mode: Some("auto".into()),
         model,
         extra_args,
-        extra_mcp_servers: None,
+        extra_mcp_servers,
         secret_files,
         run_id,
     })

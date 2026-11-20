@@ -19,6 +19,7 @@ pub mod feeds;
 pub mod habits;
 pub mod human;
 pub mod jira;
+pub mod kit;
 pub mod links;
 pub mod memory;
 pub mod model;

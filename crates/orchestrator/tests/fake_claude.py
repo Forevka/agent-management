@@ -23,10 +23,86 @@ def arg(name):
     return argv[argv.index(name) + 1] if name in argv else None
 
 
+def kit_cli(argv):
+    """`claude plugin ...` and `claude mcp ...`, as the node's kit runs them.
+
+    Every call is logged, and its effect is made on the config files the way the real CLI makes
+    it (verified against claude 2.1), so the node's next look sees the result. Only ever inside
+    CLAUDE_CONFIG_DIR: a test must never touch the developer's own ~/.claude.
+    """
+    cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+    if not cfg:
+        sys.stderr.write("refusing: CLAUDE_CONFIG_DIR is not set\n")
+        return 2
+    with open(os.path.join(cfg, "fake-cli.log"), "a") as f:
+        f.write(json.dumps(argv) + "\n")
+
+    def load(path, default):
+        try:
+            return json.load(open(path))
+        except (OSError, ValueError):
+            return default
+
+    def save(path, value):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        json.dump(value, open(path, "w"), indent=2)
+
+    claude_json = os.path.join(cfg, ".claude.json")
+    plugins = os.path.join(cfg, "plugins")
+    installed_path = os.path.join(plugins, "installed_plugins.json")
+    known_path = os.path.join(plugins, "known_marketplaces.json")
+    rest = [a for a in argv if a not in ("--scope", "user")]
+    if rest[:2] == ["mcp", "add-json"]:
+        name, config = rest[2], json.loads(rest[3])
+        data = load(claude_json, {})
+        servers = data.setdefault("mcpServers", {})
+        if name in servers:
+            print("MCP server %s already exists in user config" % name)
+            return 1
+        servers[name] = config
+        save(claude_json, data)
+        print("Added MCP server %s to user config" % name)
+        return 0
+    if rest[:2] == ["mcp", "remove"]:
+        data = load(claude_json, {})
+        if data.get("mcpServers", {}).pop(rest[2], None) is None:
+            print('No MCP server named "%s" in user scope' % rest[2])
+            return 1
+        save(claude_json, data)
+        return 0
+    if rest[:3] == ["plugin", "marketplace", "add"]:
+        source = rest[3]
+        name = source.rstrip("/").split("/")[-1].removesuffix(".git")
+        known = load(known_path, {})
+        known[name] = {"source": {"source": "github", "repo": source}}
+        save(known_path, known)
+        return 0
+    if rest[:2] == ["plugin", "install"]:
+        plugin_id = rest[2]
+        if plugin_id.split("@")[-1] not in load(known_path, {}):
+            print("Plugin %s not found in any marketplace" % plugin_id)
+            return 1
+        installed = load(installed_path, {"version": 2, "plugins": {}})
+        installed["plugins"][plugin_id] = [{"scope": "user", "version": "1.0.0"}]
+        save(installed_path, installed)
+        return 0
+    if rest[:2] == ["plugin", "uninstall"]:
+        installed = load(installed_path, {"version": 2, "plugins": {}})
+        installed["plugins"].pop(rest[2], None)
+        save(installed_path, installed)
+        return 0
+    sys.stderr.write("fake claude: unknown command %r\n" % argv)
+    return 1
+
+
+if len(sys.argv) > 1 and sys.argv[1] in ("plugin", "mcp"):
+    sys.exit(kit_cli(sys.argv[1:]))
+
 # The same environment `fleet agent ...` reads in a real session.
 mcp = {"FLEET_IPC_ADDR": os.environ["FLEET_IPC_ADDR"], "FLEET_IPC_TOKEN": os.environ["FLEET_IPC_TOKEN"]}
 host, port = mcp["FLEET_IPC_ADDR"].rsplit(":", 1)
-assert json.load(open(arg("--mcp-config")))["mcpServers"]["fleet"]["args"] == ["mcp"]
+mcp_servers = json.load(open(arg("--mcp-config")))["mcpServers"]
+assert mcp_servers["fleet"]["args"] == ["mcp"]
 
 
 def tool(name, args):
@@ -51,7 +127,12 @@ out({"type": "system", "subtype": "init", "session_id": session, "model": arg("-
      "models": [sys.argv[i + 1] for i, a in enumerate(sys.argv[:-1]) if a == "--model"],
      "allowed_tools": arg("--allowedTools"), "tools": arg("--tools"), "effort": arg("--effort"),
      "efforts": [sys.argv[i + 1] for i, a in enumerate(sys.argv[:-1]) if a == "--effort"],
-     "strict_mcp": "--strict-mcp-config" in sys.argv, "setting_sources": arg("--setting-sources")})
+     "strict_mcp": "--strict-mcp-config" in sys.argv, "setting_sources": arg("--setting-sources"),
+     # The servers this session gets, and where its config is (a per-run file the test checks).
+     "mcp_servers": sorted(mcp_servers), "mcp_config": arg("--mcp-config")})
+# The kit's servers' env as the session sees it: a careless session printing it must not get the
+# values into the transcript.
+out({"type": "mcp_env", "env": {n: s.get("env", {}) for n, s in mcp_servers.items() if n != "fleet"}})
 
 skill = os.path.join(arg("--plugin-dir"), "skills", "fleet", "SKILL.md")
 out({"type": "skill", "present": os.path.exists(skill), "role": os.environ.get("FLEET_ROLE"), "cwd": os.getcwd()})

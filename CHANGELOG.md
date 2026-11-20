@@ -6,6 +6,21 @@ VPS rolls it out), so each section below is one merge. How to add to this file i
 
 ## Unreleased
 
+- **The kit.** The owner's Claude Code skills, plugins and MCP servers, managed on the new
+  **Kit** page, imported from a node (secrets moved into the vault, placeholders kept), and
+  installed on every node at user scope — never over a skill or MCP server of the machine's own,
+  and removing only what the kit installed. A per-node matrix shows installed, failed, conflict
+  or removed. Only the owner changes it; the brain cannot, not even by proposal.
+- **Agent sessions get exactly the kit's MCP servers.** Every session now runs with
+  `--strict-mcp-config`: the fleet's permission server plus the kit's enabled MCP servers
+  (workers only; the brain, the secretary and the retrospective get none), from a per-run config
+  under the node's data dir that is deleted when the run exits. MCP servers configured on a
+  machine some other way no longer load in agent sessions — add the ones agents need to the kit.
+- New messages (`KitCaptureRequest`, `KitCapture`, `Kit`, `KitStatus`), sent only to nodes level
+  with the orchestrator's release; no protocol bump. Migration `0025_kit` (add-only).
+
+## v0.2.7 — 2026-11-21
+
 - **Projects assigned to a node, cloned on demand.** A project records its git URL; a URL with
   credentials, a query string or a fragment in it is refused. On a node's page the owner assigns
   projects to it and may set where clones go (default `~/fleet-projects`); only the owner can, and

@@ -61,6 +61,8 @@ pub fn router() -> Router<O> {
         .route("/api/retro", get(retro).post(retro_act))
         .route("/api/people", get(people).post(people_act))
         .route("/api/people/{id}", get(person).post(person_act))
+        .route("/api/kit", get(kit).post(kit_act))
+        .route("/api/kit/{id}", get(kit_item))
         .route("/api/invite", post(invite))
 }
 
@@ -1371,6 +1373,77 @@ async fn person_act(
     let done = match a.op.as_str() {
         "edit" => crate::people::owner_edit(&o, id, &a.body).await?,
         "delete" => crate::people::owner_delete(&o, id).await?,
+        other => {
+            return Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                format!("unknown operation {other:?}"),
+            ));
+        }
+    };
+    Ok(Json(json!({"done": done})))
+}
+
+// ---------------------------------------------------------------- the kit
+
+async fn kit(State(o): State<O>, h: HeaderMap) -> Api {
+    guard!(o, h);
+    Ok(Json(crate::kit::json(&o).await?))
+}
+
+/// One item for its editor: a skill's files in full, an MCP server's config with placeholders.
+async fn kit_item(State(o): State<O>, h: HeaderMap, Path(id): Path<i64>) -> Api {
+    guard!(o, h);
+    Ok(Json(crate::kit::item_json(&o, id).await?))
+}
+
+/// Every change to the kit, as the owner (the kit refuses anyone else; see `kit.rs`).
+async fn kit_act(State(o): State<O>, h: HeaderMap, Json(a): Json<Act>) -> Api {
+    use crate::kit;
+    guard!(o, h, write);
+    let b = &a.body;
+    let id = || b["id"].as_i64().context("id is required");
+    let done = match a.op.as_str() {
+        // What a node has, to choose from. The answer carries no secret value.
+        "capture" => {
+            return Ok(Json(
+                kit::capture(&o, Actor::Owner, &need(b, "node")?).await?,
+            ));
+        }
+        "import" => {
+            let sel: kit::Selection = serde_json::from_value(b.clone())
+                .context("skills, plugins and mcp are lists of names")?;
+            kit::import(&o, Actor::Owner, &need(b, "capture")?, &sel).await?
+        }
+        "enable" => kit::set_enabled(&o, Actor::Owner, id()?, true).await?,
+        "disable" => kit::set_enabled(&o, Actor::Owner, id()?, false).await?,
+        "delete" => kit::delete(&o, Actor::Owner, id()?).await?,
+        "skill_save" => {
+            let files: std::collections::BTreeMap<String, String> =
+                serde_json::from_value(b["files"].clone()).context("files are {path: text}")?;
+            kit::save_skill(&o, Actor::Owner, &need(b, "name")?, &files).await?
+        }
+        "mcp_save" => {
+            // The editor sends the config as the text the owner typed.
+            let config: Value = match &b["config"] {
+                Value::String(text) => {
+                    serde_json::from_str(text).context("the config is not valid JSON")?
+                }
+                other => other.clone(),
+            };
+            kit::save_mcp(&o, Actor::Owner, &need(b, "name")?, config).await?
+        }
+        "plugin_add" => {
+            let p = fleet_proto::KitPlugin {
+                plugin: need(b, "plugin")?,
+                marketplace: need(b, "marketplace")?,
+                marketplace_source: need(b, "source")?,
+            };
+            kit::add_plugin(&o, Actor::Owner, &p).await?
+        }
+        "secret_set" => {
+            let value = b["value"].as_str().context("value is required")?;
+            kit::set_secret(&o, Actor::Owner, &need(b, "key")?, value).await?
+        }
         other => {
             return Err(ApiError(
                 StatusCode::BAD_REQUEST,

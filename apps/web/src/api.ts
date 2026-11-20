@@ -388,3 +388,49 @@ export type Events = {
   events: { id: number; at: string; kind: string; data: string }[]
   more: boolean
 }
+
+
+// ---------------------------------------------------------------- the kit
+
+export type KitKind = 'skill' | 'plugin' | 'mcp'
+
+/** `pending` until the node reports; `removed` once it took the kit's own copy away. */
+export type KitState = 'pending' | 'installed' | 'failed' | 'conflict' | 'removed'
+
+export type KitItem = {
+  id: number
+  kind: KitKind
+  /** A skill's directory, `plugin@marketplace`, or the MCP server's name. */
+  name: string
+  enabled: boolean
+  /** A plugin's `{plugin, marketplace, marketplace_source}`; an MCP server's config, with
+   *  `${secret:NAME}` placeholders where its secrets are. Never a secret value. */
+  spec: Record<string, unknown>
+  /** A skill's files, path and size; the item endpoint has their text. */
+  files: { path: string; bytes: number }[] | null
+  /** Placeholders of an MCP server whose secret is not set: it is left out until it is. */
+  missing_secrets: string[]
+  updated_at: string
+}
+
+export type Kit = {
+  items: KitItem[]
+  nodes: { id: string; name: string; online: boolean; version: string; current: boolean }[]
+  status: { node: string; item: number; state: KitState; detail: string; at: string }[]
+  /** Names of the kit's secrets. Values are never read back. */
+  secrets: string[]
+}
+
+export type KitItemDetail = Omit<KitItem, 'files' | 'missing_secrets'> & {
+  files: Record<string, string> | null
+}
+
+/** What a node reported having, to choose from. Secrets show as the placeholders they would get. */
+export type KitCapture = {
+  capture: string
+  node: string
+  skills: { name: string; in_kit: boolean; files: { path: string; bytes: number }[] }[]
+  plugins: { name: string; in_kit: boolean; marketplace_source: string }[]
+  mcp: { name: string; in_kit: boolean; config: Record<string, unknown>; secrets: string[] }[]
+  skipped: { kind: string; name: string; reason: string }[]
+}
