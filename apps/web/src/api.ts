@@ -60,6 +60,8 @@ export type Item = {
 }
 
 export type Task = {
+  /** The fleet's own short handle (`F-41`), which the owner names this task by. */
+  key: string
   id: string
   project: string
   title: string

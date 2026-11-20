@@ -1582,7 +1582,8 @@ async fn model_effort_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &Fake
     assert!(
         chat.sent()
             .iter()
-            .any(|(_, _, h, _)| h.contains(&format!("<b>{id}</b>"))
+            // The intro leads with the task's key; its id is below, as something to copy.
+            .any(|(_, _, h, _)| h.contains(&format!("<code>{id}</code>"))
                 && h.contains("model sonnet, effort high")),
         "the opening message says what it runs with"
     );
@@ -2412,6 +2413,19 @@ async fn api_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool) {
         .iter()
         .find(|c| c["id"] == "demo-BS-1")
         .unwrap_or_else(|| panic!("the task that really ran is on the board: {body}"));
+    // Every card carries the short handle the owner names it by, and no two share one.
+    let keys: Vec<&str> = cards.iter().filter_map(|c| c["key"].as_str()).collect();
+    assert_eq!(keys.len(), cards.len(), "every card has a key: {body}");
+    assert!(
+        keys.iter()
+            .all(|k| crate::model::parse_task_key(k).is_some()),
+        "a key is the fleet's own shape, never a ticket's: {keys:?}"
+    );
+    assert_eq!(
+        keys.iter().collect::<std::collections::HashSet<_>>().len(),
+        keys.len(),
+        "two tasks must not answer to the same key: {keys:?}"
+    );
     assert!(
         bs1["sessions"].as_i64().unwrap_or(0) > 0 && bs1["milestones"].as_i64().unwrap_or(0) > 0,
         "a card carries its own counts, so the board needs no query per task: {bs1}"
@@ -2433,6 +2447,29 @@ async fn api_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool) {
             .iter()
             .all(|c| c["needs_you"]["kind"].is_string() && c["needs_you"]["since"].is_string()),
         "a task waiting on the owner says what it waits for and since when: {waiting:?}"
+    );
+
+    // A task answers to its key everywhere its id is taken, so the owner never has to know
+    // which they are holding — including the web URL the board's cards link from.
+    let key = bs1["key"].as_str().unwrap();
+    let (status, by_key) = call(
+        "GET",
+        &format!("/api/tasks/{key}"),
+        Some(cookie.clone()),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{by_key}");
+    assert_eq!(
+        by_key["task"]["id"], "demo-BS-1",
+        "the key found the task: {by_key}"
+    );
+    // And a ticket is not a key: `demo-BS-1`'s own ticket must not resolve to some task 1,
+    // which is the confusion the one-letter prefix exists to make impossible.
+    let (status, miss) = call("GET", "/api/tasks/BS-1", Some(cookie.clone()), None).await;
+    assert_ne!(
+        status, 200,
+        "an external ticket is not one of the fleet's keys: {miss}"
     );
 
     // Sessions: every run the fleet has started, which is the history the old UI never kept.
@@ -4582,8 +4619,35 @@ async fn brain_heard(db: &sqlx::PgPool, prefix: &str) -> usize {
         .count()
 }
 
-#[tokio::test]
-async fn task_lifecycle_through_a_real_node() {
+/// The end-to-end test, on a thread with a stack big enough to hold it.
+///
+/// Every `.await` on an `async fn` keeps that function's locals inside the calling future, so
+/// this one future carries all fourteen flows at once. It outgrew a test thread's 2 MiB twice
+/// while being written, each time failing as a bare `has overflowed its stack` before the first
+/// assertion — a confusing way to learn that a test got longer. Boxing the flows (see the call
+/// list at the end) buys headroom; this buys the rest, once, so the next flow added here does
+/// not have to rediscover the problem.
+///
+/// The runtime is `new_current_thread`, which is what `#[tokio::test]` builds, so spawned tasks
+/// run on this same roomy thread and the test's timing is unchanged.
+#[test]
+fn task_lifecycle_through_a_real_node() {
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(lifecycle());
+        })
+        .unwrap()
+        .join()
+        // The child thread's panic has already been printed; this fails the test with it.
+        .unwrap();
+}
+
+async fn lifecycle() {
     let Some(db) = test_db().await else {
         eprintln!("skipped: TEST_DATABASE_URL not set");
         return;
@@ -5058,7 +5122,8 @@ async fn task_lifecycle_through_a_real_node() {
     // Sound only where the owner is needed or a task ended.
     for (needle, expected) in [
         ("<b>Milestones</b>", Notify::Silent),
-        ("🆕 <b>demo-BS-1</b>", Notify::Silent),
+        // The intro leads with the fleet's own key, which is what the owner says back.
+        ("🆕 <b>F-", Notify::Silent),
         ("📋 Plan ready", Notify::Silent),
         ("❓ <b>Q-", Notify::Sound),
         ("✅ <b>Done.</b>", Notify::Sound),
@@ -5066,6 +5131,14 @@ async fn task_lifecycle_through_a_real_node() {
     ] {
         assert_eq!(chat.notify_of(needle), Some(expected), "{needle}");
     }
+    // The key is what the intro leads with, but the long id is still there to copy: an owner
+    // reading the topic should not have to go to the web to find out which task this is.
+    assert!(
+        chat.sent()
+            .iter()
+            .any(|(_, _, html, _)| html.starts_with("🆕 <b>F-") && html.contains("demo-BS-1")),
+        "the task's opening message carries both its key and its id"
+    );
     assert!(
         ops.iter()
             .any(|op| matches!(op, Op::Close(t) if Some(*t) == task.topic_id)),

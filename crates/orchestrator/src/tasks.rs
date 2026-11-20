@@ -475,6 +475,8 @@ pub async fn create_task(o: &Arc<Orchestrator>, req: CreateTask) -> Result<TaskR
         bail!("task {id} already exists; use send_to_task to continue it");
     }
     let topic = o.chat.create_topic(&topic_name(&id, &req.title)).await?;
+    // `key_no` is not named here on purpose: the column defaults to the fleet-wide sequence, so
+    // every task gets the handle the owner names it by (`F-41`) whichever path creates it.
     sqlx::query("insert into tasks (id, project, title, brief, agent_id, status, topic_id, model, effort) values ($1, $2, $3, $4, $5, 'queued', $6, $7, $8)")
         .bind(&id)
         .bind(&proj.slug)
@@ -488,9 +490,11 @@ pub async fn create_task(o: &Arc<Orchestrator>, req: CreateTask) -> Result<TaskR
         .await?;
     let task = o.task(&id).await?.context("task vanished")?;
     let intro = format!(
-        "🆕 <b>{}</b> · {}\nAgent: <b>{}</b> ({}) · {}\n<blockquote expandable>{}</blockquote>",
-        esc(&task.id),
+        // The key leads, because it is what the owner will say back to name this task.
+        "🆕 <b>{}</b> · {}\n<code>{}</code>\nAgent: <b>{}</b> ({}) · {}\n<blockquote expandable>{}</blockquote>",
+        esc(&task.key()),
         esc(&task.title),
+        esc(&task.id),
         esc(&agent.name),
         esc(&agent.role),
         esc(&model_effort_label(&task, &agent, &o.cfg.model, None)),
@@ -1995,6 +1999,7 @@ mod tests {
             model: None,
             effort: None,
             plan_approved,
+            key_no: Some(1),
         };
         // New work plans; so does a follow-up to finished work.
         assert!(plan_first(&task("p-1", "queued", true), None));

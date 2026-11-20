@@ -105,6 +105,8 @@ export function BoardColumn({
 export type BoardCardProps = {
   to: string
   title: ReactNode
+  /** The handle this card is named by, set across from the title. */
+  badge?: ReactNode
   /** A small mark before the title, tinted by the card's tone. */
   mark?: ReactNode
   /** Two lines at most; the rest is clamped away. */
@@ -116,12 +118,15 @@ export type BoardCardProps = {
   facts?: { icon: ReactNode; value: ReactNode; title: string }[]
 }
 
-export function BoardCard({ to, title, mark, text, state, tone = 'default', facts }: BoardCardProps) {
+export function BoardCard({ to, title, badge, mark, text, state, tone = 'default', facts }: BoardCardProps) {
   return (
     <Link className="fx-card" data-tone={tone} to={to}>
-      <span className="fx-card__title">
-        {mark && <span className="fx-card__mark">{mark}</span>}
-        {title}
+      <span className="fx-card__head">
+        <span className="fx-card__title">
+          {mark && <span className="fx-card__mark">{mark}</span>}
+          {title}
+        </span>
+        {badge && <span className="fx-card__badge">{badge}</span>}
       </span>
       {text && <span className="fx-card__text">{text}</span>}
       <span className="fx-card__state">{state}</span>
@@ -368,6 +373,29 @@ const css = /* css */ `
 .fx-card:focus-visible {
   outline: 2px solid var(--aui-focus, rgba(0, 96, 226, 0.7));
   outline-offset: 2px;
+}
+
+.fx-card__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+/* The handle the owner says out loud to name this task. Monospace and tabular so a column of
+   them lines up, and quiet: it is for saying, not for reading past. */
+.fx-card__badge {
+  flex: 0 0 auto;
+  font-family: var(--aui-font-mono, ui-monospace, monospace);
+  font-size: 11px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+  color: var(--aui-muted, #737373);
+  padding: 1px 5px;
+  border: 1px solid var(--aui-border, #e5e5e5);
+  border-radius: 5px;
+  white-space: nowrap;
 }
 
 .fx-card__title {

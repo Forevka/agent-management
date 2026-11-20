@@ -700,7 +700,8 @@ pub async fn handle(
             );
             let t = o.task(id).await?.with_context(|| format!("no task {id}"))?;
             tasks::deliver(o, &t, format!("[Follow-up from the orchestrator] {text}")).await?;
-            ok(format!("Sent to {id}."))
+            // Named back by key and id, since the brain may have been handed either.
+            ok(format!("Sent to {} ({}).", t.key(), t.id))
         }
         "stop_task" => {
             let id = args["task_id"].as_str().context("task_id required")?;
@@ -710,7 +711,7 @@ pub async fn handle(
             );
             let t = o.task(id).await?.with_context(|| format!("no task {id}"))?;
             tasks::stop(o, &t, false).await?;
-            ok(format!("Stopping {id}."))
+            ok(format!("Stopping {} ({}).", t.key(), t.id))
         }
         // The condition for a wakeup an agent asked for in plain words: only the orchestrator
         // writes these, and it is compiled before it is stored (see `wakeups`).

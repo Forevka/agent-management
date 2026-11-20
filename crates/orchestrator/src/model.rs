@@ -76,6 +76,59 @@ pub struct TaskRow {
     /// run started in plan mode until the approval, so a run lost meanwhile is resumed in plan
     /// mode again (see `tasks::plan_first`).
     pub plan_approved: bool,
+    /// The fleet's own short handle for this task, as a number (see [`task_key`]). The fleet's
+    /// standing sessions have none: they are not work.
+    pub key_no: Option<i64>,
+}
+
+impl TaskRow {
+    /// `F-41`, or the task's id when it has no key of its own.
+    pub fn key(&self) -> String {
+        self.key_no.map_or_else(|| self.id.clone(), task_key)
+    }
+}
+
+/// The fleet's own task keys: `F-41`.
+///
+/// A task's id is long and usually carries the ticket it is about (`bioins-BIOINS-5068`), which
+/// is awkward to say and easy to mistake for the ticket itself. The key is short, fleet-wide and
+/// deliberately one letter, so it cannot be read as a Jira project. [`check_key_prefix`] makes
+/// that a guarantee rather than a hope.
+pub const TASK_KEY_PREFIX: &str = "F";
+
+pub fn task_key(n: i64) -> String {
+    format!("{TASK_KEY_PREFIX}-{n}")
+}
+
+/// Reads `F-41` (in any case, with surrounding space) and returns 41.
+///
+/// Anything else is `None`, including a Jira key that happens to end in a number: the prefix must
+/// match exactly, so `DAP-356` and `BIOINS-5068` are never mistaken for the fleet's own.
+pub fn parse_task_key(s: &str) -> Option<i64> {
+    let (prefix, n) = s.trim().split_once('-')?;
+    if !prefix.eq_ignore_ascii_case(TASK_KEY_PREFIX) {
+        return None;
+    }
+    n.parse().ok().filter(|n| *n > 0)
+}
+
+/// Refuses a fleet key prefix that a project's Jira key would answer to as well.
+///
+/// Checked at startup against every project, because the whole point of the key is that the
+/// owner can say one and mean exactly one thing. A fleet that silently had both would be worse
+/// than one with no keys at all.
+pub fn check_key_prefix(jira_keys: &[String]) -> anyhow::Result<()> {
+    if let Some(clash) = jira_keys
+        .iter()
+        .find(|k| k.eq_ignore_ascii_case(TASK_KEY_PREFIX))
+    {
+        anyhow::bail!(
+            "project Jira key {clash:?} is the same as the fleet's own task-key prefix \
+             {TASK_KEY_PREFIX:?}: a task key and a ticket would be indistinguishable. \
+             Change the project's Jira key, or TASK_KEY_PREFIX in model.rs."
+        );
+    }
+    Ok(())
 }
 
 /// The effort levels Claude Code accepts (`claude --help`, 2.1.268).
@@ -301,6 +354,7 @@ mod tests {
             model: model.map(Into::into),
             effort: effort.map(Into::into),
             plan_approved: true,
+            key_no: Some(1),
         }
     }
 
@@ -359,5 +413,51 @@ mod tests {
             assert!(check_effort(e).is_ok());
         }
         assert!(check_effort("turbo").is_err());
+    }
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::{check_key_prefix, parse_task_key, task_key};
+
+    #[test]
+    fn a_fleet_key_is_never_read_out_of_a_jira_ticket() {
+        assert_eq!(task_key(41), "F-41");
+        assert_eq!(parse_task_key("F-41"), Some(41));
+        // Said in passing, in any case, is still the same key.
+        assert_eq!(parse_task_key(" f-41 "), Some(41));
+        // The whole point: a real ticket is not one of ours, however it is shaped.
+        for ticket in [
+            "DAP-356",
+            "BIOINS-5068",
+            "FL-41",
+            "FF-41",
+            "F41",
+            "F-",
+            "F-0",
+            "F-x",
+            "-41",
+            "41",
+            "",
+        ] {
+            assert_eq!(
+                parse_task_key(ticket),
+                None,
+                "{ticket:?} is not a fleet key"
+            );
+        }
+    }
+
+    #[test]
+    fn a_project_keyed_like_the_fleet_stops_the_orchestrator() {
+        assert!(check_key_prefix(&["DAP".into(), "BIOINS".into()]).is_ok());
+        // Including the case where only the case differs: Jira keys are matched without it.
+        for clash in ["F", "f"] {
+            let e = check_key_prefix(&["DAP".into(), clash.into()]).unwrap_err();
+            assert!(
+                e.to_string().contains("indistinguishable"),
+                "a clash must say why: {e}"
+            );
+        }
     }
 }

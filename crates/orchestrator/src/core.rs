@@ -886,9 +886,24 @@ impl Orchestrator {
             .await?)
     }
 
+    /// A task by its id, or by the fleet's own short key (`F-41`).
+    ///
+    /// Both are accepted everywhere one task is named — the brain's tools, the web URLs, the
+    /// owner's own words — because the key exists so the owner never has to care which they
+    /// have. An id is tried first: it is exact, and a key is a shape no id can take.
     pub async fn task(&self, id: &str) -> Result<Option<TaskRow>> {
-        Ok(sqlx::query_as("select * from tasks where id = $1")
+        let by_id: Option<TaskRow> = sqlx::query_as("select * from tasks where id = $1")
             .bind(id)
+            .fetch_optional(&self.db)
+            .await?;
+        if by_id.is_some() {
+            return Ok(by_id);
+        }
+        let Some(n) = crate::model::parse_task_key(id) else {
+            return Ok(None);
+        };
+        Ok(sqlx::query_as("select * from tasks where key_no = $1")
+            .bind(n)
             .fetch_optional(&self.db)
             .await?)
     }

@@ -160,6 +160,8 @@ fn need(v: &Value, key: &str) -> Result<String> {
 fn task_json(t: &TaskRow) -> Value {
     json!({
         "id": t.id,
+        // The short handle the owner names this task by, everywhere a task is shown.
+        "key": t.key(),
         "project": t.project,
         "title": t.title,
         "status": t.status,

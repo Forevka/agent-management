@@ -144,6 +144,7 @@ export default function BoardPage() {
                       key={t.id}
                       to={`/tasks/${t.id}`}
                       title={t.title || t.id}
+                      badge={t.key}
                       mark={<SparkIcon />}
                       text={t.brief}
                       tone={cardTone(t)}
@@ -242,7 +243,7 @@ function BoardList({ tasks }: { tasks: BoardTask[] }) {
                 {t.title || t.id}
               </Link>
               <Text size="1" tone="muted" mono>
-                {t.id}
+                {t.key} · {t.id}
               </Text>
             </Stack>
           ),

@@ -226,6 +226,15 @@ async fn orchestrator(
         .run(&db)
         .await
         .context("running database migrations")?;
+    // The fleet's own task keys (`F-41`) are only worth having if one of them names exactly one
+    // thing, so a project whose Jira key is the same letter stops the orchestrator here rather
+    // than leaving the owner with two meanings for the same word.
+    let jira_keys: Vec<String> =
+        sqlx::query_scalar("select jira_key from projects where jira_key is not null")
+            .fetch_all(&db)
+            .await
+            .context("reading project Jira keys")?;
+    fleet_orchestrator::model::check_key_prefix(&jira_keys)?;
     let auth = DbAuth::new(db.clone());
 
     let ep = bind_endpoint(
