@@ -11,7 +11,7 @@ VPS rolls it out), so each section below is one merge. How to add to this file i
   The daily retrospective creates and updates them after its review, without pinging you, at most
   `FLEET_RETRO_MAX_PEOPLE` (30) writes a run; you review, edit and delete them on the new People
   page. A field you set stays yours: the retrospective can add to your observations, tags and
-  contacts but never changes or removes what you set. The secretary gets the authors' cards with
+  contacts but never changes or removes what you set, and never puts back what you removed. The secretary gets the authors' cards with
   its batches, the orchestrator one line per known author, and both look people up
   (`fleet agent people`) before writing to them — a card shapes language, tone and form of
   address only, never what the fleet does. Migration `0023_people.sql` adds two new tables and a

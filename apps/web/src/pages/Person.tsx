@@ -145,7 +145,7 @@ export default function Person() {
 
             <Section
               title="Edit"
-              description="A field you change here stays yours: the retrospective may still add observations, tags and contacts, but never changes or removes what you set. A wrong contact can be removed here, or moved by removing it and adding it to the right person."
+              description="A field you change here stays yours: the retrospective may still add observations, tags and contacts, but never changes or removes what you set, and never puts back an observation, tag or contact you removed. A wrong contact can be removed here, or moved by removing it and adding it to the right person."
             >
               {/* Keyed by the last update, so a save (or the retrospective's next pass) resets it. */}
               <EditForm

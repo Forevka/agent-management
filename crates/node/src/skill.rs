@@ -470,7 +470,8 @@ fleet agent retro person --name "Zed Example" --position "Backend lead" --langua
   `--untag <tag>` take one away; `--position`, `--brief -`, `--language en|uk` set a field;
   `--last-interaction <RFC 3339>` only ever moves forward.
 - Fields the owner set themselves are theirs (the card says which): a write that would change one,
-  or take something out of their observations or tags, is refused. Add to them instead.
+  or take something out of their observations or tags, or put back something they removed, is
+  refused. Add something new instead.
 - The owner is not one of these people: keep no record of them.
 - There is a limit on writes per run. Spend it on the people who matter most.
 

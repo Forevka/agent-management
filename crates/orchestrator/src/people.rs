@@ -70,6 +70,21 @@ pub struct Person {
     /// add to observations, tags and contacts). Never cleared by the retrospective.
     pub owner_fields: Vec<String>,
     pub owner_edited_at: Option<DateTime<Utc>>,
+    /// What the owner removed (see [`removed_key`]): the retrospective may not add it back.
+    pub owner_removed: Vec<String>,
+}
+
+/// How a removed item is remembered: an observation or a tag lowercased, a contact by its
+/// source and user id (or handle, when it has no id).
+pub fn removed_key(kind: &str, item: &str) -> String {
+    format!("{kind}:{}", item.to_lowercase())
+}
+
+fn contact_key(source: &str, native_id: Option<&str>, handle: &str) -> String {
+    removed_key(
+        "contact",
+        &format!("{source}|{}", native_id.unwrap_or(handle)),
+    )
 }
 
 /// How a person is shown alongside messages: the whole card (the secretary, who drafts to them),
@@ -330,11 +345,14 @@ pub fn apply(p: &mut Person, e: &Edit, now: DateTime<Utc>) -> Result<Vec<&'stati
         }
     }
     if let Some(v) = &e.brief {
+        // A browser's textarea sends CRLF: the same text with other line breaks is no change
+        // (and must not make an untouched brief the owner's).
         let v = v
             .as_deref()
-            .map(str::trim)
+            .map(|s| s.replace("\r\n", "\n").replace('\r', "\n"))
+            .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty())
-            .map(|s| clip(s, BRIEF_MAX));
+            .map(|s| clip(&s, BRIEF_MAX));
         if v != p.brief {
             p.brief = v;
             changed.push("brief");
@@ -771,7 +789,9 @@ pub async fn touch(o: &Orchestrator, source: &str, author_id: &str, ts_unix: f64
         "update people p
             set last_interaction = greatest(p.last_interaction, least(to_timestamp($3), now()))
            from person_contacts c
-          where c.person_id = p.id and c.source = $1 and c.native_id = $2",
+          where c.person_id = p.id and c.source = $1 and c.native_id = $2
+            and not exists (select 1 from feed_messages f
+                             where f.from_owner and f.source = $1 and f.author_id = $2)",
     )
     .bind(source)
     .bind(author_id)
@@ -949,22 +969,28 @@ pub async fn retro_write(o: &Orchestrator, run: i64, args: &Value) -> Result<Str
     };
     let before = p.clone();
     let mut changed = apply(&mut p, &edit, Utc::now())?;
-    // The owner's corrections stand: what they set, the retrospective does not change.
-    let blocked = owner_conflicts(&before, &p, &changed);
+    // The owner's corrections stand: what they set the retrospective does not change, and what
+    // they removed it does not put back.
+    let blocked = owner_conflicts(&before, &p, &changed, &edit.add_contacts);
     ensure!(
         blocked.is_empty(),
-        "#{} {}: the owner set {} themselves, so leave {} as it is (you may still add \
-         observations, tags and contacts); nothing was written",
+        "#{} {}: {}; nothing was written. You may still add observations, tags and contacts the \
+         owner has not removed.",
         p.id,
         tasks::untrusted(&p.name, NAME_MAX),
-        blocked.join(", "),
-        if blocked.len() == 1 { "that" } else { "those" }
+        blocked.join("; ")
     );
     let keep = before.owner_fields.iter().any(|f| f == "contacts");
-    if write_contacts(&mut tx, p.id, None, &edit.add_contacts, keep).await? {
+    let (was, is) = write_contacts(&mut tx, p.id, None, &edit.add_contacts, keep).await?;
+    if was != is {
         changed.push("contacts");
     }
-    save(&mut tx, &p, "retro").await?;
+    // A write that changes nothing leaves the record alone: no new `updated_at` for the owner's
+    // open form to trip over. It is still audited, and still counts against the run's limit,
+    // so a retrospective repeating itself cannot write without end.
+    if created || !changed.is_empty() {
+        save(&mut tx, &p, "retro").await?;
+    }
     sqlx::query(
         "insert into audit_log (actor, action, detail) values ('retro', 'person.upsert', $1)",
     )
@@ -992,11 +1018,36 @@ pub async fn retro_write(o: &Orchestrator, run: i64, args: &Value) -> Result<Str
     })
 }
 
-/// The fields the owner set that a retrospective edit from `before` to `after` would change. A
-/// field the owner set may not change at all, except that observations and tags may still grow
-/// (nothing in them may be taken away, since once the owner has edited a list the retrospective
-/// cannot tell their items from its own).
-pub fn owner_conflicts(before: &Person, after: &Person, changed: &[&str]) -> Vec<&'static str> {
+/// The owner's removals after an edit of theirs: `kept` plus every key that was in a list before
+/// and is not after, minus every key the owner (re-)added. Each pair is one list's keys, before
+/// and after (see [`removed_key`]).
+pub fn tombstones<const N: usize>(
+    kept: &[String],
+    lists: [(Vec<String>, Vec<String>); N],
+) -> Vec<String> {
+    let mut out: Vec<String> = kept.to_vec();
+    for (before, after) in lists {
+        for gone in before.iter().filter(|k| !after.contains(k)) {
+            if !out.contains(gone) {
+                out.push(gone.clone());
+            }
+        }
+        out.retain(|k| !after.contains(k));
+    }
+    out
+}
+
+/// What in a retrospective edit from `before` to `after` (plus the contacts it adds) goes against
+/// the owner, one complaint each. A field the owner set may not change at all, except that
+/// observations and tags may still grow: nothing in them may be taken away, since once the owner
+/// has edited a list the retrospective cannot tell their items from its own. And nothing the
+/// owner removed — an observation, a tag, a contact on this person — may come back.
+pub fn owner_conflicts(
+    before: &Person,
+    after: &Person,
+    changed: &[&str],
+    add_contacts: &[NewContact],
+) -> Vec<String> {
     let kept = |old: &[String], new: &[String]| {
         old.iter()
             .all(|o| new.iter().any(|n| n.to_lowercase() == o.to_lowercase()))
@@ -1006,22 +1057,47 @@ pub fn owner_conflicts(before: &Person, after: &Person, changed: &[&str]) -> Vec
         if !before.owner_fields.iter().any(|o| o == f) {
             continue;
         }
-        let allowed = match *f {
-            "observations" => kept(&before.observations, &after.observations),
-            "tags" => kept(&before.tags, &after.tags),
-            _ => false,
-        };
-        if !allowed {
-            out.push(match *f {
-                "name" => "name",
-                "position" => "position",
-                "brief" => "brief",
-                "projects" => "projects",
-                "language" => "language",
-                "observations" => "observations (only adding to them)",
-                "tags" => "tags (only adding to them)",
-                _ => "a field",
-            });
+        match *f {
+            "observations" | "tags" => {
+                let ok = if *f == "observations" {
+                    kept(&before.observations, &after.observations)
+                } else {
+                    kept(&before.tags, &after.tags)
+                };
+                if !ok {
+                    out.push(format!("the owner's {f} can only be added to"));
+                }
+            }
+            other => out.push(format!("the owner set {other}")),
+        }
+    }
+    let removed = |key: String| before.owner_removed.contains(&key);
+    let added = |old: &[String], new: &[String]| -> Vec<String> {
+        new.iter()
+            .filter(|n| !old.iter().any(|o| o.to_lowercase() == n.to_lowercase()))
+            .cloned()
+            .collect()
+    };
+    for o in added(&before.observations, &after.observations) {
+        if removed(removed_key("obs", &o)) {
+            out.push(format!(
+                "the owner removed the observation {}",
+                tasks::untrusted(&o, OBSERVATION_MAX)
+            ));
+        }
+    }
+    for t in added(&before.tags, &after.tags) {
+        if removed(removed_key("tag", &t)) {
+            out.push(format!("the owner removed the tag {t}"));
+        }
+    }
+    for c in add_contacts {
+        if removed(contact_key(&c.source, c.native_id.as_deref(), &c.handle)) {
+            out.push(format!(
+                "the owner removed the {} contact {} from this person",
+                c.source,
+                tasks::untrusted(c.native_id.as_deref().unwrap_or(&c.handle), HANDLE_MAX)
+            ));
         }
     }
     out
@@ -1062,15 +1138,15 @@ async fn save(tx: &mut sqlx::PgConnection, p: &Person, by: &str) -> Result<()> {
 
 /// Writes a person's contacts: `replace` (the owner's form) swaps the whole list, `add` adds to
 /// it. A contact whose user id is another person's is refused, since that is how a feed author is
-/// recognised; one already there is updated in place. Returns whether anything changed.
+/// recognised; one already there is updated in place. Returns the contacts before and after.
 async fn write_contacts(
     tx: &mut sqlx::PgConnection,
     person: i64,
     replace: Option<&[NewContact]>,
     add: &[NewContact],
     keep_existing: bool,
-) -> Result<bool> {
-    let before: Vec<(String, Option<String>, String)> = sqlx::query_as(
+) -> Result<(Vec<ContactRow>, Vec<ContactRow>)> {
+    let before: Vec<ContactRow> = sqlx::query_as(
         "select source, native_id, handle from person_contacts where person_id = $1 order by id",
     )
     .bind(person)
@@ -1088,7 +1164,7 @@ async fn write_contacts(
     for c in add {
         add_contact(tx, person, c, keep_existing).await?;
     }
-    let after: Vec<(String, Option<String>, String)> = sqlx::query_as(
+    let after: Vec<ContactRow> = sqlx::query_as(
         "select source, native_id, handle from person_contacts where person_id = $1 order by id",
     )
     .bind(person)
@@ -1099,8 +1175,11 @@ async fn write_contacts(
         "a person has at most {MAX_CONTACTS} contacts ({} given)",
         after.len()
     );
-    Ok(before != after)
+    Ok((before, after))
 }
+
+/// A contact as stored: source, user id, handle.
+type ContactRow = (String, Option<String>, String);
 
 async fn add_contact(
     tx: &mut sqlx::PgConnection,
@@ -1204,6 +1283,7 @@ pub fn json(p: &Person, contacts: &[Contact]) -> Value {
         "updated_by": p.updated_by,
         "owner_fields": p.owner_fields,
         "owner_edited_at": p.owner_edited_at,
+        "owner_removed": p.owner_removed,
         "contacts": contacts.iter().map(|c| json!({
             "id": c.id, "source": c.source, "handle": c.handle, "native_id": c.native_id,
         })).collect::<Vec<_>>(),
@@ -1335,16 +1415,17 @@ pub async fn owner_edit(o: &Orchestrator, id: i64, body: &Value) -> Result<Strin
             p.updated_at.format("%Y-%m-%d %H:%M:%S UTC")
         );
     }
+    let before = p.clone();
     let mut changed = apply(&mut p, &edit, Utc::now())?;
-    if write_contacts(
+    let (was, is) = write_contacts(
         &mut tx,
         id,
         edit.contacts.as_deref(),
         &edit.add_contacts,
         false,
     )
-    .await?
-    {
+    .await?;
+    if was != is {
         changed.push("contacts");
     }
     save(&mut tx, &p, "owner").await?;
@@ -1354,12 +1435,41 @@ pub async fn owner_edit(o: &Orchestrator, id: i64, body: &Value) -> Result<Strin
             fields.push((*f).to_owned());
         }
     }
-    if fields != p.owner_fields || !changed.is_empty() {
-        sqlx::query("update people set owner_fields = $2, owner_edited_at = now() where id = $1")
-            .bind(id)
-            .bind(&fields)
-            .execute(&mut *tx)
-            .await?;
+    let contact = |c: &ContactRow| contact_key(&c.0, c.1.as_deref(), &c.2);
+    let removed = tombstones(
+        &before.owner_removed,
+        [
+            (
+                before
+                    .observations
+                    .iter()
+                    .map(|o| removed_key("obs", o))
+                    .collect(),
+                p.observations
+                    .iter()
+                    .map(|o| removed_key("obs", o))
+                    .collect(),
+            ),
+            (
+                before.tags.iter().map(|t| removed_key("tag", t)).collect(),
+                p.tags.iter().map(|t| removed_key("tag", t)).collect(),
+            ),
+            (
+                was.iter().map(contact).collect(),
+                is.iter().map(contact).collect(),
+            ),
+        ],
+    );
+    if !changed.is_empty() || removed != before.owner_removed {
+        sqlx::query(
+            "update people set owner_fields = $2, owner_removed = $3, owner_edited_at = now()
+              where id = $1",
+        )
+        .bind(id)
+        .bind(&fields)
+        .bind(&removed)
+        .execute(&mut *tx)
+        .await?;
     }
     audit_tx(
         &mut tx,
@@ -1416,6 +1526,7 @@ mod tests {
             updated_by: "retro".into(),
             owner_fields: vec![],
             owner_edited_at: None,
+            owner_removed: vec![],
         }
     }
 
@@ -1713,7 +1824,8 @@ mod tests {
         );
     }
 
-    /// What the owner set, the retrospective does not change; it may still add to their lists.
+    /// What the owner set, the retrospective does not change; it may still add to their lists,
+    /// but never put back what they removed.
     #[test]
     fn owner_fields_stick() {
         let mut before = person();
@@ -1721,35 +1833,42 @@ mod tests {
         before.observations = vec!["Non-technical".into()];
         before.tags = vec!["reviewer".into()];
         before.owner_fields = vec!["position".into(), "observations".into(), "tags".into()];
+        before.owner_removed = vec![
+            removed_key("obs", "Works nights"),
+            removed_key("tag", "night-owl"),
+            contact_key("slack", Some("U0ZED"), "@zed"),
+            contact_key("email", None, "Zed@Example.test"),
+        ];
         let try_edit = |e: Edit| {
             let mut after = before.clone();
             let changed = apply(&mut after, &e, now()).unwrap();
-            owner_conflicts(&before, &after, &changed)
+            owner_conflicts(&before, &after, &changed, &e.add_contacts)
         };
         assert_eq!(
             try_edit(Edit {
                 position: Some(Some("CEO".into())),
                 ..Default::default()
             }),
-            ["position"]
+            ["the owner set position"]
         );
         assert!(
             try_edit(Edit {
                 add_observations: vec!["Works late".into()],
-                add_tags: vec!["night owl".into()],
+                add_tags: vec!["reviewer-of-notes".into()],
                 language: Some(Some("uk".into())),
                 brief: Some(Some("Owns notes".into())),
+                add_contacts: vec![contact("slack", "@zed", Some("U0OTHER")).unwrap()],
                 ..Default::default()
             })
             .is_empty(),
-            "adding to the owner's lists and setting fields they did not is fine"
+            "adding something new to the owner's lists and setting fields they did not is fine"
         );
         assert_eq!(
             try_edit(Edit {
                 remove_observations: vec!["non-technical".into()],
                 ..Default::default()
             }),
-            ["observations (only adding to them)"]
+            ["the owner's observations can only be added to"]
         );
         assert_eq!(
             try_edit(Edit {
@@ -1757,7 +1876,28 @@ mod tests {
                 position: Some(None),
                 ..Default::default()
             }),
-            ["position", "tags (only adding to them)"]
+            [
+                "the owner set position",
+                "the owner's tags can only be added to"
+            ]
+        );
+        // What the owner removed does not come back, in any case or spelling of it.
+        assert_eq!(
+            try_edit(Edit {
+                add_observations: vec!["works  NIGHTS".into()],
+                add_tags: vec!["Night Owl".into()],
+                add_contacts: vec![
+                    contact("slack", "@zed2", Some("U0ZED")).unwrap(),
+                    contact("email", "zed@example.test", None).unwrap(),
+                ],
+                ..Default::default()
+            }),
+            [
+                "the owner removed the observation \"works NIGHTS\"",
+                "the owner removed the tag night-owl",
+                "the owner removed the slack contact \"U0ZED\" from this person",
+                "the owner removed the email contact \"zed@example.test\" from this person",
+            ]
         );
         // A field the owner never touched is the retrospective's to change.
         let mut free = person();
@@ -1772,9 +1912,49 @@ mod tests {
             now(),
         )
         .unwrap();
-        assert!(owner_conflicts(&free, &after, &changed).is_empty());
+        assert!(owner_conflicts(&free, &after, &changed, &[]).is_empty());
     }
 
+    /// The owner's edit remembers what it took out, and forgets it when they put it back.
+    #[test]
+    fn the_owners_removals_are_remembered_until_they_undo_them() {
+        let k = |s: &str| removed_key("obs", s);
+        let removed = tombstones(
+            &[k("old one")],
+            [
+                (vec![k("a"), k("b")], vec![k("a")]),
+                (vec![], vec![]),
+                (
+                    vec![contact_key("slack", Some("U1"), "@x")],
+                    vec![contact_key("slack", Some("U2"), "@x")],
+                ),
+            ],
+        );
+        assert_eq!(
+            removed,
+            [k("old one"), k("b"), contact_key("slack", Some("U1"), "@x")]
+        );
+        let readded = tombstones(&removed, [(vec![k("a")], vec![k("a"), k("old one")])]);
+        assert_eq!(readded, [k("b"), contact_key("slack", Some("U1"), "@x")]);
+    }
+
+    /// A browser sends its textarea back with CRLF: the same text is no change.
+    #[test]
+    fn line_breaks_do_not_count_as_an_edit() {
+        let mut p = person();
+        p.brief = Some("Owns notes.\nReviews search.".into());
+        let same = Edit {
+            brief: Some(Some("Owns notes.\r\nReviews search.\r\n".into())),
+            ..Default::default()
+        };
+        assert!(apply(&mut p, &same, now()).unwrap().is_empty());
+        assert_eq!(p.brief.as_deref(), Some("Owns notes.\nReviews search."));
+        let lone_cr = Edit {
+            brief: Some(Some("  Owns notes.\rReviews search.  ".into())),
+            ..Default::default()
+        };
+        assert!(apply(&mut p, &lone_cr, now()).unwrap().is_empty());
+    }
     /// However many people wrote, the section stays within its share of the digest and its
     /// instruction is always there, whole.
     #[test]

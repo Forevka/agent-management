@@ -22,7 +22,11 @@ create table people (
     -- observations, tags, contacts). Sticky: the retrospective never clears it, and may not change
     -- such a field (for observations, tags and contacts it may still add, never take away).
     owner_fields     text[] not null default '{}',
-    owner_edited_at  timestamptz
+    owner_edited_at  timestamptz,
+    -- What the owner took out of the record, so the retrospective cannot put it back: `obs:` and
+    -- `tag:` entries (lowercased) and `contact:<source>|<user id>` (or `|<handle>` without one).
+    -- Re-adding an item themselves drops its entry.
+    owner_removed    text[] not null default '{}'
 );
 -- One record per name, whatever its case: the retrospective updates by name, never duplicates.
 create unique index people_name on people (lower(name));

@@ -44,7 +44,7 @@ export default function People() {
     <Page>
       <PageHeader
         title="People"
-        description="Your colleagues the agents come into contact with. The retrospective keeps these records every day from the day’s messages and its memories, without pinging you; the orchestrator and the secretary read a person’s card before writing to them, and use it only for how they write (language, tone, form of address), never for what the fleet does. Correct anything here: a field you set stays yours, and the retrospective can only add to it."
+        description="Your colleagues the agents come into contact with. The retrospective keeps these records every day from the day’s messages and its memories, without pinging you; the orchestrator and the secretary read a person’s card before writing to them, and use it only for how they write (language, tone, form of address), never for what the fleet does. Correct anything here: a field you set stays yours, the retrospective can only add to it, and what you remove stays removed."
         meta={
           state.data && (
             <Text size="1" tone="muted">

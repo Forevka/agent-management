@@ -292,6 +292,9 @@ export type Person = {
   owner_fields: string[]
   /** When the owner last edited the record; null if they never have. */
   owner_edited_at: string | null
+  /** What the owner removed, which the retrospective may not put back (`obs:…`, `tag:…`,
+   * `contact:<source>|<user id or handle>`). */
+  owner_removed: string[]
   contacts: { id: number; source: string; handle: string; native_id: string | null }[]
 }
 

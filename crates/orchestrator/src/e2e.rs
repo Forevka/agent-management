@@ -4889,11 +4889,16 @@ async fn people_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) 
         ),
         (
             json!({"id": zed_id, "remove_observations": ["prefers short and quick communication"]}),
-            "observations (only adding to them)",
+            "the owner's observations can only be added to",
         ),
         (
             json!({"id": zed_id, "remove_tags": ["reviewer"]}),
-            "tags (only adding to them)",
+            "the owner's tags can only be added to",
+        ),
+        // The owner took this one out in their edit: it does not come back.
+        (
+            json!({"id": zed_id, "add_observations": ["works only on backend parts"]}),
+            "the owner removed the observation",
         ),
     ] {
         let e = crate::people::retro_write(o, run, &args)
@@ -4969,6 +4974,58 @@ async fn people_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) 
         saved["done"].as_str().unwrap().contains("position"),
         "{saved}"
     );
+    // A write that changes nothing leaves the record alone, so the owner's open form stays
+    // current.
+    let at: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("select updated_at from people where id = $1")
+            .bind(zed_id)
+            .fetch_one(db)
+            .await
+            .unwrap();
+    let same = crate::people::retro_write(
+        o,
+        run,
+        &json!({"id": zed_id, "add_observations": ["Answers within the hour"]}),
+    )
+    .await
+    .unwrap();
+    assert!(same.contains("already says that"), "{same}");
+    let at_after: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("select updated_at from people where id = $1")
+            .bind(zed_id)
+            .fetch_one(db)
+            .await
+            .unwrap();
+    assert_eq!(at, at_after, "a write that changes nothing touches nothing");
+    // The owner takes the email contact off him: the retrospective cannot attach it to him
+    // again, though it may attach it to someone else (which is how a contact moves).
+    crate::people::owner_edit(
+        o,
+        zed_id,
+        &json!({"contacts": [{"source": "slack", "handle": "@zed", "native_id": "U0ZED"}]}),
+    )
+    .await
+    .unwrap();
+    let back = crate::people::retro_write(
+        o,
+        run,
+        &json!({"id": zed_id, "add_contacts": [{"source": "email", "handle": "zed@example.test"}]}),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        back.to_string()
+            .contains("the owner removed the email contact"),
+        "{back:#}"
+    );
+    let moved = crate::people::retro_write(
+        o,
+        run,
+        &json!({"name": "Olya", "add_contacts": [{"source": "email", "handle": "zed@example.test"}]}),
+    )
+    .await
+    .unwrap();
+    assert!(moved.contains("Updated #"), "{moved}");
     // A name another person has is refused in words; so is a second record by name.
     assert!(
         crate::people::owner_edit(o, zed_id, &json!({"name": "OLYA"}))
