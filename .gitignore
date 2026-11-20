@@ -15,3 +15,7 @@ apps/web/dist/
 # Scratch state from editor tooling that runs inside the repo. It is per-machine and per-session;
 # a copy of it was staged by accident once, which is what this line is for.
 .omc/
+
+# A local code index (12 MB, rebuilt with `codegraph init`). Derived from the source, so it is
+# per-machine and goes stale the moment anyone commits.
+.codegraph/

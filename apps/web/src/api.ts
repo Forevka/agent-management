@@ -111,6 +111,18 @@ export type Node = {
   sessions?: { run_id: string; task: string; started_at: string; status: string }[]
 }
 
+/** One card on the board: a task, plus what the card shows, so the page runs no query itself. */
+export type BoardTask = Task & {
+  brief: string
+  sessions: number
+  milestones: number
+  milestones_done: number
+  /** When the state the card shows began, for the duration it counts up. */
+  since: string
+  /** What this task wants from the owner, if anything. The blocking item wins. */
+  needs_you: { id: number; kind: string; blocking: boolean; since: string } | null
+}
+
 export type Overview = {
   items: Item[]
   tasks: Task[]

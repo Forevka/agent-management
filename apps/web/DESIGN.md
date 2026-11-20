@@ -34,7 +34,9 @@ Four things we wanted are Pro, so they are ours, in `components/fx/`, written to
 | Stat Card | `fx/stat.tsx` — `Stat` |
 | Toaster, Command Menu | not built; nothing needs them yet |
 
-Also ours, because the free set has no equivalent: `fx/layout.tsx` (`Page`, `PageHeader`, `Section`,
+Also ours, because the free set has no equivalent: `fx/board.tsx` (the landing page's columns and
+cards — a *reading* board, not a planning one: the cards do not drag, because a column is the
+task's real state in the fleet and moving one by hand would be a lie), `fx/layout.tsx` (`Page`, `PageHeader`, `Section`,
 `Stack`, `Row`, `Grid`, `Text`, `Heading`), `fx/note.tsx` (a callout), `fx/radio.tsx`, `fx/theme.tsx`
 (dark mode), `fx/icons.tsx` (inline icons — see "No external anything" below).
 

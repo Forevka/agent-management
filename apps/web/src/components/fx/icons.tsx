@@ -118,3 +118,51 @@ export const RefreshIcon = (p: IconProps) => (
     <path d="M20 5.5v6h-6" />
   </Icon>
 )
+
+/** An agent did this: the four-point spark the library uses for anything model-driven. */
+export const SparkIcon = (p: IconProps) => (
+  <Icon {...p}>
+    <path d="M12 3.2c.9 4.3 1.6 5 5.9 5.9-4.3.9-5 1.6-5.9 5.9-.9-4.3-1.6-5-5.9-5.9 4.3-.9 5-1.6 5.9-5.9Z" />
+    <path d="M18.2 15.1c.4 1.9.7 2.2 2.6 2.6-1.9.4-2.2.7-2.6 2.6-.4-1.9-.7-2.2-2.6-2.6 1.9-.4 2.2-.7 2.6-2.6Z" />
+  </Icon>
+)
+
+/** How many times a task has run: stacked sessions. */
+export const SessionsIcon = (p: IconProps) => (
+  <Icon {...p}>
+    <path d="M12 3.6 3.4 8 12 12.4 20.6 8 12 3.6Z" />
+    <path d="m3.4 12.6 8.6 4.4 8.6-4.4" />
+    <path d="m3.4 17 8.6 4.4 8.6-4.4" />
+  </Icon>
+)
+
+/** Checklist progress: how much of the plan is ticked off. */
+export const MilestoneIcon = (p: IconProps) => (
+  <Icon {...p}>
+    <path d="M4 6.4h5" />
+    <path d="M4 12h5" />
+    <path d="M4 17.6h5" />
+    <path d="m12.6 5.6 1.6 1.6 3-3" />
+    <path d="m12.6 11.2 1.6 1.6 3-3" />
+    <path d="m12.6 16.8 1.6 1.6 3-3" />
+  </Icon>
+)
+
+/** The board view's two-column glyph, and the list view's lines. */
+export const BoardIcon = (p: IconProps) => (
+  <Icon {...p}>
+    <rect x="3.6" y="4.4" width="6.2" height="15.2" rx="1.4" />
+    <rect x="14.2" y="4.4" width="6.2" height="9.4" rx="1.4" />
+  </Icon>
+)
+
+export const ListIcon = (p: IconProps) => (
+  <Icon {...p}>
+    <path d="M9 6.6h11" />
+    <path d="M9 12h11" />
+    <path d="M9 17.4h11" />
+    <path d="M4.6 6.6h.01" />
+    <path d="M4.6 12h.01" />
+    <path d="M4.6 17.4h.01" />
+  </Icon>
+)

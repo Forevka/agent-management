@@ -2390,6 +2390,51 @@ async fn api_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool) {
         "{body}"
     );
 
+    // The board: one card per task, carrying everything the card shows so the page runs no
+    // query of its own. It must also carry work that is *done*, which the overview deliberately
+    // drops — a board with no "done" column hides the one thing worth seeing at a glance. By
+    // this point the flow has stopped tasks but finished none, so one is marked done here.
+    sqlx::query("update tasks set status = 'done' where id = 'demo-ME-1'")
+        .execute(db)
+        .await
+        .unwrap();
+    let (status, body) = call("GET", "/api/board", Some(cookie.clone()), None).await;
+    assert_eq!(status, 200, "{body}");
+    let cards = body["tasks"].as_array().unwrap();
+    assert!(!cards.is_empty(), "the board has the fleet's work: {body}");
+    assert!(
+        cards
+            .iter()
+            .all(|c| !crate::model::is_builtin_task(c["id"].as_str().unwrap_or(""))),
+        "the fleet's own standing sessions are not work on a board: {body}"
+    );
+    let bs1 = cards
+        .iter()
+        .find(|c| c["id"] == "demo-BS-1")
+        .unwrap_or_else(|| panic!("the task that really ran is on the board: {body}"));
+    assert!(
+        bs1["sessions"].as_i64().unwrap_or(0) > 0 && bs1["milestones"].as_i64().unwrap_or(0) > 0,
+        "a card carries its own counts, so the board needs no query per task: {bs1}"
+    );
+    assert!(
+        bs1["brief"].as_str().is_some_and(|b| !b.is_empty()) && bs1["since"].is_string(),
+        "a card carries the words and the clock it shows: {bs1}"
+    );
+    assert!(
+        cards
+            .iter()
+            .any(|c| c["id"] == "demo-ME-1" && c["status"] == "done"),
+        "finished work is on the board, unlike on the overview: {body}"
+    );
+    // Whatever wants the owner says so on the card itself, so the first column needs no join.
+    let waiting: Vec<&Value> = cards.iter().filter(|c| !c["needs_you"].is_null()).collect();
+    assert!(
+        waiting
+            .iter()
+            .all(|c| c["needs_you"]["kind"].is_string() && c["needs_you"]["since"].is_string()),
+        "a task waiting on the owner says what it waits for and since when: {waiting:?}"
+    );
+
     // Sessions: every run the fleet has started, which is the history the old UI never kept.
     // `demo-BS-1` has really run by now, through a real node.
     let (status, body) = call("GET", "/api/runs?project=demo", Some(cookie.clone()), None).await;

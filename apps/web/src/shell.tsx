@@ -10,7 +10,7 @@ import { ThemeToggle } from '@/components/fx/theme'
  */
 
 const NAV = [
-  ['/', 'Dashboard'],
+  ['/', 'Board'],
   ['/tasks', 'Tasks'],
   ['/sessions', 'Sessions'],
   ['/projects', 'Projects'],
@@ -30,7 +30,7 @@ export function Shell() {
       </style>
       <header className="fx-header">
         <div className="fx-header__inner">
-          <NavLink to="/" className="fx-brand" aria-label="Fleet, dashboard">
+          <NavLink to="/" className="fx-brand" aria-label="Fleet, the board">
             <span className="fx-brand__mark" aria-hidden="true">
               F
             </span>
@@ -38,7 +38,7 @@ export function Shell() {
           </NavLink>
           <nav className="fx-nav" aria-label="Sections">
             {NAV.map(([to, label]) => (
-              // `end` so "Dashboard" is only current on "/" itself.
+              // `end` so "Board" is only current on "/" itself.
               <NavLink key={to} to={to} end={to === '/'} className="fx-nav__link">
                 {label}
               </NavLink>

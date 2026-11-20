@@ -42,6 +42,7 @@ type O = Arc<Orchestrator>;
 pub fn router() -> Router<O> {
     Router::new()
         .route("/api/overview", get(overview))
+        .route("/api/board", get(board))
         .route("/api/items/{id}", get(item).post(item_answer))
         .route("/api/tasks", get(tasks))
         .route("/api/tasks/{id}", get(task))
@@ -226,8 +227,9 @@ async fn overview(State(o): State<O>, h: HeaderMap) -> Api {
     guard!(o, h);
     let items = human::open_items(&o).await?;
     let tasks: Vec<TaskRow> = sqlx::query_as(
-        "select * from tasks where id not in ('brain', 'secretary') and status <> 'done' order by updated_at desc limit 50",
+        "select * from tasks where id <> all($1) and status <> 'done' order by updated_at desc limit 50",
     )
+    .bind(crate::model::BUILTIN_TASKS)
     .fetch_all(&o.db)
     .await?;
     let nodes: Vec<NodeRow> = sqlx::query_as("select * from nodes order by name")
@@ -240,7 +242,7 @@ async fn overview(State(o): State<O>, h: HeaderMap) -> Api {
                 count(t.id) filter (where t.status not in ('done','stopped','failed')) as open,
                 count(t.id) filter (where t.running) as running,
                 count(t.id) as total
-         from projects p left join tasks t on t.project = p.slug and t.id not in ('brain','secretary')
+         from projects p left join tasks t on t.project = p.slug and t.id not in ('brain','secretary','retro')
          group by p.slug, p.name order by p.slug",
     )
     .fetch_all(&o.db)
@@ -261,6 +263,82 @@ async fn overview(State(o): State<O>, h: HeaderMap) -> Api {
         "todos_open": todos,
         "sessions_today": sessions_today,
     })))
+}
+
+/// Everything the board needs, in one call: one card per task, already carrying what the card
+/// shows, so the page runs no query of its own and the columns are a pure grouping.
+///
+/// Unlike the overview this includes work that has just finished — a board with no "done" column
+/// would hide the thing the owner most wants to see at a glance, that the fleet got somewhere.
+async fn board(State(o): State<O>, h: HeaderMap) -> Api {
+    guard!(o, h);
+    // Open work always, finished work only while it is still news. `limit` is a backstop: a
+    // fleet that somehow has hundreds of open tasks should still render.
+    let rows: Vec<TaskRow> = sqlx::query_as(
+        "select * from tasks
+         where id <> all($1)
+           and (status not in ('done', 'stopped', 'failed')
+                or updated_at > now() - interval '24 hours')
+         order by updated_at desc limit 120",
+    )
+    .bind(crate::model::BUILTIN_TASKS)
+    .fetch_all(&o.db)
+    .await?;
+    let ids: Vec<String> = rows.iter().map(|t| t.id.clone()).collect();
+    // Two counts per card, both in one query each rather than one per row.
+    let sessions: Vec<(String, i64)> = sqlx::query_as(
+        "select task_id, count(*) from runs where task_id = any($1) group by task_id",
+    )
+    .bind(&ids)
+    .fetch_all(&o.db)
+    .await?;
+    let milestones: Vec<(String, i64, i64)> = sqlx::query_as(
+        "select task_id, count(*) filter (where done), count(*)
+         from milestones where task_id = any($1) group by task_id",
+    )
+    .bind(&ids)
+    .fetch_all(&o.db)
+    .await?;
+    // What each task is waiting on, if anything. The blocking one wins: it is the one that has
+    // actually stopped an agent, and a card has room to name one thing.
+    let open = human::open_items(&o).await?;
+    let cards: Vec<Value> = rows
+        .iter()
+        .map(|t| {
+            let mut v = task_json(t);
+            v["sessions"] = json!(
+                sessions
+                    .iter()
+                    .find(|(id, _)| *id == t.id)
+                    .map_or(0, |(_, n)| *n)
+            );
+            let (done, total) = milestones
+                .iter()
+                .find(|(id, _, _)| *id == t.id)
+                .map_or((0, 0), |(_, d, n)| (*d, *n));
+            v["milestones_done"] = json!(done);
+            v["milestones"] = json!(total);
+            v["brief"] = json!(crate::chat::clip(&t.brief, 240));
+            // When the state on the card began, so it can count up: a run's own start while it
+            // runs, and otherwise the last thing that happened to it.
+            v["since"] = json!(if t.running {
+                t.dispatched_at.unwrap_or(t.updated_at)
+            } else {
+                t.updated_at
+            });
+            v["needs_you"] = match open
+                .iter()
+                .find(|i| i.task_id.as_deref() == Some(t.id.as_str()))
+            {
+                Some(i) => json!({
+                    "id": i.id, "kind": i.kind, "blocking": i.blocking, "since": i.created_at,
+                }),
+                None => Value::Null,
+            };
+            v
+        })
+        .collect();
+    Ok(Json(json!({ "tasks": cards })))
 }
 
 // ---------------------------------------------------------------- tasks and sessions
@@ -292,7 +370,7 @@ async fn tasks(State(o): State<O>, h: HeaderMap, Query(q): Query<TaskQuery>) -> 
            and ($2::text is null or status = $2)
            and ($3::text is null or agent_id = $3)
            and ($4::text is null or id ilike '%' || $4 || '%' or title ilike '%' || $4 || '%')
-           and ($5 or id not in ('brain', 'secretary'))";
+           and ($5 or id not in ('brain', 'secretary', 'retro'))";
     let rows: Vec<TaskRow> = sqlx::query_as(&format!(
         "select * from tasks {WHERE} order by updated_at desc limit $6 offset $7"
     ))
@@ -652,14 +730,14 @@ async fn project(State(o): State<O>, h: HeaderMap, Path(slug): Path<String>) -> 
         .fetch_all(&o.db)
         .await?;
     let tasks: Vec<TaskRow> = sqlx::query_as(
-        "select * from tasks where project = $1 and id not in ('brain','secretary') order by updated_at desc limit 100",
+        "select * from tasks where project = $1 and id not in ('brain','secretary','retro') order by updated_at desc limit 100",
     )
     .bind(&slug)
     .fetch_all(&o.db)
     .await?;
     let (sessions, open): (i64, i64) = sqlx::query_as(
         "select (select count(*) from runs where project = $1),
-                (select count(*) from tasks where project = $1 and status not in ('done','stopped','failed') and id not in ('brain','secretary'))",
+                (select count(*) from tasks where project = $1 and status not in ('done','stopped','failed') and id not in ('brain','secretary','retro'))",
     )
     .bind(&slug)
     .fetch_one(&o.db)

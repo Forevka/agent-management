@@ -5,7 +5,7 @@ import './aui.css'
 import { startTheme } from '@/components/fx/theme'
 
 import { Shell } from './shell'
-import Dashboard from './pages/Dashboard'
+import BoardPage from './pages/Board'
 import Tasks from './pages/Tasks'
 import TaskDetail from './pages/TaskDetail'
 import Sessions from './pages/Sessions'
@@ -30,7 +30,7 @@ createRoot(document.getElementById('root')!).render(
     <BrowserRouter>
       <Routes>
         <Route element={<Shell />}>
-          <Route path="/" element={<Dashboard />} />
+          <Route path="/" element={<BoardPage />} />
           <Route path="/tasks" element={<Tasks />} />
           <Route path="/tasks/:id" element={<TaskDetail />} />
           <Route path="/sessions" element={<Sessions />} />
