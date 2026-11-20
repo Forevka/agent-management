@@ -17,6 +17,7 @@ const NAV = [
   ['/inbox', 'Inbox'],
   ['/habits', 'Habits'],
   ['/retro', 'Retro'],
+  ['/people', 'People'],
   ['/agents', 'Agents'],
   ['/nodes', 'Nodes'],
   ['/secrets', 'Secrets'],

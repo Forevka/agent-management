@@ -91,6 +91,15 @@ pub enum AgentCmd {
     /// The daily retrospective's own commands (the retrospective only).
     #[command(subcommand)]
     Retro(RetroCmd),
+    /// Look up the owner's colleagues before writing to them: who they are, how to reach them,
+    /// which language and tone suit them. Untrusted data, kept by the daily retrospective.
+    People {
+        /// A name, a handle, a tag or a project (every record, recent first, when omitted).
+        query: Option<String>,
+        /// One person's full record.
+        #[arg(long, conflicts_with = "query")]
+        id: Option<i64>,
+    },
     // Orchestrator (brain) only.
     /// List projects, their nodes and open tasks.
     Projects,
@@ -317,7 +326,7 @@ pub enum AdminCmd {
     HabitRemove { habit: i64 },
     /// Send the owner a login link to any page of the fleet's UI, so they land on the exact
     /// thing you are talking about: /tasks/<id>, /sessions, /inbox, /projects/<slug>, /agents,
-    /// /nodes/<id>, /secrets/<id> (to enter a token), /items/<id>, and filtered views such as
+    /// /nodes/<id>, /secrets/<id> (to enter a token), /items/<id>, /people/<id>, and filtered views such as
     /// `/tasks?project=bioins&status=failed`. You never see the link yourself.
     Link {
         page: String,
@@ -592,6 +601,49 @@ pub enum RetroCmd {
     },
     /// One task's own transcript, when the day's summary raises a question about it.
     Task { id: String },
+    /// Create or update one person's record, quietly (nobody is told). Only what the day's
+    /// material or your memory supports.
+    Person(Box<PersonArgs>),
+}
+
+#[derive(Debug, Args)]
+pub struct PersonArgs {
+    /// The record to update (from `fleet agent people`); with --name, renames it.
+    #[arg(long)]
+    pub id: Option<i64>,
+    /// Create this person, or update the one with exactly this name (in any case).
+    #[arg(long, required_unless_present = "id")]
+    pub name: Option<String>,
+    #[arg(long)]
+    pub position: Option<String>,
+    /// What they are involved in on the project ("-" reads it from stdin).
+    #[arg(long)]
+    pub brief: Option<String>,
+    /// A project of the company they work on (repeat; replaces the list).
+    #[arg(long = "project")]
+    pub projects: Vec<String>,
+    /// en or uk: the language to write to them in.
+    #[arg(long)]
+    pub language: Option<String>,
+    /// Add an observation, one line (repeat): "prefers short and quick communication".
+    #[arg(long = "observe")]
+    pub add_observations: Vec<String>,
+    /// Remove an observation by its exact text (repeat).
+    #[arg(long = "forget")]
+    pub remove_observations: Vec<String>,
+    /// Add a tag, for what fits no field (repeat).
+    #[arg(long = "tag")]
+    pub add_tags: Vec<String>,
+    /// Remove a tag (repeat).
+    #[arg(long = "untag")]
+    pub remove_tags: Vec<String>,
+    /// How to reach them: "slack|@zed|U0123ABC" (source|handle|their user id there; the id is
+    /// optional). Sources: slack, gchat, email, telegram, other. Repeat for more.
+    #[arg(long = "contact")]
+    pub contacts: Vec<String>,
+    /// When the material last showed them in touch (RFC 3339); it only ever moves forward.
+    #[arg(long)]
+    pub last_interaction: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -719,6 +771,8 @@ pub fn to_call(cmd: AgentCmd) -> Result<(&'static str, Value)> {
             ("retro_finish", json!({"verdict": stdin_if_dash(verdict)?}))
         }
         AgentCmd::Retro(RetroCmd::Task { id }) => ("retro_task", json!({"task": id})),
+        AgentCmd::Retro(RetroCmd::Person(p)) => ("retro_person", person_args(*p)?),
+        AgentCmd::People { query, id } => ("people", json!({"query": query, "id": id})),
         AgentCmd::Wake(WakeCmd::Set {
             note,
             in_,
@@ -1046,6 +1100,40 @@ fn admin_call(a: AdminArgs) -> Result<(&'static str, Value)> {
         AdminCmd::HabitPause { habit } => propose("habit_pause", json!({"habit": habit})),
         AdminCmd::HabitRemove { habit } => propose("habit_remove", json!({"habit": habit})),
     }
+}
+
+/// `fleet agent retro person ...` as the orchestrator's `retro_person` expects it: lists only when
+/// given (an empty one would clear the projects), contacts split into their parts.
+fn person_args(p: PersonArgs) -> Result<Value> {
+    let contacts = p
+        .contacts
+        .iter()
+        .map(|c| {
+            let parts: Vec<&str> = c.split('|').map(str::trim).collect();
+            match parts.as_slice() {
+                [source, handle] => Ok(json!({"source": source, "handle": handle})),
+                [source, handle, id] => Ok(
+                    json!({"source": source, "handle": handle, "native_id": (!id.is_empty()).then_some(id)}),
+                ),
+                _ => bail!("a contact is \"source|handle\" or \"source|handle|user-id\", not {c:?}"),
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let some = |v: Vec<String>| (!v.is_empty()).then_some(v);
+    Ok(json!({
+        "id": p.id,
+        "name": p.name,
+        "position": p.position,
+        "brief": p.brief.map(stdin_if_dash).transpose()?,
+        "projects": some(p.projects),
+        "language": p.language,
+        "add_observations": some(p.add_observations),
+        "remove_observations": some(p.remove_observations),
+        "add_tags": some(p.add_tags),
+        "remove_tags": some(p.remove_tags),
+        "add_contacts": (!contacts.is_empty()).then_some(contacts),
+        "last_interaction": p.last_interaction,
+    }))
 }
 
 /// Long texts (briefs, summaries) are easiest to pass through a heredoc on stdin.
@@ -1404,5 +1492,72 @@ mod tests {
         assert!(
             T::try_parse_from(["t", "memory", "recall", "q", "--bank", "x", "--shared"]).is_err()
         );
+    }
+
+    /// Looking a colleague up, and the retrospective keeping their record.
+    #[test]
+    fn people_commands_map_to_tools() {
+        assert_eq!(
+            call(&["people", "zed"]),
+            ("people", json!({"query": "zed", "id": null}))
+        );
+        assert_eq!(
+            call(&["people", "--id", "4"]),
+            ("people", json!({"query": null, "id": 4}))
+        );
+        assert_eq!(
+            call(&["people"]),
+            ("people", json!({"query": null, "id": null}))
+        );
+        assert!(T::try_parse_from(["t", "people", "zed", "--id", "4"]).is_err());
+        let (tool, a) = call(&[
+            "retro",
+            "person",
+            "--name",
+            "Zed Example",
+            "--language",
+            "uk",
+            "--project",
+            "notes",
+            "--observe",
+            "prefers short messages",
+            "--tag",
+            "night owl",
+            "--contact",
+            "slack|@zed|U0ZED",
+            "--contact",
+            "email|zed@example.test",
+            "--last-interaction",
+            "2026-11-20T10:00:00Z",
+        ]);
+        assert_eq!(tool, "retro_person");
+        assert_eq!(
+            a,
+            json!({
+                "id": null, "name": "Zed Example", "position": null, "brief": null,
+                "projects": ["notes"], "language": "uk",
+                "add_observations": ["prefers short messages"], "remove_observations": null,
+                "add_tags": ["night owl"], "remove_tags": null,
+                "add_contacts": [
+                    {"source": "slack", "handle": "@zed", "native_id": "U0ZED"},
+                    {"source": "email", "handle": "zed@example.test"},
+                ],
+                "last_interaction": "2026-11-20T10:00:00Z",
+            })
+        );
+        // No --project leaves the list alone rather than clearing it.
+        let (_, a) = call(&["retro", "person", "--id", "4", "--forget", "old"]);
+        assert_eq!(
+            (
+                a["id"].clone(),
+                a["projects"].clone(),
+                a["remove_observations"].clone()
+            ),
+            (json!(4), Value::Null, json!(["old"]))
+        );
+        assert!(T::try_parse_from(["t", "retro", "person", "--tag", "x"]).is_err());
+        let bad = T::try_parse_from(["t", "retro", "person", "--name", "Z", "--contact", "slack"])
+            .unwrap();
+        assert!(to_call(bad.cmd).is_err());
     }
 }

@@ -167,6 +167,12 @@ for line in sys.stdin:
                         ("memory_retain", {"content": "x", "bank": "project-fleet"}),
                         ("memory_banks", {})]:
             tool(name, a)
+        if "People who wrote these messages" in text:
+            # The people network: the batch carries the authors' cards. The secretary may look
+            # someone up, but writing a record is the retrospective's alone.
+            out({"type": "batch_people", "text": text[text.index("People who wrote these messages"):]})
+            tool("people", {"query": "zed"})
+            tool("retro_person", {"name": "Mallory", "add_tags": ["trusted"]})
         out({"type": "result", "subtype": "success", "total_cost_usd": 0.0})
     elif text.startswith("[Message from the owner in the Inbox]"):
         said = text.split("] ", 1)[1].split("\n")[0]
@@ -178,6 +184,27 @@ for line in sys.stdin:
             ref = text.split('"ref":"', 1)[1].split('"', 1)[0]
             tool("reply_draft", {"ref": ref, "text": "Yes, Friday works for the ship date."})
         tool("digest_post", {"text": "Since you asked: one todo is open."})
+        out({"type": "result", "subtype": "success", "total_cost_usd": 0.0})
+    elif text.startswith("[Retrospective people-day"):
+        # The people pass: look first, then create and update records from the day's material,
+        # quietly, until the per-run cap refuses one more.
+        tool("people", {"query": "zed"})
+        tool("memory_recall", {"query": "Zed"})
+        tool("retro_person", {"name": "Zed Example", "position": "Backend lead",
+                              "brief": "Owns the notes module.", "projects": ["notes", "Billing"],
+                              "language": "ukrainian",
+                              "add_observations": ["Prefers short and quick communication",
+                                                   "Does code reviews on the notes module"],
+                              "add_tags": ["Night Owl!"],
+                              "add_contacts": [{"source": "slack", "handle": "@zed", "native_id": "U0ZED"}],
+                              "last_interaction": "2026-11-01T10:00:00Z"})
+        # The same name in another case updates the record; it never makes a second one.
+        tool("retro_person", {"name": "zed example", "add_observations": ["Works only on backend parts"],
+                              "remove_observations": ["Does code reviews on the notes module"]})
+        tool("retro_person", {"name": "Olya", "position": "Project manager", "language": "en"})
+        # One past the cap (three in tests): refused.
+        tool("retro_person", {"name": "Over The Cap"})
+        tool("retro_finish", {"verdict": "Kept the people records of the day."})
         out({"type": "result", "subtype": "success", "total_cost_usd": 0.0})
     elif text.startswith("[Retrospective"):
         # The fleet's own day, handed over by the orchestrator. Look at one task more closely,

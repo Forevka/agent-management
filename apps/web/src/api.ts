@@ -269,6 +269,44 @@ export type Habits = {
   }[]
 }
 
+/// One of the owner's colleagues, as the people records know them. Written by the daily
+/// retrospective from what it read (untrusted text: rendered as text, never markup), and edited
+/// by the owner, which makes `updated_by` "owner".
+export type Person = {
+  id: number
+  name: string
+  position: string | null
+  brief: string | null
+  /** The company's projects they work on: free text, not necessarily fleet projects. */
+  projects: string[]
+  /** `en`, `uk`, or not known. */
+  language: 'en' | 'uk' | null
+  observations: string[]
+  tags: string[]
+  last_interaction: string | null
+  created_at: string
+  updated_at: string
+  updated_by: 'retro' | 'owner'
+  contacts: { id: number; source: string; handle: string; native_id: string | null }[]
+}
+
+export type People = {
+  people: Person[]
+  /** Every record, whatever the filters. */
+  total: number
+  /** Tags and projects in use, most frequent first: the recurring tags are the ones worth a field. */
+  tags: { tag: string; count: number }[]
+  projects: { project: string; count: number }[]
+  sources: string[]
+}
+
+export type PersonDetail = {
+  person: Person
+  /** What was done to the record lately, and by whom (`retro` or `owner`). */
+  history: { at: string; actor: string; action: string; changed: string[] | null }[]
+  sources: string[]
+}
+
 export type Agents = {
   agents: {
     id: string

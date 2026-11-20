@@ -170,6 +170,9 @@ pub struct RetroConfig {
     pub effort: String,
     /// At most this many proposals per run: a day's improvements the owner will actually read.
     pub max_proposals: i64,
+    /// At most this many people records written per run (see `people`): enough for a day's
+    /// colleagues, too few for a crafted message to rewrite the whole directory.
+    pub max_people: i64,
     /// The project a proposal becomes a task in — the fleet's own source, never a product
     /// project. "Make task" refuses when it does not exist.
     pub project: String,
@@ -188,6 +191,7 @@ impl RetroConfig {
             model: text("FLEET_RETRO_MODEL", fleet_model),
             effort: text("FLEET_RETRO_EFFORT", "high"),
             max_proposals: env_num("FLEET_RETRO_MAX_PROPOSALS", 3),
+            max_people: env_num("FLEET_RETRO_MAX_PEOPLE", 30).max(0),
             project: text("FLEET_RETRO_PROJECT", "fleet-src"),
         }
     }
@@ -199,6 +203,8 @@ impl RetroConfig {
             model: "opus".into(),
             effort: "high".into(),
             max_proposals: 2,
+            // Small, so the end-to-end test can show the (cap + 1)th write refused.
+            max_people: 3,
             project: "fleet-src".into(),
         }
     }

@@ -19,6 +19,8 @@ import Agents from './pages/Agents'
 import Inbox from './pages/Inbox'
 import Habits from './pages/Habits'
 import Retro from './pages/Retro'
+import People from './pages/People'
+import Person from './pages/Person'
 import Item from './pages/Item'
 
 // Before the first paint: the owner's choice of light or dark is on <html> already, so the page
@@ -44,6 +46,8 @@ createRoot(document.getElementById('root')!).render(
           <Route path="/inbox" element={<Inbox />} />
           <Route path="/habits" element={<Habits />} />
           <Route path="/retro" element={<Retro />} />
+          <Route path="/people" element={<People />} />
+          <Route path="/people/:id" element={<Person />} />
           <Route path="/items/:id" element={<Item />} />
         </Route>
       </Routes>

@@ -59,6 +59,8 @@ pub fn router() -> Router<O> {
         .route("/api/inbox", get(inbox).post(inbox_act))
         .route("/api/habits", get(habits).post(habits_act))
         .route("/api/retro", get(retro).post(retro_act))
+        .route("/api/people", get(people).post(people_act))
+        .route("/api/people/{id}", get(person).post(person_act))
         .route("/api/invite", post(invite))
 }
 
@@ -1276,4 +1278,68 @@ async fn retro_act(State(o): State<O>, h: HeaderMap, Json(a): Json<Act>) -> Api 
     };
     let note = crate::retro::button(&o, &format!("rt|{id}|{action}")).await?;
     Ok(Json(json!({"done": note})))
+}
+
+// ---------------------------------------------------------------- people
+
+#[derive(Deserialize)]
+struct PeopleQuery {
+    /// A name, handle, tag, project or position, any part of it.
+    q: Option<String>,
+    tag: Option<String>,
+    project: Option<String>,
+    language: Option<String>,
+    limit: Option<i64>,
+}
+
+/// The people records, filtered: what the retrospective has written and the owner reviews.
+async fn people(State(o): State<O>, h: HeaderMap, Query(q): Query<PeopleQuery>) -> Api {
+    guard!(o, h);
+    let filter = crate::people::Filter {
+        q: q.q,
+        tag: q.tag,
+        project: q.project,
+        language: q.language,
+        limit: q.limit.unwrap_or(200),
+    };
+    Ok(Json(crate::people::list_json(&o, &filter).await?))
+}
+
+/// The owner adds someone the retrospective has not met yet.
+async fn people_act(State(o): State<O>, h: HeaderMap, Json(a): Json<Act>) -> Api {
+    guard!(o, h, write);
+    if a.op != "create" {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("unknown operation {:?}", a.op),
+        ));
+    }
+    let id = crate::people::owner_create(&o, &need(&a.body, "name")?).await?;
+    Ok(Json(json!({"done": format!("Added #{id}."), "id": id})))
+}
+
+async fn person(State(o): State<O>, h: HeaderMap, Path(id): Path<i64>) -> Api {
+    guard!(o, h);
+    Ok(Json(crate::people::detail_json(&o, id).await?))
+}
+
+/// The owner's edit (whatever the form sends replaces what is there) or delete.
+async fn person_act(
+    State(o): State<O>,
+    h: HeaderMap,
+    Path(id): Path<i64>,
+    Json(a): Json<Act>,
+) -> Api {
+    guard!(o, h, write);
+    let done = match a.op.as_str() {
+        "edit" => crate::people::owner_edit(&o, id, &a.body).await?,
+        "delete" => crate::people::owner_delete(&o, id).await?,
+        other => {
+            return Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                format!("unknown operation {other:?}"),
+            ));
+        }
+    };
+    Ok(Json(json!({"done": done})))
 }

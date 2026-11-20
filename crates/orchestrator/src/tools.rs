@@ -63,6 +63,7 @@ pub async fn handle(
             | "memory_recall"
             | "memory_reflect"
             | "memory_banks"
+            | "people"
     );
     if is_secretary && !secretary::TOOLS.contains(&call.tool.as_str()) && !read_only {
         bail!("{} is not available to the secretary", call.tool);
@@ -477,6 +478,9 @@ pub async fn handle(
         "feed_search" => {
             ok(crate::feeds::search(o, &task.project, is_brain || is_secretary, &args).await?)
         }
+        // Who a colleague is, before writing to them: every agent's, read-only. The records are
+        // the retrospective's to write (`retro_person`, gated below with its other tools).
+        "people" => ok(crate::people::tool(o, &args).await?),
         // Read-only, so the brain and the secretary can both find a workflow by id: the brain
         // to `send-to-task` one instead of creating a new task, the secretary to link a todo.
         "workflow_list" => ok(workflows::list(o).await?),

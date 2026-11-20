@@ -2348,6 +2348,16 @@ async fn api_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool) {
         ),
         ("/api/habits", &["habits"], &[]),
         ("/api/retro", &["proposals", "runs"], &[]),
+        (
+            "/api/people",
+            &["people", "tags", "projects", "sources"],
+            &[],
+        ),
+        (
+            "/api/people?q=x&tag=y&project=z&language=en",
+            &["people"],
+            &[],
+        ),
     ] {
         let (status, body) = call("GET", uri, Some(cookie.clone()), None).await;
         assert_eq!(status, 200, "GET {uri} answered {status}: {body}");
@@ -4434,6 +4444,417 @@ async fn retro_flow(
             .then_some(())
     })
     .await;
+}
+
+/// Every tool result a builtin session's fake reported, as (tool, ok, result).
+async fn tool_results(db: &sqlx::PgPool, task: &str) -> Vec<(String, bool, String)> {
+    events(db, task)
+        .await
+        .into_iter()
+        .filter(|e| e["type"] == "tool_result")
+        .map(|e| {
+            (
+                e["tool"].as_str().unwrap_or_default().to_owned(),
+                e["ok"].as_bool().unwrap_or(false),
+                e["result"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// The people network: the retrospective keeps records of the owner's colleagues from the day's
+/// material, quietly and within its cap; a message from someone with a record bumps when they
+/// were last in touch and hands the secretary their card with the batch; every agent can look
+/// them up, none but the retrospective can write; and the owner edits and deletes on the web.
+async fn people_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) {
+    use crate::model::{BRAIN_AGENT, BRAIN_TASK};
+    use fleet_feeds::{ConversationKind as ConvKind, FeedEvent};
+
+    // A Slack colleague as the Slack adapters deliver them: their user id is what a record's
+    // contact matches.
+    let zed = |id: &str, text: &str, ts: f64| fleet_feeds::FeedMessage {
+        source: "slack".into(),
+        author_id: Some("U0ZED".into()),
+        ts_unix: ts,
+        ..incoming("C-notes", "notes", ConvKind::Channel, id, "Zed", text)
+    };
+    // The reviews of the earlier flows (the scheduled one and the one asked for) are closed
+    // first, so the run reviewed here is the only one open.
+    wait_for("earlier retrospectives close", || async {
+        let open: i64 = sqlx::query_scalar("select count(*) from retro_runs where verdict is null")
+            .fetch_one(db)
+            .await
+            .unwrap();
+        (open == 0).then_some(())
+    })
+    .await;
+    let now = || chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+    deliver_feed(
+        o,
+        vec![FeedEvent::Message(zed(
+            "p1",
+            "Can we sync on the notes API?",
+            now() - 3600.0,
+        ))],
+    )
+    .await;
+
+    // The day's digest names who wrote, and that nobody has a record yet. The owner is not
+    // one of the people.
+    let digest = crate::retro::digest(o, "people-check").await.unwrap();
+    assert!(
+        digest.contains("## People") && digest.contains("0 people record(s) exist"),
+        "{digest}"
+    );
+    assert!(
+        digest.contains("- slack \"U0ZED\" \"Zed\" · 1 message(s) · no record"),
+        "the day's authors are listed, framed: {digest}"
+    );
+    assert!(
+        !digest.contains("u-Owner"),
+        "the owner is not a colleague: {digest}"
+    );
+    assert!(digest.contains("retro person"), "and it says what to do");
+
+    // The retrospective's pass: two records, an update by the same name in another case, and
+    // the (cap + 1)th write refused.
+    assert!(crate::retro::run_for(o, "people-day").await.unwrap());
+    wait_for("the people pass closes", || async {
+        sqlx::query_scalar::<_, Option<String>>(
+            "select verdict from retro_runs where day = 'people-day'",
+        )
+        .fetch_one(db)
+        .await
+        .unwrap()
+    })
+    .await;
+    let writes: Vec<(bool, String)> = tool_results(db, "retro")
+        .await
+        .into_iter()
+        .filter(|(t, _, _)| t == "retro_person")
+        .map(|(_, ok, r)| (ok, r))
+        .collect();
+    assert_eq!(writes.len(), 4, "{writes:?}");
+    assert!(
+        writes[..3].iter().all(|(ok, _)| *ok),
+        "three writes within the cap: {writes:?}"
+    );
+    assert!(
+        !writes[3].0 && writes[3].1.contains("limit"),
+        "the fourth is refused: {writes:?}"
+    );
+    let looked: Vec<(bool, String)> = tool_results(db, "retro")
+        .await
+        .into_iter()
+        .filter(|(t, _, _)| t == "people")
+        .map(|(_, ok, r)| (ok, r))
+        .collect();
+    assert!(
+        looked
+            .iter()
+            .any(|(ok, r)| *ok && r.contains("No person matches")),
+        "the retrospective may read the records too: {looked:?}"
+    );
+    let names: Vec<String> = sqlx::query_scalar("select name from people order by id")
+        .fetch_all(db)
+        .await
+        .unwrap();
+    assert_eq!(
+        names,
+        ["Zed Example", "Olya"],
+        "one record per person, nothing past the cap"
+    );
+    let zed_row: crate::people::Person =
+        sqlx::query_as("select * from people where name = 'Zed Example'")
+            .fetch_one(db)
+            .await
+            .unwrap();
+    let zed_id = zed_row.id;
+    assert_eq!(zed_row.position.as_deref(), Some("Backend lead"));
+    assert_eq!(zed_row.brief.as_deref(), Some("Owns the notes module."));
+    assert_eq!(zed_row.projects, ["notes", "Billing"]);
+    assert_eq!(zed_row.language.as_deref(), Some("uk"));
+    assert_eq!(
+        zed_row.observations,
+        [
+            "Prefers short and quick communication",
+            "Works only on backend parts"
+        ]
+    );
+    assert_eq!(zed_row.tags, ["night-owl"], "tags are normalised");
+    assert_eq!(zed_row.updated_by, "retro");
+    let retro_seen = zed_row.last_interaction.expect("the material said when");
+    let contacts: Vec<(String, Option<String>, String)> = sqlx::query_as(
+        "select source, native_id, handle from person_contacts where person_id = $1",
+    )
+    .bind(zed_id)
+    .fetch_all(db)
+    .await
+    .unwrap();
+    assert_eq!(
+        contacts,
+        [(
+            "slack".to_owned(),
+            Some("U0ZED".to_owned()),
+            "@zed".to_owned()
+        )]
+    );
+    let audited: i64 = sqlx::query_scalar(
+        "select count(*) from audit_log a join retro_runs r on a.detail->>'run' = r.id::text
+          where a.actor = 'retro' and a.action = 'person.upsert' and r.day = 'people-day'",
+    )
+    .fetch_one(db)
+    .await
+    .unwrap();
+    assert_eq!(
+        audited, 3,
+        "every write is audited, and only those that happened"
+    );
+    // Quiet: the owner asked not to be pinged about these.
+    assert!(
+        !chat
+            .sent()
+            .iter()
+            .any(|(_, _, html, _)| html.contains("Zed Example") || html.contains("Olya")),
+        "nothing about a person record reaches Telegram"
+    );
+    // The next digest reads the record back.
+    let digest = crate::retro::digest(o, "people-check-2").await.unwrap();
+    assert!(
+        digest.contains("2 people record(s) exist")
+            && digest.contains(&format!("· #{zed_id} \"Zed Example\"")),
+        "{digest}"
+    );
+
+    // A later message from him: he was in touch then, and the secretary's batch carries his card.
+    let sent_at = now();
+    deliver_feed(
+        o,
+        vec![FeedEvent::Message(zed(
+            "p2",
+            "Short version: the notes API moved to v2.",
+            sent_at,
+        ))],
+    )
+    .await;
+    let bumped: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("select last_interaction from people where id = $1")
+            .bind(zed_id)
+            .fetch_one(db)
+            .await
+            .unwrap();
+    let bumped = bumped.unwrap();
+    assert!(
+        bumped > retro_seen && (bumped.timestamp_millis() as f64 / 1000.0 - sent_at).abs() < 1.0,
+        "last interaction is the new message's time: {bumped} (was {retro_seen})"
+    );
+    // Both of his messages go in this batch (with whatever earlier flows left waiting).
+    assert!(crate::secretary::flush(o, true).await.unwrap() >= 2);
+    let card = wait_for("the secretary's batch carries the card", || async {
+        events(db, "secretary").await.into_iter().find_map(|e| {
+            (e["type"] == "batch_people").then(|| e["text"].as_str().unwrap_or_default().to_owned())
+        })
+    })
+    .await;
+    for needle in [
+        "untrusted data, written by the retrospective",
+        "Zed Example",
+        "Backend lead",
+        "Language: Ukrainian",
+        "Prefers short and quick communication",
+        "slack @zed (U0ZED)",
+    ] {
+        assert!(card.contains(needle), "{needle:?} missing from {card}");
+    }
+    assert!(!card.contains("Olya"), "only the authors' cards: {card}");
+    // The secretary may look people up, and cannot write a record.
+    let results = wait_for("the secretary tried both", || async {
+        let r = tool_results(db, "secretary").await;
+        r.iter().any(|(t, _, _)| t == "retro_person").then_some(r)
+    })
+    .await;
+    assert!(
+        results
+            .iter()
+            .any(|(t, ok, r)| t == "people" && *ok && r.contains("Zed Example")),
+        "{results:?}"
+    );
+    assert!(
+        results
+            .iter()
+            .any(|(t, ok, r)| t == "retro_person" && !*ok && r.contains("not available")),
+        "{results:?}"
+    );
+    assert!(
+        !sqlx::query_scalar::<_, bool>(
+            "select exists(select 1 from people where name = 'Mallory')"
+        )
+        .fetch_one(db)
+        .await
+        .unwrap()
+    );
+
+    // The brain reading the feed gets the card with the messages, and so do escalations and
+    // Inbox requests, which share the helper.
+    let read = crate::feeds::read(
+        o,
+        "fleet",
+        true,
+        &json!({"refs": [crate::feeds::msg_ref("slack", "C-notes", "p2")]}),
+    )
+    .await
+    .unwrap();
+    assert!(
+        read.contains("v2") && read.contains("Zed Example") && read.contains("untrusted data"),
+        "{read}"
+    );
+    let about =
+        crate::people::about_refs(o, &[crate::feeds::msg_ref("slack", "C-notes", "p1")]).await;
+    assert!(about.contains("Works only on backend parts"), "{about}");
+
+    // Any agent may look him up, by a handle or by number; none but the retrospective writes.
+    let alice: String = sqlx::query_scalar("select agent_id from tasks where id = 'demo-BS-1'")
+        .fetch_one(db)
+        .await
+        .unwrap();
+    let found = call_as(o, &alice, "demo-BS-1", "people", json!({"query": "@zed"}))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        found.ok && found.result.contains("Zed Example"),
+        "{}",
+        found.result
+    );
+    assert!(found.result.contains("untrusted data"));
+    let one = call_as(o, &alice, "demo-BS-1", "people", json!({"id": zed_id}))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        one.result.contains("Works only on backend parts"),
+        "{}",
+        one.result
+    );
+    for (agent, task) in [(alice.as_str(), "demo-BS-1"), (BRAIN_AGENT, BRAIN_TASK)] {
+        let refused = call_as(
+            o,
+            agent,
+            task,
+            "retro_person",
+            json!({"name": "Zed Example", "position": "CEO"}),
+        )
+        .await;
+        let e = refused.expect_err("only the retrospective writes a record");
+        assert!(
+            e.to_string()
+                .contains("only available to the retrospective"),
+            "{e:#}"
+        );
+    }
+    let position: Option<String> = sqlx::query_scalar("select position from people where id = $1")
+        .bind(zed_id)
+        .fetch_one(db)
+        .await
+        .unwrap();
+    assert_eq!(position.as_deref(), Some("Backend lead"));
+
+    // The owner's side, through the real router: the list with its filters, one record, an
+    // edit that makes the record theirs, and a delete.
+    let list = api_get(
+        o,
+        "/api/people?q=zed&tag=night-owl&language=uk&project=NOTES",
+    )
+    .await;
+    assert_eq!(list["people"].as_array().unwrap().len(), 1, "{list}");
+    assert_eq!(list["people"][0]["contacts"][0]["native_id"], "U0ZED");
+    assert_eq!(list["total"], 2);
+    assert!(
+        list["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["tag"] == "night-owl")
+    );
+    let none = api_get(o, "/api/people?language=en&tag=night-owl").await;
+    assert_eq!(none["people"].as_array().unwrap().len(), 0, "{none}");
+    let uri = format!("/api/people/{zed_id}");
+    let done = api_post(
+        o,
+        &uri,
+        json!({"op": "edit", "body": {
+            "position": "Tech lead",
+            "observations": ["Prefers short and quick communication"],
+            "tags": ["Night Owl", "Reviewer"],
+            "contacts": [
+                {"source": "slack", "handle": "@zed", "native_id": "U0ZED"},
+                {"source": "email", "handle": "zed@example.test"},
+            ],
+        }}),
+    )
+    .await;
+    assert!(done["done"].as_str().unwrap().contains("Saved"), "{done}");
+    let detail = api_get(o, &uri).await;
+    let p = &detail["person"];
+    assert_eq!(p["updated_by"], "owner");
+    assert_eq!(p["position"], "Tech lead");
+    assert_eq!(
+        p["observations"],
+        json!(["Prefers short and quick communication"])
+    );
+    assert_eq!(p["tags"], json!(["night-owl", "reviewer"]));
+    assert_eq!(p["contacts"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        p["brief"], "Owns the notes module.",
+        "fields not sent are kept"
+    );
+    let history = detail["history"].as_array().unwrap();
+    assert!(
+        history
+            .iter()
+            .any(|h| h["actor"] == "owner" && h["action"] == "person.edit")
+            && history
+                .iter()
+                .any(|h| h["actor"] == "retro" && h["action"] == "person.upsert"),
+        "{detail}"
+    );
+    // A name another person has is refused in words; so is a second record by name.
+    assert!(
+        crate::people::owner_edit(o, zed_id, &json!({"name": "OLYA"}))
+            .await
+            .is_err()
+    );
+    assert!(crate::people::owner_create(o, "olya").await.is_err());
+    let added = api_post(
+        o,
+        "/api/people",
+        json!({"op": "create", "body": {"name": "Ivan"}}),
+    )
+    .await;
+    assert!(added["id"].as_i64().is_some(), "{added}");
+
+    let gone = api_post(o, &uri, json!({"op": "delete"})).await;
+    assert!(gone["done"].as_str().unwrap().contains("Deleted"), "{gone}");
+    let left: i64 = sqlx::query_scalar(
+        "select (select count(*) from people where id = $1) + (select count(*) from person_contacts where person_id = $1)",
+    )
+    .bind(zed_id)
+    .fetch_one(db)
+    .await
+    .unwrap();
+    assert_eq!(left, 0, "the record and its contacts are gone");
+    let read = crate::feeds::read(
+        o,
+        "fleet",
+        true,
+        &json!({"refs": [crate::feeds::msg_ref("slack", "C-notes", "p2")]}),
+    )
+    .await
+    .unwrap();
+    assert!(
+        !read.contains("Zed Example"),
+        "no card without a record: {read}"
+    );
 }
 
 /// Housekeeping tidies the forum: a finished task's topic goes once it has been quiet, and
@@ -6587,6 +7008,10 @@ async fn lifecycle() {
     // 23. The daily retrospective: the fleet reviews its own day and proposes how to be better.
     //     After the habits flow, so the day it reads has really happened.
     Box::pin(retro_flow(&o, &db, &chat, &hindsight_calls)).await;
+
+    // 23b. The people network: the retrospective keeps the records quietly, the secretary and
+    //      the brain see a card with a person's messages, and only the owner edits on the web.
+    Box::pin(people_flow(&o, &db, &chat)).await;
 
     // 24. A project grows a second and third agent rather than let its tasks queue behind one,
     //     and the bot each new agent needs is asked of the owner with a button, not a token.

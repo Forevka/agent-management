@@ -437,9 +437,20 @@ it has somewhere to work:
    ```
 
 The retrospective holds no secrets, runs in an empty directory with only
-`fleet agent` in its shell, and can do exactly two things: propose and
-conclude. It cannot create a task, answer you, message an agent or change a
-setting — every proposal waits for your tap.
+`fleet agent` in its shell, and can do three things: propose, conclude, and
+keep the people records. It cannot create a task, answer you, message an agent
+or change a setting — every proposal waits for your tap.
+
+**People records.** After its review it also creates and updates the records of
+your colleagues the fleet deals with (position, projects, how to reach them,
+language, observations, tags) from the day's messages and its memories — without
+telling you. The orchestrator and the secretary read a person's card before
+they write to them. Review and correct them on the web UI's People page (your
+edits are marked as yours). How many records one run may write:
+
+```sh
+FLEET_RETRO_MAX_PEOPLE=30
+```
 
 ## 7. Backups
 

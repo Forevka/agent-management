@@ -6,6 +6,16 @@ VPS rolls it out), so each section below is one merge. How to add to this file i
 
 ## Unreleased
 
+- **People network.** The fleet keeps records of your colleagues (position, what they work on,
+  the company's projects, how to reach them, language, observations, and tags for anything else).
+  The daily retrospective creates and updates them after its review, without pinging you, at most
+  `FLEET_RETRO_MAX_PEOPLE` (30) writes a run; you review, edit and delete them on the new People
+  page. The orchestrator and the secretary get a person's card with their messages and look
+  people up (`fleet agent people`) before writing to them. Migration `0023_people.sql` adds two
+  new tables only.
+
+## v0.2.5 — 2026-11-21
+
 - **Changelog.** This file: what changed in each release, written with the change itself.
 - The Windows installer waits for a binary that was just stopped to let go of its file (the tray
   holds it a few seconds), instead of failing halfway through a reinstall.
