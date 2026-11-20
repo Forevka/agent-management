@@ -406,7 +406,8 @@ async fn dispatch_locked(
     };
 
     let run_id = crate::web::random_token()[..12].to_owned();
-    let new_status = if plan_first(task, resume.as_deref()) {
+    let planning = plan_first(task, resume.as_deref());
+    let new_status = if planning {
         status::PLANNING
     } else {
         status::RUNNING
@@ -416,8 +417,10 @@ async fn dispatch_locked(
     // events of this run may change it. Only one claim can win while the task is not running,
     // and none once the agent or the node is gone: the share locks wait for an agent removal or
     // a node revoke in progress, which end or refuse running tasks under their own locks.
+    // A run in plan mode opens a planning round, which only the owner's approval closes.
     let claimed = sqlx::query(
-        "update tasks set node_id = $2, run_id = $3, running = true, dispatched_at = now(), status = $4, updated_at = now()
+        "update tasks set node_id = $2, run_id = $3, running = true, dispatched_at = now(), status = $4, updated_at = now(),
+                          plan_approved = plan_approved and not $6
          where id = $1 and not running
            and exists (select 1 from agents where id = $5 for share)
            and exists (select 1 from nodes where id = $2 for share)",
@@ -427,6 +430,7 @@ async fn dispatch_locked(
     .bind(&run_id)
     .bind(new_status)
     .bind(&agent.id)
+    .bind(planning)
     .execute(&o.db)
     .await?
     .rows_affected()
@@ -552,9 +556,12 @@ async fn dispatch_locked(
 }
 
 /// New work starts in plan mode so the human approves the plan; follow-ups to a running or
-/// approved task continue in auto mode. The brain and the secretary never plan.
+/// approved task continue in auto mode. A task whose plan was never approved resumes in plan
+/// mode too: a run lost to a node restart (or an idle close) while it planned must not come
+/// back in auto and skip the approval. The fleet's own sessions never plan.
 fn plan_first(task: &TaskRow, resume: Option<&str>) -> bool {
-    !crate::model::is_builtin_task(&task.id) && (resume.is_none() || task.status == status::DONE)
+    !crate::model::is_builtin_task(&task.id)
+        && (resume.is_none() || task.status == status::DONE || !task.plan_approved)
 }
 
 /// Leaves a task queued (keeping a follow-up message for when it starts) and says why.
@@ -1620,6 +1627,51 @@ fn env_quote(v: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unapproved_plan_is_resumed_in_plan_mode() {
+        let task = |id: &str, status: &str, plan_approved: bool| TaskRow {
+            id: id.into(),
+            project: "p".into(),
+            title: "t".into(),
+            brief: String::new(),
+            agent_id: Some("a".into()),
+            node_id: None,
+            status: status.into(),
+            topic_id: None,
+            checklist_msg_id: None,
+            session_id: Some("s".into()),
+            running: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            run_id: None,
+            dispatched_at: None,
+            model: None,
+            effort: None,
+            plan_approved,
+        };
+        // New work plans; so does a follow-up to finished work.
+        assert!(plan_first(&task("p-1", "queued", true), None));
+        assert!(plan_first(&task("p-1", status::DONE, true), Some("s")));
+        // An approved task carries on in auto mode when resumed.
+        assert!(!plan_first(&task("p-1", status::RUNNING, true), Some("s")));
+        assert!(!plan_first(&task("p-1", status::FAILED, true), Some("s")));
+        // Its plan never approved, a resumed run (lost to a restart while it planned, then
+        // queued, stopped or failed) plans again rather than skipping the approval.
+        for status in [
+            status::PLANNING,
+            status::QUEUED,
+            status::STOPPED,
+            status::FAILED,
+        ] {
+            assert!(
+                plan_first(&task("p-1", status, false), Some("s")),
+                "{status}"
+            );
+        }
+        // The fleet's own sessions never plan.
+        assert!(!plan_first(&task(BRAIN_TASK, "queued", false), None));
+    }
 
     #[test]
     fn the_secretarys_first_turn_keeps_the_newest_texts() {

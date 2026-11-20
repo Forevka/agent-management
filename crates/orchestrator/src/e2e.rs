@@ -3275,6 +3275,95 @@ async fn habit_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) {
     );
 }
 
+/// A task whose run is lost while its plan waits on the owner (its node restarted) comes back
+/// in plan mode when a message resumes it: an interruption never skips the owner's approval.
+async fn lost_plan_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool) {
+    // A recurring job the owner's habit would approve, but with an open question in its plan,
+    // which a habit never answers: the plan stays open.
+    let task = tasks::create_task(
+        o,
+        CreateTask {
+            project: "demo".into(),
+            title: "Review MR !90".into(),
+            brief: "Review it; the target is unclear.".into(),
+            ticket: Some("MR90".into()),
+            agent: Some("Robin".into()),
+            new_agent: None,
+            model: None,
+            effort: None,
+        },
+    )
+    .await
+    .unwrap();
+    wait_for("the plan waits on the owner", || {
+        open_item(db, &task.id, "plan")
+    })
+    .await;
+    let planning = wait_for("the session is known", || async {
+        o.task(&task.id)
+            .await
+            .unwrap()
+            .filter(|t| t.session_id.is_some())
+    })
+    .await;
+    assert_eq!(planning.status, "planning");
+    assert!(!planning.plan_approved, "a run in plan mode opens a round");
+    let lost_run = planning.run_id.clone();
+
+    // Its node restarts: the run is gone, exactly as `node_connected` ends it.
+    let ended: Vec<TaskRow> =
+        sqlx::query_as("update tasks set running = false where id = $1 and running returning *")
+            .bind(&task.id)
+            .fetch_all(db)
+            .await
+            .unwrap();
+    o.runs_lost(&ended, "its node restarted").await;
+
+    // A message (the owner's follow-up, a wakeup) resumes the same session — in plan mode.
+    tasks::deliver(o, &task, "[Message from the human] any news?".into())
+        .await
+        .unwrap();
+    let resumed = wait_for("the session resumed", || async {
+        o.task(&task.id)
+            .await
+            .unwrap()
+            .filter(|t| t.running && t.run_id != lost_run)
+    })
+    .await;
+    assert_eq!(resumed.session_id, planning.session_id, "the same session");
+    assert_eq!(resumed.status, "planning");
+    let modes = wait_for("the resumed run reports its mode", || async {
+        let modes: Vec<String> = events(db, &task.id)
+            .await
+            .iter()
+            .filter(|e| e["type"] == "system")
+            .filter_map(|e| e["permission_mode"].as_str().map(str::to_owned))
+            .collect();
+        (modes.len() == 2).then_some(modes)
+    })
+    .await;
+    assert_eq!(
+        modes,
+        ["plan", "plan"],
+        "an unapproved plan is never resumed in auto mode"
+    );
+
+    // The lost run's plan card is still open. Approving it now approves a plan of a run that is
+    // gone, not whatever the resumed run will present: the round stays open.
+    let stale = open_item(db, &task.id, "plan")
+        .await
+        .expect("the lost run's plan card");
+    human::answer(o, stale.id, Answer::Approve).await.unwrap();
+    let after = o.task(&task.id).await.unwrap().unwrap();
+    assert!(
+        !after.plan_approved && after.status == "planning",
+        "a stale card does not approve the newer round: {} {}",
+        after.plan_approved,
+        after.status
+    );
+    tasks::stop(o, &resumed, false).await.unwrap();
+}
+
 /// The daily retrospective: the fleet reads its own day, proposes improvements to itself, and
 /// the owner's tap is the only thing that turns one into work. Its memory is the loop: what it
 /// concluded, what the owner decided and what came of the work are retained, and Hindsight keeps
@@ -3335,6 +3424,19 @@ async fn retro_flow(
     ] {
         assert!(digest.contains(needle), "the digest lacks {needle:?}");
     }
+    // The text demo-BS-1's old run handed back reached its current run: shown with what became
+    // of it, never as a lost message.
+    assert!(
+        digest.contains(&format!(
+            "- demo-BS-1 [{}] [Message from the human] meant for the old run",
+            crate::core::REDELIVERED_TO_RUN
+        )),
+        "a handed-back text is shown with its outcome: {digest}"
+    );
+    assert!(
+        !digest.contains("[undelivered]"),
+        "a handed-back text is not trouble: {digest}"
+    );
     assert!(
         digest.len() < 13_000,
         "the digest stays readable: {} chars",
@@ -5273,6 +5375,9 @@ async fn task_lifecycle_through_a_real_node() {
 
     // 22. Habits: the owner's repeated decisions, offered back and then made for them.
     habit_flow(&o, &db, &chat).await;
+
+    // 22b. A run lost while its plan waited on the owner resumes in plan mode, not auto.
+    lost_plan_flow(&o, &db).await;
 
     // 23. The daily retrospective: the fleet reviews its own day and proposes how to be better.
     //     After the habits flow, so the day it reads has really happened.

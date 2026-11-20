@@ -742,6 +742,13 @@ pub async fn button(o: &Arc<Orchestrator>, data: &str) -> Result<String> {
                 // Only a task still going can be stopped; saying otherwise would tell the owner
                 // work was taken back when it had already happened.
                 if task.running || !matches!(task.status.as_str(), "done" | "stopped" | "failed") {
+                    // The approval is taken back with the task: whatever resumes it later (the
+                    // owner's reply, an answer, a wakeup) brings the plan back to the owner
+                    // instead of carrying on with it in auto mode.
+                    sqlx::query("update tasks set plan_approved = false where id = $1")
+                        .bind(&task_id)
+                        .execute(&o.db)
+                        .await?;
                     tasks::stop(o, &task, false).await?;
                     stopped.push(task_id);
                 } else {
