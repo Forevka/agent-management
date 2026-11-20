@@ -76,6 +76,18 @@ pub(crate) fn owner_payload(row: &HumanItemRow) -> Value {
 }
 
 pub async fn create(o: &Orchestrator, item: NewItem<'_>) -> Result<HumanItemRow> {
+    create_with(o, item, true).await
+}
+
+/// [create], optionally without posting the item anywhere. Only for an item the orchestrator
+/// answers itself at once (a plan under an `auto` plan gate, see `plan_gate`): the owner is not
+/// asked, so a card asking them would be noise. Whoever passes `false` must [announce] the item
+/// after all if they end up not answering it, so an open item is never one nobody can see.
+pub(crate) async fn create_with(
+    o: &Orchestrator,
+    item: NewItem<'_>,
+    announce_it: bool,
+) -> Result<HumanItemRow> {
     let project = item
         .project
         .clone()
@@ -94,13 +106,15 @@ pub async fn create(o: &Orchestrator, item: NewItem<'_>) -> Result<HumanItemRow>
     .bind(&item.call_id)
     .fetch_one(&o.db)
     .await?;
-    // The agent now waits on the owner: "typing…" would say the opposite.
+    // The agent now waits on the owner: "typing…" would say the opposite. Not for an item the
+    // orchestrator answers at once: the agent carries straight on.
     if item.blocking
+        && announce_it
         && let Some(task) = item.task
     {
         o.stop_working(&task.id);
     }
-    if let Err(e) = announce(o, &row, item.task).await {
+    if announce_it && let Err(e) = announce(o, &row, item.task).await {
         tracing::warn!("announcing Q-{} failed: {e:#}", row.id);
     }
     if item.blocking
@@ -116,7 +130,11 @@ pub async fn create(o: &Orchestrator, item: NewItem<'_>) -> Result<HumanItemRow>
 }
 
 /// Posts the item in the project's human topic (and a pointer in the task topic).
-async fn announce(o: &Orchestrator, row: &HumanItemRow, task: Option<&TaskRow>) -> Result<()> {
+pub(crate) async fn announce(
+    o: &Orchestrator,
+    row: &HumanItemRow,
+    task: Option<&TaskRow>,
+) -> Result<()> {
     let from = match task {
         Some(t) => o.task_sender(t).await,
         None => From::Orchestrator,

@@ -72,6 +72,16 @@ for line in sys.stdin:
         continue
     text = msg["message"]["content"]
     out({"type": "assistant", "message": {"content": [{"type": "text", "text": "got: " + text[:400]}]}})
+    # The plan gate flow: every message plans, and nothing else. The plan says the owner is
+    # needed only when the text says it is unclear, which a gate set to `auto` must respect.
+    if "plan-gate" in text:
+        plan = "# Plan\n1. Read the new pings\n2. Draft the replies"
+        if "unclear" in text:
+            plan += "\n\nOpen question: which channel counts?"
+        r = tool("permission", {"tool_name": "ExitPlanMode", "input": {"plan": plan}})
+        out({"type": "plan_decision", "decision": json.loads(r["result"])})
+        out({"type": "result", "subtype": "success", "total_cost_usd": 0.0})
+        continue
     # A recurring job (the habits flow): present a plan and finish, nothing else. The plan says
     # the owner is needed only when the brief says the job is unclear, which is what lets the
     # test show that a habit never answers such a plan.

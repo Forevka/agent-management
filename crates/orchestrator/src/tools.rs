@@ -768,7 +768,27 @@ async fn permission(
         }));
     }
     match existing {
-        Some((state, _)) if state == "open" => return Ok(None),
+        Some((state, _)) if state == "open" => {
+            // A plan the gate meant to approve but did not get to (the orchestrator stopped in
+            // between) was never shown to anyone: show it now, so it waits for the owner rather
+            // than for nobody. Only an old one, so this never races the gate's own approval.
+            let unseen: Option<crate::model::HumanItemRow> = sqlx::query_as(
+                "select * from human_items
+                  where node_id = $1 and call_id = $2 and state = 'open'
+                    and tg_msg is null and cardinality(tg_msgs) = 0
+                    and created_at < now() - interval '1 minute'",
+            )
+            .bind(node.to_string())
+            .bind(&call.call_id)
+            .fetch_optional(&o.db)
+            .await?;
+            if let Some(item) = unseen
+                && let Err(e) = human::announce(o, &item, Some(task)).await
+            {
+                tracing::warn!("announcing Q-{} late failed: {e:#}", item.id);
+            }
+            return Ok(None);
+        }
         Some((_, Some(answer))) if answer.0.get("decision").is_some() => {
             return Ok(Some(ToolResult {
                 call_id: call.call_id.clone(),
@@ -795,7 +815,14 @@ async fn permission(
     // shown (`plan`, `display`) is a copy without the project's secret values.
     let display = tasks::redact_display(o, &task.project, &args["input"]).await?;
     let payload = json!({"tool_name": tool, "input": args["input"], "plan": display["plan"], "display": display});
-    let row = human::create(
+    // A plan the task's gate leaves to the orchestrator (`plan_gate`) is recorded like any
+    // other, but without a card asking the owner, and approved right after.
+    let auto = if kind == "plan" {
+        crate::plan_gate::auto_approves(o, task, display["plan"].as_str().unwrap_or_default()).await
+    } else {
+        None
+    };
+    let row = human::create_with(
         o,
         NewItem {
             task: Some(task),
@@ -807,8 +834,13 @@ async fn permission(
             node_id: Some(node.to_string()),
             call_id: Some(call.call_id.clone()),
         },
+        auto.is_none(),
     )
     .await?;
+    if let Some(source) = auto {
+        crate::plan_gate::approve(o, &row, task, source).await;
+        return Ok(None);
+    }
     // A plan of a job the owner always approves, with nothing in it that needs them, is approved
     // by the habit they taught instead of waiting for a tap (`habits`). Only a habit they
     // approved can do this, and only for a plan; everything else waits, as it always did.

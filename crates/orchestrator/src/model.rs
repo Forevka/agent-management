@@ -35,6 +35,8 @@ pub struct ProjectRow {
     pub next_ticket: i32,
     pub needs_you_topic: Option<i64>,
     pub fyi_topic: Option<i64>,
+    /// Who approves plans of its tasks that are not workflows: `owner` or `auto` (`plan_gate`).
+    pub plan_gate: String,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -233,6 +235,8 @@ pub struct WorkflowRow {
     pub tg_msg: Option<i64>,
     pub last_run_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
+    /// Who approves the plans of its runs: `auto` (the default) or `owner` (`plan_gate`).
+    pub plan_gate: String,
 }
 
 /// Something the owner kept doing that the fleet now does for them (see `habits.rs`). Created

@@ -2678,6 +2678,9 @@ pub(crate) async fn project_json(o: &Orchestrator, slug: &str) -> Result<Value> 
             }),
             None => Value::Null,
         },
+        // Who approves plans of its tasks (`plan_gate`); only the owner sets it, on the project
+        // page.
+        "plan_gate": p.plan_gate,
         "secret_folders": folders,
         "slack_channels": channels.iter().map(|(s, id, n, t)| json!({"source": s, "channel_id": id, "name": n, "triage": t})).collect::<Vec<_>>(),
         "nodes": on,

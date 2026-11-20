@@ -127,6 +127,8 @@ export type Project = {
   description: string
   folders?: string[]
   jira?: { key: string | null; board: number | null; credential_folder: string | null }
+  /// Who approves plans of its tasks that are not workflows (a workflow has its own, on its card).
+  plan_gate?: 'owner' | 'auto'
 }
 
 /// A row of the project list, which is the brain's `admin_read` shape: here `jira` is just the
