@@ -58,6 +58,8 @@ cargo fmt --all
   - Do not hold a `std::sync::Mutex` across `.await`.
 - **Database.**
   - Migrations are add-only: new files in `crates/orchestrator/migrations/`, never edits to applied ones.
+  - **The previous release must run against the new schema**, because that is what a rollback does: a new column is nullable or has a default (so older code can still insert rows that do not mention it), nothing is renamed or dropped, and nothing tightens a constraint older code may break. The migrator ignores applied migrations it does not know (`ignore_missing`), so the older binary starts; this rule is what makes it then *work*.
+  - A migration that touches existing rows (a default, a backfill, a new unique index) is the kind no test can catch: CI and the e2e always start from an empty database. The deploy dry-runs it against the live database first (`fleet migrate --dry-run`); run that yourself against a copy of real data before merging such a change.
   - Queries are runtime-checked (`sqlx::query*` with binds). Never `format!` user data into SQL.
 - **Trust boundaries.**
   - Only `TELEGRAM_OWNER_ID` can command the fleet.

@@ -479,21 +479,32 @@ that exact commit with the next patch version (`v0.2.0`, `v0.2.1`, …) and disp
 `release.yml`, which publishes the binaries with SHA-256 sums. On the VPS,
 `fleet-update.timer` notices the new release within five minutes and rolls it out:
 
-1. checks out the tag in `/opt/fleet` and builds its image (`FLEET_VERSION=<tag>`);
+1. checks the tag is **on `main`** — a tag pushed anywhere else is refused, so the owner's
+   merge stays the only way in — then checks it out in `/opt/fleet` and builds its image
+   (`FLEET_VERSION=<tag>`);
 2. **dry-runs its migrations against the live database** (`fleet migrate --dry-run`: all
    pending migrations in one transaction, then rolled back) and stops if any fails —
-   CI's empty database cannot show what a migration does to rows that already exist;
-3. backs the database up to `/root/backups/fleet-before-<tag>.sql.gz` and checks the dump
-   is real;
+   CI's empty database cannot show what a migration does to rows that already exist. It
+   also refuses what a real start would (a half-applied or edited migration). It waits at
+   most 5 s for a lock, so it never stalls the live orchestrator; a dry run that ran out of
+   time waiting is retried next tick rather than counted as a failure;
+3. backs the database up to `/root/backups/fleet-before-<tag>.sql.gz` (the newest ten are
+   kept) and checks the dump is real;
 4. swaps the image in and waits for 20 s of continuous health (running, the right version,
-   the web answering), **rolling back to the previous image** if it does not get there;
+   the web answering), **rolling back to the previous image** if it does not get there —
+   and health-checking that too, so the message says whether the rollback really worked.
+   Rolling back is possible because the migrator ignores migrations it does not know and new
+   columns are nullable or defaulted (CLAUDE.md);
 5. updates this host's node once no agent is running on it, or after two hours regardless
-   (runs resume from their sessions).
+   (runs resume from their sessions). A node binary that will not start is put back and
+   not tried again until the next release.
 
-It says what it did in the Telegram group — quietly on success, loudly on failure. A release
-that failed is not retried; the next one is. To retry it anyway:
-`rm /var/lib/fleet-update/failed-<tag>`. `journalctl -u fleet-update` has the detail, and
-`fleet --version` on any binary says which release it is.
+After any failure `/opt/fleet` is put back on the commit that is running, so a hand deploy
+cannot build the release the updater rejected. It says what it did in the Telegram group —
+quietly on success, loudly on failure. A release that failed is not retried; the next one
+is. To retry it anyway: `rm /var/lib/fleet-update/failed-<tag>`.
+`journalctl -u fleet-update` has the detail, and `fleet --version` on any binary says which
+release it is.
 
 **The updater runs as root, so it is the one part of a release that never updates itself.**
 systemd runs the installed copy, `/usr/local/sbin/fleet-update`; when a release changes

@@ -181,6 +181,14 @@ jobs:
           fi
           # Stable versions only: a hand-made prerelease (v0.3.0-rc.1) is not the line to count from.
           last=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | grep -v -- '-' | head -n1 || true)
+          # Never give older code a newer number. Concurrency orders new pushes, but not a
+          # "re-run failed jobs" on an old run: that would tag an old commit as the newest
+          # release, which GitHub then calls "latest" and the VPS refuses as not a fast-forward.
+          if [ -n "$last" ] && ! git merge-base --is-ancestor "$(git rev-list -n1 "$last")" "$GITHUB_SHA"; then
+            echo "$GITHUB_SHA is not newer than $last (a re-run of an older commit?): not releasing it"
+            echo "new=skip" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           if [ -z "$last" ]; then
             next=v0.2.0
           else
@@ -201,6 +209,7 @@ jobs:
       # A tag pushed with GITHUB_TOKEN starts no workflow, so the release is dispatched at the tag
       # explicitly; `workflow_dispatch` is the documented exception to that rule.
       - name: Dispatch the release
+        if: steps.next.outputs.new != 'skip'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.next.outputs.tag }}

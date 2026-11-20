@@ -45,4 +45,21 @@ pub use core::Orchestrator;
 pub use vault::Vault;
 
 /// Embedded migrations, applied at startup.
-pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+///
+/// **Tolerates migrations it does not know** (`ignore_missing`), which is what makes rolling
+/// back safe. By default sqlx refuses to start against a database that has an applied migration
+/// missing from the binary (`VersionMissing`) — so after a release that added a migration failed
+/// its health check, the previous release would crash-loop instead of taking over, while the
+/// updater announced a successful rollback. Since migrations are add-only, older code works
+/// against a newer schema, provided every new column is nullable or has a default (see
+/// CLAUDE.md), so it can still insert rows that do not mention it.
+///
+/// Built through sqlx's public `set_ignore_missing` rather than its `#[doc(hidden)]` fields,
+/// which it documents as semver-exempt. The dry run (`preflight`) uses this same migrator, so it
+/// accepts and refuses exactly what a real start would.
+pub static MIGRATOR: std::sync::LazyLock<sqlx::migrate::Migrator> =
+    std::sync::LazyLock::new(|| {
+        let mut m = sqlx::migrate!("./migrations");
+        m.set_ignore_missing(true);
+        m
+    });

@@ -178,7 +178,13 @@ async fn run(cli: Cli) -> Result<()> {
                 }
                 Some((v, e)) => {
                     // Printed in full rather than returned, so the updater's log has the
-                    // database's own words; the exit status is what it acts on.
+                    // database's own words; the exit status is what it acts on. 75 is
+                    // EX_TEMPFAIL: a lock or statement wait ran out, so try again later; 1 means
+                    // the migration itself is wrong for this database, so do not deploy it.
+                    if run.transient {
+                        eprintln!("dry run could not finish at {v:04} (try again later): {e}");
+                        std::process::exit(75)
+                    }
                     eprintln!("dry run FAILED at {v:04}: {e}");
                     std::process::exit(1)
                 }
