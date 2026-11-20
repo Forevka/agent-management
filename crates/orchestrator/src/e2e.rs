@@ -3717,6 +3717,35 @@ async fn habit_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) {
         "the agent asked something in it: {}",
         plan.payload.0["plan"]
     );
+    //    And the habit says why it stood aside, naming the task and the marker, so "why did it
+    //    not approve that one?" is answered in its log. Waited for: the plan is open (and seen
+    //    above) a moment before the habit has looked at it and written why it stood aside.
+    let (what, candidate) = wait_for("the habit logs why it stood aside", || async {
+        sqlx::query_as::<_, (String, Option<String>)>(
+            "select what, candidate from habit_log
+              where habit_id = $1 and kind = 'skipped' and source = 'orchestrator'
+                and task_id = $2",
+        )
+        .bind(habit.id)
+        .bind(&unclear.id)
+        .fetch_optional(db)
+        .await
+        .unwrap()
+    })
+    .await;
+    let marker = crate::habits::stopper(plan.payload.0["plan"].as_str().unwrap()).unwrap();
+    assert!(
+        what.contains(&format!("the plan says {marker:?}")),
+        "{what}"
+    );
+    assert_eq!(candidate.as_deref(), Some(unclear.id.as_str()));
+    let checked: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("select last_checked_at from habits where id = $1")
+            .bind(habit.id)
+            .fetch_one(db)
+            .await
+            .unwrap();
+    assert!(checked.is_some(), "looking at a plan counts as evaluating");
     human::answer(o, plan.id, Answer::Approve).await.unwrap();
     done(unclear.id).await;
 
@@ -3759,38 +3788,147 @@ async fn habit_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) {
         "the paused habit already covers that"
     );
 
-    // 7. The other kind: a standing request of the owner's, made without being asked, and made
-    //    once per interval rather than every tick.
-    let (action, summary) = crate::admin::prepare(
-        o,
-        crate::admin::AdminAction::HabitAdd {
-            kind: "do".into(),
-            why: "every Monday you ask for the weekend's chat".into(),
-            project: None,
-            title_like: None,
-            decision: None,
-            schedule: Some("every:15m".into()),
-            brief: Some("Summarise the weekend's chat activity.".into()),
-        },
-    )
-    .await
-    .unwrap();
-    assert!(summary.contains("without being asked"), "{summary}");
+    // 7. The other kind: a standing duty the owner stated, made without being asked, and made
+    //    once per interval rather than every tick. It belongs to a project, and the project
+    //    must be a real one.
+    let duty = |project: &str| crate::admin::AdminAction::HabitAdd {
+        kind: "do".into(),
+        why: "\"every day pick two fresh MRs from #code-reviews and review them\"".into(),
+        project: Some(project.into()),
+        title_like: None,
+        decision: None,
+        schedule: Some("every:15m".into()),
+        brief: Some("Pick two fresh MRs from #code-reviews and review them.".into()),
+    };
+    assert!(
+        crate::admin::prepare(o, duty("no-such-project"))
+            .await
+            .is_err(),
+        "a duty's project is a real project"
+    );
+    let (action, summary) = crate::admin::prepare(o, duty("demo")).await.unwrap();
+    assert!(
+        summary.contains("without being asked in project demo"),
+        "{summary}"
+    );
+    assert!(summary.contains("I report what I did"), "{summary}");
     crate::admin::execute(o, crate::admin::Actor::Owner, &action)
         .await
         .unwrap();
+    let duty_id: i64 = sqlx::query_scalar("select id from habits where kind = 'do'")
+        .fetch_one(db)
+        .await
+        .unwrap();
+    // The brain cannot report on a request it was never handed.
+    let early = call_as(
+        o,
+        "orchestrator",
+        "brain",
+        "habit_report",
+        json!({"habit": format!("H-{duty_id}"), "did": "reviewed !1"}),
+    )
+    .await;
+    assert!(
+        early.is_err_and(|e| e.to_string().contains("has not handed you a request")),
+        "a report is always about a request that was made"
+    );
     crate::habits::run_due(o).await.unwrap();
-    let standing = "[Standing request from the owner (habit H-";
+    let standing = format!("[Standing request from the owner (habit H-{duty_id}, project demo)]");
     wait_for("the brain gets the standing request", || async {
-        (brain_heard(db, standing).await > 0).then_some(())
+        (brain_heard(db, &standing).await > 0).then_some(())
     })
     .await;
     crate::habits::run_due(o).await.unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(
-        brain_heard(db, standing).await,
+        brain_heard(db, &standing).await,
         1,
         "a schedule asks once per interval, not once per tick"
+    );
+    let habits = || async { crate::admin::read(o, "habits", None).await.unwrap() };
+    let mine = |all: &str| {
+        let all: Value = serde_json::from_str(all).unwrap();
+        all["habits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|h| h["id"] == json!(duty_id))
+            .cloned()
+            .unwrap()
+    };
+    let shown = mine(&habits().await);
+    assert!(!shown["last_checked_at"].is_null(), "{shown}");
+    assert!(!shown["last_fired_at"].is_null(), "{shown}");
+    assert!(
+        shown["status"]
+            .as_str()
+            .unwrap()
+            .ends_with("no report from the brain yet"),
+        "{shown}"
+    );
+
+    //    The brain reports what it did and what it passed over, and that is what the owner reads
+    //    when they ask whether it ran.
+    let reported = call_as(
+        o,
+        "orchestrator",
+        "brain",
+        "habit_report",
+        json!({"habit": duty_id, "did": "reviewed !21 and !22",
+               "skipped": ["MR !20: already reviewed by someone else"]}),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(reported.ok, "{}", reported.result);
+    let shown = mine(&habits().await);
+    assert!(
+        shown["status"]
+            .as_str()
+            .unwrap()
+            .ends_with("the brain reported"),
+        "{shown}"
+    );
+    let log = shown["log"].as_array().unwrap();
+    assert!(
+        log.iter()
+            .any(|e| e["kind"] == "report" && e["what"] == "reviewed !21 and !22"),
+        "{log:?}"
+    );
+    assert!(
+        log.iter().any(|e| e["kind"] == "skipped"
+            && e["source"] == "brain"
+            && e["candidate"] == "MR !20"
+            && e["what"] == "already reviewed by someone else"),
+        "{log:?}"
+    );
+    assert!(log.iter().any(|e| e["kind"] == "fired"), "{log:?}");
+
+    //    Held by its daily cap, it says so — once, however many ticks look at it.
+    sqlx::query(
+        "update habits set cap = 1, last_used_at = now() - interval '1 hour' where id = $1",
+    )
+    .bind(duty_id)
+    .execute(db)
+    .await
+    .unwrap();
+    crate::habits::run_due(o).await.unwrap();
+    crate::habits::run_due(o).await.unwrap();
+    let capped: i64 = sqlx::query_scalar(
+        "select count(*) from habit_log
+          where habit_id = $1 and kind = 'skipped' and what like '%daily cap%'",
+    )
+    .bind(duty_id)
+    .fetch_one(db)
+    .await
+    .unwrap();
+    assert_eq!(capped, 1, "a cap reached is one line, not one per tick");
+    let status = mine(&habits().await)["status"].as_str().unwrap().to_owned();
+    assert!(status.contains("daily cap of 1 is reached"), "{status}");
+    assert_eq!(
+        brain_heard(db, &standing).await,
+        1,
+        "and it asked nothing more"
     );
 }
 
@@ -5843,7 +5981,8 @@ async fn lifecycle() {
     }
 
     // Other agents cannot administer the fleet, whatever they claim.
-    for tool in ["admin_read", "admin_propose", "web_link"] {
+    // Nor write a habit's log: what the owner reads about "did it run?" is the brain's account.
+    for tool in ["admin_read", "admin_propose", "web_link", "habit_report"] {
         let refused = crate::tools::handle(
             &o,
             node_key,

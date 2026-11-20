@@ -722,16 +722,31 @@ async fn command(
                  over, and you decide whether to take it."
                     .into()
             } else {
-                let mut s = String::from("<b>Habits</b>\n");
+                // The pointer first: a long list is cut at Telegram's limit from the end.
+                let mut s = String::from(
+                    "<b>Habits</b>\n<i>Each one's card in the Rules topic has Pause and Delete; \
+                     its full log is on the web page (/web).</i>\n",
+                );
                 for h in &rows {
                     s.push_str(&format!(
                         "{} H-{} · {}\n",
                         if h.active { "🔁" } else { "⏸" },
                         h.id,
-                        esc(&crate::habits::describe(h))
+                        esc(&crate::habits::describe(h)),
                     ));
+                    // Where it stands, from its own log: the answer to "did it run?". A paused
+                    // one already says why in its description.
+                    if h.active {
+                        let record = crate::habits::record(o, h.id).await?;
+                        s.push_str(&format!(
+                            "    <i>{}</i>\n",
+                            esc(&clip(
+                                &crate::habits::status(h, &record, chrono::Utc::now()),
+                                140
+                            ))
+                        ));
+                    }
                 }
-                s.push_str("<i>Each one's card in the Rules topic has Pause and Delete.</i>");
                 s
             }
         }

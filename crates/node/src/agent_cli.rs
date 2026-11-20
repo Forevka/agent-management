@@ -141,6 +141,9 @@ pub enum AgentCmd {
     Reply { text: String },
     /// Pass the owner's wishes on to the secretary (e.g. what to ignore, what is a todo).
     SecretaryNote { text: String },
+    /// The owner's habits: report what you did with a standing request.
+    #[command(subcommand)]
+    Habit(HabitCmd),
     // Secretary only.
     /// The owner's todo list.
     #[command(subcommand)]
@@ -290,7 +293,8 @@ pub enum AdminCmd {
         /// What of the owner's own doing this was learned from, in their terms. They read it.
         #[arg(long)]
         why: String,
-        /// decide: the project whose plans it covers.
+        /// decide: the project whose plans it covers. do: the project the duty belongs to
+        /// (optional, but name it when there is one).
         #[arg(long)]
         project: Option<String>,
         /// decide: which tasks, as a pattern over the lowercased title with digits as '#'
@@ -502,6 +506,22 @@ pub enum JiraCmd {
         project: Option<String>,
         #[arg(long)]
         note: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum HabitCmd {
+    /// After a `[Standing request ... (habit H-n)]`: what you did, and each candidate you passed
+    /// over and why. It is what the owner reads when they ask whether the habit ran.
+    Report {
+        /// The habit: 3 or H-3.
+        habit: String,
+        /// What you did ("-" reads it from stdin).
+        #[arg(long)]
+        did: Option<String>,
+        /// A candidate you passed over: "<candidate>: <reason>" (repeatable).
+        #[arg(long)]
+        skipped: Vec<String>,
     },
 }
 
@@ -846,6 +866,18 @@ pub fn to_call(cmd: AgentCmd) -> Result<(&'static str, Value)> {
         AgentCmd::SecretaryNote { text } => {
             ("secretary_note", json!({"text": stdin_if_dash(text)?}))
         }
+        AgentCmd::Habit(HabitCmd::Report {
+            habit,
+            did,
+            skipped,
+        }) => (
+            "habit_report",
+            json!({
+                "habit": habit,
+                "did": did.map(stdin_if_dash).transpose()?,
+                "skipped": skipped,
+            }),
+        ),
         AgentCmd::Todo(TodoCmd::Add {
             title,
             detail,
@@ -1280,6 +1312,24 @@ mod tests {
         assert_eq!(
             call(&["secretary-note", "Alice is VIP"]).0,
             "secretary_note"
+        );
+        assert_eq!(
+            call(&[
+                "habit",
+                "report",
+                "H-3",
+                "--did",
+                "reviewed !12",
+                "--skipped",
+                "!10: already reviewed",
+                "--skipped",
+                "!11: draft"
+            ]),
+            (
+                "habit_report",
+                json!({"habit": "H-3", "did": "reviewed !12",
+                       "skipped": ["!10: already reviewed", "!11: draft"]})
+            )
         );
         assert_eq!(
             call(&["admin", "show", "project", "demo"]),

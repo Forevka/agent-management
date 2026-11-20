@@ -2132,11 +2132,24 @@ pub async fn prepare(o: &Orchestrator, action: AdminAction) -> Result<(AdminActi
                         .to_owned();
                     ensure!(!brief.is_empty(), "brief required");
                     check_len("brief", &brief, MAX_PROPOSED_DESCRIPTION)?;
+                    // The project a standing duty belongs to, when it has one: a label the
+                    // request carries and the owner reads, so it must name a real project.
+                    let project = match project {
+                        Some(p) if !p.trim().is_empty() => {
+                            Some(tasks::project(o, p.trim()).await?.slug)
+                        }
+                        _ => None,
+                    };
                     let summary = format!(
-                        "From now on, {schedule} ({}), do this without being asked: {}. It \
-                         reaches me as if you had just asked for it, at most 10 times a day, and \
+                        "From now on, {schedule} ({}), do this without being asked{}: {}. It \
+                         reaches me as if you had just asked for it, at most 10 times a day; I \
+                         report what I did and what I passed over, which /habits shows, and \
                          /habits pauses it. Learned from: {}.",
                         crate::habits::how_often(&schedule),
+                        project
+                            .as_deref()
+                            .map(|p| format!(" in project {p}"))
+                            .unwrap_or_default(),
                         q(&brief),
                         q(&why)
                     );
@@ -2144,7 +2157,7 @@ pub async fn prepare(o: &Orchestrator, action: AdminAction) -> Result<(AdminActi
                         A::HabitAdd {
                             kind: "do".into(),
                             why,
-                            project: None,
+                            project,
                             title_like: None,
                             decision: None,
                             schedule: Some(schedule),
@@ -2652,7 +2665,7 @@ pub async fn read(o: &Orchestrator, what: &str, target: Option<&str>) -> Result<
                     .collect(),
             )
         }
-        "habits" => crate::habits::json(o).await?,
+        "habits" => crate::habits::json(o, true).await?,
         other => bail!(
             "unknown read {other:?}; use projects, project <slug>, agents [project], bots, nodes, node <id|name>, secrets, secret <folder>, status, items or habits"
         ),

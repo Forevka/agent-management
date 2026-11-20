@@ -1223,7 +1223,7 @@ async fn inbox_act(State(o): State<O>, h: HeaderMap, Json(a): Json<Act>) -> Api 
 
 async fn habits(State(o): State<O>, h: HeaderMap) -> Api {
     guard!(o, h);
-    Ok(Json(crate::habits::json(&o).await?))
+    Ok(Json(crate::habits::json(&o, false).await?))
 }
 
 /// The same three things the buttons on a habit's card do, by the same code path, so the web and

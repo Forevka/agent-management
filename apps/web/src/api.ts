@@ -230,8 +230,21 @@ export type Habits = {
     paused_why: string | null
     cap: number
     created_at: string
-    last_used_at: string | null
-    uses: { at: string; what: string }[]
+    /// One line on where it stands ("fired …; no report from the brain yet"), the same line
+    /// `/habits` shows in Telegram.
+    status: string
+    last_checked_at: string | null
+    last_fired_at: string | null
+    last_report_at: string | null
+    /// Newest first: what it did, what it looked at and left, and what the brain reported.
+    log: {
+      at: string
+      kind: 'fired' | 'skipped' | 'failed' | 'report'
+      source: 'orchestrator' | 'brain'
+      task: string | null
+      candidate: string | null
+      what: string
+    }[]
   }[]
 }
 

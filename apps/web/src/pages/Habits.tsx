@@ -5,6 +5,32 @@ import { Page, PageHeader, Row, Section, Stack, Text } from '@/components/fx/lay
 import type { Habits as HabitsT } from '../api'
 import { ActionButton, Loaded, When, useApi } from '../ui'
 
+type Entry = HabitsT['habits'][number]['log'][number]
+
+/// How each line of a habit's log reads at a glance: acting is good news, standing aside is
+/// worth a look, failing is not.
+const TONE: Record<Entry['kind'], 'success' | 'neutral' | 'warning' | 'danger' | 'info'> = {
+  fired: 'success',
+  skipped: 'warning',
+  failed: 'danger',
+  report: 'info',
+}
+
+/// The habit's own matching "stands aside"; the orchestrator, handling a standing request,
+/// "passes over" a candidate (and says why).
+function label(kind: Entry['kind'], source: Entry['source']): string {
+  switch (kind) {
+    case 'fired':
+      return 'acted'
+    case 'skipped':
+      return source === 'brain' ? 'passed over' : 'stood aside'
+    case 'failed':
+      return 'failed'
+    case 'report':
+      return 'report'
+  }
+}
+
 /// What the fleet does without being asked, because the owner kept doing it themselves. The page
 /// exists so there is one place that answers "what acts on its own, and how do I stop it".
 export default function Habits() {
@@ -46,32 +72,44 @@ export default function Habits() {
                         <Text size="1" tone="muted" mono>
                           H-{h.id}
                         </Text>
+                        {h.project && <Badge tone="info">{h.project}</Badge>}
                         <Text size="1" tone="muted">
                           up to {h.cap}/day
                         </Text>
-                        {h.last_used_at && (
+                        {h.last_checked_at && (
+                          <Row gap="1">
+                            <Text size="1" tone="muted">
+                              last checked
+                            </Text>
+                            <When at={h.last_checked_at} />
+                          </Row>
+                        )}
+                        {h.last_fired_at && (
                           <Row gap="1">
                             <Text size="1" tone="muted">
                               last acted
                             </Text>
-                            <When at={h.last_used_at} />
+                            <When at={h.last_fired_at} />
                           </Row>
                         )}
                       </Row>
-                      {h.paused_why && (
-                        <Text size="1" tone="muted" breakAll>
-                          Paused: {h.paused_why}
-                        </Text>
-                      )}
-                      {h.uses.length > 0 && (
+                      <Text size="2" breakAll>
+                        {h.status}
+                      </Text>
+                      {h.log.length > 0 && (
                         <Stack gap="1">
                           <Text size="1" tone="muted" weight="medium">
-                            Recently
+                            Log
                           </Text>
-                          {h.uses.map((u, i) => (
-                            <Text key={i} size="1" tone="muted" breakAll>
-                              {u.at} — {u.what}
-                            </Text>
+                          {h.log.map((e, i) => (
+                            <Row key={i} gap="2" align="start">
+                              <When at={e.at} />
+                              <Badge tone={TONE[e.kind]}>{label(e.kind, e.source)}</Badge>
+                              <Text size="1" tone="muted" breakAll>
+                                {e.candidate && e.kind !== 'fired' ? `${e.candidate}: ` : ''}
+                                {e.what}
+                              </Text>
+                            </Row>
                           ))}
                         </Stack>
                       )}
@@ -109,16 +147,26 @@ export default function Habits() {
       <Section title="How a habit is born">
         <Card>
           <CardContent>
-            <Text as="p" size="2" tone="muted">
-              Once a day the orchestrator looks at what you have been deciding and asking for. If
-              the same decision has gone your way three times in a fortnight with nothing sent back
-              for changes, it offers a habit as an ordinary Approve / Reject card — and only your
-              tap creates one. A habit never answers a plan that names a blocker, an open question
-              or an unclear acceptance criterion, never answers while another question of that task
-              is open, and stands aside for good once you send any plan of that shape back. Each one
-              is capped per day (see each habit above), and the card it leaves in the task’s topic
-              has a button that stops the task and pauses the habit.
-            </Text>
+            <Stack gap="2">
+              <Text as="p" size="2" tone="muted">
+                Once a day the orchestrator looks at what you have been deciding and asking for. If
+                the same decision has gone your way three times in a fortnight with nothing sent
+                back for changes, it offers a habit as an ordinary Approve / Reject card — and only
+                your tap creates one. A habit never answers a plan that names a blocker, an open
+                question or an unclear acceptance criterion, never answers while another question of
+                that task is open, and stands aside for good once you send any plan of that shape
+                back. Each one is capped per day (see each habit above), and the card it leaves in
+                the task’s topic has a button that stops the task and pauses the habit.
+              </Text>
+              <Text as="p" size="2" tone="muted">
+                A standing duty you state yourself (“every day review two fresh MRs”, “always keep
+                the Jira status current”) is offered as a habit straight away, with your words, a
+                schedule and its project, instead of being kept in the orchestrator’s memory. Each
+                habit keeps a log: when it was last checked, when it last acted, what it stood aside
+                from and why, and the orchestrator’s report of what it did with each request and
+                what it passed over. So “did something go wrong?” is answered here.
+              </Text>
+            </Stack>
           </CardContent>
         </Card>
       </Section>
