@@ -1,12 +1,16 @@
 import { useState } from 'react'
-import {
-  Badge, Box, Button, Callout, Card, Code, Flex, Heading, Select, Table, Text, TextField,
-} from '@radix-ui/themes'
-import { LockClosedIcon } from '@radix-ui/react-icons'
 import { Link } from 'react-router-dom'
+import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import { Card, CardContent, CardHeader } from '@/components/ui/card'
+import { Select } from '@/components/ui/select'
+import { TextField } from '@/components/ui/text-field'
+import { Page, PageHeader, Row, Section, Stack, Text } from '@/components/fx/layout'
+import { Note } from '@/components/fx/note'
+import { Table } from '@/components/fx/table'
 import * as api from '../api'
 import type { Secrets as SecretsT } from '../api'
-import { ErrorNote, Loaded, Section, useApi } from '../ui'
+import { ErrorNote, Loaded, useApi } from '../ui'
 
 export default function Secrets() {
   const state = useApi<SecretsT>('/api/secrets')
@@ -28,113 +32,104 @@ export default function Secrets() {
   }
 
   return (
-    <>
-      <Heading size="6" mt="5" mb="3">
-        Secrets
-      </Heading>
+    <Page>
+      <PageHeader title="Secrets" description="Folders of key/value pairs an agent can be given for one run." />
 
-      <Callout.Root mb="3">
-        <Callout.Icon>
-          <LockClosedIcon />
-        </Callout.Icon>
-        <Callout.Text>
-          Values are encrypted at rest and never shown again — not here, not to an agent that reads
-          them. A folder reaches an agent only as a <Code>.env</Code> file for one run, outside the
-          project directory, deleted when the agent exits.
-        </Callout.Text>
-      </Callout.Root>
+      <Note tone="info" title="Write-only on purpose">
+        Values are encrypted at rest and never shown again — not here, and not to an agent that
+        reads them. A folder reaches an agent only as a <Text mono>.env</Text> file for one run,
+        outside the project directory, deleted when the agent exits.
+      </Note>
 
       {error && <ErrorNote>{error}</ErrorNote>}
 
       <Loaded state={state}>
         {(d) => (
           <>
-            <Table.Root variant="surface">
-              <Table.Header>
-                <Table.Row>
-                  <Table.ColumnHeaderCell>Folder</Table.ColumnHeaderCell>
-                  <Table.ColumnHeaderCell>Keys</Table.ColumnHeaderCell>
-                  <Table.ColumnHeaderCell>Projects</Table.ColumnHeaderCell>
-                </Table.Row>
-              </Table.Header>
-              <Table.Body>
-                {d.folders.map((f) => (
-                  <Table.Row key={f.id}>
-                    <Table.Cell>
-                      <Link className="fleet-row-link" to={`/secrets/${f.id}`}>
+            <Table
+              rows={d.folders}
+              rowKey={(f) => String(f.id)}
+              loading={state.loading}
+              empty="No folders yet"
+              columns={[
+                {
+                  key: 'folder',
+                  header: 'Folder',
+                  width: '40%',
+                  cell: (f) => (
+                    <Stack gap="1">
+                      <Link to={`/secrets/${f.id}`} className="fx-link">
                         {f.name}
                       </Link>
                       {f.preset && f.preset !== 'custom' && (
-                        <Text as="div" size="1" color="gray">
+                        <Text size="1" tone="muted">
                           {f.preset}
                         </Text>
                       )}
-                    </Table.Cell>
-                    <Table.Cell>
-                      <Text size="2">{f.keys}</Text>
-                    </Table.Cell>
-                    <Table.Cell>
-                      <Flex gap="1" wrap="wrap">
-                        {f.projects.length === 0 ? (
-                          <Text size="2" color="gray">
-                            bound to none
-                          </Text>
-                        ) : (
-                          f.projects.map((p) => (
-                            <Badge key={p} variant="soft">
-                              {p}
-                            </Badge>
-                          ))
-                        )}
-                      </Flex>
-                    </Table.Cell>
-                  </Table.Row>
-                ))}
-              </Table.Body>
-            </Table.Root>
+                    </Stack>
+                  ),
+                },
+                { key: 'keys', header: 'Keys', numeric: true, cell: (f) => <Text size="1">{f.keys}</Text> },
+                {
+                  key: 'projects',
+                  header: 'Projects',
+                  cell: (f) =>
+                    f.projects.length === 0 ? (
+                      <Text size="1" tone="muted">
+                        bound to none
+                      </Text>
+                    ) : (
+                      <Row gap="1">
+                        {f.projects.map((p) => (
+                          <Badge key={p}>{p}</Badge>
+                        ))}
+                      </Row>
+                    ),
+                },
+              ]}
+            />
 
             <Section title="New folder">
               <Card>
-                <form
-                  onSubmit={(e) => {
-                    e.preventDefault()
-                    void create(new FormData(e.currentTarget))
-                  }}
-                >
-                  <Flex gap="2" align="end" wrap="wrap">
-                    <label style={{ minWidth: '14rem', flexGrow: 1 }}>
-                      <Text as="div" size="2" mb="1" weight="medium">
-                        Name
-                      </Text>
-                      <TextField.Root name="name" placeholder="jira" required />
-                    </label>
-                    <Box>
-                      <Text as="div" size="2" mb="1" weight="medium">
-                        Preset
-                      </Text>
-                      {/* A preset only suggests the keys; a folder may hold anything. */}
-                      <Select.Root value={preset} onValueChange={setPreset}>
-                        <Select.Trigger />
-                        <Select.Content>
-                          {d.presets.map((p) => (
-                            <Select.Item key={p.name} value={p.name}>
-                              {p.name}
-                              {p.keys.length > 0 ? ` (${p.keys.length} keys)` : ''}
-                            </Select.Item>
-                          ))}
-                        </Select.Content>
-                      </Select.Root>
-                    </Box>
-                    <Button type="submit" loading={busy}>
-                      Create
-                    </Button>
-                  </Flex>
-                </form>
+                <CardHeader
+                  title="Add a folder"
+                  description="A preset only suggests the keys; a folder may hold anything."
+                />
+                <CardContent>
+                  <form
+                    onSubmit={(e) => {
+                      e.preventDefault()
+                      void create(new FormData(e.currentTarget))
+                    }}
+                  >
+                    <Row gap="3" align="end">
+                      <div style={{ minWidth: '14rem', flexGrow: 1 }}>
+                        <TextField name="name" label="Name" placeholder="jira" required size="sm" />
+                      </div>
+                      <div style={{ minWidth: '12rem' }}>
+                        <Select
+                          label="Preset"
+                          size="sm"
+                          value={preset}
+                          onChange={setPreset}
+                          options={d.presets.map((p) => ({
+                            value: p.name,
+                            label: p.name,
+                            description: p.keys.length > 0 ? `${p.keys.length} keys` : undefined,
+                          }))}
+                        />
+                      </div>
+                      <Button type="submit" loading={busy} variant="secondary">
+                        Create
+                      </Button>
+                    </Row>
+                  </form>
+                </CardContent>
               </Card>
             </Section>
           </>
         )}
       </Loaded>
-    </>
+    </Page>
   )
 }

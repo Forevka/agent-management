@@ -1,9 +1,13 @@
 import { useMemo } from 'react'
-import { Badge, Box, Flex, Heading, Select, Table, Text, TextField } from '@radix-ui/themes'
-import { MagnifyingGlassIcon } from '@radix-ui/react-icons'
 import { Link, useSearchParams } from 'react-router-dom'
+import { Badge } from '@/components/ui/badge'
+import { Select } from '@/components/ui/select'
+import { TextField } from '@/components/ui/text-field'
+import { Page, PageHeader, Row, Stack, Text } from '@/components/fx/layout'
+import { Table } from '@/components/fx/table'
+import { SearchIcon } from '@/components/fx/icons'
 import type { Overview, Task } from '../api'
-import { Empty, Loaded, StatusBadge, When, useApi } from '../ui'
+import { Loaded, StatusBadge, When, useApi } from '../ui'
 
 const STATUSES = ['queued', 'planning', 'running', 'waiting', 'done', 'stopped', 'failed']
 
@@ -38,117 +42,128 @@ export default function Tasks() {
   }
 
   return (
-    <>
-      <Heading size="6" mt="5" mb="3">
-        Tasks
-      </Heading>
+    <Page>
+      <PageHeader
+        title="Tasks"
+        description="Everything the fleet has worked on. The filters are in the URL, so a view can be shared."
+        meta={
+          state.data && (
+            <Text size="1" tone="muted">
+              {state.data.tasks.length} of {state.data.total}
+            </Text>
+          )
+        }
+      />
 
-      <Flex gap="2" wrap="wrap" align="center" mb="3">
-        <Box style={{ minWidth: '14rem', flexGrow: 1 }}>
-          <TextField.Root
+      <Row gap="2" align="end">
+        <div style={{ minWidth: '15rem', flexGrow: 1 }}>
+          <TextField
             placeholder="Search id or title"
             defaultValue={q}
             onChange={(e) => set('q', e.currentTarget.value)}
-          >
-            <TextField.Slot>
-              <MagnifyingGlassIcon />
-            </TextField.Slot>
-          </TextField.Root>
-        </Box>
-        <Select.Root value={project || 'all'} onValueChange={(v) => set('project', v === 'all' ? '' : v)}>
-          <Select.Trigger placeholder="Project" />
-          <Select.Content>
-            <Select.Item value="all">Every project</Select.Item>
-            {(overview.data?.projects ?? []).map((p) => (
-              <Select.Item key={p.slug} value={p.slug}>
-                {p.name || p.slug}
-              </Select.Item>
-            ))}
-          </Select.Content>
-        </Select.Root>
-        <Select.Root value={status || 'all'} onValueChange={(v) => set('status', v === 'all' ? '' : v)}>
-          <Select.Trigger placeholder="Status" />
-          <Select.Content>
-            <Select.Item value="all">Any status</Select.Item>
-            {STATUSES.map((s) => (
-              <Select.Item key={s} value={s}>
-                {s}
-              </Select.Item>
-            ))}
-          </Select.Content>
-        </Select.Root>
-        <Select.Root value={builtin ? 'true' : 'false'} onValueChange={(v) => set('builtin', v === 'true' ? 'true' : '')}>
-          <Select.Trigger />
-          <Select.Content>
-            <Select.Item value="false">Work only</Select.Item>
-            {/* The brain and the secretary are standing sessions, not work: off by default. */}
-            <Select.Item value="true">Include the brain and secretary</Select.Item>
-          </Select.Content>
-        </Select.Root>
-      </Flex>
+            prefix={<SearchIcon />}
+            clearable
+            onClear={() => set('q', '')}
+            size="sm"
+            aria-label="Search tasks"
+          />
+        </div>
+        <div style={{ minWidth: '11rem' }}>
+          <Select
+            size="sm"
+            aria-label="Project"
+            value={project || 'all'}
+            onChange={(v) => set('project', v === 'all' ? '' : v)}
+            options={[
+              { value: 'all', label: 'Every project' },
+              ...(overview.data?.projects ?? []).map((p) => ({ value: p.slug, label: p.name || p.slug })),
+            ]}
+          />
+        </div>
+        <div style={{ minWidth: '10rem' }}>
+          <Select
+            size="sm"
+            aria-label="Status"
+            value={status || 'all'}
+            onChange={(v) => set('status', v === 'all' ? '' : v)}
+            options={[{ value: 'all', label: 'Any status' }, ...STATUSES.map((s) => ({ value: s, label: s }))]}
+          />
+        </div>
+        <div style={{ minWidth: '13rem' }}>
+          {/* The brain, the secretary and the retrospective are standing sessions, not work. */}
+          <Select
+            size="sm"
+            aria-label="Include the fleet's own sessions"
+            value={builtin ? 'true' : 'false'}
+            onChange={(v) => set('builtin', v === 'true' ? 'true' : '')}
+            options={[
+              { value: 'false', label: 'Work only' },
+              { value: 'true', label: "The fleet's own sessions too" },
+            ]}
+          />
+        </div>
+      </Row>
 
       <Loaded state={state}>
         {(d) => (
-          <>
-            <Text size="2" color="gray">
-              {d.tasks.length} of {d.total}
-            </Text>
-            {d.tasks.length === 0 ? (
-              <Empty>No task matches.</Empty>
-            ) : (
-              <Table.Root variant="surface" mt="2">
-                <Table.Header>
-                  <Table.Row>
-                    <Table.ColumnHeaderCell>Task</Table.ColumnHeaderCell>
-                    <Table.ColumnHeaderCell>Project</Table.ColumnHeaderCell>
-                    <Table.ColumnHeaderCell>Status</Table.ColumnHeaderCell>
-                    <Table.ColumnHeaderCell>Agent</Table.ColumnHeaderCell>
-                    <Table.ColumnHeaderCell>Sessions</Table.ColumnHeaderCell>
-                    <Table.ColumnHeaderCell>Touched</Table.ColumnHeaderCell>
-                  </Table.Row>
-                </Table.Header>
-                <Table.Body>
-                  {d.tasks.map((t) => (
-                    <Table.Row key={t.id}>
-                      <Table.Cell>
-                        <Link className="fleet-row-link" to={`/tasks/${t.id}`}>
-                          {t.id}
-                        </Link>
-                        <Text as="div" size="2" color="gray" className="fleet-wrap">
-                          {t.title}
-                        </Text>
-                      </Table.Cell>
-                      <Table.Cell>
-                        <Link className="fleet-row-link" to={`/projects/${t.project}`}>
-                          <Text size="2">{t.project}</Text>
-                        </Link>
-                      </Table.Cell>
-                      <Table.Cell>
-                        <StatusBadge status={t.status} running={t.running} />
-                      </Table.Cell>
-                      <Table.Cell>
-                        <Text size="2">{t.agent ?? '—'}</Text>
-                      </Table.Cell>
-                      <Table.Cell>
-                        {t.sessions ? (
-                          <Badge variant="soft">{t.sessions}</Badge>
-                        ) : (
-                          <Text size="2" color="gray">
-                            —
-                          </Text>
-                        )}
-                      </Table.Cell>
-                      <Table.Cell>
-                        <When at={t.updated_at} />
-                      </Table.Cell>
-                    </Table.Row>
-                  ))}
-                </Table.Body>
-              </Table.Root>
-            )}
-          </>
+          <Table
+            dense
+            rows={d.tasks}
+            rowKey={(t) => t.id}
+            loading={state.loading}
+            empty={q || status || project ? 'No task matches those filters' : 'No task yet'}
+            columns={[
+              {
+                key: 'task',
+                header: 'Task',
+                width: '34%',
+                cell: (t) => (
+                  <Stack gap="1">
+                    <Link to={`/tasks/${t.id}`} className="fx-link">
+                      {t.id}
+                    </Link>
+                    <Text size="1" tone="muted" breakAll>
+                      {t.title}
+                    </Text>
+                  </Stack>
+                ),
+              },
+              {
+                key: 'project',
+                header: 'Project',
+                secondary: true,
+                cell: (t) => (
+                  <Link to={`/projects/${t.project}`} className="fx-link" data-muted="">
+                    {t.project}
+                  </Link>
+                ),
+              },
+              { key: 'status', header: 'Status', cell: (t) => <StatusBadge status={t.status} running={t.running} /> },
+              {
+                key: 'agent',
+                header: 'Agent',
+                secondary: true,
+                cell: (t) => <Text size="1">{t.agent ?? '—'}</Text>,
+              },
+              {
+                key: 'sessions',
+                header: 'Sessions',
+                numeric: true,
+                secondary: true,
+                cell: (t) =>
+                  t.sessions ? (
+                    <Badge>{t.sessions}</Badge>
+                  ) : (
+                    <Text size="1" tone="muted">
+                      —
+                    </Text>
+                  ),
+              },
+              { key: 'touched', header: 'Touched', align: 'end', cell: (t) => <When at={t.updated_at} /> },
+            ]}
+          />
         )}
       </Loaded>
-    </>
+    </Page>
   )
 }

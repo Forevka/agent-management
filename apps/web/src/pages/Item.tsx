@@ -1,15 +1,20 @@
 import { useState } from 'react'
-import {
-  Badge, Box, Button, Callout, Card, Checkbox, Code, Flex, Heading, RadioGroup, Text, TextArea,
-} from '@radix-ui/themes'
-import { CheckCircledIcon, InfoCircledIcon } from '@radix-ui/react-icons'
 import { Link, useParams } from 'react-router-dom'
+import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import { Card, CardContent, CardFooter, CardHeader } from '@/components/ui/card'
+import { Checkbox } from '@/components/ui/checkbox'
+import { TextArea } from '@/components/ui/text-area'
+import { Page, PageHeader, Row, Section, Stack, Text } from '@/components/fx/layout'
+import { Note } from '@/components/fx/note'
+import { RadioGroup } from '@/components/fx/radio'
 import * as api from '../api'
 import { HOLDS_THE_AGENT } from '../api'
 import type { Item as ItemT } from '../api'
 import { ErrorNote, Loaded, Pre, useApi } from '../ui'
 
-const str = (v: unknown): string => (typeof v === 'string' ? v : v === undefined || v === null ? '' : JSON.stringify(v, null, 2))
+const str = (v: unknown): string =>
+  typeof v === 'string' ? v : v === undefined || v === null ? '' : JSON.stringify(v, null, 2)
 
 /// Answers to an `AskUserQuestion`, keyed the way the server wants them: the item's id, then the
 /// question's own text, then the labels picked. The server maps labels back itself, so nothing
@@ -26,56 +31,39 @@ function Questions({ item, answers, set }: { item: ItemT; answers: Answers; set:
         const options = (q.options as Record<string, unknown>[]) ?? []
         const picked = answers[item.id]?.[text] ?? []
         const pick = (label: string, on: boolean) => {
-          const next = multi
-            ? on
-              ? [...picked, label]
-              : picked.filter((p) => p !== label)
-            : [label]
+          const next = multi ? (on ? [...picked, label] : picked.filter((p) => p !== label)) : [label]
           set({ ...answers, [item.id]: { ...(answers[item.id] ?? {}), [text]: next } })
         }
         return (
-          <Card key={qi} mb="2">
-            <Text as="div" weight="medium" mb="2" className="fleet-wrap">
-              {text}
-            </Text>
-            {multi ? (
-              <Flex direction="column" gap="2">
-                {options.map((o, oi) => (
-                  <Text as="label" size="2" key={oi}>
-                    <Flex gap="2">
-                      <Checkbox
-                        checked={picked.includes(str(o.label))}
-                        onCheckedChange={(v) => pick(str(o.label), v === true)}
-                      />
-                      <Box>
-                        <Text as="div">{str(o.label)}</Text>
-                        <Text as="div" size="1" color="gray" className="fleet-wrap">
-                          {str(o.description)}
-                        </Text>
-                      </Box>
-                    </Flex>
-                  </Text>
-                ))}
-              </Flex>
-            ) : (
-              <RadioGroup.Root value={picked[0] ?? ''} onValueChange={(v) => pick(v, true)}>
-                <Flex direction="column" gap="2">
+          <Card key={qi}>
+            <CardHeader title={text} titleAs="h3" />
+            <CardContent>
+              {multi ? (
+                <Stack gap="2">
                   {options.map((o, oi) => (
-                    <Text as="label" size="2" key={oi}>
-                      <Flex gap="2">
-                        <RadioGroup.Item value={str(o.label)} />
-                        <Box>
-                          <Text as="div">{str(o.label)}</Text>
-                          <Text as="div" size="1" color="gray" className="fleet-wrap">
-                            {str(o.description)}
-                          </Text>
-                        </Box>
-                      </Flex>
-                    </Text>
+                    <Checkbox
+                      key={oi}
+                      variant="card"
+                      label={str(o.label)}
+                      description={str(o.description) || undefined}
+                      checked={picked.includes(str(o.label))}
+                      onChange={(e) => pick(str(o.label), e.currentTarget.checked)}
+                    />
                   ))}
-                </Flex>
-              </RadioGroup.Root>
-            )}
+                </Stack>
+              ) : (
+                <RadioGroup
+                  name={`q-${item.id}-${qi}`}
+                  value={picked[0] ?? ''}
+                  onChange={(v) => pick(v, true)}
+                  options={options.map((o) => ({
+                    value: str(o.label),
+                    label: str(o.label),
+                    description: str(o.description) || undefined,
+                  }))}
+                />
+              )}
+            </CardContent>
           </Card>
         )
       })}
@@ -115,259 +103,261 @@ export default function Item() {
 
   if (done) {
     return (
-      <Box mt="5">
-        <Callout.Root color="green" mb="3">
-          <Callout.Icon>
-            <CheckCircledIcon />
-          </Callout.Icon>
-          <Callout.Text>
-            {done.join(' · ') || 'Answered.'}
-          </Callout.Text>
-        </Callout.Root>
-        <Link to="/">Back to the dashboard</Link>
-      </Box>
+      <Page>
+        <Note tone="success" title={done.join(' · ') || 'Answered.'}>
+          <Link to="/" className="fx-link">
+            Back to the dashboard
+          </Link>
+        </Note>
+      </Page>
     )
   }
 
   return (
-    <Loaded state={state}>
-      {(it) => {
-        const p = it.payload ?? {}
-        const plan = it.kind === 'plan' ? it : it.related?.find((r) => r.kind === 'plan')
-        const questions = [it, ...(it.related ?? [])].filter((i) => i.kind === 'question')
-        return (
-          <>
-            <Flex align="center" gap="3" mt="5" mb="1" wrap="wrap">
-              <Heading size="6">{plan ? 'Plan review' : `Q-${it.id}`}</Heading>
-              <Badge color={it.blocking ? 'red' : 'amber'} variant="soft">
-                {it.kind}
-              </Badge>
-              {it.task && (
-                <Link className="fleet-row-link" to={`/tasks/${it.task}`}>
-                  {it.task}
-                </Link>
-              )}
-              {it.agent && (
-                <Text size="2" color="gray">
-                  {it.agent}
-                </Text>
-              )}
-            </Flex>
-            {/* What is waiting, in words, so the question can be answered from this page alone. */}
-            {(() => {
-              const waiting = HOLDS_THE_AGENT.includes(it.kind)
-                ? 'the agent is stopped until you answer.'
-                : it.kind === 'ask'
-                  ? 'your answer reaches the agent as a message; it keeps working meanwhile.'
-                  : ''
-              return (
-                (it.task_title || waiting) && (
-                  <Text as="div" size="2" color="gray" mb="2" className="fleet-wrap">
-                    {it.task_title}
-                    {it.task_title && waiting ? ' — ' : ''}
-                    {waiting}
-                  </Text>
-                )
-              )
-            })()}
-            {it.state && it.state !== 'open' && (
-              <Callout.Root color="gray" my="3">
-                <Callout.Icon>
-                  <InfoCircledIcon />
-                </Callout.Icon>
-                <Callout.Text>This was already {it.state}.</Callout.Text>
-              </Callout.Root>
-            )}
-
-            {error && <ErrorNote>{error}</ErrorNote>}
-
-            {/* A plan is shown as text, not rendered markup: an agent writes it. */}
-            {plan && (
-              <Card my="3">
-                <Text as="div" size="2" color="gray" mb="2">
-                  The agent’s plan
-                </Text>
-                <Pre>{str(plan.payload?.plan ?? plan.summary)}</Pre>
-              </Card>
-            )}
-
-            {questions.length > 0 && (
-              <Box my="3">
-                <Heading size="3" mb="2">
-                  Questions
-                </Heading>
-                {questions.map((q) => (
-                  <Questions key={q.id} item={q} answers={answers} set={setAnswers} />
-                ))}
-                {!plan && (
-                  <Button onClick={() => void send('questions')} loading={busy === 'questions'}>
-                    Submit answers
-                  </Button>
-                )}
-              </Box>
-            )}
-
-            {it.kind === 'ask' && (
-              <Card my="3">
-                <Text as="div" weight="medium" mb="2" className="fleet-wrap">
-                  {str(p.question) || it.summary}
-                </Text>
-                <RadioGroup.Root value={choice} onValueChange={setChoice}>
-                  <Flex direction="column" gap="2">
-                    {((p.options as unknown[]) ?? []).map((o, i) => (
-                      <Text as="label" size="2" key={i}>
-                        <Flex gap="2" align="center">
-                          <RadioGroup.Item value={String(i)} />
-                          {str(o)}
-                        </Flex>
-                      </Text>
-                    ))}
-                  </Flex>
-                </RadioGroup.Root>
-                <Box mt="3">
-                  <Text as="div" size="2" mb="1">
-                    Or answer in your own words
-                  </Text>
-                  <TextArea value={text} onChange={(e) => setText(e.currentTarget.value)} />
-                </Box>
-                <Box mt="3">
-                  <Button
-                    onClick={() =>
-                      void send('answer', text.trim() ? { text } : { choice: Number(choice) })
-                    }
-                    loading={busy === 'answer'}
-                    disabled={!text.trim() && choice === ''}
-                  >
-                    Send answer
-                  </Button>
-                </Box>
-              </Card>
-            )}
-
-            {it.kind === 'permission' && (
-              <Card my="3">
-                <Text as="div" mb="2">
-                  The agent wants to use <Code>{str(p.tool_name)}</Code>:
-                </Text>
-                <Pre>{str(p)}</Pre>
-                <Flex gap="2" mt="3">
-                  <Button onClick={() => void send('allow')} loading={busy === 'allow'}>
-                    Allow
-                  </Button>
-                  <Button color="red" variant="soft" onClick={() => void send('deny')} loading={busy === 'deny'}>
-                    Deny
-                  </Button>
-                </Flex>
-              </Card>
-            )}
-
-            {it.kind === 'admin_change' && (
-              <Card my="3">
-                <Text as="div" weight="medium" mb="2" className="fleet-wrap">
-                  {str(p.summary)}
-                </Text>
-                {typeof p.note === 'string' && (
-                  <Text as="p" size="2" color="gray" mb="2" className="fleet-wrap">
-                    The orchestrator’s note, in its own words: {p.note}
-                  </Text>
-                )}
-                <Text as="div" size="1" color="gray" mb="1">
-                  The exact change
-                </Text>
-                <Pre>{str(p.action)}</Pre>
-                <Flex gap="2" mt="3">
-                  <Button onClick={() => void send('accept')} loading={busy === 'accept'}>
-                    Approve
-                  </Button>
-                  <Button variant="soft" color="red" onClick={() => void send('dismiss')} loading={busy === 'dismiss'}>
-                    Reject
-                  </Button>
-                </Flex>
-              </Card>
-            )}
-
-            {(it.kind === 'task_proposal' || it.kind === 'slack_reply' || it.kind === 'reply') && (
-              <Card my="3">
-                {it.kind === 'task_proposal' ? (
-                  <>
-                    <Text as="div" weight="medium" className="fleet-wrap">
-                      {str(p.title)}
-                    </Text>
-                    <Text as="div" size="2" color="gray" mb="2">
-                      in {str(p.project)}
-                    </Text>
-                    <Pre>{str(p.brief)}</Pre>
-                  </>
-                ) : (
-                  <>
-                    <Text as="div" size="2" mb="2" className="fleet-wrap">
-                      Reply to <strong>{str(p.destination ?? p.channel_id)}</strong>, posted{' '}
-                      <strong>as you</strong>
-                      {typeof p.in_reply_to === 'string' ? `, answering ${p.in_reply_to}` : ''}.
-                    </Text>
-                    <Pre>{str(p.text)}</Pre>
-                    {typeof p.quote === 'string' && p.quote && (
-                      <Text as="p" size="1" color="gray" mt="2" className="fleet-wrap">
-                        {p.quote}
+    <Page>
+      <Loaded state={state}>
+        {(it) => {
+          const p = it.payload ?? {}
+          const plan = it.kind === 'plan' ? it : it.related?.find((r) => r.kind === 'plan')
+          const questions = [it, ...(it.related ?? [])].filter((i) => i.kind === 'question')
+          const waiting = HOLDS_THE_AGENT.includes(it.kind)
+            ? 'the agent is stopped until you answer.'
+            : it.kind === 'ask'
+              ? 'your answer reaches the agent as a message; it keeps working meanwhile.'
+              : ''
+          return (
+            <>
+              <PageHeader
+                title={plan ? 'Plan review' : `Q-${it.id}`}
+                // What is waiting, in words, so the question can be answered from this page alone.
+                description={
+                  it.task_title || waiting
+                    ? `${it.task_title ?? ''}${it.task_title && waiting ? ' — ' : ''}${waiting}`
+                    : undefined
+                }
+                meta={
+                  <Row gap="2">
+                    <Badge tone={it.blocking ? 'danger' : 'warning'} dot>
+                      {it.kind}
+                    </Badge>
+                    {it.task && (
+                      <Link to={`/tasks/${it.task}`} className="fx-link">
+                        {it.task}
+                      </Link>
+                    )}
+                    {it.agent && (
+                      <Text size="1" tone="muted">
+                        {it.agent}
                       </Text>
                     )}
-                    <Text as="p" size="1" color="gray" mt="2">
-                      To change the wording, reply to the draft in Telegram.
-                    </Text>
-                  </>
-                )}
-                <Flex gap="2" mt="3">
-                  <Button onClick={() => void send('accept')} loading={busy === 'accept'}>
-                    {it.kind === 'task_proposal' ? 'Create the task' : 'Send'}
-                  </Button>
-                  <Button variant="soft" onClick={() => void send('dismiss')} loading={busy === 'dismiss'}>
-                    Dismiss
-                  </Button>
-                </Flex>
-              </Card>
-            )}
+                  </Row>
+                }
+              />
 
-            {/* A kind this page has no form for: it is still shown, as text, and answered in
-                Telegram. Better than a page that looks empty. */}
-            {!WITH_FORM.includes(it.kind) && (
-              <Card my="3">
-                <Text as="div" size="2" color="gray" mb="2">
-                  {it.summary || 'The agent is waiting on you.'}
-                </Text>
-                <Pre>{str(p)}</Pre>
-                <Text as="p" size="1" color="gray" mt="2">
-                  Answer this one in Telegram.
-                </Text>
-              </Card>
-            )}
+              {it.state && it.state !== 'open' && <Note tone="info">This was already {it.state}.</Note>}
 
-            {plan && (
-              <Card my="3">
-                <Heading size="3" mb="2">
-                  Decision
-                </Heading>
-                <Text as="div" size="2" mb="1">
-                  Feedback — required to ask for changes
-                </Text>
-                <TextArea value={feedback} onChange={(e) => setFeedback(e.currentTarget.value)} />
-                <Flex gap="2" mt="3">
-                  <Button onClick={() => void send('approve')} loading={busy === 'approve'}>
-                    Approve the plan
-                  </Button>
-                  <Button
-                    variant="soft"
-                    onClick={() => void send('revise', { feedback })}
-                    loading={busy === 'revise'}
-                    disabled={!feedback.trim()}
-                  >
-                    Request changes
-                  </Button>
-                </Flex>
-              </Card>
-            )}
-          </>
-        )
-      }}
-    </Loaded>
+              {error && <ErrorNote>{error}</ErrorNote>}
+
+              {/* A plan is shown as text, not rendered markup: an agent writes it. */}
+              {plan && (
+                <Section title="The agent’s plan">
+                  <Pre>{str(plan.payload?.plan ?? plan.summary)}</Pre>
+                </Section>
+              )}
+
+              {questions.length > 0 && (
+                <Section title="Questions">
+                  <Stack gap="2">
+                    {questions.map((q) => (
+                      <Questions key={q.id} item={q} answers={answers} set={setAnswers} />
+                    ))}
+                    {!plan && (
+                      <Row>
+                        <Button onClick={() => void send('questions')} loading={busy === 'questions'}>
+                          Submit answers
+                        </Button>
+                      </Row>
+                    )}
+                  </Stack>
+                </Section>
+              )}
+
+              {it.kind === 'ask' && (
+                <Card>
+                  <CardHeader title={str(p.question) || it.summary} />
+                  <CardContent>
+                    <Stack gap="3">
+                      {((p.options as unknown[]) ?? []).length > 0 && (
+                        <RadioGroup
+                          name={`ask-${it.id}`}
+                          value={choice}
+                          onChange={setChoice}
+                          options={((p.options as unknown[]) ?? []).map((o, i) => ({
+                            value: String(i),
+                            label: str(o),
+                          }))}
+                        />
+                      )}
+                      <TextArea
+                        label="Or answer in your own words"
+                        value={text}
+                        onChange={(e) => setText(e.currentTarget.value)}
+                        minRows={2}
+                      />
+                    </Stack>
+                  </CardContent>
+                  <CardFooter>
+                    <Button
+                      onClick={() => void send('answer', text.trim() ? { text } : { choice: Number(choice) })}
+                      loading={busy === 'answer'}
+                      disabled={!text.trim() && choice === ''}
+                    >
+                      Send answer
+                    </Button>
+                  </CardFooter>
+                </Card>
+              )}
+
+              {it.kind === 'permission' && (
+                <Card>
+                  <CardHeader title={`The agent wants to use ${str(p.tool_name)}`} />
+                  <CardContent>
+                    <Pre>{str(p)}</Pre>
+                  </CardContent>
+                  <CardFooter>
+                    <Row gap="2">
+                      <Button onClick={() => void send('allow')} loading={busy === 'allow'}>
+                        Allow
+                      </Button>
+                      <Button variant="destructive" onClick={() => void send('deny')} loading={busy === 'deny'}>
+                        Deny
+                      </Button>
+                    </Row>
+                  </CardFooter>
+                </Card>
+              )}
+
+              {it.kind === 'admin_change' && (
+                <Card>
+                  <CardHeader
+                    title={str(p.summary)}
+                    description={
+                      typeof p.note === 'string'
+                        ? `The orchestrator’s note, in its own words: ${p.note}`
+                        : undefined
+                    }
+                  />
+                  <CardContent>
+                    <Stack gap="2">
+                      <Text size="1" tone="muted">
+                        The exact change
+                      </Text>
+                      <Pre>{str(p.action)}</Pre>
+                    </Stack>
+                  </CardContent>
+                  <CardFooter>
+                    <Row gap="2">
+                      <Button onClick={() => void send('accept')} loading={busy === 'accept'}>
+                        Approve
+                      </Button>
+                      <Button variant="destructive" onClick={() => void send('dismiss')} loading={busy === 'dismiss'}>
+                        Reject
+                      </Button>
+                    </Row>
+                  </CardFooter>
+                </Card>
+              )}
+
+              {(it.kind === 'task_proposal' || it.kind === 'slack_reply' || it.kind === 'reply') && (
+                <Card>
+                  {it.kind === 'task_proposal' ? (
+                    <>
+                      <CardHeader title={str(p.title)} description={`in ${str(p.project)}`} />
+                      <CardContent>
+                        <Pre>{str(p.brief)}</Pre>
+                      </CardContent>
+                    </>
+                  ) : (
+                    <>
+                      <CardHeader
+                        title={`Reply to ${str(p.destination ?? p.channel_id)}`}
+                        description={`Posted as you${typeof p.in_reply_to === 'string' ? `, answering ${p.in_reply_to}` : ''}.`}
+                      />
+                      <CardContent>
+                        <Stack gap="2">
+                          <Pre>{str(p.text)}</Pre>
+                          {typeof p.quote === 'string' && p.quote && (
+                            <Text size="1" tone="muted" breakAll>
+                              {p.quote}
+                            </Text>
+                          )}
+                          <Text size="1" tone="muted">
+                            To change the wording, reply to the draft in Telegram.
+                          </Text>
+                        </Stack>
+                      </CardContent>
+                    </>
+                  )}
+                  <CardFooter>
+                    <Row gap="2">
+                      <Button onClick={() => void send('accept')} loading={busy === 'accept'}>
+                        {it.kind === 'task_proposal' ? 'Create the task' : 'Send'}
+                      </Button>
+                      <Button variant="secondary" onClick={() => void send('dismiss')} loading={busy === 'dismiss'}>
+                        Dismiss
+                      </Button>
+                    </Row>
+                  </CardFooter>
+                </Card>
+              )}
+
+              {/* A kind this page has no form for: it is still shown, as text, and answered in
+                  Telegram. Better than a page that looks empty. */}
+              {!WITH_FORM.includes(it.kind) && (
+                <Card>
+                  <CardHeader
+                    title={it.summary || 'The agent is waiting on you.'}
+                    description="Answer this one in Telegram."
+                  />
+                  <CardContent>
+                    <Pre>{str(p)}</Pre>
+                  </CardContent>
+                </Card>
+              )}
+
+              {plan && (
+                <Card>
+                  <CardHeader title="Decision" />
+                  <CardContent>
+                    <TextArea
+                      label="Feedback"
+                      hint="Required to ask for changes."
+                      value={feedback}
+                      onChange={(e) => setFeedback(e.currentTarget.value)}
+                      minRows={2}
+                    />
+                  </CardContent>
+                  <CardFooter>
+                    <Row gap="2">
+                      <Button onClick={() => void send('approve')} loading={busy === 'approve'}>
+                        Approve the plan
+                      </Button>
+                      <Button
+                        variant="secondary"
+                        onClick={() => void send('revise', { feedback })}
+                        loading={busy === 'revise'}
+                        disabled={!feedback.trim()}
+                      >
+                        Request changes
+                      </Button>
+                    </Row>
+                  </CardFooter>
+                </Card>
+              )}
+            </>
+          )
+        }}
+      </Loaded>
+    </Page>
   )
 }

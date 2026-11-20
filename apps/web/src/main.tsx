@@ -1,9 +1,8 @@
 import React from 'react'
 import { createRoot } from 'react-dom/client'
 import { BrowserRouter, Route, Routes } from 'react-router-dom'
-import { Theme } from '@radix-ui/themes'
-import '@radix-ui/themes/styles.css'
-import './app.css'
+import './aui.css'
+import { startTheme } from '@/components/fx/theme'
 
 import { Shell } from './shell'
 import Dashboard from './pages/Dashboard'
@@ -22,34 +21,32 @@ import Habits from './pages/Habits'
 import Retro from './pages/Retro'
 import Item from './pages/Item'
 
+// Before the first paint: the owner's choice of light or dark is on <html> already, so the page
+// never flashes the wrong one (see components/fx/theme.tsx).
+startTheme()
+
 createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
-    {/* The theme follows the operating system, which is what the old stylesheet did too.
-        `grayColor=sand` and the indigo accent keep the fleet's own quiet palette. */}
-    <Theme accentColor="indigo" grayColor="sand" radius="medium" appearance="inherit">
-      {/* The v7 behaviours, opted into now: they are what this app already expects, and it
-          keeps the console clean so a real warning stands out. */}
-      <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
-        <Routes>
-          <Route element={<Shell />}>
-            <Route path="/" element={<Dashboard />} />
-            <Route path="/tasks" element={<Tasks />} />
-            <Route path="/tasks/:id" element={<TaskDetail />} />
-            <Route path="/sessions" element={<Sessions />} />
-            <Route path="/projects" element={<Projects />} />
-            <Route path="/projects/:slug" element={<ProjectDetail />} />
-            <Route path="/secrets" element={<Secrets />} />
-            <Route path="/secrets/:id" element={<SecretFolder />} />
-            <Route path="/nodes" element={<Nodes />} />
-            <Route path="/nodes/:id" element={<NodeDetail />} />
-            <Route path="/agents" element={<Agents />} />
-            <Route path="/inbox" element={<Inbox />} />
-            <Route path="/habits" element={<Habits />} />
-            <Route path="/retro" element={<Retro />} />
-            <Route path="/items/:id" element={<Item />} />
-          </Route>
-        </Routes>
-      </BrowserRouter>
-    </Theme>
+    <BrowserRouter>
+      <Routes>
+        <Route element={<Shell />}>
+          <Route path="/" element={<Dashboard />} />
+          <Route path="/tasks" element={<Tasks />} />
+          <Route path="/tasks/:id" element={<TaskDetail />} />
+          <Route path="/sessions" element={<Sessions />} />
+          <Route path="/projects" element={<Projects />} />
+          <Route path="/projects/:slug" element={<ProjectDetail />} />
+          <Route path="/secrets" element={<Secrets />} />
+          <Route path="/secrets/:id" element={<SecretFolder />} />
+          <Route path="/nodes" element={<Nodes />} />
+          <Route path="/nodes/:id" element={<NodeDetail />} />
+          <Route path="/agents" element={<Agents />} />
+          <Route path="/inbox" element={<Inbox />} />
+          <Route path="/habits" element={<Habits />} />
+          <Route path="/retro" element={<Retro />} />
+          <Route path="/items/:id" element={<Item />} />
+        </Route>
+      </Routes>
+    </BrowserRouter>
   </React.StrictMode>,
 )

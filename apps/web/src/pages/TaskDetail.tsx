@@ -1,11 +1,15 @@
 import { useState } from 'react'
-import {
-  Badge, Box, Button, Card, Code, Flex, Heading, Table, Tabs, Text,
-} from '@radix-ui/themes'
-import { CheckIcon } from '@radix-ui/react-icons'
 import { Link, useParams } from 'react-router-dom'
+import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import { Card, CardContent } from '@/components/ui/card'
+import { EmptyState } from '@/components/ui/empty-state'
+import { SegmentedControl } from '@/components/ui/segmented-control'
+import { Page, PageHeader, Row, Section, Stack, Text } from '@/components/fx/layout'
+import { Facts, Table } from '@/components/fx/table'
+import { ArrowLeftIcon, CheckIcon } from '@/components/fx/icons'
 import type { Events, Item, TaskDetail as Detail } from '../api'
-import { Duration, Empty, Loaded, Pre, Section, StatusBadge, When, useApi } from '../ui'
+import { Duration, Loaded, Pre, StatusBadge, When, useApi } from '../ui'
 
 /// Whether an item is still waiting for the owner. An item from an older build of the API may
 /// carry no state at all; it is then treated as settled rather than as a false alarm, because
@@ -17,21 +21,21 @@ function isOpen(i: Item): boolean {
 /// One item of a task, linking to its own page, where the question and the answer are.
 function ItemCard({ item, answered }: { item: Item; answered?: boolean }) {
   return (
-    <Card asChild>
-      <Link to={`/items/${item.id}`} style={{ textDecoration: 'none' }}>
-        <Flex gap="2" align="center" wrap="wrap">
-          <Badge color={answered ? 'gray' : item.blocking ? 'red' : 'amber'} variant="soft">
+    <Card as="div" interactive>
+      <Link to={`/items/${item.id}`} className="fx-item">
+        <Row gap="2">
+          <Badge tone={answered ? 'neutral' : item.blocking ? 'danger' : 'warning'} dot>
             {item.kind}
           </Badge>
-          <Text size="2" className="fleet-wrap">
+          <Text size="2" breakAll>
             {item.summary}
           </Text>
-          {answered ? (
-            <Text size="1" color="gray">
+          {answered && (
+            <Text size="1" tone="muted">
               {item.state}
             </Text>
-          ) : null}
-        </Flex>
+          )}
+        </Row>
       </Link>
     </Card>
   )
@@ -41,221 +45,252 @@ function ItemCard({ item, answered }: { item: Item; answered?: boolean }) {
 /// or a Slack message — so it is shown as text and never as markup.
 function Event({ kind, at, data }: { kind: string; at: string; data: string }) {
   const [open, setOpen] = useState(false)
-  const color = kind === 'err' ? 'red' : kind === 'exit' ? 'amber' : 'gray'
+  const tone = kind === 'err' ? 'danger' : kind === 'exit' ? 'warning' : 'neutral'
   const oneLine = data.replace(/\s+/g, ' ').slice(0, 200)
   return (
-    <Box py="1" style={{ borderBottom: '1px solid var(--gray-a3)' }}>
-      <Flex gap="2" align="center" wrap="wrap">
-        <Badge color={color} variant="soft">
-          {kind}
-        </Badge>
+    <div className="fx-event">
+      <Row gap="2">
+        <Badge tone={tone}>{kind}</Badge>
         <When at={at} />
-        <Button size="1" variant="ghost" onClick={() => setOpen(!open)}>
+        <Button size="sm" variant="ghost" onClick={() => setOpen(!open)}>
           {open ? 'less' : 'more'}
         </Button>
-      </Flex>
-      {open ? (
-        <Box mt="1">
-          <Pre>{data}</Pre>
-        </Box>
-      ) : (
-        <Text as="div" size="1" color="gray" className="fleet-wrap" style={{ fontFamily: 'var(--code-font-family)' }}>
-          {oneLine}
-        </Text>
-      )}
-    </Box>
+      </Row>
+      {open ? <Pre>{data}</Pre> : <Text size="1" tone="muted" mono breakAll as="div">{oneLine}</Text>}
+    </div>
   )
 }
+
+type Tab = 'sessions' | 'checklist' | 'brief' | 'transcript'
 
 export default function TaskDetail() {
   const { id = '' } = useParams()
   const state = useApi<Detail>(`/api/tasks/${encodeURIComponent(id)}`, 10_000)
   const events = useApi<Events>(`/api/tasks/${encodeURIComponent(id)}/events?limit=200`)
+  const [tab, setTab] = useState<Tab>('sessions')
 
   return (
-    <Loaded state={state}>
-      {(d) => (
-        <>
-          <Flex align="center" gap="3" mt="5" mb="1" wrap="wrap">
-            <Heading size="6">{d.task.id}</Heading>
-            <StatusBadge status={d.task.status} running={d.task.running} />
-          </Flex>
-          <Text as="p" size="3" mb="3" className="fleet-wrap">
-            {d.task.title}
-          </Text>
-
-          <Card>
-            <Flex gap="5" wrap="wrap">
-              <Box>
-                <Text as="div" size="1" color="gray">
-                  Project
-                </Text>
-                <Link className="fleet-row-link" to={`/projects/${d.task.project}`}>
-                  {d.task.project}
+    <Page>
+      <style href="fx-taskdetail" precedence="default">
+        {css}
+      </style>
+      <Loaded state={state}>
+        {(d) => (
+          <>
+            <PageHeader
+              title={d.task.id}
+              description={d.task.title}
+              back={
+                <Link to="/tasks" className="fx-link" data-muted="">
+                  <ArrowLeftIcon /> All tasks
                 </Link>
-              </Box>
-              <Box>
-                <Text as="div" size="1" color="gray">
-                  Agent
-                </Text>
-                <Text size="2">{d.task.agent ?? '—'}</Text>
-              </Box>
-              <Box>
-                <Text as="div" size="1" color="gray">
-                  Node
-                </Text>
-                <Text size="2" className="fleet-wrap">
-                  {d.task.node ?? '—'}
-                </Text>
-              </Box>
-              <Box>
-                <Text as="div" size="1" color="gray">
-                  Runs with
-                </Text>
-                <Text size="2">
-                  {d.task.model ?? 'the agent’s model'}
-                  {d.task.effort ? ` · ${d.task.effort}` : ''}
-                </Text>
-              </Box>
-              <Box>
-                <Text as="div" size="1" color="gray">
-                  Created
-                </Text>
-                <When at={d.task.created_at} />
-              </Box>
-            </Flex>
-          </Card>
+              }
+              meta={<StatusBadge status={d.task.status} running={d.task.running} />}
+            />
 
-          {/* Open items only: a task keeps its answered questions, and showing those under
-              "Waiting on you" told the owner they were holding up work they had already
-              answered. The rest are listed below, as a record of what was asked. */}
-          {d.items.filter(isOpen).length > 0 && (
-            <Section title="Waiting on you">
-              <Flex direction="column" gap="2">
-                {d.items.filter(isOpen).map((i) => (
-                  <ItemCard key={i.id} item={i} />
-                ))}
-              </Flex>
-            </Section>
-          )}
+            <Card>
+              <CardContent>
+                <Facts
+                  items={[
+                    [
+                      'Project',
+                      <Link to={`/projects/${d.task.project}`} className="fx-link">
+                        {d.task.project}
+                      </Link>,
+                    ],
+                    ['Agent', d.task.agent ?? '—'],
+                    ['Node', d.task.node ?? '—'],
+                    [
+                      'Runs with',
+                      `${d.task.model ?? 'the agent’s model'}${d.task.effort ? ` · ${d.task.effort}` : ''}`,
+                    ],
+                    ['Created', <When at={d.task.created_at} />],
+                  ]}
+                />
+              </CardContent>
+            </Card>
 
-          {d.items.filter((i) => !isOpen(i)).length > 0 && (
-            <Section title="Answered">
-              <Flex direction="column" gap="2">
-                {d.items
-                  .filter((i) => !isOpen(i))
-                  .map((i) => (
-                    <ItemCard key={i.id} item={i} answered />
+            {/* Open items only: a task keeps its answered questions, and showing those under
+                "Waiting on you" told the owner they were holding up work they had already
+                answered. The rest are listed below, as a record of what was asked. */}
+            {d.items.filter(isOpen).length > 0 && (
+              <Section title="Waiting on you">
+                <Stack gap="2">
+                  {d.items.filter(isOpen).map((i) => (
+                    <ItemCard key={i.id} item={i} />
                   ))}
-              </Flex>
-            </Section>
-          )}
+                </Stack>
+              </Section>
+            )}
 
-          <Tabs.Root defaultValue="sessions" mt="5">
-            <Tabs.List>
-              <Tabs.Trigger value="sessions">Sessions ({d.sessions.length})</Tabs.Trigger>
-              <Tabs.Trigger value="checklist">Checklist ({d.milestones.length})</Tabs.Trigger>
-              <Tabs.Trigger value="brief">Brief</Tabs.Trigger>
-              <Tabs.Trigger value="transcript">Transcript</Tabs.Trigger>
-            </Tabs.List>
-
-            <Box pt="3">
-              <Tabs.Content value="sessions">
-                {d.sessions.length === 0 ? (
-                  <Empty>This task has not run yet.</Empty>
-                ) : (
-                  <Table.Root variant="surface">
-                    <Table.Header>
-                      <Table.Row>
-                        <Table.ColumnHeaderCell>Started</Table.ColumnHeaderCell>
-                        <Table.ColumnHeaderCell>Lasted</Table.ColumnHeaderCell>
-                        <Table.ColumnHeaderCell>Node</Table.ColumnHeaderCell>
-                        <Table.ColumnHeaderCell>Claude session</Table.ColumnHeaderCell>
-                        <Table.ColumnHeaderCell>Ended</Table.ColumnHeaderCell>
-                      </Table.Row>
-                    </Table.Header>
-                    <Table.Body>
-                      {d.sessions.map((r) => (
-                        <Table.Row key={r.run_id}>
-                          <Table.Cell>
-                            <When at={r.started_at} />
-                          </Table.Cell>
-                          <Table.Cell>
-                            <Duration from={r.started_at} to={r.ended_at} />
-                          </Table.Cell>
-                          <Table.Cell>
-                            <Text size="2" className="fleet-wrap">
-                              {r.node ?? '—'}
-                            </Text>
-                          </Table.Cell>
-                          <Table.Cell>
-                            <Text size="1" className="fleet-wrap">
-                              <Code variant="ghost">{r.session ?? '—'}</Code>
-                            </Text>
-                          </Table.Cell>
-                          <Table.Cell>
-                            {r.status === 'running' ? (
-                              <Badge color="green" variant="solid">
-                                live
-                              </Badge>
-                            ) : (
-                              <Text size="2" color={r.outcome?.startsWith('lost') ? 'amber' : 'gray'}>
-                                {r.outcome ?? 'ended'}
-                              </Text>
-                            )}
-                          </Table.Cell>
-                        </Table.Row>
-                      ))}
-                    </Table.Body>
-                  </Table.Root>
-                )}
-              </Tabs.Content>
-
-              <Tabs.Content value="checklist">
-                {d.milestones.length === 0 ? (
-                  <Empty>No checklist.</Empty>
-                ) : (
-                  <Flex direction="column" gap="1">
-                    {d.milestones.map((m) => (
-                      <Flex key={m.idx} gap="2" align="center">
-                        <Text color={m.done ? 'green' : 'gray'}>{m.done ? <CheckIcon /> : '○'}</Text>
-                        <Text size="2" color={m.done ? 'gray' : undefined} className="fleet-wrap">
-                          {m.title}
-                        </Text>
-                      </Flex>
+            {d.items.filter((i) => !isOpen(i)).length > 0 && (
+              <Section title="Answered">
+                <Stack gap="2">
+                  {d.items
+                    .filter((i) => !isOpen(i))
+                    .map((i) => (
+                      <ItemCard key={i.id} item={i} answered />
                     ))}
-                  </Flex>
-                )}
-              </Tabs.Content>
+                </Stack>
+              </Section>
+            )}
 
-              <Tabs.Content value="brief">
-                <Pre>{d.task.brief ?? ''}</Pre>
-              </Tabs.Content>
+            <Stack gap="3">
+              <SegmentedControl<Tab>
+                kind="tabs"
+                variant="underline"
+                aria-label="What to look at"
+                value={tab}
+                onChange={setTab}
+                options={[
+                  { value: 'sessions', label: 'Sessions', count: d.sessions.length },
+                  { value: 'checklist', label: 'Checklist', count: d.milestones.length },
+                  { value: 'brief', label: 'Brief' },
+                  { value: 'transcript', label: 'Transcript' },
+                ]}
+              />
 
-              <Tabs.Content value="transcript">
+              {tab === 'sessions' && (
+                <Table
+                  dense
+                  rows={d.sessions}
+                  rowKey={(r) => r.run_id}
+                  empty="This task has not run yet"
+                  columns={[
+                    { key: 'started', header: 'Started', cell: (r) => <When at={r.started_at} /> },
+                    {
+                      key: 'lasted',
+                      header: 'Lasted',
+                      align: 'end',
+                      cell: (r) => <Duration from={r.started_at} to={r.ended_at} />,
+                    },
+                    {
+                      key: 'node',
+                      header: 'Node',
+                      secondary: true,
+                      cell: (r) => (
+                        <Text size="1" breakAll>
+                          {r.node ?? '—'}
+                        </Text>
+                      ),
+                    },
+                    {
+                      key: 'session',
+                      header: 'Claude session',
+                      secondary: true,
+                      cell: (r) => (
+                        <Text size="1" mono breakAll>
+                          {r.session ?? '—'}
+                        </Text>
+                      ),
+                    },
+                    {
+                      key: 'ended',
+                      header: 'Ended',
+                      cell: (r) =>
+                        r.status === 'running' ? (
+                          <Badge tone="success" live>
+                            live
+                          </Badge>
+                        ) : (
+                          <Text size="1" tone={r.outcome?.startsWith('lost') ? 'warning' : 'muted'}>
+                            {r.outcome ?? 'ended'}
+                          </Text>
+                        ),
+                    },
+                  ]}
+                />
+              )}
+
+              {tab === 'checklist' &&
+                (d.milestones.length === 0 ? (
+                  <EmptyState title="No checklist" text="The agent publishes one after its plan is approved." bare />
+                ) : (
+                  <Card>
+                    <CardContent>
+                      <Stack gap="2">
+                        {d.milestones.map((m) => (
+                          <Row key={m.idx} gap="2" align="start">
+                            <span className="fx-check" data-done={m.done || undefined} aria-hidden="true">
+                              {m.done ? <CheckIcon /> : null}
+                            </span>
+                            <Text size="2" tone={m.done ? 'muted' : 'default'} breakAll>
+                              {m.title}
+                            </Text>
+                          </Row>
+                        ))}
+                      </Stack>
+                    </CardContent>
+                  </Card>
+                ))}
+
+              {tab === 'brief' && <Pre>{d.task.brief ?? ''}</Pre>}
+
+              {tab === 'transcript' && (
                 <Loaded state={events}>
                   {(e) =>
                     e.events.length === 0 ? (
-                      <Empty>Nothing recorded.</Empty>
+                      <EmptyState title="Nothing recorded" bare />
                     ) : (
-                      <Box>
-                        {e.more && (
-                          <Text size="1" color="gray">
-                            The latest {e.events.length} lines.
-                          </Text>
-                        )}
-                        {e.events.map((ev) => (
-                          <Event key={ev.id} kind={ev.kind} at={ev.at} data={ev.data} />
-                        ))}
-                      </Box>
+                      <Card>
+                        <CardContent>
+                          <Stack gap="0">
+                            {e.more && (
+                              <Text size="1" tone="muted">
+                                The latest {e.events.length} lines.
+                              </Text>
+                            )}
+                            {e.events.map((ev) => (
+                              <Event key={ev.id} kind={ev.kind} at={ev.at} data={ev.data} />
+                            ))}
+                          </Stack>
+                        </CardContent>
+                      </Card>
                     )
                   }
                 </Loaded>
-              </Tabs.Content>
-            </Box>
-          </Tabs.Root>
-        </>
-      )}
-    </Loaded>
+              )}
+            </Stack>
+          </>
+        )}
+      </Loaded>
+    </Page>
   )
 }
+
+const css = /* css */ `
+.fx-event {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--aui-border, #e5e5e5);
+  min-width: 0;
+}
+.fx-event:last-child {
+  border-bottom: 0;
+}
+
+/* A milestone's tick: a circle that fills in, so a finished checklist reads at a glance. */
+.fx-check {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 17px;
+  height: 17px;
+  margin-top: 2px;
+  border: 1.5px solid var(--aui-border-strong, #d4d4d8);
+  border-radius: 999px;
+  color: transparent;
+  font-size: 11px;
+  transition:
+    background-color 160ms ease,
+    border-color 160ms ease,
+    color 160ms ease;
+}
+.fx-check[data-done] {
+  background: var(--aui-success, #1e8a4f);
+  border-color: var(--aui-success, #1e8a4f);
+  color: #fff;
+}
+`

@@ -1,12 +1,19 @@
 import { useState } from 'react'
-import {
-  Badge, Box, Button, Card, Checkbox, Code, Flex, Grid, Heading, Link as RLink, Table, Text,
-  TextArea, TextField,
-} from '@radix-ui/themes'
 import { Link, useParams } from 'react-router-dom'
+import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import { Card, CardContent, CardHeader } from '@/components/ui/card'
+import { Checkbox } from '@/components/ui/checkbox'
+import { EmptyState } from '@/components/ui/empty-state'
+import { TextArea } from '@/components/ui/text-area'
+import { TextField } from '@/components/ui/text-field'
+import { Grid, Page, PageHeader, Row, Section, Stack, Text } from '@/components/fx/layout'
+import { Stat } from '@/components/fx/stat'
+import { Table } from '@/components/fx/table'
+import { ArrowLeftIcon } from '@/components/fx/icons'
 import * as api from '../api'
 import type { ProjectDetail as Detail } from '../api'
-import { ActionButton, Empty, ErrorNote, Loaded, Section, StatusBadge, When, useApi } from '../ui'
+import { ActionButton, ErrorNote, Loaded, StatusBadge, When, useApi } from '../ui'
 
 export default function ProjectDetail() {
   const { slug = '' } = useParams()
@@ -29,294 +36,257 @@ export default function ProjectDetail() {
   }
 
   return (
-    <Loaded state={state}>
-      {(d) => (
-        <>
-          <Heading size="6" mt="5" mb="1">
-            {d.project.name || d.project.slug}
-          </Heading>
-          <Text as="p" size="2" color="gray" mb="3">
-            <Code variant="ghost">{d.project.slug}</Code>
-          </Text>
-
-          {error && <ErrorNote>{error}</ErrorNote>}
-
-          <Grid columns={{ initial: '2', sm: '4' }} gap="3">
-            <Card>
-              <Text as="div" size="6" weight="bold">
-                {d.open_tasks}
-              </Text>
-              <Text as="div" size="2" color="gray">
-                open tasks
-              </Text>
-            </Card>
-            <Card asChild>
-              <Link to={`/sessions?project=${d.project.slug}`} style={{ textDecoration: 'none' }}>
-                <Text as="div" size="6" weight="bold">
-                  {d.sessions}
+    <Page>
+      <Loaded state={state}>
+        {(d) => (
+          <>
+            <PageHeader
+              title={d.project.name || d.project.slug}
+              description={d.project.description || undefined}
+              back={
+                <Link to="/projects" className="fx-link" data-muted="">
+                  <ArrowLeftIcon /> All projects
+                </Link>
+              }
+              meta={
+                <Text size="1" tone="muted" mono>
+                  {d.project.slug}
                 </Text>
-                <Text as="div" size="2" color="gray">
-                  sessions, all time
-                </Text>
-              </Link>
-            </Card>
-            <Card>
-              <Text as="div" size="6" weight="bold">
-                {d.channels.length}
-              </Text>
-              <Text as="div" size="2" color="gray">
-                mapped channels
-              </Text>
-            </Card>
-            <Card>
-              <Text as="div" size="6" weight="bold">
-                {d.nodes.length}
-              </Text>
-              <Text as="div" size="2" color="gray">
-                nodes with a checkout
-              </Text>
-            </Card>
-          </Grid>
+              }
+            />
 
-          <Section
-            title="Tasks"
-            aside={
-              <RLink asChild size="2">
-                <Link to={`/tasks?project=${d.project.slug}`}>All, with filters →</Link>
-              </RLink>
-            }
-          >
-            {d.tasks.length === 0 ? (
-              <Empty>No task in this project yet.</Empty>
-            ) : (
-              <Table.Root variant="surface">
-                <Table.Header>
-                  <Table.Row>
-                    <Table.ColumnHeaderCell>Task</Table.ColumnHeaderCell>
-                    <Table.ColumnHeaderCell>Status</Table.ColumnHeaderCell>
-                    <Table.ColumnHeaderCell>Agent</Table.ColumnHeaderCell>
-                    <Table.ColumnHeaderCell>Touched</Table.ColumnHeaderCell>
-                  </Table.Row>
-                </Table.Header>
-                <Table.Body>
-                  {d.tasks.map((t) => (
-                    <Table.Row key={t.id}>
-                      <Table.Cell>
-                        <Link className="fleet-row-link" to={`/tasks/${t.id}`}>
+            {error && <ErrorNote>{error}</ErrorNote>}
+
+            <Grid min={200} gap="3">
+              <Stat label="open tasks" value={d.open_tasks} to={`/tasks?project=${d.project.slug}`} />
+              <Stat label="sessions, all time" value={d.sessions} to={`/sessions?project=${d.project.slug}`} />
+              <Stat label="mapped channels" value={d.channels.length} />
+              <Stat label="nodes with a checkout" value={d.nodes.length} />
+            </Grid>
+
+            <Section
+              title="Tasks"
+              action={
+                <Link to={`/tasks?project=${d.project.slug}`} className="fx-link" data-muted="">
+                  All, with filters →
+                </Link>
+              }
+            >
+              <Table
+                rows={d.tasks}
+                rowKey={(t) => t.id}
+                empty="No task in this project yet"
+                columns={[
+                  {
+                    key: 'task',
+                    header: 'Task',
+                    width: '45%',
+                    cell: (t) => (
+                      <Stack gap="1">
+                        <Link to={`/tasks/${t.id}`} className="fx-link">
                           {t.id}
                         </Link>
-                        <Text as="div" size="2" color="gray" className="fleet-wrap">
+                        <Text size="1" tone="muted" breakAll>
                           {t.title}
                         </Text>
-                      </Table.Cell>
-                      <Table.Cell>
-                        <StatusBadge status={t.status} running={t.running} />
-                      </Table.Cell>
-                      <Table.Cell>
-                        <Text size="2">{t.agent ?? '—'}</Text>
-                      </Table.Cell>
-                      <Table.Cell>
-                        <When at={t.updated_at} />
-                      </Table.Cell>
-                    </Table.Row>
-                  ))}
-                </Table.Body>
-              </Table.Root>
-            )}
-          </Section>
-
-          <Section title="Settings">
-            <Card>
-              <form
-                onSubmit={(e) => {
-                  e.preventDefault()
-                  const f = new FormData(e.currentTarget)
-                  void save('edit', {
-                    name: f.get('name'),
-                    description: f.get('description'),
-                    // Every checkbox is sent, so the list replaces what is bound.
-                    folders: d.folders.filter((x) => f.get(`folder-${x.id}`) === 'on').map((x) => x.id),
-                  })
-                }}
-              >
-                <Flex direction="column" gap="3">
-                  <label>
-                    <Text as="div" size="2" mb="1" weight="medium">
-                      Name
-                    </Text>
-                    <TextField.Root name="name" defaultValue={d.project.name} />
-                  </label>
-                  <label>
-                    <Text as="div" size="2" mb="1" weight="medium">
-                      Description
-                    </Text>
-                    <TextArea name="description" defaultValue={d.project.description} />
-                  </label>
-                  <Box>
-                    <Text as="div" size="2" mb="1" weight="medium">
-                      Secret folders agents in this project may read
-                    </Text>
-                    {d.folders.length === 0 ? (
-                      <Text size="2" color="gray">
-                        No folders yet — make one on the <Link to="/secrets">Secrets</Link> page.
-                      </Text>
-                    ) : (
-                      <Flex direction="column" gap="1">
-                        {d.folders.map((f) => (
-                          <Text as="label" size="2" key={f.id}>
-                            <Flex gap="2" align="center">
-                              <Checkbox name={`folder-${f.id}`} defaultChecked={f.bound} />
-                              {f.name}
-                            </Flex>
-                          </Text>
-                        ))}
-                      </Flex>
-                    )}
-                  </Box>
-                  <Box>
-                    <Button type="submit" loading={saving === 'edit'}>
-                      Save
-                    </Button>
-                  </Box>
-                </Flex>
-              </form>
-            </Card>
-          </Section>
-
-          <Section title="Jira">
-            <Card>
-              <Text as="p" size="2" color="gray" mb="3">
-                The orchestrator holds the credential and makes the calls; agents never get a token.
-                Leave the folder empty to use the shared <Code>jira</Code> folder.
-              </Text>
-              <form
-                onSubmit={(e) => {
-                  e.preventDefault()
-                  const f = new FormData(e.currentTarget)
-                  void save('jira', {
-                    key: f.get('key'),
-                    board: f.get('board'),
-                    folder: f.get('folder'),
-                  })
-                }}
-              >
-                <Grid columns={{ initial: '1', sm: '3' }} gap="3">
-                  <label>
-                    <Text as="div" size="2" mb="1" weight="medium">
-                      Project key
-                    </Text>
-                    <TextField.Root name="key" placeholder="BIOINS" defaultValue={d.project.jira?.key ?? ''} />
-                  </label>
-                  <label>
-                    <Text as="div" size="2" mb="1" weight="medium">
-                      Board (optional)
-                    </Text>
-                    <TextField.Root name="board" placeholder="7" defaultValue={d.project.jira?.board ?? ''} />
-                  </label>
-                  <label>
-                    <Text as="div" size="2" mb="1" weight="medium">
-                      Credential folder
-                    </Text>
-                    <TextField.Root
-                      name="folder"
-                      placeholder="jira"
-                      defaultValue={d.project.jira?.credential_folder ?? ''}
-                    />
-                  </label>
-                </Grid>
-                <Box mt="3">
-                  <Button type="submit" loading={saving === 'jira'}>
-                    Save Jira
-                  </Button>
-                </Box>
-              </form>
-            </Card>
-          </Section>
-
-          <Section title="Channels">
-            <Card>
-              {d.channels.length === 0 ? (
-                <Empty>No channel maps to this project.</Empty>
-              ) : (
-                <Flex direction="column" gap="2" mb="3">
-                  {d.channels.map((c) => (
-                    <Flex key={c.channel_id} gap="2" align="center" wrap="wrap">
-                      <Badge variant="soft">{c.source}</Badge>
-                      <Text size="2">{c.name}</Text>
-                      <Code variant="ghost">{c.channel_id}</Code>
-                      {c.triage && (
-                        <Badge color="amber" variant="soft">
-                          triaged
-                        </Badge>
-                      )}
-                      <Box flexGrow="1" />
-                      <ActionButton
-                        path={path}
-                        op="unchannel"
-                        body={{ channel: c.channel_id }}
-                        color="red"
-                        variant="ghost"
-                        confirm={`Stop mapping ${c.name} to this project?`}
-                        onDone={() => void state.reload()}
-                      >
-                        Remove
-                      </ActionButton>
-                    </Flex>
-                  ))}
-                </Flex>
-              )}
-              <form
-                onSubmit={(e) => {
-                  e.preventDefault()
-                  const f = new FormData(e.currentTarget)
-                  void save('channel', { channel: f.get('channel'), triage: f.get('triage') === 'on' })
-                }}
-              >
-                <Flex gap="2" align="end" wrap="wrap">
-                  <label style={{ flexGrow: 1, minWidth: '14rem' }}>
-                    <Text as="div" size="2" mb="1" weight="medium">
-                      Add a channel
-                    </Text>
-                    {/* A name works: the server resolves it against the conversations you are in. */}
-                    <TextField.Root name="channel" placeholder="code-reviews, or a channel id" />
-                  </label>
-                  <Text as="label" size="2">
-                    <Flex gap="2" align="center" height="32px">
-                      <Checkbox name="triage" />
-                      the secretary triages it
-                    </Flex>
-                  </Text>
-                  <Button type="submit" loading={saving === 'channel'}>
-                    Add
-                  </Button>
-                </Flex>
-              </form>
-            </Card>
-          </Section>
-
-          {d.nodes.length > 0 && (
-            <Section title="Nodes with a checkout">
-              <Flex direction="column" gap="2">
-                {d.nodes.map((n) => (
-                  <Card key={n.id}>
-                    <Flex gap="2" align="center" wrap="wrap">
-                      <Badge color={n.online ? 'green' : 'gray'} variant="soft">
-                        {n.online ? 'online' : 'offline'}
-                      </Badge>
-                      <Link className="fleet-row-link" to={`/nodes/${n.id}`}>
-                        {n.name}
-                      </Link>
-                      <Code variant="ghost" className="fleet-wrap">
-                        {n.path}
-                      </Code>
-                    </Flex>
-                  </Card>
-                ))}
-              </Flex>
+                      </Stack>
+                    ),
+                  },
+                  { key: 'status', header: 'Status', cell: (t) => <StatusBadge status={t.status} running={t.running} /> },
+                  { key: 'agent', header: 'Agent', secondary: true, cell: (t) => <Text size="1">{t.agent ?? '—'}</Text> },
+                  { key: 'touched', header: 'Touched', align: 'end', cell: (t) => <When at={t.updated_at} /> },
+                ]}
+              />
             </Section>
-          )}
-        </>
-      )}
-    </Loaded>
+
+            <Section title="Settings">
+              <Card>
+                <CardContent>
+                  <form
+                    onSubmit={(e) => {
+                      e.preventDefault()
+                      const f = new FormData(e.currentTarget)
+                      void save('edit', {
+                        name: f.get('name'),
+                        description: f.get('description'),
+                        // Every checkbox is sent, so the list replaces what is bound.
+                        folders: d.folders.filter((x) => f.get(`folder-${x.id}`) === 'on').map((x) => x.id),
+                      })
+                    }}
+                  >
+                    <Stack gap="3">
+                      <TextField name="name" label="Name" defaultValue={d.project.name} size="sm" />
+                      <TextArea name="description" label="Description" defaultValue={d.project.description} minRows={2} />
+                      <Stack gap="2">
+                        <Text size="2" weight="medium">
+                          Secret folders agents in this project may read
+                        </Text>
+                        {d.folders.length === 0 ? (
+                          <Text size="2" tone="muted">
+                            No folders yet — make one on the{' '}
+                            <Link to="/secrets" className="fx-link">
+                              Secrets
+                            </Link>{' '}
+                            page.
+                          </Text>
+                        ) : (
+                          <Stack gap="1">
+                            {d.folders.map((f) => (
+                              <Checkbox key={f.id} name={`folder-${f.id}`} defaultChecked={f.bound} label={f.name} />
+                            ))}
+                          </Stack>
+                        )}
+                      </Stack>
+                      <Row>
+                        <Button type="submit" loading={saving === 'edit'} variant="secondary">
+                          Save
+                        </Button>
+                      </Row>
+                    </Stack>
+                  </form>
+                </CardContent>
+              </Card>
+            </Section>
+
+            <Section title="Jira">
+              <Card>
+                <CardHeader
+                  title="This project's tracker"
+                  description="The orchestrator holds the credential and makes the calls; agents get tools, never a token. Leave the folder empty to use the shared jira folder."
+                />
+                <CardContent>
+                  <form
+                    onSubmit={(e) => {
+                      e.preventDefault()
+                      const f = new FormData(e.currentTarget)
+                      void save('jira', { key: f.get('key'), board: f.get('board'), folder: f.get('folder') })
+                    }}
+                  >
+                    <Stack gap="3">
+                      <Grid min={200} gap="3">
+                        <TextField
+                          name="key"
+                          label="Project key"
+                          placeholder="BIOINS"
+                          defaultValue={d.project.jira?.key ?? ''}
+                          size="sm"
+                        />
+                        <TextField
+                          name="board"
+                          label="Board"
+                          optional
+                          placeholder="7"
+                          defaultValue={d.project.jira?.board ?? ''}
+                          size="sm"
+                        />
+                        <TextField
+                          name="folder"
+                          label="Credential folder"
+                          optional
+                          placeholder="jira"
+                          defaultValue={d.project.jira?.credential_folder ?? ''}
+                          size="sm"
+                        />
+                      </Grid>
+                      <Row>
+                        <Button type="submit" loading={saving === 'jira'} variant="secondary">
+                          Save Jira
+                        </Button>
+                      </Row>
+                    </Stack>
+                  </form>
+                </CardContent>
+              </Card>
+            </Section>
+
+            <Section title="Channels">
+              <Card>
+                <CardContent>
+                  <Stack gap="3">
+                    {d.channels.length === 0 ? (
+                      <EmptyState title="No channel maps to this project" bare />
+                    ) : (
+                      <Stack gap="2">
+                        {d.channels.map((c) => (
+                          <Row key={c.channel_id} gap="2" justify="between">
+                            <Row gap="2">
+                              <Badge>{c.source}</Badge>
+                              <Text size="2">{c.name}</Text>
+                              <Text size="1" tone="muted" mono>
+                                {c.channel_id}
+                              </Text>
+                              {c.triage && <Badge tone="warning">triaged</Badge>}
+                            </Row>
+                            <ActionButton
+                              path={path}
+                              op="unchannel"
+                              body={{ channel: c.channel_id }}
+                              variant="ghost"
+                              confirm={`Stop mapping ${c.name} to this project?`}
+                              onDone={() => void state.reload()}
+                            >
+                              Remove
+                            </ActionButton>
+                          </Row>
+                        ))}
+                      </Stack>
+                    )}
+                    <form
+                      onSubmit={(e) => {
+                        e.preventDefault()
+                        const f = new FormData(e.currentTarget)
+                        void save('channel', { channel: f.get('channel'), triage: f.get('triage') === 'on' })
+                      }}
+                    >
+                      <Row gap="3" align="end">
+                        <div style={{ flexGrow: 1, minWidth: '14rem' }}>
+                          {/* A name works: the server resolves it against the conversations you are in. */}
+                          <TextField
+                            name="channel"
+                            label="Add a channel"
+                            placeholder="code-reviews, or a channel id"
+                            size="sm"
+                          />
+                        </div>
+                        <Checkbox name="triage" label="the secretary triages it" />
+                        <Button type="submit" loading={saving === 'channel'} variant="secondary">
+                          Add
+                        </Button>
+                      </Row>
+                    </form>
+                  </Stack>
+                </CardContent>
+              </Card>
+            </Section>
+
+            {d.nodes.length > 0 && (
+              <Section title="Nodes with a checkout">
+                <Stack gap="2">
+                  {d.nodes.map((n) => (
+                    <Card key={n.id}>
+                      <CardContent>
+                        <Row gap="2" justify="between">
+                          <Row gap="2">
+                            <Badge tone={n.online ? 'success' : 'neutral'} dot live={n.online || undefined}>
+                              {n.online ? 'online' : 'offline'}
+                            </Badge>
+                            <Link to={`/nodes/${n.id}`} className="fx-link">
+                              {n.name}
+                            </Link>
+                          </Row>
+                          <Text size="1" tone="muted" mono breakAll>
+                            {n.path}
+                          </Text>
+                        </Row>
+                      </CardContent>
+                    </Card>
+                  ))}
+                </Stack>
+              </Section>
+            )}
+          </>
+        )}
+      </Loaded>
+    </Page>
   )
 }

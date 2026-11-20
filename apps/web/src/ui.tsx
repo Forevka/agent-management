@@ -1,11 +1,17 @@
-// The pieces every page is built from: how data is loaded, how a status reads, how time reads,
-// and the frame around it all.
+// The pieces every page is built from: how data is loaded, how a status reads, how time reads.
+//
+// Nothing here styles anything. The look lives in the components under `components/ui` (affectUI,
+// MIT) and `components/fx` (ours, same contract); this file is the app's own vocabulary on top of
+// them — see apps/web/DESIGN.md.
 
 import { useCallback, useEffect, useRef, useState } from 'react'
-import {
-  Badge, Box, Button, Callout, Card, Code, Flex, Heading, Spinner, Text,
-} from '@radix-ui/themes'
-import { ExclamationTriangleIcon } from '@radix-ui/react-icons'
+import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import { Card, CardContent, CardHeader } from '@/components/ui/card'
+import { CodeBlock } from '@/components/ui/code-block'
+import { Spinner } from '@/components/ui/spinner'
+import { Note } from '@/components/fx/note'
+import { Text } from '@/components/fx/layout'
 import * as api from './api'
 
 /// Loading, with three outcomes the pages treat differently: data, an error worth showing, and
@@ -58,10 +64,13 @@ export function Loaded<T>({
   if (state.error) return <ErrorNote>{state.error}</ErrorNote>
   if (!state.data) {
     return (
-      <Flex align="center" gap="2" py="6" justify="center">
-        <Spinner />
-        <Text color="gray">Loading…</Text>
-      </Flex>
+      <div
+        style={{ display: 'flex', alignItems: 'center', gap: 8, justifyContent: 'center', padding: '48px 0' }}
+        role="status"
+      >
+        <Spinner size={16} />
+        <Text tone="muted">Loading…</Text>
+      </div>
     )
   }
   return <>{children(state.data)}</>
@@ -69,84 +78,79 @@ export function Loaded<T>({
 
 export function ErrorNote({ children }: { children: React.ReactNode }) {
   return (
-    <Callout.Root color="red" my="3">
-      <Callout.Icon>
-        <ExclamationTriangleIcon />
-      </Callout.Icon>
-      <Callout.Text>{children}</Callout.Text>
-    </Callout.Root>
+    <Note tone="danger" title="That did not work">
+      {children}
+    </Note>
   )
 }
 
 export function SignIn() {
   return (
-    <Card my="4">
-      <Heading size="4" mb="2">
-        Sign in
-      </Heading>
-      <Text as="p" color="gray">
-        Send <Code>/web</Code> to the orchestrator bot in Telegram for a fresh login link.
-      </Text>
+    <Card>
+      <CardHeader title="Sign in" description="This page needs a fresh link." />
+      <CardContent>
+        <Text as="p" tone="muted">
+          Send <Text mono>/web</Text> to the orchestrator bot in Telegram and open the link it sends
+          back.
+        </Text>
+      </CardContent>
     </Card>
   )
 }
 
 export function Empty({ children }: { children: React.ReactNode }) {
   return (
-    <Box py="5">
-      <Text color="gray" size="2">
-        {children}
-      </Text>
-    </Box>
+    <Text as="p" tone="muted" size="1">
+      {children}
+    </Text>
   )
 }
 
-/// Status colours, one mapping for the whole app so a word always looks the same.
-const TASK_COLORS: Record<string, 'green' | 'blue' | 'amber' | 'gray' | 'red' | 'purple'> = {
-  running: 'green',
+/// Status tones, one mapping for the whole app so a word always looks the same.
+const TASK_TONES: Record<string, 'neutral' | 'info' | 'success' | 'warning' | 'danger' | 'purple'> = {
+  running: 'success',
   planning: 'purple',
-  waiting: 'amber',
-  queued: 'blue',
-  done: 'gray',
-  stopped: 'gray',
-  failed: 'red',
+  waiting: 'warning',
+  queued: 'info',
+  done: 'neutral',
+  stopped: 'neutral',
+  failed: 'danger',
 }
 
 /// A task's status and whether a session is live are two different things, and the orchestrator's
 /// word for the first is "running" either way: a task whose agent finished its turn keeps
 /// `status = running` (it is in progress and resumable) with no session behind it. Showing that
 /// as "running" says something untrue, so an in-progress task with nothing live reads as **idle**
-/// — the work is open, nothing is happening this second.
+/// — the work is open, nothing is happening this second. A live session gets the pulsing dot,
+/// which is the one place in this app something blinks.
 export function StatusBadge({ status, running }: { status: string; running?: boolean }) {
   const resting = !running && (status === 'running' || status === 'planning')
   return (
-    <Flex gap="1" align="center" asChild>
-      <span>
-        <Badge
-          color={resting ? 'gray' : (TASK_COLORS[status] ?? 'gray')}
-          variant="soft"
-          title={
-            resting
-              ? `${status}, but no session is live: the work is open and a message resumes it`
-              : undefined
-          }
-        >
-          {resting ? 'idle' : status}
+    <span style={{ display: 'inline-flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
+      <Badge
+        tone={resting ? 'neutral' : (TASK_TONES[status] ?? 'neutral')}
+        dot
+        title={
+          resting
+            ? `${status}, but no session is live: the work is open and a message resumes it`
+            : undefined
+        }
+      >
+        {resting ? 'idle' : status}
+      </Badge>
+      {running && (
+        <Badge tone="success" live title="a session is running right now">
+          live
         </Badge>
-        {running && (
-          <Badge color="green" variant="solid" title="a session is running right now">
-            live
-          </Badge>
-        )}
-      </span>
-    </Flex>
+      )}
+    </span>
   )
 }
 
 /// Time as a person reads it ("4 min ago"), with the exact timestamp on hover — the absolute
 /// one still matters when something went wrong.
 export function When({ at }: { at: string | null | undefined }) {
-  if (!at) return <Text color="gray">—</Text>
+  if (!at) return <Text tone="muted">—</Text>
   const d = new Date(at)
   const secs = Math.round((Date.now() - d.getTime()) / 1000)
   const rel = (): string => {
@@ -163,7 +167,7 @@ export function When({ at }: { at: string | null | undefined }) {
     return d.toLocaleDateString()
   }
   return (
-    <Text color="gray" size="2" title={d.toLocaleString()}>
+    <Text size="1" tone="muted" title={d.toLocaleString()}>
       {rel()}
     </Text>
   )
@@ -176,7 +180,7 @@ export function Duration({ from, to }: { from: string; to: string | null }) {
   const text =
     secs < 60 ? `${secs}s` : secs < 3600 ? `${Math.round(secs / 60)}m` : `${(secs / 3600).toFixed(1)}h`
   return (
-    <Text size="2" color={to ? 'gray' : 'green'}>
+    <Text size="1" tone={to ? 'muted' : 'success'}>
       {text}
       {!to && ' …'}
     </Text>
@@ -190,8 +194,8 @@ export function ActionButton({
   path,
   body,
   children,
-  color,
-  variant,
+  variant = 'secondary',
+  size,
   confirm,
   onDone,
   disabled,
@@ -200,8 +204,8 @@ export function ActionButton({
   path: string
   body?: unknown
   children: React.ReactNode
-  color?: 'red' | 'green' | 'gray'
-  variant?: 'solid' | 'soft' | 'outline' | 'ghost'
+  variant?: 'primary' | 'secondary' | 'ghost' | 'destructive'
+  size?: 'sm' | 'md' | 'lg'
   /// When set, the click asks first. For anything that cannot be undone.
   confirm?: string
   onDone?: (result: { done?: unknown }) => void
@@ -223,62 +227,29 @@ export function ActionButton({
     }
   }
   return (
-    <Flex direction="column" gap="1">
+    <span style={{ display: 'inline-flex', flexDirection: 'column', gap: 4, minWidth: 0 }}>
       <Button
         onClick={() => void run()}
-        color={color}
-        variant={variant ?? 'soft'}
+        variant={variant}
+        size={size ?? 'sm'}
         disabled={busy || disabled}
         loading={busy}
       >
         {children}
       </Button>
       {error && (
-        <Text size="1" color="red">
+        <Text size="1" tone="danger">
           {error}
         </Text>
       )}
-    </Flex>
+    </span>
   )
 }
 
-/// A section with a heading, which is most of every page.
-export function Section({
-  title,
-  aside,
-  children,
-}: {
-  title: string
-  aside?: React.ReactNode
-  children: React.ReactNode
-}) {
-  return (
-    <Box mt="5">
-      <Flex justify="between" align="center" mb="2" gap="3" wrap="wrap">
-        <Heading size="3">{title}</Heading>
-        {aside}
-      </Flex>
-      {children}
-    </Box>
-  )
+/// Agent output, a brief, a ticket: untrusted text, shown as text, never as markup. The code
+/// block wraps, scrolls and can be copied, which is what someone reading a transcript wants.
+export function Pre({ children, maxHeight = 352 }: { children: string; maxHeight?: number }) {
+  return <CodeBlock code={children} wrap maxHeight={maxHeight} copyable />
 }
 
-/// Agent output and ticket text are untrusted: they are rendered as text, inside a scroll box,
-/// never as markup.
-export function Pre({ children }: { children: string }) {
-  return (
-    <Box
-      style={{
-        maxHeight: '22rem',
-        overflow: 'auto',
-        background: 'var(--gray-a2)',
-        borderRadius: 'var(--radius-3)',
-        padding: 'var(--space-3)',
-      }}
-    >
-      <Text as="div" size="1" style={{ whiteSpace: 'pre-wrap', fontFamily: 'var(--code-font-family)' }}>
-        {children}
-      </Text>
-    </Box>
-  )
-}
+export { Section } from '@/components/fx/layout'

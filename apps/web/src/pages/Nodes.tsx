@@ -1,9 +1,15 @@
 import { useState } from 'react'
-import { Badge, Box, Button, Callout, Card, Code, Flex, Heading, Table, Text } from '@radix-ui/themes'
 import { Link } from 'react-router-dom'
+import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import { Card, CardContent, CardHeader } from '@/components/ui/card'
+import { TextField } from '@/components/ui/text-field'
+import { Page, PageHeader, Row, Section, Stack, Text } from '@/components/fx/layout'
+import { Note } from '@/components/fx/note'
+import { Table } from '@/components/fx/table'
 import * as api from '../api'
 import type { Node } from '../api'
-import { ErrorNote, Loaded, Section, When, useApi } from '../ui'
+import { ErrorNote, Loaded, When, useApi } from '../ui'
 
 export default function Nodes() {
   const state = useApi<{ nodes: Node[] }>('/api/nodes', 15_000)
@@ -25,92 +31,101 @@ export default function Nodes() {
   }
 
   return (
-    <>
-      <Heading size="6" mt="5" mb="3">
-        Nodes
-      </Heading>
+    <Page>
+      <PageHeader title="Nodes" description="The machines that run agents, and what each is doing." />
       {error && <ErrorNote>{error}</ErrorNote>}
 
       <Loaded state={state}>
         {(d) => (
-          <Table.Root variant="surface">
-            <Table.Header>
-              <Table.Row>
-                <Table.ColumnHeaderCell>Node</Table.ColumnHeaderCell>
-                <Table.ColumnHeaderCell>Status</Table.ColumnHeaderCell>
-                <Table.ColumnHeaderCell>Projects</Table.ColumnHeaderCell>
-                <Table.ColumnHeaderCell>Seen</Table.ColumnHeaderCell>
-              </Table.Row>
-            </Table.Header>
-            <Table.Body>
-              {d.nodes.map((n) => (
-                <Table.Row key={n.id}>
-                  <Table.Cell>
-                    <Link className="fleet-row-link" to={`/nodes/${n.id}`}>
+          <Table
+            rows={d.nodes}
+            rowKey={(n) => n.id}
+            loading={state.loading}
+            empty="No node has joined yet"
+            columns={[
+              {
+                key: 'node',
+                header: 'Node',
+                width: '32%',
+                cell: (n) => (
+                  <Stack gap="1">
+                    <Link to={`/nodes/${n.id}`} className="fx-link">
                       {n.name}
                     </Link>
-                    <Text as="div" size="1" color="gray">
+                    <Text size="1" tone="muted">
                       {n.os} · {n.version}
                     </Text>
-                  </Table.Cell>
-                  <Table.Cell>
-                    <Flex gap="2" align="center">
-                      <Badge color={n.online ? 'green' : 'gray'} variant="soft">
-                        {n.online ? 'online' : 'offline'}
-                      </Badge>
-                      <Text size="2" color="gray">
-                        {n.running.length}/{n.max_agents}
-                      </Text>
-                    </Flex>
-                  </Table.Cell>
-                  <Table.Cell>
-                    <Flex gap="1" wrap="wrap">
+                  </Stack>
+                ),
+              },
+              {
+                key: 'status',
+                header: 'Status',
+                cell: (n) => (
+                  <Row gap="2">
+                    <Badge tone={n.online ? 'success' : 'neutral'} dot live={n.online || undefined}>
+                      {n.online ? 'online' : 'offline'}
+                    </Badge>
+                    <Text size="1" tone="muted">
+                      {n.running.length}/{n.max_agents} agents
+                    </Text>
+                  </Row>
+                ),
+              },
+              {
+                key: 'projects',
+                header: 'Projects',
+                secondary: true,
+                cell: (n) =>
+                  n.projects.length === 0 ? (
+                    <Text size="1" tone="muted">
+                      none mapped
+                    </Text>
+                  ) : (
+                    <Row gap="1">
                       {n.projects.map((p) => (
-                        <Badge key={p.project} variant="soft">
-                          {p.project}
-                        </Badge>
+                        <Badge key={p.project}>{p.project}</Badge>
                       ))}
-                    </Flex>
-                  </Table.Cell>
-                  <Table.Cell>
-                    <When at={n.last_seen} />
-                  </Table.Cell>
-                </Table.Row>
-              ))}
-            </Table.Body>
-          </Table.Root>
+                    </Row>
+                  ),
+              },
+              { key: 'seen', header: 'Seen', align: 'end', cell: (n) => <When at={n.last_seen} /> },
+            ]}
+          />
         )}
       </Loaded>
 
       <Section title="Add a node">
         <Card>
-          <Text as="p" size="2" color="gray" mb="3">
-            An invite is single-use. Run <Code>fleet join &lt;ticket&gt;</Code> on the machine.
-          </Text>
-          <Button onClick={() => void invite()} loading={busy}>
-            Create an invite
-          </Button>
-          {ticket && (
-            <Callout.Root mt="3">
-              <Callout.Text>
-                <Text as="div" size="1" color="gray" mb="1">
-                  Copy it now — it is not shown again.
-                </Text>
-                <Box
-                  style={{
-                    userSelect: 'all',
-                    overflowWrap: 'anywhere',
-                    fontFamily: 'var(--code-font-family)',
-                    fontSize: 'var(--font-size-1)',
-                  }}
-                >
-                  {ticket}
-                </Box>
-              </Callout.Text>
-            </Callout.Root>
-          )}
+          <CardHeader
+            title="One machine, one invite"
+            description="An invite is single-use and expires. Run it on the machine that should join."
+          />
+          <CardContent>
+            <Stack gap="3">
+              <Text size="2" tone="muted">
+                Run <Text mono>fleet join &lt;ticket&gt;</Text> there.
+              </Text>
+              <Row>
+                <Button onClick={() => void invite()} loading={busy} variant="secondary">
+                  Create an invite
+                </Button>
+              </Row>
+              {ticket && (
+                <Note tone="warning" title="Copy it now — it is not shown again">
+                  <TextField
+                    value={ticket}
+                    readOnly
+                    copyable
+                    aria-label="Invite ticket"
+                    onFocus={(e) => e.currentTarget.select()}
+                  />
+                </Note>
+              )}
+            </Stack>
+          </CardContent>
         </Card>
       </Section>
-    </>
+    </Page>
   )
 }

@@ -1,0 +1,205 @@
+/*
+ * The page-level design tokens every component reads.
+ *
+ * This is the whole theme. The components in `components/ui` (affectUI, MIT) and the ones in
+ * `components/fx` (ours, written to the same contract) carry their own styles and never hard-code
+ * a colour: each declares component-scoped variables that read these with a fallback, e.g.
+ * `--ui-btn-ink: var(--aui-ink, #171717)`. So the way to restyle the fleet is to change a value
+ * here, and the way to add a component is to follow that contract — see `apps/web/DESIGN.md`.
+ *
+ * The values are affectUI's own defaults (the fallbacks their components ship with), so the fleet
+ * looks like the library's examples rather than like a near-miss of them. Two deliberate
+ * departures, both noted below: the muted tone and the font stack.
+ */
+
+:root {
+  color-scheme: light;
+
+  /* Text and surfaces */
+  --aui-ink: #171717;
+  --aui-surface: #ffffff;
+  --aui-subtle: #f0f0f0;
+  --aui-border: #e5e5e5;
+  --aui-border-strong: #d4d4d8;
+  /* affectUI's own default is #8f8f8f. At 2.9:1 on white that fails WCAG AA for the small text
+     this app is mostly made of (table cells, timestamps, hints), so we take their alternative
+     #737373 (4.7:1), which several of their own components use for the same job. */
+  --aui-muted: #737373;
+  --aui-placeholder: #b5b5b5;
+
+  /* The one accent: a filled control is near-black, like their primary button. */
+  --aui-primary: #171717;
+  --aui-on-primary: #ffffff;
+  --aui-focus: rgba(0, 96, 226, 0.7);
+
+  /* Status, in the pairs their components expect: a readable ink and a soft fill. */
+  --aui-danger: #c4320a;
+  --aui-danger-soft: #fdecea;
+  --aui-success: #1e8a4f;
+  --aui-success-soft: #e6f6ed;
+  --aui-warning: #b25e00;
+  --aui-warning-soft: #fff1e0;
+  --aui-info: #2456d6;
+  --aui-info-soft: #eaf1ff;
+
+  /* Hues for charts, dots and illustrations. */
+  --aui-red: #f04438;
+  --aui-green: #5fc88a;
+  --aui-blue: #4fb0fe;
+  --aui-amber: #e8b000;
+  --aui-orange: #e07a3c;
+  --aui-teal: #2aa79b;
+
+  /* Shape and motion */
+  --aui-radius: 10px;
+  --aui-radius-sm: 7px;
+  --aui-radius-lg: 16px;
+  --aui-ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --aui-shadow-card: 0 1px 2px rgba(0, 0, 0, 0.06);
+  --aui-shadow-popover: 0 0 0 1px rgba(0, 0, 0, 0.06), 0 12px 32px rgba(0, 0, 0, 0.12);
+  --aui-overlay: #ffffff;
+
+  /* The orchestrator serves this page and must work on a machine with no internet (see
+     index.html), so there is no webfont: Inter is used when the machine has it, and the system
+     stack otherwise. Everything else about the typography is affectUI's. */
+  --aui-font: "Inter", "InterVariable", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --aui-font-mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+
+  /* Ours, for the frame around the components: the page sits a shade under its cards. */
+  --fx-page: #fafafa;
+  --fx-page-width: 1200px;
+  --fx-header-height: 56px;
+}
+
+/* Dark mode is a class or attribute on an ancestor, never a media query: that is the contract
+   every component is written against (`:where(.dark, [data-theme="dark"]) .ui-x`), and it is what
+   lets the header's toggle override the operating system. `theme.tsx` sets it on <html>. */
+:root[data-theme="dark"],
+:root.dark {
+  color-scheme: dark;
+
+  --aui-ink: #ededed;
+  --aui-surface: #19191b;
+  --aui-subtle: #111113;
+  --aui-border: #2a2a2e;
+  --aui-border-strong: #3a3a40;
+  --aui-muted: #8b8b92;
+  --aui-placeholder: #5c5c63;
+
+  --aui-primary: #ededed;
+  --aui-on-primary: #121213;
+  --aui-focus: rgba(77, 141, 255, 0.8);
+
+  --aui-danger: #ff8a7a;
+  --aui-danger-soft: #3b1c14;
+  --aui-success: #7dcf9f;
+  --aui-success-soft: #123020;
+  --aui-warning: #ffb35c;
+  --aui-warning-soft: #3a2610;
+  --aui-info: #8ab4ff;
+  --aui-info-soft: #16243f;
+
+  --aui-red: #ff6b5f;
+  --aui-green: #7dcf9f;
+  --aui-blue: #4fb0fe;
+  --aui-amber: #e6c24d;
+  --aui-orange: #f2a15c;
+  --aui-teal: #4fc3b4;
+
+  --aui-shadow-card: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --aui-shadow-popover: 0 0 0 1px rgba(255, 255, 255, 0.06), 0 12px 32px rgba(0, 0, 0, 0.5);
+  --aui-overlay: #19191b;
+
+  --fx-page: #111113;
+}
+
+/* ---------- Base ---------- */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  /* A scrollbar that appears between pages must not shift the layout sideways. */
+  scrollbar-gutter: stable;
+}
+
+body {
+  margin: 0;
+  background: var(--fx-page);
+  color: var(--aui-ink);
+  font-family: var(--aui-font);
+  font-size: 14px;
+  line-height: 1.5;
+  letter-spacing: -0.01em;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Form controls do not inherit the page's font on their own. Not `body` — it is given the font
+   above, and listing it here would make it inherit from <html> instead and fall back to serif. */
+input,
+button,
+textarea,
+select {
+  font-family: inherit;
+}
+
+a {
+  color: inherit;
+}
+
+/* The one link style the app uses: ink, medium, underlined on hover. There is no accent hue to
+   colour links with — affectUI's palette has one near-black primary and uses weight and an
+   underline instead, which keeps a table of links from turning into a field of blue. */
+.fx-link {
+  color: var(--aui-ink);
+  font-weight: 500;
+  text-decoration: none;
+  text-underline-offset: 2px;
+  border-radius: 3px;
+  transition: color 140ms ease;
+}
+.fx-link:hover {
+  text-decoration: underline;
+  text-decoration-thickness: 1.5px;
+}
+.fx-link[data-muted] {
+  color: var(--aui-muted);
+  font-weight: 400;
+}
+
+/* A link that fills the card it sits in, so the whole card is the target rather than the few
+   words inside it. The card draws the hover state (`interactive`); this only carries the text. */
+.fx-item {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  color: inherit;
+  text-decoration: none;
+  min-width: 0;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--aui-focus) 30%, transparent);
+}
+
+/* A focus ring on every interactive thing, in one place: the components that draw their own
+   (buttons, fields) override it, and everything else inherits something visible. */
+:focus-visible {
+  outline: 2px solid var(--aui-focus);
+  outline-offset: 2px;
+  border-radius: var(--aui-radius-sm);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+  }
+}

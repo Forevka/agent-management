@@ -1,9 +1,14 @@
 import { useState } from 'react'
-import { Badge, Box, Button, Card, Code, Flex, Heading, Table, Text, TextField } from '@radix-ui/themes'
 import { Link } from 'react-router-dom'
+import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import { Card, CardContent, CardHeader } from '@/components/ui/card'
+import { TextField } from '@/components/ui/text-field'
+import { Page, PageHeader, Row, Section, Stack, Text } from '@/components/fx/layout'
+import { Table } from '@/components/fx/table'
 import * as api from '../api'
 import type { Overview, ProjectRow } from '../api'
-import { ErrorNote, Loaded, Section, useApi } from '../ui'
+import { ErrorNote, Loaded, useApi } from '../ui'
 
 export default function Projects() {
   const state = useApi<{ projects: ProjectRow[] }>('/api/projects')
@@ -30,107 +35,108 @@ export default function Projects() {
   }
 
   return (
-    <>
-      <Heading size="6" mt="5" mb="3">
-        Projects
-      </Heading>
+    <Page>
+      <PageHeader title="Projects" description="What the fleet works on, and where its work stands." />
       {error && <ErrorNote>{error}</ErrorNote>}
 
       <Loaded state={state}>
         {(d) => (
-          <Table.Root variant="surface">
-            <Table.Header>
-              <Table.Row>
-                <Table.ColumnHeaderCell>Project</Table.ColumnHeaderCell>
-                <Table.ColumnHeaderCell>Jira</Table.ColumnHeaderCell>
-                <Table.ColumnHeaderCell>Tasks</Table.ColumnHeaderCell>
-              </Table.Row>
-            </Table.Header>
-            <Table.Body>
-              {d.projects.map((p) => {
-                const counts = overview.data?.projects.find((x) => x.slug === p.slug)
-                return (
-                  <Table.Row key={p.slug}>
-                    <Table.Cell>
-                      <Link className="fleet-row-link" to={`/projects/${p.slug}`}>
-                        {p.name || p.slug}
-                      </Link>
-                      <Text as="div" size="1" color="gray">
-                        <Code variant="ghost">{p.slug}</Code>
+          <Table
+            rows={d.projects}
+            rowKey={(p) => p.slug}
+            loading={state.loading}
+            empty="No projects yet"
+            columns={[
+              {
+                key: 'project',
+                header: 'Project',
+                width: '40%',
+                cell: (p) => (
+                  <Stack gap="1">
+                    <Link to={`/projects/${p.slug}`} className="fx-link">
+                      {p.name || p.slug}
+                    </Link>
+                    <Text size="1" tone="muted" mono>
+                      {p.slug}
+                    </Text>
+                  </Stack>
+                ),
+              },
+              {
+                key: 'jira',
+                header: 'Jira',
+                secondary: true,
+                cell: (p) =>
+                  p.jira ? (
+                    <Badge>{p.jira}</Badge>
+                  ) : (
+                    <Text size="1" tone="muted">
+                      —
+                    </Text>
+                  ),
+              },
+              {
+                key: 'tasks',
+                header: 'Tasks',
+                align: 'end',
+                cell: (p) => {
+                  const counts = overview.data?.projects.find((x) => x.slug === p.slug)
+                  if (!counts)
+                    return (
+                      <Text size="1" tone="muted">
+                        —
                       </Text>
-                    </Table.Cell>
-                    <Table.Cell>
-                      {p.jira ? (
-                        <Badge variant="soft">{p.jira}</Badge>
-                      ) : (
-                        <Text size="2" color="gray">
-                          —
-                        </Text>
+                    )
+                  return (
+                    <Row gap="2" justify="end">
+                      {counts.running > 0 && (
+                        <Badge tone="success" live>
+                          {counts.running} live
+                        </Badge>
                       )}
-                    </Table.Cell>
-                    <Table.Cell>
-                      {counts ? (
-                        <Flex gap="2" align="center">
-                          {counts.running > 0 && (
-                            <Badge color="green" variant="soft">
-                              {counts.running} live
-                            </Badge>
-                          )}
-                          <Text size="2">
-                            {counts.open} open of {counts.total}
-                          </Text>
-                        </Flex>
-                      ) : (
-                        <Text size="2" color="gray">
-                          —
-                        </Text>
-                      )}
-                    </Table.Cell>
-                  </Table.Row>
-                )
-              })}
-            </Table.Body>
-          </Table.Root>
+                      <Text size="1">
+                        {counts.open} open of {counts.total}
+                      </Text>
+                    </Row>
+                  )
+                },
+              },
+            ]}
+          />
         )}
       </Loaded>
 
       <Section title="New project">
         <Card>
-          <form
-            onSubmit={(e) => {
-              e.preventDefault()
-              void create(new FormData(e.currentTarget))
-            }}
-          >
-            <Flex gap="2" align="end" wrap="wrap">
-              <label style={{ minWidth: '9rem' }}>
-                <Text as="div" size="2" mb="1" weight="medium">
-                  Slug
-                </Text>
-                {/* The slug prefixes every task id, so it is short and permanent. */}
-                <TextField.Root name="slug" placeholder="bioins" required />
-              </label>
-              <label style={{ minWidth: '12rem', flexGrow: 1 }}>
-                <Text as="div" size="2" mb="1" weight="medium">
-                  Name
-                </Text>
-                <TextField.Root name="name" placeholder="Bio Insights" />
-              </label>
-              <label style={{ minWidth: '14rem', flexGrow: 2 }}>
-                <Text as="div" size="2" mb="1" weight="medium">
-                  Description
-                </Text>
-                <TextField.Root name="description" />
-              </label>
-              <Box>
-                <Button type="submit" loading={busy}>
+          <CardHeader
+            title="Add a project"
+            description="The slug prefixes every task id, so keep it short — it is permanent."
+          />
+          <CardContent>
+            <form
+              onSubmit={(e) => {
+                e.preventDefault()
+                void create(new FormData(e.currentTarget))
+              }}
+            >
+              <Row gap="3" align="end">
+                <div style={{ minWidth: '9rem' }}>
+                  <TextField name="slug" label="Slug" placeholder="bioins" required size="sm" />
+                </div>
+                <div style={{ minWidth: '12rem', flexGrow: 1 }}>
+                  <TextField name="name" label="Name" placeholder="Bio Insights" optional size="sm" />
+                </div>
+                <div style={{ minWidth: '14rem', flexGrow: 2 }}>
+                  <TextField name="description" label="Description" optional size="sm" />
+                </div>
+                <Button type="submit" loading={busy} variant="secondary">
                   Create
                 </Button>
-              </Box>
-            </Flex>
-          </form>
+              </Row>
+            </form>
+          </CardContent>
         </Card>
       </Section>
-    </>
+    </Page>
   )
 }

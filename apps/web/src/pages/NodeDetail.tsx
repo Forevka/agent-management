@@ -1,12 +1,19 @@
 import { useState } from 'react'
-import {
-  Badge, Box, Button, Callout, Card, Code, Flex, Grid, Heading, Select, Table, Text, TextArea,
-  TextField,
-} from '@radix-ui/themes'
 import { Link, useNavigate, useParams } from 'react-router-dom'
+import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import { Card, CardContent, CardHeader } from '@/components/ui/card'
+import { EmptyState } from '@/components/ui/empty-state'
+import { Select } from '@/components/ui/select'
+import { TextArea } from '@/components/ui/text-area'
+import { TextField } from '@/components/ui/text-field'
+import { Grid, Page, PageHeader, Row, Section, Stack, Text } from '@/components/fx/layout'
+import { Note } from '@/components/fx/note'
+import { Table } from '@/components/fx/table'
+import { ArrowLeftIcon } from '@/components/fx/icons'
 import * as api from '../api'
 import type { Node } from '../api'
-import { ActionButton, Empty, ErrorNote, Loaded, Section, When, useApi } from '../ui'
+import { ActionButton, ErrorNote, Loaded, When, useApi } from '../ui'
 
 const AUTH_MODES = ['default', 'oauth_token', 'api_key']
 
@@ -41,167 +48,184 @@ export default function NodeDetail() {
   }
 
   return (
-    <Loaded state={state}>
-      {(n) => (
-        <>
-          <Flex align="center" gap="3" mt="5" mb="1" wrap="wrap">
-            <Heading size="6">{n.name}</Heading>
-            <Badge color={n.online ? 'green' : 'gray'} variant="soft">
-              {n.online ? 'online' : 'offline'}
-            </Badge>
-          </Flex>
-          <Text as="p" size="2" color="gray" mb="3" className="fleet-wrap">
-            <Code variant="ghost">{n.id}</Code> · {n.os} · {n.version}
-          </Text>
+    <Page>
+      <Loaded state={state}>
+        {(n) => (
+          <>
+            <PageHeader
+              title={n.name}
+              description={`${n.os} · ${n.version}`}
+              back={
+                <Link to="/nodes" className="fx-link" data-muted="">
+                  <ArrowLeftIcon /> All nodes
+                </Link>
+              }
+              meta={
+                <Row gap="2">
+                  <Badge tone={n.online ? 'success' : 'neutral'} dot live={n.online || undefined}>
+                    {n.online ? 'online' : 'offline'}
+                  </Badge>
+                  <Text size="1" tone="muted" mono breakAll>
+                    {n.id}
+                  </Text>
+                </Row>
+              }
+            />
 
-          {error && <ErrorNote>{error}</ErrorNote>}
-          {pushError && (
-            <Callout.Root color="amber" my="3">
-              <Callout.Text>
-                Saved, but sending it to the node failed — it gets the settings when it next
-                connects.
-                <Box mt="1" style={{ fontFamily: 'var(--code-font-family)', fontSize: 'var(--font-size-1)' }}>
+            {error && <ErrorNote>{error}</ErrorNote>}
+            {pushError && (
+              <Note tone="warning" title="Saved, but the node did not hear it">
+                It gets the settings when it next connects.
+                <Text as="div" size="1" mono breakAll>
                   {pushError}
-                </Box>
-              </Callout.Text>
-            </Callout.Root>
-          )}
-
-          <Section title="Projects on this machine">
-            {n.projects.length === 0 ? (
-              <Empty>
-                No project is mapped here. Mapping happens on the node itself, in the tray app.
-              </Empty>
-            ) : (
-              <Flex direction="column" gap="2">
-                {n.projects.map((p) => (
-                  <Card key={p.project}>
-                    <Flex gap="2" align="center" wrap="wrap">
-                      <Link className="fleet-row-link" to={`/projects/${p.project}`}>
-                        {p.project}
-                      </Link>
-                      <Code variant="ghost" className="fleet-wrap">
-                        {p.path}
-                      </Code>
-                    </Flex>
-                  </Card>
-                ))}
-              </Flex>
+                </Text>
+              </Note>
             )}
-          </Section>
 
-          <Section title="Settings">
-            <Card>
-              <form
-                onSubmit={(e) => {
-                  e.preventDefault()
-                  void save(new FormData(e.currentTarget))
-                }}
-              >
-                <Flex direction="column" gap="3">
-                  <label>
-                    <Text as="div" size="2" mb="1" weight="medium">
-                      How Claude is started — one argument per line
-                    </Text>
-                    <TextArea name="command" defaultValue={n.command.join('\n')} rows={4} />
-                  </label>
-                  <Grid columns={{ initial: '1', sm: '2' }} gap="3">
-                    <Box>
-                      <Text as="div" size="2" mb="1" weight="medium">
-                        Authentication
-                      </Text>
-                      <Select.Root
-                        value={authMode ?? n.auth_mode}
-                        onValueChange={setAuthMode}
-                      >
-                        <Select.Trigger />
-                        <Select.Content>
-                          {AUTH_MODES.map((m) => (
-                            <Select.Item key={m} value={m}>
-                              {m}
-                            </Select.Item>
-                          ))}
-                        </Select.Content>
-                      </Select.Root>
-                    </Box>
-                    <label>
-                      <Text as="div" size="2" mb="1" weight="medium">
-                        Max agents at once
-                      </Text>
-                      <TextField.Root name="max_agents" type="number" min="1" defaultValue={n.max_agents} />
-                    </label>
-                  </Grid>
-                  <label>
-                    <Text as="div" size="2" mb="1" weight="medium">
-                      Token or key {n.has_auth_secret && '— one is stored; leave blank to keep it'}
-                    </Text>
-                    <TextField.Root name="auth_secret" type="password" autoComplete="off" />
-                  </label>
-                  <Box>
-                    <Button type="submit" loading={busy}>
-                      Save
-                    </Button>
-                  </Box>
-                </Flex>
-              </form>
-            </Card>
-          </Section>
-
-          <Section
-            title="Recent sessions here"
-            aside={
-              <Link to={`/sessions`}>
-                <Text size="2">All sessions →</Text>
-              </Link>
-            }
-          >
-            {!n.sessions || n.sessions.length === 0 ? (
-              <Empty>Nothing has run on this node yet.</Empty>
-            ) : (
-              <Table.Root variant="surface">
-                <Table.Header>
-                  <Table.Row>
-                    <Table.ColumnHeaderCell>Task</Table.ColumnHeaderCell>
-                    <Table.ColumnHeaderCell>Started</Table.ColumnHeaderCell>
-                    <Table.ColumnHeaderCell>Status</Table.ColumnHeaderCell>
-                  </Table.Row>
-                </Table.Header>
-                <Table.Body>
-                  {n.sessions.map((r) => (
-                    <Table.Row key={r.run_id}>
-                      <Table.Cell>
-                        <Link className="fleet-row-link" to={`/tasks/${r.task}`}>
-                          {r.task}
-                        </Link>
-                      </Table.Cell>
-                      <Table.Cell>
-                        <When at={r.started_at} />
-                      </Table.Cell>
-                      <Table.Cell>
-                        <Badge color={r.status === 'running' ? 'green' : 'gray'} variant="soft">
-                          {r.status}
-                        </Badge>
-                      </Table.Cell>
-                    </Table.Row>
+            <Section title="Projects on this machine">
+              {n.projects.length === 0 ? (
+                <EmptyState
+                  title="No project is mapped here"
+                  text="Mapping happens on the node itself, in the tray app."
+                />
+              ) : (
+                <Stack gap="2">
+                  {n.projects.map((p) => (
+                    <Card key={p.project}>
+                      <CardContent>
+                        <Row gap="3" justify="between">
+                          <Link to={`/projects/${p.project}`} className="fx-link">
+                            {p.project}
+                          </Link>
+                          <Text size="1" tone="muted" mono breakAll>
+                            {p.path}
+                          </Text>
+                        </Row>
+                      </CardContent>
+                    </Card>
                   ))}
-                </Table.Body>
-              </Table.Root>
-            )}
-          </Section>
+                </Stack>
+              )}
+            </Section>
 
-          <Section title="Danger">
-            <ActionButton
-              path={path}
-              op="revoke"
-              color="red"
-              confirm={`Revoke ${n.name}? Its key stops working and anything running on it ends.`}
-              onDone={() => navigate('/nodes')}
+            <Section title="Settings">
+              <Card>
+                <CardHeader
+                  title="How this node runs Claude"
+                  description="One argument per line. A change is pushed to the node at once when it is connected."
+                />
+                <CardContent>
+                  <form
+                    onSubmit={(e) => {
+                      e.preventDefault()
+                      void save(new FormData(e.currentTarget))
+                    }}
+                  >
+                    <Stack gap="3">
+                      <TextArea
+                        name="command"
+                        label="Command"
+                        defaultValue={n.command.join('\n')}
+                        minRows={4}
+                        maxRows={12}
+                      />
+                      <Grid min={220} gap="3">
+                        <Select
+                          label="Authentication"
+                          size="sm"
+                          value={authMode ?? n.auth_mode}
+                          onChange={setAuthMode}
+                          options={AUTH_MODES.map((m) => ({ value: m, label: m }))}
+                        />
+                        <TextField
+                          name="max_agents"
+                          label="Max agents at once"
+                          type="number"
+                          min="1"
+                          defaultValue={n.max_agents}
+                          size="sm"
+                        />
+                      </Grid>
+                      <TextField
+                        name="auth_secret"
+                        label="Token or key"
+                        hint={n.has_auth_secret ? 'One is stored; leave blank to keep it.' : undefined}
+                        type="password"
+                        autoComplete="off"
+                        size="sm"
+                        optional
+                      />
+                      <Row>
+                        <Button type="submit" loading={busy} variant="secondary">
+                          Save
+                        </Button>
+                      </Row>
+                    </Stack>
+                  </form>
+                </CardContent>
+              </Card>
+            </Section>
+
+            <Section
+              title="Recent sessions here"
+              action={
+                <Link to="/sessions" className="fx-link" data-muted="">
+                  All sessions →
+                </Link>
+              }
             >
-              Revoke this node
-            </ActionButton>
-          </Section>
-        </>
-      )}
-    </Loaded>
+              <Table
+                rows={n.sessions ?? []}
+                rowKey={(r) => r.run_id}
+                empty="Nothing has run on this node yet"
+                columns={[
+                  {
+                    key: 'task',
+                    header: 'Task',
+                    cell: (r) => (
+                      <Link to={`/tasks/${r.task}`} className="fx-link">
+                        {r.task}
+                      </Link>
+                    ),
+                  },
+                  { key: 'started', header: 'Started', cell: (r) => <When at={r.started_at} /> },
+                  {
+                    key: 'status',
+                    header: 'Status',
+                    align: 'end',
+                    cell: (r) => (
+                      <Badge tone={r.status === 'running' ? 'success' : 'neutral'} dot live={r.status === 'running' || undefined}>
+                        {r.status}
+                      </Badge>
+                    ),
+                  },
+                ]}
+              />
+            </Section>
+
+            <Section title="Danger">
+              <Card>
+                <CardContent>
+                  <Row gap="3" justify="between">
+                    <Text size="2" tone="muted">
+                      Revoking stops this node's key working and ends anything running on it.
+                    </Text>
+                    <ActionButton
+                      path={path}
+                      op="revoke"
+                      variant="destructive"
+                      confirm={`Revoke ${n.name}? Its key stops working and anything running on it ends.`}
+                      onDone={() => navigate('/nodes')}
+                    >
+                      Revoke this node
+                    </ActionButton>
+                  </Row>
+                </CardContent>
+              </Card>
+            </Section>
+          </>
+        )}
+      </Loaded>
+    </Page>
   )
 }

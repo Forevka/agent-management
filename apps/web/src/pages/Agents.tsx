@@ -1,15 +1,20 @@
 import { useState } from 'react'
-import {
-  Badge, Box, Button, Card, Code, Flex, Heading, Select, Table, Text, TextField,
-} from '@radix-ui/themes'
 import { Link } from 'react-router-dom'
+import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import { Card, CardContent, CardHeader } from '@/components/ui/card'
+import { EmptyState } from '@/components/ui/empty-state'
+import { Select } from '@/components/ui/select'
+import { TextField } from '@/components/ui/text-field'
+import { Page, PageHeader, Row, Section, Stack, Text } from '@/components/fx/layout'
+import { Table } from '@/components/fx/table'
 import * as api from '../api'
 import type { Agents as AgentsT } from '../api'
-import { ActionButton, Empty, ErrorNote, Loaded, Section, useApi } from '../ui'
+import { ActionButton, ErrorNote, Loaded, useApi } from '../ui'
 
 /// One agent's model and effort. Kept as its own component so each row holds its own draft
 /// state and saving one does not disturb the others.
-function AgentRow({
+function RunsWith({
   agent,
   efforts,
   defaultModel,
@@ -41,64 +46,45 @@ function AgentRow({
   }
 
   return (
-    <Table.Row>
-      <Table.Cell>
-        <Text weight="medium">{agent.name}</Text>
-        <Text as="div" size="1" color="gray">
-          <Code variant="ghost">{agent.id}</Code>
+    <Stack gap="1">
+      <Row gap="2" align="end">
+        <div style={{ width: '11rem' }}>
+          <TextField
+            size="sm"
+            value={model}
+            placeholder={defaultModel}
+            list={`models-${agent.id}`}
+            aria-label={`Model for ${agent.name}`}
+            onChange={(e) => setModel(e.currentTarget.value)}
+          />
+          <datalist id={`models-${agent.id}`}>
+            {suggested.map((m) => (
+              <option key={m} value={m} />
+            ))}
+          </datalist>
+        </div>
+        <div style={{ width: '9.5rem' }}>
+          <Select
+            size="sm"
+            aria-label={`Effort for ${agent.name}`}
+            value={effort || 'default'}
+            onChange={(v) => setEffort(v === 'default' ? '' : v)}
+            options={[
+              { value: 'default', label: 'default effort' },
+              ...efforts.map((e) => ({ value: e, label: e })),
+            ]}
+          />
+        </div>
+        <Button size="sm" variant="secondary" onClick={() => void save()} loading={busy}>
+          Save
+        </Button>
+      </Row>
+      {error && (
+        <Text size="1" tone="danger">
+          {error}
         </Text>
-      </Table.Cell>
-      <Table.Cell>
-        <Badge variant="soft">{agent.role}</Badge>
-      </Table.Cell>
-      <Table.Cell>
-        {agent.project ? (
-          <Link className="fleet-row-link" to={`/projects/${agent.project}`}>
-            <Text size="2">{agent.project}</Text>
-          </Link>
-        ) : (
-          <Text size="2" color="gray">
-            any
-          </Text>
-        )}
-      </Table.Cell>
-      <Table.Cell>
-        <Flex gap="2" align="center" wrap="wrap">
-          <Box style={{ width: '10rem' }}>
-            <TextField.Root
-              value={model}
-              placeholder={defaultModel}
-              list={`models-${agent.id}`}
-              onChange={(e) => setModel(e.currentTarget.value)}
-            />
-            <datalist id={`models-${agent.id}`}>
-              {suggested.map((m) => (
-                <option key={m} value={m} />
-              ))}
-            </datalist>
-          </Box>
-          <Select.Root value={effort || 'default'} onValueChange={(v) => setEffort(v === 'default' ? '' : v)}>
-            <Select.Trigger />
-            <Select.Content>
-              <Select.Item value="default">default effort</Select.Item>
-              {efforts.map((e) => (
-                <Select.Item key={e} value={e}>
-                  {e}
-                </Select.Item>
-              ))}
-            </Select.Content>
-          </Select.Root>
-          <Button size="2" variant="soft" onClick={() => void save()} loading={busy}>
-            Save
-          </Button>
-        </Flex>
-        {error && (
-          <Text size="1" color="red">
-            {error}
-          </Text>
-        )}
-      </Table.Cell>
-    </Table.Row>
+      )}
+    </Stack>
   )
 }
 
@@ -122,99 +108,130 @@ export default function Agents() {
   }
 
   return (
-    <>
-      <Heading size="6" mt="5" mb="3">
-        Agents
-      </Heading>
+    <Page>
+      <PageHeader title="Agents" description="Who the fleet can put on a task, and what each one runs with." />
       {error && <ErrorNote>{error}</ErrorNote>}
 
       <Loaded state={state}>
         {(d) => (
           <>
-            <Table.Root variant="surface">
-              <Table.Header>
-                <Table.Row>
-                  <Table.ColumnHeaderCell>Agent</Table.ColumnHeaderCell>
-                  <Table.ColumnHeaderCell>Role</Table.ColumnHeaderCell>
-                  <Table.ColumnHeaderCell>Project</Table.ColumnHeaderCell>
-                  <Table.ColumnHeaderCell>Runs with</Table.ColumnHeaderCell>
-                </Table.Row>
-              </Table.Header>
-              <Table.Body>
-                {d.agents.map((a) => (
-                  <AgentRow
-                    key={a.id}
-                    agent={a}
-                    efforts={d.efforts}
-                    defaultModel={d.default_model}
-                    suggested={d.suggested_models}
-                    onSaved={() => void state.reload()}
-                  />
-                ))}
-              </Table.Body>
-            </Table.Root>
-
-            <Section title="Telegram bots">
-              <Text as="p" size="2" color="gray" mb="2">
-                The pool of identities agents speak as. A bot’s token is stored encrypted and never
-                shown again.
-              </Text>
-              {d.bots.length === 0 ? (
-                <Empty>No bot in the pool.</Empty>
-              ) : (
-                <Flex direction="column" gap="2" mb="3">
-                  {d.bots.map((b) => (
-                    <Card key={b.id}>
-                      <Flex gap="2" align="center" wrap="wrap">
-                        <Text weight="medium">@{b.username}</Text>
-                        {b.agent ? (
-                          <Badge variant="soft">{b.agent}</Badge>
-                        ) : (
-                          <Badge color="gray" variant="soft">
-                            free
-                          </Badge>
-                        )}
-                        <Box flexGrow="1" />
-                        <ActionButton
-                          path="/api/agents"
-                          op="delete"
-                          body={{ id: b.id }}
-                          color="red"
-                          variant="ghost"
-                          confirm={`Remove @${b.username} from the pool?`}
-                          onDone={() => void state.reload()}
-                        >
-                          Remove
-                        </ActionButton>
-                      </Flex>
-                    </Card>
-                  ))}
-                </Flex>
-              )}
-              <Card>
-                <form
-                  onSubmit={(e) => {
-                    e.preventDefault()
-                    void addBot(new FormData(e.currentTarget), e.currentTarget)
-                  }}
-                >
-                  <Flex gap="2" align="end" wrap="wrap">
-                    <label style={{ flexGrow: 1, minWidth: '16rem' }}>
-                      <Text as="div" size="2" mb="1" weight="medium">
-                        Add a bot by token
+            <Table
+              rows={d.agents}
+              rowKey={(a) => a.id}
+              loading={state.loading}
+              empty="No agent yet"
+              columns={[
+                {
+                  key: 'agent',
+                  header: 'Agent',
+                  cell: (a) => (
+                    <Stack gap="1">
+                      <Text weight="medium">{a.name}</Text>
+                      <Text size="1" tone="muted" mono>
+                        {a.id}
                       </Text>
-                      <TextField.Root name="token" type="password" autoComplete="off" required />
-                    </label>
-                    <Button type="submit" loading={busy}>
-                      Add
-                    </Button>
-                  </Flex>
-                </form>
-              </Card>
+                    </Stack>
+                  ),
+                },
+                { key: 'role', header: 'Role', cell: (a) => <Badge>{a.role}</Badge> },
+                {
+                  key: 'project',
+                  header: 'Project',
+                  secondary: true,
+                  cell: (a) =>
+                    a.project ? (
+                      <Link to={`/projects/${a.project}`} className="fx-link">
+                        {a.project}
+                      </Link>
+                    ) : (
+                      <Text size="1" tone="muted">
+                        any
+                      </Text>
+                    ),
+                },
+                {
+                  key: 'runs',
+                  header: 'Runs with',
+                  width: '28rem',
+                  cell: (a) => (
+                    <RunsWith
+                      agent={a}
+                      efforts={d.efforts}
+                      defaultModel={d.default_model}
+                      suggested={d.suggested_models}
+                      onSaved={() => void state.reload()}
+                    />
+                  ),
+                },
+              ]}
+            />
+
+            <Section
+              title="Telegram bots"
+              description="The pool of identities agents speak as. A bot’s token is stored encrypted and never shown again."
+            >
+              <Stack gap="3">
+                {d.bots.length === 0 ? (
+                  <EmptyState title="No bot in the pool" bare />
+                ) : (
+                  <Stack gap="2">
+                    {d.bots.map((b) => (
+                      <Card key={b.id}>
+                        <CardContent>
+                          <Row gap="2" justify="between">
+                            <Row gap="2">
+                              <Text weight="medium">@{b.username}</Text>
+                              {b.agent ? <Badge tone="info">{b.agent}</Badge> : <Badge>free</Badge>}
+                            </Row>
+                            <ActionButton
+                              path="/api/agents"
+                              op="delete"
+                              body={{ id: b.id }}
+                              variant="ghost"
+                              confirm={`Remove @${b.username} from the pool?`}
+                              onDone={() => void state.reload()}
+                            >
+                              Remove
+                            </ActionButton>
+                          </Row>
+                        </CardContent>
+                      </Card>
+                    ))}
+                  </Stack>
+                )}
+                <Card>
+                  <CardHeader title="Add a bot" description="Paste the token BotFather gave you." />
+                  <CardContent>
+                    <form
+                      onSubmit={(e) => {
+                        e.preventDefault()
+                        void addBot(new FormData(e.currentTarget), e.currentTarget)
+                      }}
+                    >
+                      <Row gap="3" align="end">
+                        <div style={{ flexGrow: 1, minWidth: '16rem' }}>
+                          <TextField
+                            name="token"
+                            type="password"
+                            autoComplete="off"
+                            required
+                            size="sm"
+                            label="Bot token"
+                            hint="Stored encrypted; it is never shown again."
+                          />
+                        </div>
+                        <Button type="submit" loading={busy} variant="secondary">
+                          Add
+                        </Button>
+                      </Row>
+                    </form>
+                  </CardContent>
+                </Card>
+              </Stack>
             </Section>
           </>
         )}
       </Loaded>
-    </>
+    </Page>
   )
 }

@@ -11,3 +11,7 @@ HANDOFF.md
 node_modules/
 apps/web/dist/
 *.tsbuildinfo
+
+# Scratch state from editor tooling that runs inside the repo. It is per-machine and per-session;
+# a copy of it was staged by accident once, which is what this line is for.
+.omc/

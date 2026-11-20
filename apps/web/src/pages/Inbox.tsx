@@ -1,22 +1,30 @@
 import { useState } from 'react'
-import {
-  Badge, Box, Button, Card, Code, Flex, Grid, Heading, Tabs, Text, TextField,
-} from '@radix-ui/themes'
 import { Link } from 'react-router-dom'
+import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import { Card, CardContent, CardFooter, CardHeader } from '@/components/ui/card'
+import { EmptyState } from '@/components/ui/empty-state'
+import { SegmentedControl } from '@/components/ui/segmented-control'
+import { TextField } from '@/components/ui/text-field'
+import { Grid, Page, PageHeader, Row, Stack, Text } from '@/components/fx/layout'
+import { Stat } from '@/components/fx/stat'
 import * as api from '../api'
 import type { Inbox as InboxT } from '../api'
-import { ActionButton, Empty, ErrorNote, Loaded, When, useApi } from '../ui'
+import { ActionButton, ErrorNote, Loaded, When, useApi } from '../ui'
 
-/// The four todo actions are the same ones the Inbox buttons in Telegram send, by the same code
-/// path on the server: done, dropped, mine (make it a task), and open it.
-const TODO_ACTIONS: [string, string, string][] = [
-  ['d', 'Done', 'gray'],
-  ['x', 'Drop', 'red'],
-  ['m', 'Make it a task', 'green'],
+/// The three todo actions are the same ones the Inbox buttons in Telegram send, by the same code
+/// path on the server: done, dropped, and mine (make it a task).
+const TODO_ACTIONS: [string, string, 'ghost' | 'secondary' | 'primary' | 'destructive'][] = [
+  ['d', 'Done', 'secondary'],
+  ['x', 'Drop', 'destructive'],
+  ['m', 'Make it a task', 'primary'],
 ]
+
+type Tab = 'todos' | 'rules' | 'triage'
 
 export default function Inbox() {
   const state = useApi<InboxT>('/api/inbox', 20_000)
+  const [tab, setTab] = useState<Tab>('todos')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
@@ -35,100 +43,77 @@ export default function Inbox() {
   }
 
   return (
-    <>
-      <Heading size="6" mt="5" mb="1">
-        Inbox
-      </Heading>
-      <Text as="p" size="2" color="gray" mb="3">
-        What the secretary has made of the messages reaching you.
-      </Text>
+    <Page>
+      <PageHeader title="Inbox" description="What the secretary has made of the messages reaching you." />
       {error && <ErrorNote>{error}</ErrorNote>}
 
       <Loaded state={state}>
         {(d) => (
           <>
-            <Grid columns={{ initial: '3' }} gap="3" mb="4">
-              <Card>
-                <Text as="div" size="6" weight="bold">
-                  {d.stats.messages_today}
-                </Text>
-                <Text as="div" size="2" color="gray">
-                  messages in 24h
-                </Text>
-              </Card>
-              <Card>
-                <Text as="div" size="6" weight="bold">
-                  {d.stats.pending}
-                </Text>
-                <Text as="div" size="2" color="gray">
-                  not yet handled
-                </Text>
-              </Card>
-              <Card>
-                <Text as="div" size="6" weight="bold">
-                  {d.stats.batches_today}
-                </Text>
-                <Text as="div" size="2" color="gray">
-                  secretary runs in 24h
-                </Text>
-              </Card>
+            <Grid min={200} gap="3">
+              <Stat label="messages in 24h" value={d.stats.messages_today} />
+              <Stat
+                label="not yet handled"
+                value={d.stats.pending}
+                tone={d.stats.pending > 0 ? 'warning' : 'default'}
+              />
+              <Stat label="secretary runs in 24h" value={d.stats.batches_today} />
             </Grid>
 
-            <Tabs.Root defaultValue="todos">
-              <Tabs.List>
-                <Tabs.Trigger value="todos">
-                  Todos ({d.todos.filter((t) => t.status === 'open').length})
-                </Tabs.Trigger>
-                <Tabs.Trigger value="rules">Rules ({d.rules.filter((r) => r.active).length})</Tabs.Trigger>
-                <Tabs.Trigger value="triage">Decisions</Tabs.Trigger>
-              </Tabs.List>
+            <Stack gap="3">
+              <SegmentedControl<Tab>
+                kind="tabs"
+                variant="underline"
+                aria-label="Inbox sections"
+                value={tab}
+                onChange={setTab}
+                options={[
+                  { value: 'todos', label: 'Todos', count: d.todos.filter((t) => t.status === 'open').length },
+                  { value: 'rules', label: 'Rules', count: d.rules.filter((r) => r.active).length },
+                  { value: 'triage', label: 'Decisions' },
+                ]}
+              />
 
-              <Box pt="3">
-                <Tabs.Content value="todos">
-                  {d.todos.length === 0 ? (
-                    <Empty>Nothing on the list.</Empty>
-                  ) : (
-                    <Flex direction="column" gap="2">
-                      {d.todos.map((t) => (
-                        <Card key={t.id} style={{ opacity: t.status === 'open' ? 1 : 0.6 }}>
-                          <Flex gap="2" align="center" mb="1" wrap="wrap">
-                            {t.status !== 'open' && (
-                              <Badge color="gray" variant="soft">
-                                {t.status}
-                              </Badge>
-                            )}
-                            <Text weight="medium" className="fleet-wrap">
-                              {t.title}
-                            </Text>
-                            <Box flexGrow="1" />
-                            <Text size="1" color="gray">
-                              {t.created_by}
-                            </Text>
-                            <When at={t.created_at} />
-                          </Flex>
-                          {t.detail && (
-                            <Text as="p" size="2" color="gray" className="fleet-wrap" mb="2">
-                              {t.detail}
-                            </Text>
-                          )}
-                          {t.workflow && (
-                            <Text as="div" size="1" mb="2">
+              {tab === 'todos' &&
+                (d.todos.length === 0 ? (
+                  <EmptyState title="Nothing on the list" />
+                ) : (
+                  <Stack gap="2">
+                    {d.todos.map((t) => (
+                      <Card key={t.id} style={{ opacity: t.status === 'open' ? 1 : 0.62 }}>
+                        <CardHeader
+                          title={t.title}
+                          description={t.detail || undefined}
+                          action={
+                            <Row gap="2" justify="end">
+                              {t.status !== 'open' && <Badge>{t.status}</Badge>}
+                              <Text size="1" tone="muted">
+                                {t.created_by}
+                              </Text>
+                              <When at={t.created_at} />
+                            </Row>
+                          }
+                        />
+                        {t.workflow && (
+                          <CardContent>
+                            <Text size="1">
                               Linked to workflow{' '}
-                              <Link className="fleet-row-link" to={`/tasks/${t.workflow}`}>
+                              <Link to={`/tasks/${t.workflow}`} className="fx-link">
                                 {t.workflow}
                               </Link>
                             </Text>
-                          )}
-                          {t.status === 'open' && (
-                            <Flex gap="2" wrap="wrap">
-                              {TODO_ACTIONS.map(([action, label, color]) => (
+                          </CardContent>
+                        )}
+                        {t.status === 'open' && (
+                          <CardFooter>
+                            <Row gap="2">
+                              {TODO_ACTIONS.map(([action, label, variant]) => (
                                 <ActionButton
                                   key={action}
                                   path="/api/inbox"
                                   op="todo"
                                   body={{ id: t.id, action }}
-                                  color={color as 'red' | 'green' | 'gray'}
-                                  variant="soft"
+                                  variant={variant}
                                   onDone={() => void state.reload()}
                                 >
                                   {/* A workflow-linked todo nudges the existing workflow instead
@@ -136,110 +121,117 @@ export default function Inbox() {
                                   {action === 'm' && t.workflow ? 'Run the workflow' : label}
                                 </ActionButton>
                               ))}
-                            </Flex>
-                          )}
-                        </Card>
-                      ))}
-                    </Flex>
-                  )}
-                </Tabs.Content>
+                            </Row>
+                          </CardFooter>
+                        )}
+                      </Card>
+                    ))}
+                  </Stack>
+                ))}
 
-                <Tabs.Content value="rules">
-                  <Flex direction="column" gap="2" mb="3">
-                    {d.rules.length === 0 ? (
-                      <Empty>No rule yet.</Empty>
-                    ) : (
-                      d.rules.map((r) => (
-                        <Card key={r.id} style={{ opacity: r.active ? 1 : 0.55 }}>
-                          <Flex gap="2" align="center" wrap="wrap">
-                            {!r.active && (
-                              <Badge color="gray" variant="soft">
-                                retired
-                              </Badge>
-                            )}
-                            <Text size="2" className="fleet-wrap">
-                              {r.text}
-                            </Text>
-                            <Box flexGrow="1" />
-                            <Text size="1" color="gray">
-                              {r.source}
-                            </Text>
-                            {r.active && (
-                              <ActionButton
-                                path="/api/inbox"
-                                op="rule_remove"
-                                body={{ id: r.id }}
-                                variant="ghost"
-                                color="red"
-                                onDone={() => void state.reload()}
-                              >
-                                Retire
-                              </ActionButton>
-                            )}
-                          </Flex>
-                        </Card>
-                      ))
-                    )}
-                  </Flex>
-                  <Card>
-                    <form
-                      onSubmit={(e) => {
-                        e.preventDefault()
-                        void addRule(new FormData(e.currentTarget), e.currentTarget)
-                      }}
-                    >
-                      <Flex gap="2" align="end" wrap="wrap">
-                        <label style={{ flexGrow: 1, minWidth: '18rem' }}>
-                          <Text as="div" size="2" mb="1" weight="medium">
-                            Tell the secretary a rule
-                          </Text>
-                          <TextField.Root
-                            name="text"
-                            placeholder="Escalate anything from the PM about BIOINS straight away"
-                            required
-                          />
-                        </label>
-                        <Button type="submit" loading={busy}>
-                          Add
-                        </Button>
-                      </Flex>
-                    </form>
-                  </Card>
-                </Tabs.Content>
-
-                <Tabs.Content value="triage">
-                  {d.triage.length === 0 ? (
-                    <Empty>No decision recorded.</Empty>
+              {tab === 'rules' && (
+                <Stack gap="3">
+                  {d.rules.length === 0 ? (
+                    <EmptyState title="No rule yet" bare />
                   ) : (
-                    <Flex direction="column" gap="2">
-                      {d.triage.map((t, i) => (
-                        <Card key={i}>
-                          <Flex gap="2" align="center" mb="1" wrap="wrap">
-                            <Badge
-                              color={t.decision === 'escalate' ? 'amber' : 'gray'}
-                              variant="soft"
-                            >
-                              {t.decision}
-                            </Badge>
-                            <When at={t.at} />
-                            <Box flexGrow="1" />
-                            <Text size="1" color="gray" className="fleet-wrap">
-                              <Code variant="ghost">{t.refs.join(', ')}</Code>
-                            </Text>
-                          </Flex>
-                          <Text as="div" size="2" className="fleet-wrap">
-                            {t.note}
-                          </Text>
+                    <Stack gap="2">
+                      {d.rules.map((r) => (
+                        <Card key={r.id} style={{ opacity: r.active ? 1 : 0.55 }}>
+                          <CardContent>
+                            <Row gap="2" justify="between">
+                              <Row gap="2">
+                                {!r.active && <Badge>retired</Badge>}
+                                <Text size="2" breakAll>
+                                  {r.text}
+                                </Text>
+                              </Row>
+                              <Row gap="2">
+                                <Text size="1" tone="muted">
+                                  {r.source}
+                                </Text>
+                                {r.active && (
+                                  <ActionButton
+                                    path="/api/inbox"
+                                    op="rule_remove"
+                                    body={{ id: r.id }}
+                                    variant="ghost"
+                                    onDone={() => void state.reload()}
+                                  >
+                                    Retire
+                                  </ActionButton>
+                                )}
+                              </Row>
+                            </Row>
+                          </CardContent>
                         </Card>
                       ))}
-                    </Flex>
+                    </Stack>
                   )}
-                </Tabs.Content>
-              </Box>
-            </Tabs.Root>
+                  <Card>
+                    <CardHeader
+                      title="Tell the secretary a rule"
+                      description="It applies to everything it triages from now on."
+                    />
+                    <CardContent>
+                      <form
+                        onSubmit={(e) => {
+                          e.preventDefault()
+                          void addRule(new FormData(e.currentTarget), e.currentTarget)
+                        }}
+                      >
+                        <Row gap="3" align="end">
+                          <div style={{ flexGrow: 1, minWidth: '18rem' }}>
+                            <TextField
+                              name="text"
+                              size="sm"
+                              placeholder="Escalate anything from the PM about BIOINS straight away"
+                              required
+                              aria-label="New rule"
+                            />
+                          </div>
+                          <Button type="submit" loading={busy} variant="secondary">
+                            Add
+                          </Button>
+                        </Row>
+                      </form>
+                    </CardContent>
+                  </Card>
+                </Stack>
+              )}
+
+              {tab === 'triage' &&
+                (d.triage.length === 0 ? (
+                  <EmptyState title="No decision recorded" bare />
+                ) : (
+                  <Stack gap="2">
+                    {d.triage.map((t, i) => (
+                      <Card key={i}>
+                        <CardContent>
+                          <Stack gap="2">
+                            <Row gap="2" justify="between">
+                              <Row gap="2">
+                                <Badge tone={t.decision === 'escalate' ? 'warning' : 'neutral'} dot>
+                                  {t.decision}
+                                </Badge>
+                                <When at={t.at} />
+                              </Row>
+                              <Text size="1" tone="muted" mono breakAll>
+                                {t.refs.join(', ')}
+                              </Text>
+                            </Row>
+                            <Text size="2" breakAll>
+                              {t.note}
+                            </Text>
+                          </Stack>
+                        </CardContent>
+                      </Card>
+                    ))}
+                  </Stack>
+                ))}
+            </Stack>
           </>
         )}
       </Loaded>
-    </>
+    </Page>
   )
 }
