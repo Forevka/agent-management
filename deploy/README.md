@@ -602,9 +602,9 @@ subcommand".
   `crates/proto`) refuses nodes on the old version with "protocol version N is
   not supported" — and names the release to update to, which Windows nodes from v0.2.4 on
   then install by themselves; older nodes are updated by hand. Version 3 added the project
-  list for the tray app; version 4 added the nodes' disk reports (free space under
-  `~/.claude` and the project directories). Avoid a bump where you can: the update notice
-  itself was added without one, sent only to nodes whose release can read it.
+  list for the tray app. Avoid a bump where you can: the update notice and the disk reports
+  (v0.2.4) were added without one — the orchestrator sends the new messages only to nodes
+  whose release can read them, and a node reports its disk only when asked.
 
 ## Troubleshooting
 

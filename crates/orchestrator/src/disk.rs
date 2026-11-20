@@ -234,6 +234,7 @@ pub async fn reported(o: &Arc<Orchestrator>, peer: EndpointId, report: DiskRepor
         )
         .await;
         if let Some((html, notify)) = notice(&name, prev, state, &report, &levels) {
+            let notify = quieted(o, &id, state, notify).await;
             // Best effort, like every post: the state is stored either way.
             if let Err(e) = o
                 .chat
@@ -245,6 +246,69 @@ pub async fn reported(o: &Arc<Orchestrator>, peer: EndpointId, report: DiskRepor
         }
     }
     if prev == DiskState::Full {
+        crate::tasks::dispatch_queued(o).await;
+    }
+    Ok(())
+}
+
+/// How long after a sounded warning about a node another one, for the same state or a milder
+/// one, comes silently. Agents build in worktrees, and a `target/` or `node_modules` swings the
+/// free space by gigabytes; a volume sitting near a threshold would otherwise ring every few
+/// minutes as it crosses back and forth.
+const SOUND_COOLDOWN_HOURS: i64 = 12;
+
+/// `notify`, unless a warning about this node at least as bad as `state` already sounded in the
+/// last [`SOUND_COOLDOWN_HOURS`]: then silent. A sounded warning is remembered (in `kv`).
+async fn quieted(o: &Arc<Orchestrator>, node_id: &str, state: DiskState, notify: Notify) -> Notify {
+    if notify != Notify::Sound {
+        return notify;
+    }
+    let key = format!("disk_notice:{node_id}");
+    let now = chrono::Utc::now();
+    let recent = match o.kv_get(&key).await {
+        Ok(Some(v)) => {
+            let worse_or_same = v["state"]
+                .as_str()
+                .is_some_and(|s| DiskState::parse(s) >= state);
+            let at = v["at"]
+                .as_str()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
+            worse_or_same
+                && at.is_some_and(|at| {
+                    now - at.with_timezone(&chrono::Utc)
+                        < chrono::Duration::hours(SOUND_COOLDOWN_HOURS)
+                })
+        }
+        _ => false,
+    };
+    if recent {
+        return Notify::Silent;
+    }
+    if let Err(e) = o
+        .kv_set(
+            &key,
+            serde_json::json!({"state": state.as_str(), "at": now.to_rfc3339()}),
+        )
+        .await
+    {
+        tracing::warn!("remembering a disk warning failed: {e:#}");
+    }
+    Notify::Sound
+}
+
+/// Called from housekeeping. A hold lasts only as long as its report is fresh ([`held`]), but
+/// queued work is otherwise only looked at again when some node reports: a node whose reports
+/// stopped (a hung drive, a node gone quiet) would keep its tasks waiting after the hold itself
+/// had lapsed. So when any `full` node's report has gone stale, the queue is looked at again.
+pub async fn release_stale_holds(o: &Arc<Orchestrator>) -> Result<()> {
+    let stale: bool = sqlx::query_scalar(
+        "select exists (select 1 from nodes where disk_state = 'full'
+            and (disk_at is null or disk_at < now() - make_interval(mins => $1::int)))",
+    )
+    .bind(STALE_AFTER_MINUTES as i32)
+    .fetch_one(&o.db)
+    .await?;
+    if stale {
         crate::tasks::dispatch_queued(o).await;
     }
     Ok(())

@@ -20,6 +20,10 @@ const BIGGEST: usize = 5;
 /// the others of a size; past it a folder's size is a lower bound, and a folder that big is one
 /// of the biggest anyway.
 const MAX_ENTRIES_PER_FOLDER: usize = 100_000;
+/// Upper bound on the time spent sizing all the session folders together. The free space is what
+/// decides anything and is measured first; the biggest folders only say where to clean up, so a
+/// slow disk or hundreds of worktree folders cut this list short rather than the report.
+const WALK_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Where Claude Code keeps its sessions for the user this node runs as: `CLAUDE_CONFIG_DIR` if
 /// set (the agents inherit the node's environment, so they use the same one), else `~/.claude`.
@@ -108,12 +112,14 @@ fn biggest_folders(dir: &Path, n: usize) -> Vec<FolderSize> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
+    let deadline = std::time::Instant::now() + WALK_LIMIT;
     let mut sizes: Vec<FolderSize> = entries
         .flatten()
         .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .take_while(|_| std::time::Instant::now() < deadline)
         .map(|e| FolderSize {
             name: e.file_name().to_string_lossy().into_owned(),
-            bytes: tree_size(&e.path(), MAX_ENTRIES_PER_FOLDER),
+            bytes: tree_size(&e.path(), MAX_ENTRIES_PER_FOLDER, deadline),
         })
         .collect();
     sizes.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.name.cmp(&b.name)));
@@ -122,8 +128,8 @@ fn biggest_folders(dir: &Path, n: usize) -> Vec<FolderSize> {
 }
 
 /// Bytes of the files under `dir`, without following symlinks (a link out of the tree must not
-/// count another disk, or loop). Looks at no more than `budget` entries.
-fn tree_size(dir: &Path, mut budget: usize) -> u64 {
+/// count another disk, or loop). Looks at no more than `budget` entries, and stops at `deadline`.
+fn tree_size(dir: &Path, mut budget: usize, deadline: std::time::Instant) -> u64 {
     let mut total = 0u64;
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
@@ -131,7 +137,8 @@ fn tree_size(dir: &Path, mut budget: usize) -> u64 {
             continue;
         };
         for e in entries.flatten() {
-            if budget == 0 {
+            if budget == 0 || (budget.is_multiple_of(1024) && std::time::Instant::now() >= deadline)
+            {
                 return total;
             }
             budget -= 1;

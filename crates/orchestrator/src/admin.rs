@@ -2140,6 +2140,32 @@ pub async fn prepare(o: &Orchestrator, action: AdminAction) -> Result<(AdminActi
                         }
                         _ => None,
                     };
+                    // Scheduled work in the fleet's own repository is the retrospective's to
+                    // propose, one owner-tapped task at a time, never a standing duty.
+                    ensure!(
+                        project.as_deref() != Some(o.cfg.brain_project.as_str()),
+                        "a standing duty cannot be in the fleet's own project"
+                    );
+                    // The owner restating a duty must not end in two habits doing it twice.
+                    let same: Option<i64> = sqlx::query_scalar(
+                        "select id from habits
+                          where kind = 'do' and active and schedule = $1
+                            and project is not distinct from $2
+                          order by id limit 1",
+                    )
+                    .bind(&schedule)
+                    .bind(&project)
+                    .fetch_optional(&o.db)
+                    .await?;
+                    if let Some(id) = same {
+                        bail!(
+                            "habit H-{id} already does something on this schedule{}; change or pause it instead of adding another",
+                            project
+                                .as_deref()
+                                .map(|p| format!(" in project {p}"))
+                                .unwrap_or_default()
+                        );
+                    }
                     let summary = format!(
                         "From now on, {schedule} ({}), do this without being asked{}: {}. It \
                          reaches me as if you had just asked for it, at most 10 times a day; I \

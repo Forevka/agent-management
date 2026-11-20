@@ -22,13 +22,13 @@ pub fn this_release() -> Option<UpdateAvailable> {
 
 /// Whether a node reporting `node` should be told to move to `this`.
 ///
-/// Only a node that can read the notice ([`fleet_proto::understands_update_notices`]: a release
+/// Only a node that can read the notice ([`fleet_proto::reads_v0_2_4_messages`]: a release
 /// after v0.2.3) and is on an *older* release. A node on a newer release than this orchestrator is
 /// left alone — it was installed from a release the VPS has not deployed yet, and will be level
 /// within minutes. Never a downgrade, and never a hand build.
 pub fn should_offer(this: &str, node: &str) -> bool {
     match (release_version(this), release_version(node)) {
-        (Some(this), Some(n)) => fleet_proto::understands_update_notices(node) && n < this,
+        (Some(this), Some(n)) => fleet_proto::reads_v0_2_4_messages(node) && n < this,
         _ => false,
     }
 }

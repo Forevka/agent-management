@@ -5152,7 +5152,7 @@ async fn lifecycle() {
     let cfg = ClientConfig {
         orchestrator: orch_addr.clone(),
         node_name: "e2e-node".into(),
-        app_version: "0".into(),
+        app_version: fleet_proto::BUILD_VERSION.into(),
         os: "linux".into(),
         join_secret: Some("inv".into()),
     };
@@ -6261,7 +6261,7 @@ async fn lifecycle() {
     let cfg2 = ClientConfig {
         orchestrator: orch_addr.clone(),
         node_name: "e2e-node-2".into(),
-        app_version: "0".into(),
+        app_version: fleet_proto::BUILD_VERSION.into(),
         os: "linux".into(),
         join_secret: Some("inv2".into()),
     };
@@ -6398,7 +6398,7 @@ async fn lifecycle() {
     let cfg3 = ClientConfig {
         orchestrator: orch_addr.clone(),
         node_name: "e2e-node-3".into(),
-        app_version: "0".into(),
+        app_version: fleet_proto::BUILD_VERSION.into(),
         os: "linux".into(),
         join_secret: None,
     };

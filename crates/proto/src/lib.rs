@@ -15,15 +15,15 @@ use serde::{Deserialize, Serialize};
 /// older node could not tell apart from a message for its current run.
 /// 3: [`Body::ProjectList`]. A version 2 node cannot decode it, and an undecodable frame drops
 /// the link, so it must be refused at the handshake instead.
-/// 4: [`Body::DiskReport`]. An older orchestrator cannot decode it, so a node that sends it must
-/// not reach one. (A node cannot tell which release its orchestrator runs, so this one could not
-/// be gated the way [`Body::UpdateAvailable`] is.)
 ///
-/// [`Body::UpdateAvailable`] needed no bump of its own: the orchestrator sends it only to nodes
-/// whose release understands it ([`understands_update_notices`]). From the release that added
-/// it on, a refusal for a protocol mismatch also carries an [`update_hint`], so a node can update
-/// itself across later bumps instead of waiting for a person.
-pub const PROTOCOL_VERSION: u32 = 4;
+/// The messages added in release v0.2.4 needed no bump: the orchestrator sends
+/// [`Body::UpdateAvailable`] and [`Body::DiskReportWanted`] only to nodes that can read them
+/// ([`reads_v0_2_4_messages`]), and a node sends [`Body::DiskReport`] only to an orchestrator
+/// that asked for it on the current connection — so no node already out there is refused, and an
+/// orchestrator rolled back to an older release is never sent a frame it cannot decode. Prefer
+/// this to a bump. From v0.2.4 on, a refusal for a protocol mismatch also carries an
+/// [`update_hint`], so a node can update itself across later bumps instead of waiting for a person.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// The build this binary is: the release that produced it (`v0.2.7`), or the workspace version
 /// with `-dev` for a binary built by hand.
@@ -149,17 +149,23 @@ pub enum Body {
     ProjectList(Vec<ProjectSummary>),
 
     // Appended in protocol version 3, after release v0.2.3. Never sent to a node that does not
-    // [`understands_update_notices`]: an older node cannot decode it, and an undecodable frame
-    // drops its link.
+    // [`reads_v0_2_4_messages`]: an older node cannot decode it, and an undecodable frame drops
+    // its link.
     /// Orchestrator -> node: a newer release is running here; update to it. Sent on connect to a
     /// node whose version is behind. See [`UpdateAvailable`].
     UpdateAvailable(UpdateAvailable),
 
-    // Appended in protocol version 4, after `UpdateAvailable` (both new in v0.2.4).
-    /// Node -> orchestrator: free space where Claude Code and the projects write. Sent on every
-    /// connect and every few minutes, so the orchestrator can warn the owner and stop starting
-    /// runs on a node whose disk is about to fill up.
+    // Appended in protocol version 3, after release v0.2.3. Sent only to an orchestrator that
+    // asked for it ([`Body::DiskReportWanted`]) on the current connection.
+    /// Node -> orchestrator: free space where Claude Code and the projects write. Sent when
+    /// asked and every few minutes after, so the orchestrator can warn the owner and stop
+    /// starting runs on a node whose disk is about to fill up.
     DiskReport(DiskReport),
+
+    // Appended in protocol version 3, after release v0.2.3. Never sent to a node that does not
+    // [`reads_v0_2_4_messages`].
+    /// Orchestrator -> node, on connect: this orchestrator reads [`Body::DiskReport`]; send them.
+    DiskReportWanted,
 }
 
 /// Which release a node should move to, and where to fetch it.
@@ -213,14 +219,16 @@ pub fn release_version(v: &str) -> Option<(u64, u64, u64)> {
     parts.next().is_none().then_some(version)
 }
 
-/// The newest release that cannot decode [`Body::UpdateAvailable`].
-const LAST_RELEASE_WITHOUT_UPDATES: (u64, u64, u64) = (0, 2, 3);
+/// The newest release that cannot decode the messages added in v0.2.4.
+const LAST_RELEASE_WITHOUT_V0_2_4: (u64, u64, u64) = (0, 2, 3);
 
-/// Whether a node reporting `app_version` can be sent [`Body::UpdateAvailable`]: a release newer
-/// than v0.2.3. A hand build (`-dev`) is never sent one — it may be older than the variant, and
-/// nobody wants a developer's binary replaced under them.
-pub fn understands_update_notices(app_version: &str) -> bool {
-    release_version(app_version).is_some_and(|v| v > LAST_RELEASE_WITHOUT_UPDATES)
+/// Whether a node reporting `app_version` can decode the messages appended after release v0.2.3
+/// ([`Body::UpdateAvailable`], [`Body::DiskReportWanted`]): a release newer than v0.2.3, or the
+/// very build this binary is (a test, or a hand build talking to itself). Any other hand build
+/// is sent none — it may be older than the variants.
+pub fn reads_v0_2_4_messages(app_version: &str) -> bool {
+    app_version == BUILD_VERSION
+        || release_version(app_version).is_some_and(|v| v > LAST_RELEASE_WITHOUT_V0_2_4)
 }
 
 /// Finds an [`update_hint`] line in a refusal's reason.
@@ -305,18 +313,20 @@ mod tests {
     }
 
     #[test]
-    fn update_notices_go_only_to_releases_that_can_read_them() {
-        // Every release up to v0.2.3 would drop its link on the unknown variant.
+    fn new_messages_go_only_to_nodes_that_can_read_them() {
+        // Every release up to v0.2.3 would drop its link on the unknown variants.
         for old in ["v0.2.0", "v0.2.3", "v0.1.9"] {
-            assert!(!understands_update_notices(old), "{old}");
+            assert!(!reads_v0_2_4_messages(old), "{old}");
         }
         for new in ["v0.2.4", "v0.2.10", "v0.3.0", "v1.0.0"] {
-            assert!(understands_update_notices(new), "{new}");
+            assert!(reads_v0_2_4_messages(new), "{new}");
         }
-        // Hand builds and binaries from before releases existed: never.
-        for other in ["0.1.0", "0.1.0-dev", "v0.3.0-rc.1", ""] {
-            assert!(!understands_update_notices(other), "{other:?}");
+        // Other hand builds, and binaries from before releases existed: never.
+        for other in ["0.1.0", "0.0.9-dev", "v0.3.0-rc.1", ""] {
+            assert!(!reads_v0_2_4_messages(other), "{other:?}");
         }
+        // The same build always reads its own messages.
+        assert!(reads_v0_2_4_messages(BUILD_VERSION));
     }
 
     #[test]
@@ -488,6 +498,11 @@ mod tests {
         });
         roundtrip(Envelope {
             seq: 11,
+            ack: 0,
+            body: Body::DiskReportWanted,
+        });
+        roundtrip(Envelope {
+            seq: 12,
             ack: 0,
             body: Body::DiskReport(DiskReport {
                 claude_dir: "C:/Users/me/.claude".into(),

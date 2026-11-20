@@ -296,6 +296,12 @@ impl Orchestrator {
         .await?;
         self.push_node_settings(&id).await?;
         self.push_project_list(Some(peer)).await?;
+        // This orchestrator reads disk reports; a node that can read the request starts sending
+        // them (one now, then every few minutes). An older node is never asked: it could not
+        // decode the request.
+        if fleet_proto::reads_v0_2_4_messages(&hello.app_version) {
+            self.server.send(peer, Body::DiskReportWanted);
+        }
         // A node behind this orchestrator's release is told to move to it; it updates itself
         // once no agent is running there (`fleet_node::update`). Every connect, so a node that
         // was off when the release landed catches up when it comes back.
@@ -977,6 +983,11 @@ impl Orchestrator {
             }
             if let Err(e) = crate::workflows::run_due(&self).await {
                 tracing::warn!("ticking due workflows failed: {e:#}");
+            }
+            if let Err(e) = crate::disk::release_stale_holds(&self).await {
+                tracing::warn!(
+                    "looking at work held for a disk whose reports stopped failed: {e:#}"
+                );
             }
             if let Err(e) = crate::tasks::prune_topics(&self).await {
                 tracing::warn!("deleting finished tasks' topics failed: {e:#}");

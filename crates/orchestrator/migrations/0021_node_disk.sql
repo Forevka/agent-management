@@ -1,4 +1,4 @@
--- Free disk space each node last reported (protocol 4, `Body::DiskReport`), and what the
+-- Free disk space each node last reported (`Body::DiskReport`), and what the
 -- orchestrator made of it. A full disk on a node corrupts session transcripts and fails every
 -- run started there, so the owner is warned before that and new runs are held on such a node.
 alter table nodes

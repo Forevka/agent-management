@@ -94,8 +94,16 @@ pub struct Node {
     /// no-op.
     update_target: tokio::sync::watch::Sender<Option<fleet_proto::UpdateAvailable>>,
     update_started: AtomicBool,
-    /// Set while a disk report is being measured, so a slow walk is never started twice.
+    /// Set while a disk report is being measured, so a slow walk is never started twice. Stays
+    /// set until the measurement really returns, even after the node stopped waiting for it, so
+    /// a hung drive ties up one blocking thread rather than a new one every few minutes.
     measuring_disk: AtomicBool,
+    /// The orchestrator on the current connection asked for disk reports
+    /// (`Body::DiskReportWanted`). An orchestrator from before them never asks — it could not
+    /// decode a report, and an undecodable frame drops the link — so a node never sends one
+    /// unasked. Cleared on every disconnect: the next connection may be to an older orchestrator
+    /// (a rollback).
+    disk_wanted: AtomicBool,
     /// A report was asked for while one was being measured: measure again when it is done.
     disk_again: AtomicBool,
 }
@@ -125,6 +133,7 @@ impl Node {
             update_started: AtomicBool::new(false),
             measuring_disk: AtomicBool::new(false),
             disk_again: AtomicBool::new(false),
+            disk_wanted: AtomicBool::new(false),
         });
         // Replaces whatever a previous node process left, so the tray sees this pid at once.
         node.update_status(|_| {});
@@ -359,9 +368,12 @@ impl Node {
                     self.update_status(|s| s.connected = true);
                     self.send_info();
                     self.resend_pending_permissions();
-                    self.report_disk();
+                    // No disk report yet: the orchestrator asks for one if it can read it.
                 }
-                Inbound::Disconnected { .. } => self.update_status(|s| s.connected = false),
+                Inbound::Disconnected { .. } => {
+                    self.disk_wanted.store(false, Ordering::Release);
+                    self.update_status(|s| s.connected = false);
+                }
                 Inbound::Message { body, .. } => self.handle(body),
             }
         }
@@ -451,6 +463,10 @@ impl Node {
                 }
             }
             Body::ProjectList(projects) => self.update_status(|s| s.projects = Some(projects)),
+            Body::DiskReportWanted => {
+                self.disk_wanted.store(true, Ordering::Release);
+                self.report_disk();
+            }
             Body::UpdateAvailable(u) => {
                 self.start_update(u, false);
             }
@@ -613,7 +629,7 @@ impl Node {
     /// tree) and sends it. Only while connected: messages queue while the link is down, and a
     /// pile of stale reports is worth less than the fresh one every connect sends.
     fn report_disk(self: &Arc<Self>) {
-        if !self.status.lock().unwrap().connected {
+        if !self.disk_wanted.load(Ordering::Acquire) || !self.status.lock().unwrap().connected {
             return;
         }
         let Some(claude_dir) = disk::claude_dir() else {
@@ -629,20 +645,28 @@ impl Node {
         let projects = self.config.lock().unwrap().projects.clone();
         let this = self.clone();
         tokio::spawn(async move {
-            let measuring =
+            let mut measuring =
                 tokio::task::spawn_blocking(move || disk::report(&claude_dir, &projects));
-            // A dead network drive or a hard NFS mount can block a probe for ever. Give up on
-            // this one (its thread stays blocked) so the next report can still be tried; the
-            // orchestrator stops holding on a report that has gone stale meanwhile.
-            let measured = tokio::time::timeout(DISK_MEASURE_LIMIT, measuring).await;
-            this.measuring_disk.store(false, Ordering::Release);
-            match measured {
-                Ok(Ok(report)) => this.client.send(Body::DiskReport(report)),
-                Ok(Err(e)) => tracing::warn!("measuring free disk space failed: {e}"),
-                Err(_) => tracing::warn!(
-                    "measuring free disk space took over {}s; a mapped drive may be hung",
-                    DISK_MEASURE_LIMIT.as_secs()
-                ),
+            // A dead network drive or a hard NFS mount can block a probe for ever. Stop waiting
+            // (the orchestrator stops holding on a report that has gone stale meanwhile), but
+            // start no other measurement until this one returns: each would block a new thread
+            // on the same drive.
+            match tokio::time::timeout(DISK_MEASURE_LIMIT, &mut measuring).await {
+                Ok(measured) => {
+                    this.measuring_disk.store(false, Ordering::Release);
+                    match measured {
+                        Ok(report) => this.client.send(Body::DiskReport(report)),
+                        Err(e) => tracing::warn!("measuring free disk space failed: {e}"),
+                    }
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "measuring free disk space took over {}s; a mapped drive may be hung",
+                        DISK_MEASURE_LIMIT.as_secs()
+                    );
+                    let _ = measuring.await;
+                    this.measuring_disk.store(false, Ordering::Release);
+                }
             }
             if this.disk_again.swap(false, Ordering::AcqRel) {
                 this.report_disk();
