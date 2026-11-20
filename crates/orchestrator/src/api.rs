@@ -687,6 +687,13 @@ async fn project_act(
     Json(a): Json<Act>,
 ) -> Api {
     guard!(o, h, write);
+    // Who approves the project's plans. Not an `AdminAction`, on purpose: those can be proposed
+    // by the brain, and this one is the owner's alone (see `plan_gate`).
+    if a.op == "plan_gate" {
+        let gate = crate::plan_gate::Gate::parse(&need(&a.body, "gate")?)?;
+        let done = crate::plan_gate::set_project(&o, &slug, gate).await?;
+        return Ok(Json(json!({"done": done})));
+    }
     let action = match a.op.as_str() {
         "edit" => AdminAction::ProjectEdit {
             slug,

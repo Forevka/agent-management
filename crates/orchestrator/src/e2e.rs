@@ -2219,6 +2219,37 @@ async fn api_get(o: &Arc<Orchestrator>, uri: &str) -> Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
+/// A POST through the real router, with a fresh session, as the web UI's actions make it.
+async fn api_post(o: &Arc<Orchestrator>, uri: &str, body: Value) -> Value {
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let session = crate::web::random_token();
+    sqlx::query(
+        "insert into web_sessions (token, expires_at) values ($1, now() + interval '1 day')",
+    )
+    .bind(&session)
+    .execute(&o.db)
+    .await
+    .unwrap();
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(
+            axum::http::header::COOKIE,
+            format!("fleet_session={session}"),
+        )
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let res = crate::web::router(o.clone()).oneshot(req).await.unwrap();
+    let status = res.status();
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let json: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    assert_eq!(status, 200, "POST {uri}: {json}");
+    json
+}
+
 /// The JSON API the web UI is built on, driven through the real axum router so routing, the
 /// cookie check and the status codes are the ones a browser gets.
 ///
@@ -3010,6 +3041,382 @@ async fn wait_retired(chat: &FakeChat, ids: &[i64], needle: &str) {
         })
         .await;
     }
+}
+
+/// The plan gate: a workflow's later plans are approved by the orchestrator and posted silently,
+/// because the owner approved the workflow once already; the owner can take that back from its
+/// card, a plan that says it needs them still waits, a project can be set the same way from the
+/// web UI, and nothing the brain can call sets either.
+async fn plan_gate_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) {
+    use crate::plan_gate::{Gate, set_project};
+    // An agent of its own, so this flow waits on nobody else's node slot.
+    sqlx::query(
+        "insert into agents (id, name, role, project) values ('pat-gate', 'Pat', 'watcher', 'demo')",
+    )
+    .execute(db)
+    .await
+    .unwrap();
+    let task = tasks::create_task(
+        o,
+        CreateTask {
+            project: "demo".into(),
+            title: "Answer code-review pings".into(),
+            brief: "plan-gate: set up a workflow that answers code-review pings.".into(),
+            ticket: Some("PG-1".into()),
+            agent: Some("Pat".into()),
+            new_agent: None,
+            model: None,
+            effort: None,
+        },
+    )
+    .await
+    .unwrap();
+    let id = task.id.clone();
+    let allowed = || async {
+        events(db, &id)
+            .await
+            .iter()
+            .filter(|e| e["type"] == "plan_decision" && e["decision"]["behavior"] == "allow")
+            .count()
+    };
+    // Ends the run, and leaves the task `done`, as an agent finishing a round of its workflow
+    // does: so the next message really starts a new run, which plans first.
+    let rest = || async {
+        let t = o.task(&id).await.unwrap().unwrap();
+        tasks::stop(o, &t, false).await.unwrap();
+        wait_for(&format!("{id} stops"), || async {
+            o.task(&id).await.unwrap().filter(|t| !t.running)
+        })
+        .await;
+        sqlx::query("update tasks set status = 'done' where id = $1")
+            .bind(&id)
+            .execute(db)
+            .await
+            .unwrap();
+    };
+    let id_ref = &id;
+    let send = |text: &'static str| async move {
+        let t = o.task(id_ref).await.unwrap().unwrap();
+        tasks::deliver(o, &t, text.into()).await.unwrap();
+    };
+
+    // 1. Not a workflow yet, in a project whose plans wait: the plan is the owner's, as always.
+    let plan = wait_for("the first plan waits for the owner", || {
+        open_item(db, &id, "plan")
+    })
+    .await;
+    copies(db, plan.id).await;
+    human::answer(o, plan.id, Answer::Approve).await.unwrap();
+    wait_for("the owner's approval reaches the agent", || async {
+        (allowed().await == 1).then_some(())
+    })
+    .await;
+
+    // 2. It becomes a workflow. The agent did that itself, so its plans still wait for the owner,
+    //    and the card says so, with the one tap that hands them to the orchestrator.
+    call_as(
+        o,
+        "pat-gate",
+        &id,
+        "workflow_finish",
+        json!({"summary": "Answers code-review pings."}),
+    )
+    .await
+    .unwrap();
+    let gate: String = sqlx::query_scalar("select plan_gate from workflows where task_id = $1")
+        .bind(&id)
+        .fetch_one(db)
+        .await
+        .unwrap();
+    assert_eq!(
+        gate, "owner",
+        "setting a workflow up, which the agent does itself, does not open the gate"
+    );
+    let gate_button = |action: &str| {
+        let data = format!("wf|{id}|{action}");
+        move |kb: &crate::chat::Keyboard| {
+            kb.iter()
+                .flatten()
+                .any(|b| b.data.as_deref() == Some(data.as_str()))
+        }
+    };
+    let has_ask_me = gate_button("gate_owner");
+    let has_auto = gate_button("gate_auto");
+    assert!(
+        chat.ops.lock().unwrap().iter().any(|op| matches!(
+            op,
+            Op::Send { html, keyboard, .. }
+                if html.contains("Plans: wait for your approval") && has_auto(keyboard)
+        )),
+        "the workflow card says who approves its plans, with the button to change it"
+    );
+    // The owner's tap on 🔓 is what makes it `auto`.
+    let reply = crate::workflows::button(o, &format!("wf|{id}|gate_auto"))
+        .await
+        .unwrap();
+    assert!(reply.contains("approved automatically"), "{reply}");
+    rest().await;
+
+    // 3. Its next run plans again, and that plan is approved without the owner: no card asks
+    //    them, the session leaves plan mode, the audit says who approved it, and the plan is in
+    //    the topic, silently, with the button that hands plans back to them.
+    send("plan-gate: a new ping came in").await;
+    wait_for("the workflow's plan is approved by its gate", || async {
+        (allowed().await == 2).then_some(())
+    })
+    .await;
+    let (state, card, pointers): (String, Option<i64>, Vec<i64>) = sqlx::query_as(
+        "select state, tg_msg, tg_msgs from human_items where task_id = $1 and kind = 'plan'
+          order by id desc limit 1",
+    )
+    .bind(&id)
+    .fetch_one(db)
+    .await
+    .unwrap();
+    assert_eq!(state, "answered");
+    assert!(
+        card.is_none() && pointers.is_empty(),
+        "nobody was asked for a plan the gate approves"
+    );
+    let (actor, detail) = gate_audit(db, &id).await;
+    assert_eq!(actor, "owner (via plan gate)");
+    assert_eq!(detail["gate"], "workflow", "{detail}");
+    let by: Option<String> = sqlx::query_scalar(
+        "select answer->>'by' from human_items where task_id = $1 and kind = 'plan'
+          order by id desc limit 1",
+    )
+    .bind(&id)
+    .fetch_one(db)
+    .await
+    .unwrap();
+    assert_eq!(
+        by.as_deref(),
+        Some("plan_gate"),
+        "marked as the gate's, so habits do not learn from it"
+    );
+    // The first switch was the owner's approval in step 1; this one is the gate's.
+    wait_for("the session switches out of plan mode again", || async {
+        let switches = events(db, &id)
+            .await
+            .iter()
+            .filter(|e| {
+                e["type"] == "control_seen"
+                    && e["request"]["subtype"] == "set_permission_mode"
+                    && e["request"]["mode"] == "auto"
+            })
+            .count();
+        (switches == 2).then_some(())
+    })
+    .await;
+    let posted = wait_for("the approved plan is posted for the record", || async {
+        chat.ops.lock().unwrap().iter().find_map(|op| match op {
+            Op::Send {
+                html,
+                keyboard,
+                notify,
+                topic,
+                ..
+            } if html.contains("Plan approved automatically") && has_ask_me(keyboard) => {
+                Some((html.clone(), *notify, *topic))
+            }
+            _ => None,
+        })
+    })
+    .await;
+    assert!(posted.0.contains("Read the new pings"), "{}", posted.0);
+    assert_eq!(
+        posted.1,
+        Notify::Silent,
+        "a record needs nothing from the owner"
+    );
+    assert_eq!(
+        posted.2,
+        o.task(&id).await.unwrap().unwrap().topic_id,
+        "in the workflow's own topic"
+    );
+    rest().await;
+
+    // 4. One tap on the card hands plans back to the owner: the next plan waits for them.
+    let reply = crate::workflows::button(o, &format!("wf|{id}|gate_owner"))
+        .await
+        .unwrap();
+    assert!(reply.contains("wait for your approval"), "{reply}");
+    // The agent finishing a round with `workflow_finish` again does not undo the owner's choice.
+    let t = o.task(&id).await.unwrap().unwrap();
+    tasks::deliver(o, &t, "plan-gate: set up again".into())
+        .await
+        .unwrap();
+    let plan = wait_for("with the gate on the owner, the plan waits", || {
+        open_item(db, &id, "plan")
+    })
+    .await;
+    copies(db, plan.id).await;
+    human::answer(o, plan.id, Answer::Approve).await.unwrap();
+    wait_for("the owner's approval reaches the agent", || async {
+        (allowed().await == 3).then_some(())
+    })
+    .await;
+    call_as(
+        o,
+        "pat-gate",
+        &id,
+        "workflow_finish",
+        json!({"summary": "Answers code-review pings, again."}),
+    )
+    .await
+    .unwrap();
+    let gate: String = sqlx::query_scalar("select plan_gate from workflows where task_id = $1")
+        .bind(&id)
+        .fetch_one(db)
+        .await
+        .unwrap();
+    assert_eq!(gate, "owner", "only the owner changes a workflow's gate");
+    rest().await;
+    send("plan-gate: another ping").await;
+    let plan = wait_for("with the gate on the owner, the plan waits", || {
+        open_item(db, &id, "plan")
+    })
+    .await;
+    copies(db, plan.id).await;
+    human::answer(o, plan.id, Answer::Approve).await.unwrap();
+    wait_for("the owner's approval reaches the agent", || async {
+        (allowed().await == 4).then_some(())
+    })
+    .await;
+    rest().await;
+
+    // 5. Back to `auto`, a plan that says it needs the owner still waits for them.
+    let reply = crate::workflows::button(o, &format!("wf|{id}|gate_auto"))
+        .await
+        .unwrap();
+    assert!(reply.contains("approved automatically"), "{reply}");
+    send("plan-gate: this ping is unclear").await;
+    let plan = wait_for("a plan with an open question waits", || {
+        open_item(db, &id, "plan")
+    })
+    .await;
+    copies(db, plan.id).await;
+    human::answer(o, plan.id, Answer::Approve).await.unwrap();
+    wait_for("the owner's approval reaches the agent", || async {
+        (allowed().await == 5).then_some(())
+    })
+    .await;
+    rest().await;
+
+    // 6. A project set to `auto` from the web UI approves a new task's plan the same way; its
+    //    record points at the project's page rather than at a workflow card.
+    let page = api_post(
+        o,
+        "/api/projects/demo",
+        json!({"op": "plan_gate", "body": {"gate": "auto"}}),
+    )
+    .await;
+    assert!(
+        page["done"]
+            .as_str()
+            .unwrap()
+            .contains("approved automatically"),
+        "{page}"
+    );
+    assert_eq!(
+        api_get(o, "/api/projects/demo").await["project"]["plan_gate"],
+        "auto"
+    );
+    let one_off = tasks::create_task(
+        o,
+        CreateTask {
+            project: "demo".into(),
+            title: "Tidy the review labels".into(),
+            brief: "plan-gate: a one-off.".into(),
+            ticket: Some("PG-2".into()),
+            agent: Some("Pat".into()),
+            new_agent: None,
+            model: None,
+            effort: None,
+        },
+    )
+    .await
+    .unwrap();
+    wait_for(
+        "the project's gate approves the new task's plan",
+        || async {
+            sqlx::query_scalar::<_, i64>(
+                "select id from human_items where task_id = $1 and kind = 'plan'
+              and (answer->>'approved')::bool",
+            )
+            .bind(&one_off.id)
+            .fetch_optional(db)
+            .await
+            .unwrap()
+        },
+    )
+    .await;
+    let (_, detail) = gate_audit(db, &one_off.id).await;
+    assert_eq!(detail["gate"], "project", "{detail}");
+    let t = o.task(&one_off.id).await.unwrap().unwrap();
+    tasks::stop(o, &t, false).await.unwrap();
+    wait_for(&format!("{} stops", one_off.id), || async {
+        o.task(&one_off.id).await.unwrap().filter(|t| !t.running)
+    })
+    .await;
+    // Put back, so the flows after this one find the project as they expect it.
+    set_project(o, "demo", Gate::Owner).await.unwrap();
+
+    // 7. Nothing the brain can call sets a gate. The closest it can come, an edit of the project
+    //    with the gate slipped in, approved by the owner, changes what it says and not the gate.
+    let description: String =
+        sqlx::query_scalar("select description from projects where slug = 'demo'")
+            .fetch_one(db)
+            .await
+            .unwrap();
+    let proposed = crate::admin::propose(
+        o,
+        &json!({"action": "project_edit", "params": {
+            "slug": "demo", "description": format!("{description} (edited)"), "plan_gate": "auto",
+        }}),
+    )
+    .await
+    .unwrap();
+    assert!(proposed.starts_with("Proposed as Q-"), "{proposed}");
+    let item: HumanItemRow = sqlx::query_as(
+        "select * from human_items where kind = 'admin_change' order by id desc limit 1",
+    )
+    .fetch_one(db)
+    .await
+    .unwrap();
+    human::answer(o, item.id, Answer::Accept).await.unwrap();
+    let (edited, gate): (String, String) =
+        sqlx::query_as("select description, plan_gate from projects where slug = 'demo'")
+            .fetch_one(db)
+            .await
+            .unwrap();
+    assert!(
+        edited.ends_with("(edited)"),
+        "the edit itself went through: {edited}"
+    );
+    assert_eq!(gate, "owner", "the brain cannot set a project's gate");
+    sqlx::query("update projects set description = $1 where slug = 'demo'")
+        .bind(&description)
+        .execute(db)
+        .await
+        .unwrap();
+}
+
+/// The newest `plan_gate.apply` audit row of `task`, once it is there: it is written after the
+/// agent already has its answer, so a test that saw the answer must still wait for it.
+async fn gate_audit(db: &sqlx::PgPool, task: &str) -> (String, Value) {
+    wait_for(&format!("{task}'s plan gate audit"), || async move {
+        sqlx::query_as::<_, (String, Value)>(
+            "select actor, detail from audit_log
+                  where action = 'plan_gate.apply' and detail->>'task' = $1
+                  order by id desc limit 1",
+        )
+        .bind(task)
+        .fetch_optional(db)
+        .await
+        .unwrap()
+    })
+    .await
 }
 
 /// Habits: the same decision of the owner's, three times, offered back to them once, and from
@@ -5378,6 +5785,10 @@ async fn task_lifecycle_through_a_real_node() {
 
     // 22b. A run lost while its plan waited on the owner resumes in plan mode, not auto.
     lost_plan_flow(&o, &db).await;
+
+    // 22c. The plan gate: a workflow's plans are approved for the owner, and only the owner
+    //      decides that (its card, a project's page).
+    plan_gate_flow(&o, &db, &chat).await;
 
     // 23. The daily retrospective: the fleet reviews its own day and proposes how to be better.
     //     After the habits flow, so the day it reads has really happened.

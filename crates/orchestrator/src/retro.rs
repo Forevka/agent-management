@@ -434,7 +434,8 @@ pub async fn digest_over(o: &Orchestrator, day: &str, days: i64) -> Result<Strin
     let decisions: Vec<(String, String, Value)> = sqlx::query_as(
         "select actor, action, detail from audit_log
           where at > now() - make_interval(days => $2::int)
-            and action in ('item.answer', 'habit.apply', 'todo.make_task', 'task.stop')
+            and action in ('item.answer', 'habit.apply', 'plan_gate.apply', 'todo.make_task',
+                           'task.stop')
           order by at desc limit $1",
     )
     .bind(SECTION_ROWS * 2)

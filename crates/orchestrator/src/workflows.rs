@@ -19,6 +19,7 @@ use crate::{
     chat::{Button, From, Keyboard, Notify},
     core::Orchestrator,
     model::{TaskRow, WorkflowRow},
+    plan_gate::{self, Gate},
     tasks,
 };
 
@@ -56,14 +57,15 @@ fn describe(schedule: Option<&str>, enabled: bool) -> String {
     }
 }
 
-fn card_html(schedule: Option<&str>, enabled: bool) -> String {
+fn card_html(schedule: Option<&str>, enabled: bool, gate: Gate) -> String {
     format!(
-        "⚙️ <b>Workflow settings</b>\n{}",
-        crate::chat::esc(&describe(schedule, enabled))
+        "⚙️ <b>Workflow settings</b>\n{}\n{}",
+        crate::chat::esc(&describe(schedule, enabled)),
+        crate::chat::esc(plan_gate::describe(gate))
     )
 }
 
-fn card_keyboard(task_id: &str, enabled: bool) -> Keyboard {
+fn card_keyboard(task_id: &str, enabled: bool, gate: Gate) -> Keyboard {
     let row = |pairs: &[(&str, &str)]| {
         pairs
             .iter()
@@ -89,6 +91,11 @@ fn card_keyboard(task_id: &str, enabled: bool) -> Keyboard {
             ),
             ("🗑 Delete", "del"),
         ]),
+        // Who approves its plans (`plan_gate`): the owner's tap here is the only way to change it.
+        row(&[match gate {
+            Gate::Auto => ("🔒 Ask me for plans", "gate_owner"),
+            Gate::Owner => ("🔓 Approve plans automatically", "gate_auto"),
+        }]),
     ]
 }
 
@@ -98,14 +105,20 @@ pub async fn start(o: &Arc<Orchestrator>, task: &TaskRow, schedule: Option<&str>
     if let Some(s) = schedule {
         validate_schedule(s)?;
     }
-    sqlx::query(
+    // A new workflow's plans wait for the owner (the column's default) until they tap 🔓 on the
+    // card: the agent calls `workflow_finish` itself, so setting one up must not open the gate.
+    // Set up again (a second `workflow_finish`), it keeps the plan gate the owner chose: only
+    // the owner changes that, never the agent finishing.
+    let gate: String = sqlx::query_scalar(
         "insert into workflows (task_id, schedule, enabled) values ($1, $2, true)
-         on conflict (task_id) do update set schedule = excluded.schedule, enabled = true",
+         on conflict (task_id) do update set schedule = excluded.schedule, enabled = true
+         returning plan_gate",
     )
     .bind(&task.id)
     .bind(schedule)
-    .execute(&o.db)
+    .fetch_one(&o.db)
     .await?;
+    let gate = Gate::parse(&gate)?;
     let Some(topic) = task.topic_id else {
         return Ok(());
     };
@@ -114,8 +127,8 @@ pub async fn start(o: &Arc<Orchestrator>, task: &TaskRow, schedule: Option<&str>
         .send(
             From::Orchestrator,
             Some(topic),
-            &card_html(schedule, true),
-            card_keyboard(&task.id, true),
+            &card_html(schedule, true, gate),
+            card_keyboard(&task.id, true, gate),
             None,
             Notify::Silent,
         )
@@ -132,8 +145,8 @@ pub async fn start(o: &Arc<Orchestrator>, task: &TaskRow, schedule: Option<&str>
 /// owner names it (e.g. so a todo can link to it, or a request can `send-to-task` it instead of
 /// creating a new one).
 pub async fn list(o: &Orchestrator) -> Result<String> {
-    let rows: Vec<(String, String, Option<String>, bool)> = sqlx::query_as(
-        "select w.task_id, t.title, w.schedule, w.enabled
+    let rows: Vec<(String, String, Option<String>, bool, String)> = sqlx::query_as(
+        "select w.task_id, t.title, w.schedule, w.enabled, w.plan_gate
          from workflows w join tasks t on t.id = w.task_id
          order by w.created_at desc",
     )
@@ -141,12 +154,14 @@ pub async fn list(o: &Orchestrator) -> Result<String> {
     .await?;
     let out: Vec<serde_json::Value> = rows
         .into_iter()
-        .map(|(task_id, title, schedule, enabled)| {
+        .map(|(task_id, title, schedule, enabled, plan_gate)| {
             json!({
                 "task": task_id,
                 "title": title,
                 "schedule": schedule,
                 "enabled": enabled,
+                // Read-only here: the owner sets it on the workflow's card.
+                "plan_gate": plan_gate,
             })
         })
         .collect();
@@ -195,6 +210,35 @@ pub async fn button(o: &Arc<Orchestrator>, data: &str) -> Result<String> {
         }
         return Ok("Workflow deleted.".into());
     }
+    if let Some(gate) = match action {
+        "gate_owner" => Some(Gate::Owner),
+        "gate_auto" => Some(Gate::Auto),
+        _ => None,
+    } {
+        sqlx::query("update workflows set plan_gate = $2 where task_id = $1")
+            .bind(task_id)
+            .bind(gate.as_str())
+            .execute(&o.db)
+            .await?;
+        o.audit(
+            "owner",
+            "workflow.plan_gate",
+            json!({"task": task_id, "gate": gate.as_str()}),
+        )
+        .await;
+        if let Some(msg) = row.tg_msg {
+            let _ = o
+                .chat
+                .edit(
+                    From::Orchestrator,
+                    msg,
+                    &card_html(row.schedule.as_deref(), row.enabled, gate),
+                    card_keyboard(task_id, row.enabled, gate),
+                )
+                .await;
+        }
+        return Ok(plan_gate::describe(gate).into());
+    }
     let (schedule, enabled): (Option<String>, bool) = match action {
         "p15" => (Some("every:15m".into()), true),
         "p30" => (Some("every:30m".into()), true),
@@ -212,6 +256,7 @@ pub async fn button(o: &Arc<Orchestrator>, data: &str) -> Result<String> {
         }
         _ => bail!("unknown button"),
     };
+    let gate = Gate::parse(&row.plan_gate)?;
     sqlx::query("update workflows set schedule = $2, enabled = $3 where task_id = $1")
         .bind(task_id)
         .bind(&schedule)
@@ -230,8 +275,8 @@ pub async fn button(o: &Arc<Orchestrator>, data: &str) -> Result<String> {
             .edit(
                 From::Orchestrator,
                 msg,
-                &card_html(schedule.as_deref(), enabled),
-                card_keyboard(task_id, enabled),
+                &card_html(schedule.as_deref(), enabled, gate),
+                card_keyboard(task_id, enabled, gate),
             )
             .await;
     }
@@ -385,6 +430,22 @@ mod tests {
         assert!(validate_schedule("daily:09:00").is_ok());
         assert!(validate_schedule("every:5m").is_err());
         assert!(validate_schedule("weekly").is_err());
+    }
+
+    #[test]
+    fn card_says_who_approves_plans_and_offers_the_other_way() {
+        let actions = |gate| -> Vec<String> {
+            card_keyboard("dap-1", true, gate)
+                .into_iter()
+                .flatten()
+                .filter_map(|b| b.data)
+                .collect()
+        };
+        assert!(card_html(None, true, Gate::Auto).contains("Plans: approved automatically"));
+        assert!(actions(Gate::Auto).contains(&"wf|dap-1|gate_owner".to_owned()));
+        assert!(!actions(Gate::Auto).contains(&"wf|dap-1|gate_auto".to_owned()));
+        assert!(card_html(None, true, Gate::Owner).contains("Plans: wait for your approval"));
+        assert!(actions(Gate::Owner).contains(&"wf|dap-1|gate_auto".to_owned()));
     }
 
     #[test]

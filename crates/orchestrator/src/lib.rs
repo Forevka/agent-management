@@ -20,6 +20,7 @@ pub mod human;
 pub mod jira;
 pub mod memory;
 pub mod model;
+pub mod plan_gate;
 pub mod prompts;
 pub mod retro;
 pub mod secretary;

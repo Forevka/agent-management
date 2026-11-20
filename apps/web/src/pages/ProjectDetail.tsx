@@ -148,6 +148,31 @@ export default function ProjectDetail() {
               </Card>
             </Section>
 
+            <Section title="Plan approval">
+              <Card>
+                <CardHeader
+                  title="Who approves this project's plans"
+                  description="Every agent plans before it works. With “ask me”, each plan waits for your approval. With “automatic”, the orchestrator approves it and posts it silently in the task’s topic, unless the plan says it needs you. That covers every task here, including the ones the orchestrator creates after reading a ticket or a Slack message. Workflows have their own setting, on their card in Telegram."
+                />
+                <CardContent>
+                  <Row gap="3">
+                    <Badge tone={d.project.plan_gate === 'auto' ? 'warning' : 'neutral'}>
+                      {d.project.plan_gate === 'auto' ? 'automatic' : 'ask me'}
+                    </Badge>
+                    <Button
+                      variant="secondary"
+                      loading={saving === 'plan_gate'}
+                      onClick={() =>
+                        void save('plan_gate', { gate: d.project.plan_gate === 'auto' ? 'owner' : 'auto' })
+                      }
+                    >
+                      {d.project.plan_gate === 'auto' ? 'Ask me for plans' : 'Approve plans automatically'}
+                    </Button>
+                  </Row>
+                </CardContent>
+              </Card>
+            </Section>
+
             <Section title="Jira">
               <Card>
                 <CardHeader

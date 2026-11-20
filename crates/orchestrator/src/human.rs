@@ -76,6 +76,18 @@ pub(crate) fn owner_payload(row: &HumanItemRow) -> Value {
 }
 
 pub async fn create(o: &Orchestrator, item: NewItem<'_>) -> Result<HumanItemRow> {
+    create_with(o, item, true).await
+}
+
+/// [create], optionally without posting the item anywhere. Only for an item the orchestrator
+/// answers itself at once (a plan under an `auto` plan gate, see `plan_gate`): the owner is not
+/// asked, so a card asking them would be noise. Whoever passes `false` must [announce] the item
+/// after all if they end up not answering it, so an open item is never one nobody can see.
+pub(crate) async fn create_with(
+    o: &Orchestrator,
+    item: NewItem<'_>,
+    announce_it: bool,
+) -> Result<HumanItemRow> {
     let project = item
         .project
         .clone()
@@ -96,14 +108,15 @@ pub async fn create(o: &Orchestrator, item: NewItem<'_>) -> Result<HumanItemRow>
     .await?;
     // The agent now waits on the owner: "typing…" would say the opposite. Either way they have
     // something of the agent's to read, so their own message counts as answered (`working`).
-    if let Some(task) = item.task {
+    // Not for an item the orchestrator answers at once: the agent carries straight on.
+    if announce_it && let Some(task) = item.task {
         if item.blocking {
             o.stop_working(&task.id);
         } else {
             o.working.answered(&task.id);
         }
     }
-    if let Err(e) = announce(o, &row, item.task).await {
+    if announce_it && let Err(e) = announce(o, &row, item.task).await {
         tracing::warn!("announcing Q-{} failed: {e:#}", row.id);
     }
     if item.blocking
@@ -119,7 +132,11 @@ pub async fn create(o: &Orchestrator, item: NewItem<'_>) -> Result<HumanItemRow>
 }
 
 /// Posts the item in the project's human topic (and a pointer in the task topic).
-async fn announce(o: &Orchestrator, row: &HumanItemRow, task: Option<&TaskRow>) -> Result<()> {
+pub(crate) async fn announce(
+    o: &Orchestrator,
+    row: &HumanItemRow,
+    task: Option<&TaskRow>,
+) -> Result<()> {
     let from = match task {
         Some(t) => o.task_sender(t).await,
         None => From::Orchestrator,

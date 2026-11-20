@@ -531,6 +531,9 @@ async fn repeated_decisions(o: &Orchestrator) -> Result<Vec<(String, String, i64
                from human_items h join tasks t on t.id = h.task_id
               where h.kind = 'plan' and h.state = 'answered'
                 and h.answered_at > now() - make_interval(days => $1::int)
+                -- Approved by a plan gate the owner set to `auto` (`plan_gate`): not a decision
+                -- of theirs, and nothing a habit would add to.
+                and coalesce(h.answer->>'by', '') <> 'plan_gate'
               group by 1, 2
          ) g
           where g.approved >= $2 and g.revised = 0
