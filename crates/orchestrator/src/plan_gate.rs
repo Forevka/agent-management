@@ -149,6 +149,9 @@ pub async fn approve(o: &Arc<Orchestrator>, item: &HumanItemRow, task: &TaskRow,
             item.id,
             task.id
         );
+        // Now the agent does wait on the owner, so "typing…" would say the opposite (what
+        // `human::create_with` does for a plan announced at once).
+        o.stop_working(&task.id);
         if let Err(e) = human::announce(o, item, Some(task)).await {
             tracing::error!(
                 "Q-{} of {} is open and could not be announced: {e:#}",

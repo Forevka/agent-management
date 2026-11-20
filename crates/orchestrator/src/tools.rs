@@ -816,10 +816,12 @@ async fn permission(
             .bind(&call.call_id)
             .fetch_optional(&o.db)
             .await?;
-            if let Some(item) = unseen
-                && let Err(e) = human::announce(o, &item, Some(task)).await
-            {
-                tracing::warn!("announcing Q-{} late failed: {e:#}", item.id);
+            if let Some(item) = unseen {
+                // It waits on the owner from now on: no "typing…" over it.
+                o.stop_working(&task.id);
+                if let Err(e) = human::announce(o, &item, Some(task)).await {
+                    tracing::warn!("announcing Q-{} late failed: {e:#}", item.id);
+                }
             }
             return Ok(None);
         }
