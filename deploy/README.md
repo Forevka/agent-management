@@ -150,7 +150,13 @@ curl -s -H "Authorization: Bearer $HINDSIGHT_API_KEY" http://127.0.0.1:8888/heal
 
 ## 6. Join a node
 
-Every node needs a one-time ticket from the orchestrator:
+**Setting one up with Claude Code?** Give the session on the new machine
+[`deploy/NODE-SETUP.md`](NODE-SETUP.md) — for example: *"Read
+https://raw.githubusercontent.com/Forevka/agent-management/main/deploy/NODE-SETUP.md and follow it."*
+It is written for an agent: it detects the OS, installs the newest release after checking its
+sums, and stops to ask you for the ticket, which projects to map and where they live.
+
+Every node needs a one-time ticket from the orchestrator (or send `/invite` in the Telegram group):
 
 ```sh
 cd /opt/fleet/deploy
