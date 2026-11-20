@@ -84,6 +84,14 @@ enum Cmd {
     Mcp,
     /// Print this host's endpoint id.
     Id,
+    /// Database migrations (uses DATABASE_URL).
+    Migrate {
+        /// Apply every pending migration in one transaction against the live database, report
+        /// what happened, and roll it all back. Exit status 0 only if every one applied. The
+        /// updater runs this with a new image before deploying it.
+        #[arg(long, required = true)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -149,6 +157,33 @@ async fn run(cli: Cli) -> Result<()> {
         Cmd::Agent(cmd) => std::process::exit(fleet_node::agent_cli::run(cmd).await?),
         Cmd::Secret { cmd } => secret(cmd),
         Cmd::Project { cmd } => project(&data_dir, cmd),
+        Cmd::Migrate { dry_run: _ } => {
+            // Only --dry-run exists: applying migrations for real is what the orchestrator does
+            // at startup, under its own checks, and there is no reason for a second way.
+            let db = connect_db().await?;
+            let run = fleet_orchestrator::preflight::dry_run(&db).await?;
+            println!("{} pending migration(s)", run.pending.len());
+            for (v, d) in &run.pending {
+                let mark = match &run.failed {
+                    Some((f, _)) if f == v => "FAIL",
+                    Some((f, _)) if f < v => "skip",
+                    _ => "ok",
+                };
+                println!("  {mark:4} {v:04} {d}");
+            }
+            match run.failed {
+                None => {
+                    println!("dry run passed; nothing was kept");
+                    Ok(())
+                }
+                Some((v, e)) => {
+                    // Printed in full rather than returned, so the updater's log has the
+                    // database's own words; the exit status is what it acts on.
+                    eprintln!("dry run FAILED at {v:04}: {e}");
+                    std::process::exit(1)
+                }
+            }
+        }
         Cmd::Id => {
             println!("{}", load_or_create_key(&data_dir)?.public());
             Ok(())

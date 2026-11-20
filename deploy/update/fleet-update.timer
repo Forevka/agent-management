@@ -1,0 +1,12 @@
+# Every five minutes: cheap when there is nothing new (one `git ls-remote`).
+[Unit]
+Description=fleet: check for a new release every five minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+# A missed tick is not worth catching up: the next one does the same work.
+Persistent=false
+
+[Install]
+WantedBy=timers.target

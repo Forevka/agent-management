@@ -22,6 +22,7 @@ pub mod links;
 pub mod memory;
 pub mod model;
 pub mod plan_gate;
+pub mod preflight;
 pub mod prompts;
 pub mod retro;
 pub mod secretary;

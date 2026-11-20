@@ -472,10 +472,46 @@ did not run (it recreates the `fleet` and `hindsight` roles).
 
 ## 8. Updating
 
-**The stack** — from `main`, which is the branch that runs. `/opt/fleet` tracks
-`origin/main`, so the commit in production has the same hash as the commit in the
-repository, and `git log -1` there answers "what is running" with no translation.
-Deploy only what CI called green.
+### Automatically: a merge to main is a deploy
+
+**Merging into `main` deploys.** When CI passes on `main`, its `Tag and release` job tags
+that exact commit with the next patch version (`v0.2.0`, `v0.2.1`, …) and dispatches
+`release.yml`, which publishes the binaries with SHA-256 sums. On the VPS,
+`fleet-update.timer` notices the new release within five minutes and rolls it out:
+
+1. checks out the tag in `/opt/fleet` and builds its image (`FLEET_VERSION=<tag>`);
+2. **dry-runs its migrations against the live database** (`fleet migrate --dry-run`: all
+   pending migrations in one transaction, then rolled back) and stops if any fails —
+   CI's empty database cannot show what a migration does to rows that already exist;
+3. backs the database up to `/root/backups/fleet-before-<tag>.sql.gz` and checks the dump
+   is real;
+4. swaps the image in and waits for 20 s of continuous health (running, the right version,
+   the web answering), **rolling back to the previous image** if it does not get there;
+5. updates this host's node once no agent is running on it, or after two hours regardless
+   (runs resume from their sessions).
+
+It says what it did in the Telegram group — quietly on success, loudly on failure. A release
+that failed is not retried; the next one is. To retry it anyway:
+`rm /var/lib/fleet-update/failed-<tag>`. `journalctl -u fleet-update` has the detail, and
+`fleet --version` on any binary says which release it is.
+
+**The updater runs as root, so it is the one part of a release that never updates itself.**
+systemd runs the installed copy, `/usr/local/sbin/fleet-update`; when a release changes
+`deploy/update/fleet-update.sh`, the group is told once, and a person applies it after
+reading it. Install it once:
+
+```sh
+install -m 0755 /opt/fleet/deploy/update/fleet-update.sh /usr/local/sbin/fleet-update
+cp /opt/fleet/deploy/update/fleet-update.{service,timer} /etc/systemd/system/
+systemctl daemon-reload && systemctl enable --now fleet-update.timer
+systemctl start fleet-update        # one run now; then `journalctl -u fleet-update`
+```
+
+### By hand
+
+**The stack** — from `main`. Deploy only what CI called green, and prefer letting the
+updater do it: by hand you skip the migration dry run, which is the step that would have
+caught the 2026-11-20 outage.
 
 ```sh
 cd /opt/fleet && git fetch origin && git merge --ff-only origin/main
@@ -494,8 +530,9 @@ docker image prune -f
   needs a dump and restore (section 7), not just a new tag.
 - Take a backup first (`deploy/scripts/backup.sh`).
 
-**Nodes:** releases are pushed to nodes once update-on-approval is
-implemented. Until then, by hand — and **update the nodes whenever the
+**Nodes:** the VPS's own node follows automatically (above). Other nodes do not yet —
+pushing releases to them over the link is the next step of auto-deploy. Until then, by
+hand — and **update the nodes whenever the
 `fleet agent` CLI changed**, not only on a protocol bump: that CLI lives in the
 node's binary, so a new agent command (or a changed one) simply does not exist
 for the sessions on a node still running the old one. The orchestrator will

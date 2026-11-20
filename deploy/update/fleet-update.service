@@ -1,0 +1,13 @@
+# Rolls the newest release out to this host. See fleet-update.sh and deploy/README.md.
+[Unit]
+Description=fleet: deploy the newest release to this host
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# The installed copy, never the repo's: this runs as root, so a change to it is applied by a
+# person (fleet-update.sh says how when one arrives), not by whoever merged it.
+ExecStart=/usr/local/sbin/fleet-update
+# A docker build can take a few minutes; a stuck one should not hold the lock for ever.
+TimeoutStartSec=30min
