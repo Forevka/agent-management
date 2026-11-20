@@ -4,8 +4,38 @@ import {
 } from '@radix-ui/themes'
 import { CheckIcon } from '@radix-ui/react-icons'
 import { Link, useParams } from 'react-router-dom'
-import type { Events, TaskDetail as Detail } from '../api'
+import type { Events, Item, TaskDetail as Detail } from '../api'
 import { Duration, Empty, Loaded, Pre, Section, StatusBadge, When, useApi } from '../ui'
+
+/// Whether an item is still waiting for the owner. An item from an older build of the API may
+/// carry no state at all; it is then treated as settled rather than as a false alarm, because
+/// the fleet asks again when it still needs something.
+function isOpen(i: Item): boolean {
+  return i.state === 'open'
+}
+
+/// One item of a task, linking to its own page, where the question and the answer are.
+function ItemCard({ item, answered }: { item: Item; answered?: boolean }) {
+  return (
+    <Card asChild>
+      <Link to={`/items/${item.id}`} style={{ textDecoration: 'none' }}>
+        <Flex gap="2" align="center" wrap="wrap">
+          <Badge color={answered ? 'gray' : item.blocking ? 'red' : 'amber'} variant="soft">
+            {item.kind}
+          </Badge>
+          <Text size="2" className="fleet-wrap">
+            {item.summary}
+          </Text>
+          {answered ? (
+            <Text size="1" color="gray">
+              {item.state}
+            </Text>
+          ) : null}
+        </Flex>
+      </Link>
+    </Card>
+  )
+}
 
 /// A transcript line. The data is whatever the agent printed — a tool result can carry a file
 /// or a Slack message — so it is shown as text and never as markup.
@@ -96,23 +126,27 @@ export default function TaskDetail() {
             </Flex>
           </Card>
 
-          {d.items.filter((i) => i.state === 'open' || !i.state).length > 0 && (
+          {/* Open items only: a task keeps its answered questions, and showing those under
+              "Waiting on you" told the owner they were holding up work they had already
+              answered. The rest are listed below, as a record of what was asked. */}
+          {d.items.filter(isOpen).length > 0 && (
             <Section title="Waiting on you">
               <Flex direction="column" gap="2">
-                {d.items.map((i) => (
-                  <Card key={i.id} asChild>
-                    <Link to={`/items/${i.id}`} style={{ textDecoration: 'none' }}>
-                      <Flex gap="2" align="center" wrap="wrap">
-                        <Badge color={i.blocking ? 'red' : 'amber'} variant="soft">
-                          {i.kind}
-                        </Badge>
-                        <Text size="2" className="fleet-wrap">
-                          {i.summary}
-                        </Text>
-                      </Flex>
-                    </Link>
-                  </Card>
+                {d.items.filter(isOpen).map((i) => (
+                  <ItemCard key={i.id} item={i} />
                 ))}
+              </Flex>
+            </Section>
+          )}
+
+          {d.items.filter((i) => !isOpen(i)).length > 0 && (
+            <Section title="Answered">
+              <Flex direction="column" gap="2">
+                {d.items
+                  .filter((i) => !isOpen(i))
+                  .map((i) => (
+                    <ItemCard key={i.id} item={i} answered />
+                  ))}
               </Flex>
             </Section>
           )}

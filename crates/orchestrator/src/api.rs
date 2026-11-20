@@ -194,6 +194,10 @@ fn item_json(i: &HumanItemRow) -> Value {
     json!({
         "id": i.id,
         "kind": i.kind,
+        // A task's page lists every item it ever had, so each one has to say whether it is still
+        // waiting: without this an answered question read as open (`state` undefined), and the
+        // page told the owner they were being waited on after they had answered.
+        "state": i.state,
         "blocking": i.blocking,
         "project": i.project,
         "task": i.task_id,
