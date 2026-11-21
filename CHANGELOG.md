@@ -1,13 +1,17 @@
 log
 
 Every merge to `main` is a release (CI tags it with the next patch version and publishes it; the
-VPS rolls it out), so each section below is one merge. How to add to this file is in `CLAUDE.md`
+VPS rolls it out), except one that changes only docs, which waits for the next. Each section
+below is one release. How to add to this file is in `CLAUDE.md`
 (*Conventions*). Newest first.
 
 ## Unreleased
 
-- Docs only: `CLAUDE.md` asks everyone working on the repo (people and agents alike) to delete
-  build folders and remove merged worktrees and clones when done. Each `target/` is 7-40 GB.
+- **Docs-only changes make no release.** A push or merge that changes only Markdown files and
+  `docs/` runs no CI, so nothing is tagged or rolled out to the nodes; it ships with the next
+  release. Branches named `docs/**` now get CI like the other work branches.
+- `CLAUDE.md` asks everyone working on the repo (people and agents alike) to delete build
+  folders and remove merged worktrees and clones when done. Each `target/` is 7-40 GB.
 
 ## v0.2.8 — 2026-11-21
 

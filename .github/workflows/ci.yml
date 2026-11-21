@@ -5,8 +5,17 @@ on:
     # Work branches too, so a pushed branch is checked before it has a pull request. `fleet/**`
     # and `retro/**` are the fleet's own agents' branches: until they were listed here, no agent
     # branch was checked before it reached main, and a merge to main is now a deploy.
-    branches: [main, 'fix/**', 'feat/**', 'fleet/**', 'retro/**']
+    branches: [main, 'fix/**', 'feat/**', 'fleet/**', 'retro/**', 'docs/**']
+    # Docs alone build nothing (no build embeds a Markdown file), so a push or pull request that
+    # changes only these runs no CI and, on main, makes no release: nothing to roll out to the
+    # nodes. A change that also touches anything else runs everything, as before.
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
   pull_request:
+    paths-ignore: # the same list as for push
+      - '**/*.md'
+      - 'docs/**'
   workflow_dispatch:
 
 permissions:

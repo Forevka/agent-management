@@ -538,7 +538,10 @@ did not run (it recreates the `fleet` and `hindsight` roles).
 **Merging into `main` deploys.** When CI passes on `main`, its `Tag and release` job tags
 that exact commit with the next patch version (`v0.2.0`, `v0.2.1`, …) and dispatches
 `release.yml`, which publishes the binaries with SHA-256 sums. On the VPS,
-`fleet-update.timer` notices the new release within five minutes and rolls it out:
+`fleet-update.timer` notices the new release within five minutes and rolls it out.
+A merge that changes only Markdown files or `docs/` runs no CI (`paths-ignore` in `ci.yml`),
+so it makes no release and nothing is rolled out; it ships with the next release.
+
 
 1. checks the tag is **on `main`** — a tag pushed anywhere else is refused, so the owner's
    merge stays the only way in — then checks it out in `/opt/fleet` and builds its image
