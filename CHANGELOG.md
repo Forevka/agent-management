@@ -7,7 +7,8 @@ VPS rolls it out), so each section below is one merge. How to add to this file i
 ## Unreleased
 
 - **The kit.** The owner's Claude Code skills, plugins and MCP servers, managed on the new
-  **Kit** page, imported from a node (secrets moved into the vault, placeholders kept), and
+  **Kit** page, imported from a node (an MCP server's whole config sealed in the vault, shown
+  only masked, with nothing of it in Postgres but its type and command or host), and
   installed on every node at user scope — never over a skill or MCP server of the machine's own,
   and removing only what the kit installed. A per-node matrix shows installed, failed, conflict
   or removed. Only the owner changes it; the brain cannot, not even by proposal.

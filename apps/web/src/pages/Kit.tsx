@@ -71,7 +71,6 @@ export default function Kit() {
               />
             ))}
             <AddSection onAdded={reload} />
-            <SecretsSection keys={d.secrets} onChange={reload} />
             <MatrixSection kit={d} />
           </>
         )}
@@ -130,10 +129,10 @@ function ItemsSection({
                     {i.files.length} file{i.files.length === 1 ? '' : 's'}
                   </Text>
                 )}
-                {i.missing_secrets.length > 0 && (
-                  <Badge tone="danger" title={i.missing_secrets.join(', ')}>
-                    secret not set
-                  </Badge>
+                {i.kind === 'mcp' && (
+                  <Text size="1" tone="muted" mono>
+                    {[i.spec.type, i.spec.command ?? i.spec.endpoint].filter(Boolean).join(' · ')}
+                  </Text>
                 )}
                 <When at={i.updated_at} />
               </Row>
@@ -282,7 +281,7 @@ function ImportSection({ kit, onImported }: { kit: KitT; onImported: () => void 
   return (
     <Section
       title="Import from a node"
-      description="Reads the skills, plugins and user-scope MCP servers a machine has. Claude.ai connectors belong to the account, not a machine, so they are not offered. An MCP server's env and header values, a URL's password and query, a password in a database URL, NAME=value pairs and flags named like a secret (API_TOKEN=…, --api-key …) go into the vault; any other secret in a config, replace with ${secret:NAME} on the server's page."
+      description="Reads the skills, plugins and user-scope MCP servers a machine has. Claude.ai connectors belong to the account, not a machine, so they are not offered. An MCP server's config is a secret as a whole: it is sealed in the vault, and shown here only masked."
     >
       <Card>
         <CardContent>
@@ -343,9 +342,9 @@ function ImportSection({ kit, onImported }: { kit: KitT; onImported: () => void 
                         `mcp:${m.name}`,
                         m.name,
                         m.in_kit,
-                        m.secrets.length > 0
-                          ? `Its values for ${m.secrets.join(', ')} go into the vault; the kit keeps placeholders.`
-                          : 'No env or header values.',
+                        `${[m.summary.type, m.summary.command ?? m.summary.endpoint].filter(Boolean).join(' · ')}${
+                          m.masked > 0 ? ` · ${m.masked} value${m.masked === 1 ? '' : 's'} masked here, sealed on import` : ''
+                        }`,
                       ),
                     )}
                   </Stack>
@@ -467,7 +466,7 @@ function AddSection({ onAdded }: { onAdded: () => void }) {
         </AddForm>
         <AddForm
           title="An MCP server"
-          description="Its config as JSON. Env and header values move into the vault; write ${secret:NAME} to use one already there."
+          description="Its config as JSON, as Claude Code takes it. It is sealed in the vault whole, and shown only masked from then on."
           op="mcp_save"
           build={(f) => ({ name: f.get('name'), config: f.get('config') })}
           onDone={onAdded}
@@ -483,81 +482,6 @@ function AddSection({ onAdded }: { onAdded: () => void }) {
           />
         </AddForm>
       </Grid>
-    </Section>
-  )
-}
-
-/// The kit's MCP secrets, by name. Write-only: a value is never read back.
-function SecretsSection({ keys, onChange }: { keys: string[]; onChange: () => void }) {
-  const [busy, setBusy] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  return (
-    <Section
-      title="Secrets"
-      description="What the kit's MCP servers use through ${secret:NAME}. Kept encrypted in the kit secret folder; values go only to the nodes."
-    >
-      <Card>
-        <CardContent>
-          <Stack gap="3">
-            <Row gap="2">
-              {keys.length === 0 ? (
-                <Text tone="muted" size="1">
-                  None yet
-                </Text>
-              ) : (
-                keys.map((k) => (
-                  <Badge key={k}>
-                    <Text mono size="1">
-                      {k}
-                    </Text>
-                  </Badge>
-                ))
-              )}
-            </Row>
-            <form
-              onSubmit={async (e) => {
-                e.preventDefault()
-                const form = e.currentTarget
-                const f = new FormData(form)
-                setBusy(true)
-                setError(null)
-                try {
-                  await api.act(PATH, 'secret_set', { key: f.get('key'), value: f.get('value') })
-                  // The value must not stay sitting in the page after it is stored.
-                  form.reset()
-                  onChange()
-                } catch (err) {
-                  setError(err instanceof Error ? err.message : String(err))
-                } finally {
-                  setBusy(false)
-                }
-              }}
-            >
-              <Row gap="3" align="end">
-                <div style={{ minWidth: '13rem' }}>
-                  <TextField name="key" label="Name" list="kit-secrets" required size="sm" placeholder="SENTRY_TOKEN" />
-                  <datalist id="kit-secrets">
-                    {keys.map((k) => (
-                      <option key={k} value={k} />
-                    ))}
-                  </datalist>
-                </div>
-                <div style={{ minWidth: '16rem', flexGrow: 1 }}>
-                  <TextField name="value" label="Value" type="password" autoComplete="off" required size="sm" />
-                </div>
-                <Button type="submit" variant="secondary" size="sm" loading={busy}>
-                  Set
-                </Button>
-              </Row>
-              {error && (
-                <Text size="1" tone="danger">
-                  {error}
-                </Text>
-              )}
-            </form>
-          </Stack>
-        </CardContent>
-      </Card>
     </Section>
   )
 }

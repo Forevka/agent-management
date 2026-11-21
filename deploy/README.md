@@ -300,9 +300,9 @@ a restart.
    installs, for your own Claude Code there and for the agents. *Import from a
    node* reads what one machine has (its user-scope MCP servers, the skills in
    its Claude config dir, its user-scope plugins) and lets you tick what to take;
-   MCP secrets (env and header values, passwords in URLs, secret-named args) go
-   into the vault's `kit` secret folder and the kit
-   keeps `${secret:NAME}` placeholders. Every node level with the orchestrator's
+   an MCP server's whole config is sealed in the vault (`FLEET_MASTER_KEY`) and
+   shown only masked; the database keeps its type and command or host. Every node
+   level with the orchestrator's
    release then installs the kit — skills next to your own (a skill or user MCP
    server of the same name that the kit did not install is reported as a
    conflict and left alone), plugins and MCP servers through the node's `claude`

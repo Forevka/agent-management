@@ -31,8 +31,8 @@ use anyhow::{Context, Result};
 use fleet_proto::{
     KitContent, KitFile, KitItemStatus, KitMcp, KitPlugin, KitSkill, KitSkipped,
     kit::{
-        MAX_SKILL_BYTES, MAX_SKILL_FILE_BYTES, MAX_SKILL_FILES, SKILL_MARKER, SpotAt,
-        has_credentials, safe_skill_path, secret_file, secret_spots, sensitive_name, valid_name,
+        MAX_SKILL_BYTES, MAX_SKILL_FILE_BYTES, MAX_SKILL_FILES, SKILL_MARKER, clean_source,
+        safe_skill_path, scrub_values, secret_file, valid_name,
     },
     redact::redact_secrets,
 };
@@ -41,6 +41,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
 
+/// The start of the name an unreadable `kit-state.json` is set aside under.
+const UNREADABLE: &str = "kit-state.json.unreadable-";
 /// How long one `claude` CLI call may take. Adding a marketplace clones a repository, which the
 /// CLI itself gives two minutes.
 const CLI_TIMEOUT: Duration = Duration::from_secs(180);
@@ -372,11 +374,11 @@ fn capture_plugins(dir: &Path, skipped: &mut Vec<KitSkipped>) -> Vec<KitPlugin> 
         }
         match known.get(marketplace) {
             // A password in the source would go into the database and to every machine.
-            Some(Some(source)) if has_credentials(source) => skip(
+            Some(Some(source)) if !clean_source(source) => skip(
                 skipped,
                 "plugin",
                 &id,
-                "its marketplace's source carries a password",
+                "its marketplace's source carries a user, password, token or query",
             ),
             Some(Some(source)) => out.push(KitPlugin {
                 plugin: plugin.into(),
@@ -472,11 +474,48 @@ impl State {
         data_dir.join("kit-state.json")
     }
 
+    /// The record, or an empty one when there is none yet. One that exists and cannot be read
+    /// is set aside (never overwritten: a person may want it) and said, loudly; the kit then
+    /// knows of nothing it installed, so it removes nothing, and [`State::trouble`] keeps saying
+    /// so in the node's kit status until the set-aside file is deleted.
     fn load(data_dir: &Path) -> Self {
-        std::fs::read_to_string(Self::path(data_dir))
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default()
+        let path = Self::path(data_dir);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Self::default(),
+            Err(e) => {
+                tracing::error!("the kit's record {} cannot be read: {e}", path.display());
+                return Self::default();
+            }
+        };
+        match serde_json::from_str(&text) {
+            Ok(s) => s,
+            Err(e) => {
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let aside = data_dir.join(format!("{UNREADABLE}{stamp}"));
+                let _ = std::fs::rename(&path, &aside);
+                tracing::error!(
+                    "the kit's record of what it installed is unreadable ({e}); set aside as {}: until it is sorted out, nothing the kit installed earlier is updated or removed",
+                    aside.display()
+                );
+                Self::default()
+            }
+        }
+    }
+
+    /// What to tell the owner about the record: a set-aside unreadable one, if any.
+    fn trouble(data_dir: &Path) -> Option<String> {
+        let aside = std::fs::read_dir(data_dir)
+            .ok()?
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .find(|n| n.starts_with(UNREADABLE))?;
+        Some(format!(
+            "this node's record of what the kit installed was unreadable and is kept as {aside} in its data dir: skills, plugins and MCP servers the kit installed before are no longer updated or removed by it; delete that file once they are sorted out"
+        ))
     }
 
     /// Written after every change the CLI made, so a crash in the middle of an apply never
@@ -626,8 +665,9 @@ pub fn plan_skill(dir: &Path, hash: &str, name: &str) -> SkillPlan {
     }
 }
 
-/// Files under `dir` that are neither the kit's (`listed`, the marker) nor junk: what the owner
-/// added to a kit skill. They are kept when the kit updates or removes it.
+/// What the owner added to a kit skill: files under `dir` that are neither the kit's (`listed`,
+/// the marker) nor an OS's junk, and whole tooling directories (`.git`, `node_modules`,
+/// `__pycache__`), which the kit never writes. They are kept when the kit updates or removes it.
 fn extras(dir: &Path, listed: &BTreeSet<String>) -> Vec<String> {
     let mut out = Vec::new();
     let mut stack = vec![(dir.to_path_buf(), String::new())];
@@ -642,7 +682,9 @@ fn extras(dir: &Path, listed: &BTreeSet<String>) -> Vec<String> {
                 continue;
             };
             if meta.is_dir() && !meta.is_symlink() {
-                if !SKIP_DIRS.contains(&file_name.as_str()) {
+                if SKIP_DIRS.contains(&file_name.as_str()) {
+                    out.push(rel);
+                } else {
                     stack.push((e.path(), format!("{rel}/")));
                 }
             } else if rel != SKILL_MARKER && !junk(&file_name) && !listed.contains(&rel) {
@@ -700,10 +742,41 @@ fn take_away(paths: &KitPaths, dir: &Path, name: &str, marker: &Marker) -> Resul
     Ok(())
 }
 
+/// What became of a skill the kit meant to write.
+enum Written {
+    Done,
+    /// A file the owner added to the kit's older copy is where the new version has one of its
+    /// own: nothing was written, so the owner's file is never overwritten.
+    Collides(String),
+}
+
+/// Whether the owner's `extra` (a file or a whole directory) and a kit file `path` would land on
+/// each other.
+fn collides(extra: &str, path: &str) -> bool {
+    extra == path
+        || path.starts_with(&format!("{extra}/"))
+        || extra.starts_with(&format!("{path}/"))
+}
+
 /// Writes a skill's directory: staged first, then swapped in, so a failure half way never
-/// leaves a broken skill where Claude Code would load it; an old copy goes back if the swap
-/// fails. Files the owner added to the kit's older copy are carried over.
-fn write_skill(paths: &KitPaths, skill: &KitSkill, hash: &str) -> Result<()> {
+/// leaves a broken skill where Claude Code would load it. Files the owner added to the kit's
+/// older copy are carried over; if one cannot be, the old copy goes back whole.
+fn write_skill(paths: &KitPaths, skill: &KitSkill, hash: &str) -> Result<Written> {
+    let dir = paths.skills().join(&skill.name);
+    let had_old = dir.exists();
+    let keep = match read_marker(&dir, &skill.name) {
+        Some(m) if had_old => {
+            let listed: BTreeSet<String> = m.files.into_iter().collect();
+            extras(&dir, &listed)
+        }
+        _ => Vec::new(),
+    };
+    if let Some(p) = keep
+        .iter()
+        .find(|e| skill.files.iter().any(|f| collides(e, &f.path)))
+    {
+        return Ok(Written::Collides(p.clone()));
+    }
     let tmp = staging(paths).join(format!("new-{}", skill.name));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp)?;
@@ -715,21 +788,8 @@ fn write_skill(paths: &KitPaths, skill: &KitSkill, hash: &str) -> Result<()> {
         std::fs::write(&path, &f.text).with_context(|| format!("writing {}", f.path))?;
     }
     std::fs::write(tmp.join(SKILL_MARKER), marker_text(skill, hash))?;
-    let dir = paths.skills().join(&skill.name);
     let old = staging(paths).join(format!("old-{}", skill.name));
     let _ = std::fs::remove_dir_all(&old);
-    let had_old = dir.exists();
-    let keep = match read_marker(&dir, &skill.name) {
-        Some(m) if had_old => {
-            let new: BTreeSet<String> = skill.files.iter().map(|f| f.path.clone()).collect();
-            let listed: BTreeSet<String> = m.files.into_iter().collect();
-            extras(&dir, &listed)
-                .into_iter()
-                .filter(|p| !new.contains(p))
-                .collect()
-        }
-        _ => Vec::new(),
-    };
     if had_old {
         std::fs::rename(&dir, &old).with_context(|| format!("moving {} aside", dir.display()))?;
     }
@@ -739,15 +799,28 @@ fn write_skill(paths: &KitPaths, skill: &KitSkill, hash: &str) -> Result<()> {
         }
         return Err(e).with_context(|| format!("putting {} in place", dir.display()));
     }
-    for rel in &keep {
+    for (i, rel) in keep.iter().enumerate() {
         if let Err(e) = carry(&old, &dir, rel) {
-            tracing::warn!("could not keep {rel} in skill {}: {e}", skill.name);
+            // Put everything back as it was: what was carried returns to the old copy, and the old
+            // copy to its place. Nothing of the owner's is ever deleted.
+            for back in &keep[..i] {
+                let _ = carry(&dir, &old, back);
+            }
+            let failed = staging(paths).join(format!("failed-{}", skill.name));
+            let _ = std::fs::remove_dir_all(&failed);
+            if std::fs::rename(&dir, &failed).is_ok() {
+                let _ = std::fs::rename(&old, &dir);
+                let _ = std::fs::remove_dir_all(&failed);
+            }
+            return Err(e).with_context(|| {
+                format!("could not keep the owner's {rel}; the old copy of the skill stays")
+            });
         }
     }
     if had_old && let Err(e) = std::fs::remove_dir_all(&old) {
         tracing::warn!("could not delete {}: {e}", old.display());
     }
-    Ok(())
+    Ok(Written::Done)
 }
 
 fn check_skill(s: &KitSkill) -> std::result::Result<(), String> {
@@ -800,9 +873,20 @@ fn apply_skills(
                 status("skill", &s.name, "installed", "")
             }
             SkillPlan::Write => match write_skill(paths, s, &hash) {
-                Ok(()) => {
+                Ok(Written::Done) => {
                     state.skills.insert(s.name.clone(), hash);
                     status("skill", &s.name, "installed", "")
+                }
+                Ok(Written::Collides(p)) => {
+                    state.skills.remove(&s.name);
+                    status(
+                        "skill",
+                        &s.name,
+                        "conflict",
+                        format!(
+                            "the owner's own {p} is where the kit's new version has a file; the kit leaves the skill alone"
+                        ),
+                    )
                 }
                 Err(e) => status("skill", &s.name, "failed", format!("{e:#}")),
             },
@@ -1078,8 +1162,7 @@ async fn apply_plugins(
         let id = p.id();
         if !valid_name(&p.plugin)
             || !valid_name(&p.marketplace)
-            || p.marketplace_source.starts_with('-')
-            || has_credentials(&p.marketplace_source)
+            || !clean_source(&p.marketplace_source)
         {
             out.push(status(
                 "plugin",
@@ -1293,12 +1376,7 @@ async fn apply_mcp(
 /// env value that is named like a secret or long enough to be one. Short, plainly named env
 /// values (`DEBUG=1`, `MODE=production`) are left readable.
 pub fn mcp_secret_values(servers: &serde_json::Map<String, Value>) -> Vec<String> {
-    servers
-        .values()
-        .flat_map(secret_spots)
-        .filter(|s| s.at != SpotAt::Env || sensitive_name(&s.name) || s.value.len() >= 12)
-        .map(|s| s.value)
-        .collect()
+    servers.values().flat_map(scrub_values).collect()
 }
 
 /// Brings this machine to the kit: installs what is missing, updates what the kit installed
@@ -1358,6 +1436,10 @@ pub async fn apply(
         }
     }
     state.save(data_dir);
+    out.push(match State::trouble(data_dir) {
+        Some(why) => status("node", "state", "failed", why),
+        None => status("node", "state", "installed", ""),
+    });
     out.push(match strict_mcp {
         Some(false) => status(
             "node",
@@ -1737,21 +1819,89 @@ mod tests {
     #[test]
     fn only_secrets_are_scrubbed_from_transcripts() {
         let servers: serde_json::Map<String, Value> = serde_json::from_str(
-            r#"{"a":{"command":"x","env":{"API_KEY":"secret-1","MODE":"production","LONG":"abcdefghijkl"}},"b":{"url":"u","headers":{"Authorization":"Bearer abcdef"}},"c":{"command":"y","args":["--api-key","k-123456","postgres://u:pw-123@db/x"]}}"#,
+            r#"{"a":{"command":"x","env":{"API_KEY":"secret-1","MODE":"fast","LONG":"abcdefghijkl"}},"b":{"url":"u","headers":{"Authorization":"Bearer abcdef"}},"c":{"command":"y","args":["--api-key","k-123456","postgres://u:pw-123@db/x","--mode","production"]}}"#,
         )
         .unwrap();
-        let mut v = mcp_secret_values(&servers);
-        v.sort();
-        assert_eq!(
-            v,
-            [
-                "Bearer abcdef",
-                "abcdefghijkl",
-                "k-123456",
-                "secret-1",
-                "u:pw-123"
-            ]
+        let v = mcp_secret_values(&servers);
+        for secret in ["secret-1", "Bearer abcdef", "k-123456", "pw-123"] {
+            assert!(
+                v.iter().any(|s| s == secret),
+                "{secret} not scrubbed: {v:?}"
+            );
+        }
+        // Plain words and flags stay readable in a transcript.
+        for plain in ["production", "--api-key"] {
+            assert!(!v.iter().any(|s| s == plain), "{plain} scrubbed: {v:?}");
+        }
+    }
+
+    #[test]
+    fn an_unreadable_record_is_set_aside_and_said() {
+        let root = temp("state");
+        std::fs::write(State::path(&root), "{ half written").unwrap();
+        let state = State::load(&root);
+        assert!(
+            state.plugins.is_empty() && state.mcp.is_empty(),
+            "nothing is taken from it"
         );
+        assert!(
+            !State::path(&root).exists(),
+            "set aside, not overwritten later"
+        );
+        let said = State::trouble(&root).expect("the node's status says so");
+        assert!(said.contains(UNREADABLE), "{said}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn the_owners_files_in_a_kit_skill_are_never_overwritten_or_deleted() {
+        let root = temp("owners-files");
+        let paths = KitPaths::at(root.join("cfg"));
+        let mut state = State::default();
+        let v1 = KitSkill {
+            name: "col".into(),
+            files: vec![file("SKILL.md", "v1")],
+        };
+        apply_skills(&paths, &mut state, &[v1], &mut Vec::new());
+        let dir = paths.skills().join("col");
+        // The owner adds a note and a tooling directory of their own.
+        std::fs::create_dir_all(dir.join("ref")).unwrap();
+        std::fs::write(dir.join("ref/notes.md"), "the owner's note").unwrap();
+        std::fs::create_dir_all(dir.join("node_modules/pkg")).unwrap();
+        std::fs::write(dir.join("node_modules/pkg/index.js"), "x").unwrap();
+        // The kit's next version has a file exactly where the owner's note is: the skill is left
+        // alone rather than the note overwritten.
+        let v2 = KitSkill {
+            name: "col".into(),
+            files: vec![file("SKILL.md", "v2"), file("ref/notes.md", "the kit's")],
+        };
+        let mut out = Vec::new();
+        apply_skills(&paths, &mut state, &[v2], &mut out);
+        assert_eq!(out[0].state, "conflict", "{out:?}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("ref/notes.md")).unwrap(),
+            "the owner's note"
+        );
+        assert_eq!(std::fs::read_to_string(dir.join("SKILL.md")).unwrap(), "v1");
+        // A version that does not collide is written, and keeps both of the owner's things.
+        let v3 = KitSkill {
+            name: "col".into(),
+            files: vec![file("SKILL.md", "v3")],
+        };
+        let mut out = Vec::new();
+        apply_skills(&paths, &mut state, &[v3], &mut out);
+        assert_eq!(out[0].state, "installed", "{out:?}");
+        assert_eq!(std::fs::read_to_string(dir.join("SKILL.md")).unwrap(), "v3");
+        assert!(
+            dir.join("ref/notes.md").exists() && dir.join("node_modules/pkg/index.js").exists()
+        );
+        // Removed from the kit: its files go, the owner's stay.
+        apply_skills(&paths, &mut state, &[], &mut Vec::new());
+        assert!(!dir.join("SKILL.md").exists());
+        assert!(
+            dir.join("ref/notes.md").exists() && dir.join("node_modules/pkg/index.js").exists()
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

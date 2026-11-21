@@ -1403,10 +1403,6 @@ async fn kit_act(State(o): State<O>, h: HeaderMap, Json(a): Json<Act>) -> Api {
             };
             kit::add_plugin(&o, Actor::Owner, &p).await?
         }
-        "secret_set" => {
-            let value = b["value"].as_str().context("value is required")?;
-            kit::set_secret(&o, Actor::Owner, &need(b, "key")?, value).await?
-        }
         other => {
             return Err(ApiError(
                 StatusCode::BAD_REQUEST,

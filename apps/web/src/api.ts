@@ -372,13 +372,11 @@ export type KitItem = {
   /** A skill's directory, `plugin@marketplace`, or the MCP server's name. */
   name: string
   enabled: boolean
-  /** A plugin's `{plugin, marketplace, marketplace_source}`; an MCP server's config, with
-   *  `${secret:NAME}` placeholders where its secrets are. Never a secret value. */
+  /** A plugin's `{plugin, marketplace, marketplace_source}`; an MCP server's summary only,
+   *  `{type, command?, endpoint?}`: its config is sealed in the vault and never sent here. */
   spec: Record<string, unknown>
   /** A skill's files, path and size; the item endpoint has their text. */
   files: { path: string; bytes: number }[] | null
-  /** Placeholders of an MCP server whose secret is not set: it is left out until it is. */
-  missing_secrets: string[]
   updated_at: string
 }
 
@@ -394,12 +392,12 @@ export type Kit = {
     note: string | null
   }[]
   status: { node: string; item: number; state: KitState; detail: string; at: string }[]
-  /** Names of the kit's secrets. Values are never read back. */
-  secrets: string[]
 }
 
-export type KitItemDetail = Omit<KitItem, 'files' | 'missing_secrets'> & {
+export type KitItemDetail = Omit<KitItem, 'files'> & {
   files: Record<string, string> | null
+  /** An MCP server's config, masked: every secret it could find reads `[masked]`. */
+  config: Record<string, unknown> | null
 }
 
 /** What a node reported having, to choose from. Secrets show as the placeholders they would get. */
@@ -407,7 +405,15 @@ export type KitCapture = {
   capture: string
   node: string
   skills: { name: string; in_kit: boolean; files: { path: string; bytes: number }[] }[]
-  plugins: { name: string; in_kit: boolean; marketplace_source: string; importable: boolean }[]
-  mcp: { name: string; in_kit: boolean; config: Record<string, unknown>; secrets: string[] }[]
+  plugins: { name: string; in_kit: boolean; marketplace_source: string }[]
+  mcp: {
+    name: string
+    in_kit: boolean
+    summary: Record<string, unknown>
+    /** The config masked; the real one is sealed in the vault on import. */
+    config: Record<string, unknown>
+    /** How many values were masked. */
+    masked: number
+  }[]
   skipped: { kind: string; name: string; reason: string }[]
 }

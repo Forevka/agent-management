@@ -311,8 +311,8 @@ pub fn secret_file(path: &str) -> bool {
             .any(|ext| name.ends_with(ext))
 }
 
-/// Whether a variable, flag or parameter name says its value is a secret (`--api-key`, `token`,
-/// `DB_PASSWORD`).
+/// Whether a variable, flag, header or key name says its value is a secret (`--api-key`, `token`,
+/// `DB_PASSWORD`, `Authorization`, `clientSecret`).
 pub fn sensitive_name(name: &str) -> bool {
     let n = name.trim_start_matches('-').to_ascii_lowercase();
     [
@@ -333,160 +333,419 @@ pub fn sensitive_name(name: &str) -> bool {
     .any(|w| n.contains(w))
 }
 
-/// The `user:password` of a `scheme://user:password@host` in `s`, if it has one with a password.
-fn userinfo(s: &str) -> Option<&str> {
-    let start = s.find("://")? + 3;
-    let rest = &s[start..];
-    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
-    let info = &authority[..authority.rfind('@')?];
-    (info.contains(':') && !info.contains("${secret:")).then_some(info)
+// ---------------------------------------------------------------- MCP configs: never shown raw
+//
+// An MCP server's config is a secret as a whole: the orchestrator keeps it sealed in its vault and
+// Postgres sees only `config_summary`. What follows is for *showing* a config to the owner
+// (`mask_config`) and for scrubbing transcripts (`scrub_values`). Masking is a heuristic over the
+// shapes secrets take, backed by a guard for anything that merely looks like a token; nothing
+// stored depends on it catching everything.
+
+/// What stands in a masked config where a secret was.
+pub const MASK: &str = "[masked]";
+
+/// Keys under which every string is a secret, whatever its own name.
+const SECRET_SECTIONS: [&str; 3] = ["env", "headers", "oauth"];
+
+/// Flags whose next argument is a secret, besides those named like one (`-p pass`).
+const SECRET_NEXT: [&str; 2] = ["-p", "-P"];
+
+/// Flags whose next argument is an HTTP header (`--header "Authorization: Bearer …"`).
+const HEADER_FLAGS: [&str; 2] = ["-H", "--header"];
+
+/// A copy of an MCP server's config with every secret it can find replaced by [`MASK`], and the
+/// secrets themselves (for scrubbing).
+pub fn mask_config(config: &serde_json::Value) -> (serde_json::Value, Vec<String>) {
+    let mut found = Vec::new();
+    let masked = mask_value(config, false, &mut found);
+    found.retain(|s| !s.is_empty());
+    found.sort();
+    found.dedup();
+    (masked, found)
 }
 
-/// Whether `s` carries a password in a `scheme://user:password@host`.
-pub fn has_credentials(s: &str) -> bool {
-    userinfo(s).is_some()
-}
-
-/// `NAME=value` where `NAME` reads as a variable name and says it is a secret.
-fn named_secret(s: &str) -> Option<(&str, &str)> {
-    let (name, value) = s.split_once('=')?;
-    let is_name = !name.is_empty()
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
-    (is_name && sensitive_name(name) && !value.is_empty()).then_some((name, value))
-}
-
-/// Where an MCP server's config holds a secret:
-///
-/// - every `env` and `headers` value;
-/// - in `url`: a `user:password@`, and every query value;
-/// - in `args`: a `user:password@` in any argument (a database DSN), `NAME=value` with a secret
-///   name (also as docker's `-e NAME=value` or `--env=NAME=value`), and a flag named like a secret
-///   with its value (`--token=…`, `--api-key …`).
-///
-/// Both sides use it: the orchestrator to move each one into the vault, the node to scrub the
-/// resolved values from transcripts.
-pub fn secret_spots(config: &serde_json::Value) -> Vec<SecretSpot> {
+fn mask_value(v: &serde_json::Value, secret: bool, found: &mut Vec<String>) -> serde_json::Value {
     use serde_json::Value;
-    let mut out = Vec::new();
-    let spot = |at: SpotAt, name: &str, prefix: &str, value: &str, suffix: &str| SecretSpot {
-        at,
-        name: name.to_owned(),
-        prefix: prefix.to_owned(),
-        value: value.to_owned(),
-        suffix: suffix.to_owned(),
-    };
-    for (section, kind) in [("env", SpotAt::Env), ("headers", SpotAt::Header)] {
-        if let Some(Value::Object(m)) = config.get(section) {
-            for (k, v) in m {
-                if let Value::String(s) = v {
-                    out.push(spot(kind.clone(), k, "", s, ""));
-                }
-            }
+    match v {
+        Value::String(s) if secret => {
+            found.push(s.clone());
+            Value::String(MASK.into())
         }
+        Value::String(s) => Value::String(mask_string(s, found)),
+        Value::Array(a) if !secret => Value::Array(mask_args(a, found)),
+        Value::Array(a) => Value::Array(a.iter().map(|x| mask_value(x, true, found)).collect()),
+        Value::Object(m) => Value::Object(
+            m.iter()
+                .map(|(k, x)| {
+                    let inner =
+                        secret || SECRET_SECTIONS.contains(&k.as_str()) || sensitive_name(k);
+                    (k.clone(), mask_value(x, inner, found))
+                })
+                .collect(),
+        ),
+        other => other.clone(),
     }
-    if let Some(Value::String(url)) = config.get("url") {
-        if let Some(info) = userinfo(url) {
-            out.push(spot(SpotAt::Url, "url_userinfo", "//", info, "@"));
-        }
-        if let Some((_, query)) = url.split_once('?') {
-            let query = query.split('#').next().unwrap_or(query);
-            for pair in query.split('&') {
-                if let Some((k, v)) = pair.split_once('=')
-                    && !v.is_empty()
-                {
-                    out.push(spot(SpotAt::Url, k, &format!("{k}="), v, ""));
-                }
-            }
-        }
+}
+
+/// A list of arguments, where a flag decides what its next one is.
+fn mask_args(args: &[serde_json::Value], found: &mut Vec<String>) -> Vec<serde_json::Value> {
+    use serde_json::Value;
+    enum Next {
+        Plain,
+        Secret,
+        Header,
     }
-    if let Some(Value::Array(args)) = config.get("args") {
-        let mut taken_next = false;
-        for (i, a) in args.iter().enumerate() {
-            let Some(a) = a.as_str() else { continue };
-            if std::mem::take(&mut taken_next) {
-                continue;
+    let mut next = Next::Plain;
+    let mut out = Vec::with_capacity(args.len());
+    for a in args {
+        let Value::String(s) = a else {
+            out.push(mask_value(a, false, found));
+            next = Next::Plain;
+            continue;
+        };
+        let masked = match std::mem::replace(&mut next, Next::Plain) {
+            Next::Secret => {
+                found.push(s.clone());
+                MASK.to_owned()
             }
-            let before = out.len();
-            if a.starts_with('-') {
-                let flag = a;
-                match flag.split_once('=') {
-                    Some((f, v)) if sensitive_name(f) && !v.is_empty() => {
-                        out.push(spot(
-                            SpotAt::Arg(i),
-                            f.trim_start_matches('-'),
-                            &format!("{f}="),
-                            v,
-                            "",
-                        ));
-                    }
-                    // `--env=NAME=value`
-                    Some((f, v)) => {
-                        if let Some((n, value)) = named_secret(v) {
-                            out.push(spot(SpotAt::Arg(i), n, &format!("{f}={n}="), value, ""));
-                        }
-                    }
-                    None if sensitive_name(flag) => {
-                        if let Some(Value::String(v)) = args.get(i + 1)
-                            && !v.starts_with('-')
-                            && !v.is_empty()
-                        {
-                            out.push(spot(
-                                SpotAt::Arg(i + 1),
-                                flag.trim_start_matches('-'),
-                                "",
-                                v,
-                                "",
-                            ));
-                            taken_next = true;
-                        }
-                    }
-                    None => {}
+            Next::Header => mask_header(s, true, found).unwrap_or_else(|| mask_string(s, found)),
+            Next::Plain if s.starts_with('-') => match s.split_once('=') {
+                Some((flag, v)) if HEADER_FLAGS.contains(&flag) => {
+                    let v = mask_header(v, true, found).unwrap_or_else(|| mask_string(v, found));
+                    format!("{flag}={v}")
                 }
-            } else if let Some((n, value)) = named_secret(a) {
-                out.push(spot(SpotAt::Arg(i), n, &format!("{n}="), value, ""));
-            }
-            // A DSN's password, where nothing above took the whole value already.
-            if out.len() == before
-                && let Some(info) = userinfo(a)
-            {
-                out.push(spot(
-                    SpotAt::Arg(i),
-                    &format!("arg{i}_userinfo"),
-                    "//",
-                    info,
-                    "@",
-                ));
-            }
+                Some((flag, v)) if sensitive_name(flag) && !v.is_empty() => {
+                    found.push(v.to_owned());
+                    format!("{flag}={MASK}")
+                }
+                Some((flag, v)) => format!("{flag}={}", mask_string(v, found)),
+                None => {
+                    if HEADER_FLAGS.contains(&s.as_str()) {
+                        next = Next::Header;
+                    } else if sensitive_name(s) || SECRET_NEXT.contains(&s.as_str()) {
+                        next = Next::Secret;
+                    }
+                    mask_string(s, found)
+                }
+            },
+            Next::Plain => mask_string(s, found),
+        };
+        // A flag's "next" never swallows another flag.
+        if matches!(next, Next::Secret)
+            && let Some(Value::String(n)) = args.get(out.len() + 1)
+            && n.starts_with('-')
+        {
+            next = Next::Plain;
         }
+        out.push(Value::String(masked));
     }
     out
 }
 
-/// One place [`secret_spots`] found a secret: `value` stands between `prefix` and `suffix` in
-/// the string at `at`, and a placeholder takes its place there.
-#[derive(Debug, Clone, PartialEq)]
-pub struct SecretSpot {
-    pub at: SpotAt,
-    /// The env var, header, parameter or flag it belongs to.
-    pub name: String,
-    pub prefix: String,
-    /// The secret itself.
-    pub value: String,
-    pub suffix: String,
+/// `Name: value` as an HTTP header, with the value masked when the name says it is a secret, or
+/// always when `any` (it came after `--header`). `None` when `s` is not a header.
+fn mask_header(s: &str, any: bool, found: &mut Vec<String>) -> Option<String> {
+    let (name, value) = s.split_once(':')?;
+    let header_name = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if !header_name || value.starts_with("//") {
+        return None;
+    }
+    let value = value.trim();
+    if value.is_empty() || !(any || sensitive_name(name)) {
+        return None;
+    }
+    found.push(value.to_owned());
+    // The scheme alone (`Bearer`) is no secret, and keeps the masked view readable.
+    if let Some((scheme, token)) = value.split_once(' ')
+        && matches!(
+            scheme.to_ascii_lowercase().as_str(),
+            "bearer" | "basic" | "token"
+        )
+    {
+        found.push(token.trim().to_owned());
+        return Some(format!("{name}: {scheme} {MASK}"));
+    }
+    Some(format!("{name}: {MASK}"))
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum SpotAt {
-    /// `config.env[name]`, the whole string.
-    Env,
-    /// `config.headers[name]`, the whole string.
-    Header,
-    /// Inside `config.url`.
-    Url,
-    /// Inside `config.args[i]`.
-    Arg(usize),
+/// One string anywhere in a config: JSON inside it, a header, then each whitespace-separated
+/// token by the rules for URLs, DSNs, `key=value` pairs and anything that looks like a token.
+fn mask_string(s: &str, found: &mut Vec<String>) -> String {
+    let t = s.trim();
+    if (t.starts_with('{') || t.starts_with('['))
+        && let Ok(inner) = serde_json::from_str::<serde_json::Value>(t)
+    {
+        return mask_value(&inner, false, found).to_string();
+    }
+    if let Some(h) = mask_header(s, false, found) {
+        return h;
+    }
+    let mut out = Vec::new();
+    let mut after_scheme = false;
+    for token in s.split(' ') {
+        if after_scheme && !token.is_empty() {
+            found.push(token.to_owned());
+            out.push(MASK.to_owned());
+            after_scheme = false;
+            continue;
+        }
+        after_scheme = matches!(token.to_ascii_lowercase().as_str(), "bearer" | "basic");
+        out.push(mask_token(token, found));
+    }
+    out.join(" ")
+}
+
+/// One token: `key=value`, a URL (userinfo, every query value), a DSN without a scheme
+/// (`user:pass@host`), or a token by its look.
+fn mask_token(token: &str, found: &mut Vec<String>) -> String {
+    if token.is_empty() {
+        return String::new();
+    }
+    // `key=value`, as libpq, env files and `-e` take them. A URL's own `=` is the URL's.
+    if !token.contains("://")
+        && let Some((k, v)) = token.split_once('=')
+        && !k.is_empty()
+        && k.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    {
+        if sensitive_name(k) && !v.is_empty() {
+            found.push(v.to_owned());
+            return format!("{k}={MASK}");
+        }
+        return format!("{k}={}", mask_token(v, found));
+    }
+    if let Some(i) = token.find("://") {
+        return mask_url(token, i, found);
+    }
+    // `user:pass@host:5432/db`: a password before an `@`.
+    if let Some(at) = token.find('@')
+        && let Some(colon) = token[..at].find(':')
+        && colon + 1 < at
+    {
+        let pass = &token[colon + 1..at];
+        found.push(pass.to_owned());
+        return format!("{}{MASK}{}", &token[..colon + 1], &token[at..]);
+    }
+    if looks_like_token(token) {
+        found.push(token.to_owned());
+        return MASK.to_owned();
+    }
+    token.to_owned()
+}
+
+/// A URL with its userinfo masked (a user alone too, which is how tokens ride in git URLs; only
+/// ssh's plain `git@` is kept) and every query value masked.
+fn mask_url(url: &str, scheme_end: usize, found: &mut Vec<String>) -> String {
+    let start = scheme_end + 3;
+    let rest = &url[start..];
+    let auth_end = rest.find(['/', '?', '#']).map_or(rest.len(), |i| i);
+    let authority = &rest[..auth_end];
+    let mut out = url[..start].to_owned();
+    match authority.rfind('@') {
+        Some(at) if &authority[..at] != "git" => {
+            let info = &authority[..at];
+            found.push(info.to_owned());
+            // The password alone too: a transcript may show it without its user.
+            if let Some((_, pass)) = info.split_once(':') {
+                found.push(pass.to_owned());
+            }
+            out.push_str(MASK);
+            out.push_str(&authority[at..]);
+        }
+        _ => out.push_str(authority),
+    }
+    let tail = &rest[auth_end..];
+    let (before_frag, frag) = match tail.find('#') {
+        Some(i) => (&tail[..i], &tail[i..]),
+        None => (tail, ""),
+    };
+    match before_frag.split_once('?') {
+        Some((path, query)) => {
+            out.push_str(path);
+            out.push('?');
+            let pairs: Vec<String> = query
+                .split('&')
+                .map(|pair| match pair.split_once('=') {
+                    Some((k, v)) if !v.is_empty() => {
+                        found.push(v.to_owned());
+                        format!("{k}={MASK}")
+                    }
+                    _ => pair.to_owned(),
+                })
+                .collect();
+            out.push_str(&pairs.join("&"));
+        }
+        None => out.push_str(before_frag),
+    }
+    out.push_str(frag);
+    out
+}
+
+/// Whether a token looks like a credential by itself: a well-known prefix, an AWS key id, a JWT,
+/// or a long high-entropy string.
+pub fn looks_like_token(token: &str) -> bool {
+    let t = token.trim_matches(|c: char| matches!(c, '"' | '\'' | ',' | ';' | '(' | ')'));
+    const PREFIXES: [&str; 17] = [
+        "ghp_",
+        "gho_",
+        "ghu_",
+        "ghs_",
+        "ghr_",
+        "github_pat_",
+        "glpat-",
+        "xoxa-",
+        "xoxb-",
+        "xoxp-",
+        "xoxr-",
+        "xoxs-",
+        "sk-",
+        "sk_live_",
+        "sk_test_",
+        "rk_live_",
+        "AIza",
+    ];
+    if PREFIXES
+        .iter()
+        .any(|p| t.starts_with(p) && t.len() >= p.len() + 8)
+    {
+        return true;
+    }
+    if t.len() == 20
+        && t.starts_with("AKIA")
+        && t[4..]
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+    {
+        return true;
+    }
+    if t.starts_with("eyJ") && t.matches('.').count() == 2 && t.contains(".eyJ") {
+        return true;
+    }
+    let charset = t
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+' | '/' | '='));
+    let digit = t.chars().any(|c| c.is_ascii_digit());
+    let lower = t.chars().any(|c| c.is_ascii_lowercase());
+    let upper = t.chars().any(|c| c.is_ascii_uppercase());
+    charset
+        && !t.starts_with('-')
+        && ((t.len() >= 32 && digit && lower && upper)
+            || (t.len() >= 40 && digit && (lower || upper)))
+}
+
+/// What may be said about an MCP server's config in Postgres, the API and the logs: its type,
+/// its command's name (no path, no arguments) or its endpoint's scheme and host (no userinfo,
+/// path or query). Nothing else of the config leaves the vault in the clear.
+pub fn config_summary(config: &serde_json::Value) -> serde_json::Value {
+    use serde_json::{Map, Value};
+    let mut out = Map::new();
+    let url = config.get("url").and_then(Value::as_str);
+    let command = config.get("command").and_then(Value::as_str);
+    let kind = match config.get("type").and_then(Value::as_str) {
+        Some(t @ ("stdio" | "http" | "sse" | "ws" | "sse-ide" | "ws-ide")) => t.to_owned(),
+        _ if url.is_some() => "http".into(),
+        _ => "stdio".into(),
+    };
+    out.insert("type".into(), Value::String(kind));
+    if let Some(c) = command {
+        let name = c.rsplit(['/', '\\']).next().unwrap_or(c);
+        let plain = !name.is_empty()
+            && name.len() <= 64
+            && name
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+            && !looks_like_token(name);
+        out.insert(
+            "command".into(),
+            Value::String(if plain {
+                name.into()
+            } else {
+                "(not shown)".into()
+            }),
+        );
+    }
+    if let Some(u) = url
+        && let Some(i) = u.find("://")
+    {
+        let scheme = &u[..i];
+        let rest = &u[i + 3..];
+        let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+        let host = authority.rsplit('@').next().unwrap_or(authority);
+        let host = host.split(':').next().unwrap_or(host);
+        let plain = |s: &str| {
+            !s.is_empty()
+                && s.chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-'))
+        };
+        if plain(scheme) && plain(host) {
+            out.insert(
+                "endpoint".into(),
+                Value::String(format!("{scheme}://{host}")),
+            );
+        }
+    }
+    Value::Object(out)
+}
+
+/// The strings to scrub from a transcript for a resolved MCP config: whatever [`mask_config`]
+/// finds, and every string in it of 8 characters or more (and each such word of a longer one)
+/// that is not a flag, a plain word, or the server's `type` or `command` — so a secret in a shape
+/// no rule knows is still scrubbed.
+pub fn scrub_values(config: &serde_json::Value) -> Vec<String> {
+    use serde_json::Value;
+    let (_, mut out) = mask_config(config);
+    fn plain(s: &str) -> bool {
+        let flag = s.starts_with('-')
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        flag || s.chars().all(|c| c.is_ascii_alphabetic())
+    }
+    fn walk(v: &Value, key: Option<&str>, out: &mut Vec<String>) {
+        match v {
+            Value::String(s) if !matches!(key, Some("type" | "command")) => {
+                for part in std::iter::once(s.as_str()).chain(s.split_whitespace()) {
+                    if part.len() >= 8 && !plain(part) {
+                        out.push(part.to_owned());
+                    }
+                }
+            }
+            Value::Array(a) => a.iter().for_each(|x| walk(x, key, out)),
+            Value::Object(m) => m.iter().for_each(|(k, x)| walk(x, Some(k), out)),
+            _ => {}
+        }
+    }
+    walk(config, None, &mut out);
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Whether a plugin marketplace source may be kept: `owner/repo`, a URL or a path with no
+/// userinfo of any kind (a token rides as a user too), no query or fragment, and nothing a CLI
+/// would read as a flag. An scp-style `git@host:owner/repo` is the one `@` allowed.
+pub fn clean_source(source: &str) -> bool {
+    let s = source.trim();
+    if s.is_empty()
+        || s.starts_with('-')
+        || s.contains(char::is_whitespace)
+        || s.contains(['?', '#'])
+    {
+        return false;
+    }
+    match s.find("://") {
+        Some(i) => {
+            let rest = &s[i + 3..];
+            let authority = &rest[..rest.find('/').unwrap_or(rest.len())];
+            !authority.contains('@')
+        }
+        None => match s.split_once('@') {
+            Some((user, _)) => user == "git" && !s[4..].contains('@'),
+            None => true,
+        },
+    }
 }
 
 /// The file a node writes into every skill directory the kit installed, holding the content
@@ -656,57 +915,210 @@ mod tests {
         }
     }
 
+    /// Every shape a secret was found in by review, and more: none survives in what Postgres, the
+    /// API or the audit could see (the summary, the masked view), and every one is scrubbed from a
+    /// transcript.
     #[test]
-    fn secrets_are_found_in_env_headers_urls_and_flags() {
-        let config = serde_json::json!({
-            "command": "docker",
-            "args": [
-                "run", "-y", "server", "--api-key", "k-1", "--token=t-2", "--verbose", "--port", "80",
-                "postgresql://dbuser:p-6@db.local:5432/app",
-                "-e", "GITHUB_TOKEN=g-7",
-                "--env=SLACK_BOT_TOKEN=s-8",
-                "API_SECRET=a-9",
-                "MODE=fast",
-            ],
-            "url": "https://u:w-10@h/mcp?team=a&access_token=q-3#frag",
-            "env": {"A": "e-4"},
-            "headers": {"Authorization": "Bearer h-5"},
-        });
-        let spots = secret_spots(&config);
-        let mut values: Vec<&str> = spots.iter().map(|s| s.value.as_str()).collect();
-        values.sort();
-        assert_eq!(
-            values,
-            [
-                "Bearer h-5",
-                "a",
-                "a-9",
-                "dbuser:p-6",
-                "e-4",
-                "g-7",
-                "k-1",
-                "q-3",
-                "s-8",
-                "t-2",
-                "u:w-10"
-            ],
-            "every query value counts, `team=a` included"
-        );
-        // Each sits exactly between its prefix and suffix in its string.
-        for s in &spots {
-            let text = match &s.at {
-                SpotAt::Env => config["env"][&s.name].as_str().unwrap().to_owned(),
-                SpotAt::Header => config["headers"][&s.name].as_str().unwrap().to_owned(),
-                SpotAt::Url => config["url"].as_str().unwrap().to_owned(),
-                SpotAt::Arg(i) => config["args"][*i].as_str().unwrap().to_owned(),
-            };
+    fn no_secret_survives_the_summary_the_masked_view_or_a_transcript() {
+        use serde_json::json;
+        let shapes: Vec<(&str, serde_json::Value)> = vec![
+            (
+                "RAWENV001",
+                json!({"command": "x", "env": {"API_KEY": "RAWENV001"}}),
+            ),
+            (
+                "RAWENV002",
+                json!({"command": "x", "env": {"MODE": "RAWENV002"}}),
+            ),
+            (
+                "RAWNEST03",
+                json!({"command": "x", "env": {"A": {"b": "RAWNEST03"}}}),
+            ),
+            (
+                "RAWOAUTH4",
+                json!({"type": "http", "url": "https://h/x", "oauth": {"clientSecret": "RAWOAUTH4"}}),
+            ),
+            (
+                "RAWHDR005",
+                json!({"type": "http", "url": "https://h/x", "headers": {"X-Team": "RAWHDR005"}}),
+            ),
+            (
+                "RAWARG006",
+                json!({"command": "mcp-remote", "args": ["https://h/x", "--header", "Authorization: Bearer RAWARG006"]}),
+            ),
+            (
+                "RAWARG007",
+                json!({"command": "mcp-remote", "args": ["--header=Authorization: Bearer RAWARG007"]}),
+            ),
+            (
+                "RAWARG008",
+                json!({"command": "x", "args": ["Authorization: Bearer RAWARG008"]}),
+            ),
+            (
+                "RAWARG009",
+                json!({"command": "x", "args": ["-H", "X-Api-Key: RAWARG009"]}),
+            ),
+            (
+                "ghp_RAWUSER10abc",
+                json!({"type": "http", "url": "https://ghp_RAWUSER10abc@github.com/o/r"}),
+            ),
+            (
+                "ghp_RAWUSER11abc",
+                json!({"command": "git", "args": ["clone", "https://ghp_RAWUSER11abc@github.com/o/r"]}),
+            ),
+            (
+                "RAWPASS12",
+                json!({"type": "http", "url": "https://bot:RAWPASS12@h/x"}),
+            ),
+            (
+                "RAWQRY013",
+                json!({"type": "http", "url": "https://h/x?team=a&key=RAWQRY013#f"}),
+            ),
+            (
+                "RAWQRY014",
+                json!({"command": "x", "args": ["--url", "https://h/x?access=RAWQRY014"]}),
+            ),
+            (
+                "RAWDSN015",
+                json!({"command": "x", "args": ["postgresql://u:RAWDSN015@db:5432/app"]}),
+            ),
+            (
+                "RAWDSN016",
+                json!({"command": "x", "args": ["u:RAWDSN016@db:5432/app"]}),
+            ),
+            (
+                "RAWPQ0017",
+                json!({"command": "x", "args": ["host=h user=u password=RAWPQ0017 dbname=d"]}),
+            ),
+            ("RAWCMD018", json!({"command": "TOKEN=RAWCMD018 npx"})),
+            ("RAWCMD019", json!({"command": "https://u:RAWCMD019@h/run"})),
+            (
+                "RAWP00020",
+                json!({"command": "mysql-mcp", "args": ["-u", "root", "-p", "RAWP00020"]}),
+            ),
+            (
+                "RAWJSON21",
+                json!({"command": "x", "args": ["--config", "{\"apiKey\": \"RAWJSON21\"}"]}),
+            ),
+            (
+                "RAWJSON22",
+                json!({"command": "x", "args": ["{\"db\": {\"password\": \"RAWJSON22\"}}"]}),
+            ),
+            (
+                "RAWDOCK23",
+                json!({"command": "docker", "args": ["run", "-e", "GITHUB_TOKEN=RAWDOCK23", "img"]}),
+            ),
+            (
+                "RAWDOCK24",
+                json!({"command": "docker", "args": ["--env=SLACK_TOKEN=RAWDOCK24"]}),
+            ),
+            (
+                "RAWFLAG25",
+                json!({"command": "x", "args": ["--api-key", "RAWFLAG25"]}),
+            ),
+            (
+                "RAWFLAG26",
+                json!({"command": "x", "args": ["--token=RAWFLAG26"]}),
+            ),
+            (
+                "RAWFLAG27",
+                json!({"command": "x", "args": ["--client-secret", "RAWFLAG27"]}),
+            ),
+            (
+                "xoxb-RAWSLACK28-1234",
+                json!({"command": "x", "args": ["xoxb-RAWSLACK28-1234"]}),
+            ),
+            (
+                "sk-RAWOPENAI29abcdef",
+                json!({"command": "x", "args": ["--model", "gpt", "sk-RAWOPENAI29abcdef"]}),
+            ),
+            (
+                "AKIARAWAWS30EXAMPLE1",
+                json!({"command": "x", "args": ["AKIARAWAWS30EXAMPLE1"]}),
+            ),
+            (
+                "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJSQVczMSJ9.c2lnbmF0dXJl",
+                json!({"command": "x", "args": ["eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJSQVczMSJ9.c2lnbmF0dXJl"]}),
+            ),
+            (
+                "Q9x7RawEntropy32TokenZ8kLmN4pQrS",
+                json!({"command": "x", "args": ["Q9x7RawEntropy32TokenZ8kLmN4pQrS"]}),
+            ),
+            (
+                "RAWDBURL33",
+                json!({"command": "x", "args": ["DATABASE_URL=postgres://u:RAWDBURL33@h/d"]}),
+            ),
+            (
+                "RAWBASIC34",
+                json!({"command": "x", "args": ["--auth", "Basic RAWBASIC34"]}),
+            ),
+        ];
+        for (raw, config) in shapes {
+            let (masked, found) = mask_config(&config);
+            let summary = config_summary(&config);
+            for (what, text) in [
+                ("masked view", masked.to_string()),
+                ("summary", summary.to_string()),
+            ] {
+                assert!(
+                    !text.contains(raw),
+                    "{raw} survives in the {what}: {text} (from {config})"
+                );
+            }
             assert!(
-                text.contains(&format!("{}{}{}", s.prefix, s.value, s.suffix)),
-                "{s:?} in {text}"
+                found.iter().any(|f| f.contains(raw)),
+                "{raw} not found in {config}: {found:?}"
+            );
+            let mut transcript = format!("tool output: {raw} and the config {config}");
+            crate::redact::redact_secrets(&mut transcript, &scrub_values(&config));
+            assert!(
+                !transcript.contains(raw),
+                "{raw} not scrubbed: {transcript}"
             );
         }
-        // A username alone, or a host, is not a secret.
-        let plain = serde_json::json!({"args": ["ssh://git@github.com/o/r", "https://h/x"]});
-        assert!(secret_spots(&plain).is_empty());
+
+        // A config stays readable where it holds no secret.
+        let plain = json!({"type": "stdio", "command": "/usr/bin/npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "--port", "8080"], "env": {}});
+        assert_eq!(mask_config(&plain).0, plain);
+        assert_eq!(
+            config_summary(&plain),
+            json!({"type": "stdio", "command": "npx"})
+        );
+        assert_eq!(
+            config_summary(
+                &json!({"type": "http", "url": "https://bot:pw@mcp.example.com:8443/x?k=v"})
+            ),
+            json!({"type": "http", "endpoint": "https://mcp.example.com"})
+        );
+        assert_eq!(
+            mask_config(&json!({"args": ["ssh://git@github.com/o/r"]})).0,
+            json!({"args": ["ssh://git@github.com/o/r"]}),
+            "ssh's plain git@ is no secret"
+        );
+    }
+
+    #[test]
+    fn a_marketplace_source_never_carries_a_credential() {
+        for ok in [
+            "o/r",
+            "https://github.com/o/r.git",
+            "git@github.com:o/r.git",
+            "C:/m",
+            "./m",
+        ] {
+            assert!(clean_source(ok), "{ok}");
+        }
+        for bad in [
+            "https://ghp_x@github.com/o/r",
+            "https://u:p@h/r",
+            "https://h/r?token=x",
+            "https://h/r#x",
+            "bot@github.com:o/r",
+            "--scope=project",
+            "a b",
+            "",
+        ] {
+            assert!(!clean_source(bad), "{bad}");
+        }
     }
 }
