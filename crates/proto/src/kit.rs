@@ -546,7 +546,7 @@ fn mask_token(token: &str, found: &mut Vec<String>) -> String {
 fn mask_url(url: &str, scheme_end: usize, found: &mut Vec<String>) -> String {
     let start = scheme_end + 3;
     let rest = &url[start..];
-    let auth_end = rest.find(['/', '?', '#']).map_or(rest.len(), |i| i);
+    let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let authority = &rest[..auth_end];
     // A token can ride as a subdomain (`https://<token>.tunnel.example`).
     let masked_host;
