@@ -134,6 +134,9 @@ enum SourceConfig {
         client_id: String,
         client_secret: String,
         refresh_token: String,
+        /// The owner's Chat user (`users/{id}`) when they named exactly one on the web;
+        /// otherwise the adapter learns it as best it can. Naming one restarts the source.
+        owner: Option<String>,
     },
 }
 
@@ -159,6 +162,7 @@ impl SourceConfig {
                 client_id,
                 client_secret,
                 refresh_token,
+                owner,
             } => {
                 // Read the way Google's own credential files are, so the token endpoint stays
                 // the adapter's default.
@@ -171,7 +175,11 @@ impl SourceConfig {
                     })
                     .to_string(),
                 )?;
-                Box::new(GChatSource::new(creds))
+                let source = GChatSource::new(creds);
+                Box::new(match owner {
+                    Some(owner) => source.with_owner(owner.clone()),
+                    None => source,
+                })
             }
         })
     }
@@ -201,10 +209,20 @@ async fn gchat_config(o: &Orchestrator) -> Result<Option<SourceConfig>> {
     ) else {
         return Ok(None);
     };
+    // The credential is one Google account. With exactly one named, that is the one it signs in
+    // as, and the adapter is told so (pinning it skips its own detection). With several, which
+    // one signs in is not known, so the adapter learns it as it would; every named one is still
+    // marked as the owner's on ingest.
+    let named = crate::people::owner_account_ids(o, "gchat").await?;
+    let owner = match <[String; 1]>::try_from(named) {
+        Ok([one]) => Some(one),
+        Err(_) => None,
+    };
     Ok(Some(SourceConfig::GoogleChat {
         client_id,
         client_secret,
         refresh_token,
+        owner,
     }))
 }
 
@@ -698,8 +716,9 @@ pub fn parse_ref(r: &str) -> Option<(String, String, String)> {
 /// Stores new messages, mirrors mapped channels to Telegram, shows triage channels to the brain
 /// and queues the rest for the secretary.
 pub async fn ingest(o: &Arc<Orchestrator>, messages: &[Incoming]) -> Result<()> {
+    let messages = owner_accounts_marked(o, messages).await?;
     let mut by_channel: BTreeMap<(String, String), Vec<&Incoming>> = BTreeMap::new();
-    for m in messages {
+    for m in &messages {
         sqlx::query(
             "insert into feed_conversations (source, conversation_id, name, kind, attention) values ($1, $2, coalesce($3, ''), $4, $5)
              on conflict (source, conversation_id) do update
@@ -789,6 +808,54 @@ pub async fn ingest(o: &Arc<Orchestrator>, messages: &[Incoming]) -> Result<()> 
         }
     }
     Ok(())
+}
+
+/// The messages as the owner said whose they are (`owner_accounts`), whatever the source could
+/// tell: one from an account the owner named as theirs is the owner's, one from an account they
+/// said is not theirs is a colleague's even when the source flagged it. A source only knows the
+/// owner's id when it could learn it, and may have learned the wrong one (see `people`'s section
+/// on the owner's accounts). Done before anything else reads the flag, so storage, the
+/// secretary's queue, `touch` and the mending of older rows all see the owner's answer. One query
+/// a batch.
+async fn owner_accounts_marked(o: &Orchestrator, messages: &[Incoming]) -> Result<Vec<Incoming>> {
+    let (sources, ids): (Vec<&str>, Vec<&str>) = messages
+        .iter()
+        .filter_map(|m| Some((m.source.as_str(), m.author_id.as_deref()?)))
+        .unzip();
+    // (source, user id, the owner said it is not theirs)
+    let said: Vec<(String, String, bool)> = if sources.is_empty() {
+        Vec::new()
+    } else {
+        sqlx::query_as(
+            "select source, native_id, disowned_at is not null from owner_accounts
+              where (source, native_id) in (select * from unnest($1::text[], $2::text[]))",
+        )
+        .bind(&sources)
+        .bind(&ids)
+        .fetch_all(&o.db)
+        .await?
+    };
+    Ok(messages
+        .iter()
+        .map(|m| {
+            let mut m = m.clone();
+            let answer = m.author_id.as_ref().and_then(|author| {
+                said.iter()
+                    .find(|(s, a, _)| *s == m.source && a == author)
+                    .map(|(_, _, disowned)| !disowned)
+            });
+            match answer {
+                Some(true) => {
+                    m.from_owner = true;
+                    // As in the adapters: the owner's own message never counts as mentioning them.
+                    m.mentions_owner = false;
+                }
+                Some(false) => m.from_owner = false,
+                None => {}
+            }
+            m
+        })
+        .collect())
 }
 
 /// Mirrors new messages of a mapped channel to its topic, and shows a triage channel's to the

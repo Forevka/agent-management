@@ -363,6 +363,30 @@ export type People = {
   sources: string[]
 }
 
+/// The owner's own accounts on each source: their messages are the owner's whatever the source
+/// could tell, and they are never one of the people. `name` is the latest display name the
+/// account wrote under (third-party data, shown as text).
+export type OwnerAccounts = {
+  accounts: {
+    source: string
+    native_id: string
+    label: string | null
+    added_at: string
+    name: string | null
+    messages: number
+  }[]
+  /** Accounts that look like the owner's: `flagged` (a source marked its messages as the
+   * owner's), `direct` (it wrote in two direct messages), `name` (it goes by the owner's name). */
+  suggestions: {
+    source: string
+    native_id: string
+    why: ('flagged' | 'direct' | 'name')[]
+    name: string | null
+    messages: number
+    person: { id: number; name: string } | null
+  }[]
+}
+
 export type PersonDetail = {
   person: Person
   /** What was done to the record lately, and by whom (`retro` or `owner`). */

@@ -7,6 +7,21 @@ below is one release. How to add to this file is in `CLAUDE.md`
 
 ## Unreleased
 
+- **You name your own accounts once, and they are never one of the people.** The People page
+  has a **Your own accounts** section: a source (Slack, Google Chat, or any other such as GitLab)
+  and your user id there. Messages from a named account are marked `from_owner` on ingest whatever
+  the source could tell, Google Chat is told which user is you (so mentions of you are right too),
+  and the account cannot be anyone's contact. Naming one marks its earlier messages as yours and
+  takes it off any record, deleting a record left with nothing else unless you edited it (the
+  confirmation says which). The section suggests accounts that look like yours: flagged by a
+  source, writing in two of your direct messages, or going by your name. "Not mine" (on an
+  account or a suggestion) is remembered: that account's messages stay a colleague's even if a
+  source marks them as yours, and its last three days of messages go to the secretary. Audited as `owner.account_add` and `owner.account_remove`. This fixes the owner's own
+  Google Chat account showing up under People, which happened when Google gave no account id.
+  Migration `0028_owner_accounts` (a new table).
+
+## v0.2.13 — 2026-11-21
+
 - **A task can be edited, stopped and written to from the web.** Its page has an **Edit** button
   (title, brief, model, effort; also `/tasks/<id>?edit=1`, linked from the board's list view),
   **Stop** (asks first) and a **message box**. A message is delivered exactly as one written in

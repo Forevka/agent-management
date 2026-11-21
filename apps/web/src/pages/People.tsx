@@ -4,12 +4,12 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Select } from '@/components/ui/select'
 import { TextField } from '@/components/ui/text-field'
-import { Page, PageHeader, Row, Stack, Text } from '@/components/fx/layout'
+import { Page, PageHeader, Row, Section, Stack, Text } from '@/components/fx/layout'
 import { Table } from '@/components/fx/table'
 import { SearchIcon } from '@/components/fx/icons'
 import * as api from '../api'
-import type { People as PeopleT } from '../api'
-import { ErrorNote, Loaded, When, useApi } from '../ui'
+import type { OwnerAccounts as OwnerAccountsT, People as PeopleT } from '../api'
+import { ActionButton, ErrorNote, Loaded, When, useApi } from '../ui'
 
 export const LANGUAGES: Record<string, string> = { en: 'English', uk: 'Ukrainian' }
 
@@ -206,7 +206,237 @@ export default function People() {
       </Loaded>
 
       <AddPerson />
+
+      <OwnAccounts onChanged={() => void state.reload()} />
     </Page>
+  )
+}
+
+const WHY: Record<string, string> = {
+  flagged: 'a source marked its messages as yours',
+  direct: 'it wrote in two of your direct messages',
+  name: 'it goes by the name your own messages carry',
+}
+
+const SOURCE_NAMES: Record<string, string> = { slack: 'Slack', gchat: 'Google Chat' }
+
+/// The owner's own accounts. A source can only tell the owner's messages apart when it knows
+/// their id there, and Google Chat often does not, so the owner names them here once.
+function OwnAccounts({ onChanged }: { onChanged: () => void }) {
+  const state = useApi<OwnerAccountsT>('/api/owner-accounts')
+  // What the last action did (which records it took the account off or deleted), as the server
+  // said it.
+  const [said, setSaid] = useState<string | null>(null)
+  const changed = (r?: { done?: unknown }) => {
+    setSaid(typeof r?.done === 'string' ? r.done : null)
+    void state.reload()
+    onChanged()
+  }
+  return (
+    <Section
+      title="Your own accounts"
+      description="The accounts you write from on each source. Their messages count as yours (never as a colleague’s), Google Chat learns which user is you (for mentions too), and they never become one of the people. Naming one takes it off any record, and deletes a record left with nothing else unless you edited it. “Not mine” is remembered: that account’s messages stay a colleague’s even if a source marks them as yours. Sources other than Slack and Google Chat are kept for when a feed reads them; today they only keep the account off people’s records."
+    >
+      <Loaded state={state}>
+        {(d) => (
+          <Stack gap="3">
+            {said && (
+              <Text size="1" tone="muted">
+                {said}
+              </Text>
+            )}
+            <Table
+              dense
+              rows={d.accounts}
+              rowKey={(a) => `${a.source}|${a.native_id}`}
+              empty="None named yet"
+              columns={[
+                {
+                  key: 'source',
+                  header: 'Source',
+                  width: '14%',
+                  cell: (a) => <Badge>{SOURCE_NAMES[a.source] ?? a.source}</Badge>,
+                },
+                {
+                  key: 'id',
+                  header: 'User id',
+                  cell: (a) => (
+                    <Text size="1" breakAll>
+                      {a.native_id}
+                    </Text>
+                  ),
+                },
+                {
+                  key: 'name',
+                  header: 'Shows as',
+                  secondary: true,
+                  cell: (a) => (
+                    <Text size="1" breakAll>
+                      {a.label ?? a.name ?? '—'}
+                    </Text>
+                  ),
+                },
+                {
+                  key: 'messages',
+                  header: 'Messages',
+                  secondary: true,
+                  align: 'end',
+                  cell: (a) => <Text size="1">{a.messages}</Text>,
+                },
+                {
+                  key: 'remove',
+                  header: '',
+                  align: 'end',
+                  cell: (a) => (
+                    <ActionButton
+                      op="remove"
+                      path="/api/owner-accounts"
+                      body={{ source: a.source, native_id: a.native_id }}
+                      variant="ghost"
+                      confirm={`${a.source} ${a.native_id} is not yours? Its messages are no longer marked as yours, even where a source marks them so, its recent ones go to the secretary, and it may show up among the people again. A record deleted when you named it does not come back.`}
+                      onDone={changed}
+                    >
+                      Not mine
+                    </ActionButton>
+                  ),
+                },
+              ]}
+            />
+            {d.suggestions.length > 0 && (
+              <Stack gap="2">
+                <Text size="1" tone="muted">
+                  These look like yours:
+                </Text>
+                {d.suggestions.map((s) => (
+                  <Row key={`${s.source}|${s.native_id}`} gap="2" align="center">
+                    <Badge>{SOURCE_NAMES[s.source] ?? s.source}</Badge>
+                    <Text size="1" breakAll>
+                      {s.name ?? s.native_id}{' '}
+                      <Text size="1" tone="muted">
+                        ({s.native_id}, {s.messages} message(s); {s.why.map((w) => WHY[w] ?? w).join('; ')})
+                      </Text>
+                    </Text>
+                    {s.person && (
+                      <Link to={`/people/${s.person.id}`} className="fx-link">
+                        on #{s.person.id} {s.person.name}
+                      </Link>
+                    )}
+                    <ActionButton
+                      op="add"
+                      path="/api/owner-accounts"
+                      body={{ source: s.source, native_id: s.native_id }}
+                      confirm={[
+                        `Is ${s.source} ${s.native_id}${s.name ? ` (${s.name})` : ''} you?`,
+                        `Its ${s.messages} message(s) become yours and are no longer triaged by the secretary.`,
+                        s.source === 'gchat' ? 'Google Chat will be told this user is you.' : '',
+                        s.person
+                          ? `It is taken off #${s.person.id} ${s.person.name}, whose record is deleted if nothing else is left of it and you never edited it.`
+                          : '',
+                      ]
+                        .filter(Boolean)
+                        .join(' ')}
+                      onDone={changed}
+                    >
+                      This is me
+                    </ActionButton>
+                    <ActionButton
+                      op="remove"
+                      path="/api/owner-accounts"
+                      body={{ source: s.source, native_id: s.native_id }}
+                      variant="ghost"
+                      confirm={`${s.source} ${s.native_id} is not yours? It is no longer suggested, and its messages count as a colleague’s even if a source marks them as yours.`}
+                      onDone={changed}
+                    >
+                      Not mine
+                    </ActionButton>
+                  </Row>
+                ))}
+              </Stack>
+            )}
+            <AddOwnAccount onDone={changed} />
+          </Stack>
+        )}
+      </Loaded>
+    </Section>
+  )
+}
+
+/// An account named by hand: Slack and Google Chat, or a source no feed reads yet (GitLab, Jira).
+function AddOwnAccount({ onDone }: { onDone: () => void }) {
+  const [source, setSource] = useState('gchat')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [done, setDone] = useState<string | null>(null)
+  return (
+    <form
+      onSubmit={(e) => {
+        e.preventDefault()
+        const form = e.currentTarget
+        const data = new FormData(form)
+        const field = (k: string) => String(data.get(k) ?? '').trim()
+        const src = source === 'other' ? field('other') : source
+        const native_id = field('native_id')
+        if (!src || !native_id) {
+          setError(!src ? 'Name the source' : 'Your user id there is needed')
+          return
+        }
+        setBusy(true)
+        setError(null)
+        setDone(null)
+        api
+          .act<{ done: string }>('/api/owner-accounts', 'add', { source: src, native_id, label: field('label') })
+          .then((r) => {
+            setDone(r.done)
+            form.reset()
+            onDone()
+          })
+          .catch((err) => setError(err instanceof Error ? err.message : String(err)))
+          .finally(() => setBusy(false))
+      }}
+    >
+      <Stack gap="2">
+        <Row gap="2" align="end">
+          <div style={{ minWidth: '9rem' }}>
+            <Select
+              size="sm"
+              label="Source"
+              value={source}
+              onChange={(v) => setSource(v ?? 'gchat')}
+              options={[
+                { value: 'gchat', label: 'Google Chat' },
+                { value: 'slack', label: 'Slack' },
+                { value: 'other', label: 'Other…' },
+              ]}
+            />
+          </div>
+          {source === 'other' && (
+            <div style={{ minWidth: '8rem' }}>
+              <TextField name="other" label="Source name" placeholder="gitlab" size="sm" />
+            </div>
+          )}
+          <div style={{ flexGrow: 1, minWidth: '12rem' }}>
+            <TextField
+              name="native_id"
+              label="Your user id there"
+              placeholder={source === 'slack' ? 'U01ABCDEF' : source === 'gchat' ? 'users/1234567890' : 'username'}
+              size="sm"
+            />
+          </div>
+          <div style={{ minWidth: '10rem' }}>
+            <TextField name="label" label="Shows as (optional)" placeholder="@you" size="sm" />
+          </div>
+          <Button type="submit" variant="secondary" loading={busy}>
+            Add
+          </Button>
+        </Row>
+        {error && <ErrorNote>{error}</ErrorNote>}
+        {done && (
+          <Text size="1" tone="muted">
+            {done}
+          </Text>
+        )}
+      </Stack>
+    </form>
   )
 }
 

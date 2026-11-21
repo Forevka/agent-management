@@ -691,7 +691,10 @@ async fn cards_for(
         "select c.person_id, c.source, c.native_id from person_contacts c
           where (c.source, c.native_id) in (select * from unnest($1::text[], $2::text[]))
             and not exists (select 1 from feed_messages f
-                             where f.from_owner and f.source = c.source and f.author_id = c.native_id)",
+                             where f.from_owner and f.source = c.source and f.author_id = c.native_id)
+            and not exists (select 1 from owner_accounts a
+                             where a.source = c.source and a.native_id = c.native_id
+                               and a.disowned_at is null)",
     )
     .bind(&sources)
     .bind(&ids)
@@ -841,10 +844,14 @@ async fn catch_up_last_interaction(tx: &mut sqlx::PgConnection, person: Option<i
 /// ([`mend_owner_accounts`]), so a failure is retried and nothing depends on which came first.
 /// Every person it touches gets an audit row of their own (their history shows it), and a
 /// dropped record's last contents are in it, so nothing is lost for good.
-pub async fn owner_seen(o: &Orchestrator, source: &str, author_id: &str) -> Result<()> {
+pub async fn owner_seen(o: &Orchestrator, source: &str, author_id: &str) -> Result<Mended> {
     let mut tx = o.db.begin().await?;
+    // As ingest stores the owner's messages: never queued for the secretary (one still waiting
+    // would be triaged as a colleague's), and never mentioning the owner.
     let marked = sqlx::query(
-        "update feed_messages set from_owner = true
+        "update feed_messages
+            set from_owner = true, mentions_owner = false,
+                secretary = case when secretary = 'pending' then null else secretary end
           where source = $1 and author_id = $2 and from_owner is not true",
     )
     .bind(source)
@@ -900,20 +907,43 @@ pub async fn owner_seen(o: &Orchestrator, source: &str, author_id: &str) -> Resu
             dropped.iter().map(|p| p.id).collect::<Vec<_>>()
         );
     }
-    Ok(())
+    Ok(Mended {
+        marked,
+        unlinked: held,
+        dropped: dropped.iter().map(|p| (p.id, p.name.clone())).collect(),
+    })
 }
 
-/// [`owner_seen`] for every account the owner is known to write from, where something is left
-/// to mend. Best-effort: a failure is logged, and the next retrospective tries again.
+/// What [`owner_seen`] mended on one account.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Mended {
+    /// Messages newly marked as the owner's.
+    pub marked: u64,
+    /// The people the account was taken off.
+    pub unlinked: Vec<i64>,
+    /// Of those, the records deleted because nothing was left of them.
+    pub dropped: Vec<(i64, String)>,
+}
+
+/// [`owner_seen`] for every account the owner is known to write from (a message flagged as
+/// theirs, or an account they named on the web), where something is left to mend, never one
+/// the owner said is not theirs. Best-effort: a failure is logged, and the next retrospective
+/// tries again.
 pub async fn mend_owner_accounts(o: &Orchestrator) {
     let accounts: Vec<(String, String)> = match sqlx::query_as(
-        "select distinct f.source, f.author_id from feed_messages f
-          where f.from_owner and f.author_id is not null
+        "select distinct a.source, a.author_id
+           from (select f.source, f.author_id from feed_messages f
+                  where f.from_owner and f.author_id is not null
+                 union
+                 select source, native_id from owner_accounts where disowned_at is null) a
+          where not exists (select 1 from owner_accounts d
+                             where d.source = a.source and d.native_id = a.author_id
+                               and d.disowned_at is not null)
             and (exists (select 1 from feed_messages m
-                          where m.source = f.source and m.author_id = f.author_id
+                          where m.source = a.source and m.author_id = a.author_id
                             and m.from_owner is not true)
                  or exists (select 1 from person_contacts c
-                             where c.source = f.source and c.native_id = f.author_id))",
+                             where c.source = a.source and c.native_id = a.author_id))",
     )
     .fetch_all(&o.db)
     .await
@@ -929,6 +959,304 @@ pub async fn mend_owner_accounts(o: &Orchestrator) {
             tracing::warn!("marking the owner's earlier {source} messages failed: {e:#}");
         }
     }
+}
+
+// ---------------------------------------------------------------- the owner's own accounts
+
+// A source can only tell the owner's messages apart when it knows the owner's id there, and
+// Google Chat often does not (token-info gives no account id for chat-only scopes, and the
+// direct-message rule needs the owner in two direct messages). So the owner can name their
+// accounts once: a message from one is the owner's whatever the source said (`feeds::ingest`),
+// Google Chat is handed its id (for `mentions_owner` too), and naming one mends what was stored
+// before ([`owner_seen`]). The owner can also say an account is *not* theirs ("Not mine",
+// `disowned_at`), which sticks: its messages are a colleague's even where a source flags them as
+// the owner's, so neither the next flagged message nor the retrospective's mending can turn it
+// back. Like the owner's edits of a record, these go straight through here, audited in the same
+// transaction: no agent may propose one.
+
+const ACCOUNT_SOURCE_MAX: usize = 40;
+const ACCOUNT_LABEL_MAX: usize = 120;
+/// At most this many suggestions on the page.
+const SUGGESTIONS_MAX: i64 = 20;
+/// How far back the suggestions that scan messages look.
+const SUGGESTION_DAYS: i32 = 30;
+/// "Not mine" hands the secretary the account's messages of at most this many days back that
+/// were kept from it as the owner's: older ones are history, not news.
+const REQUEUE_DAYS: i32 = 3;
+
+/// A source as `owner_accounts` keeps it: lowercase letters, digits, `-` and `_`. Free text
+/// rather than [`SOURCES`], so an account on a source no feed reads yet (GitLab, Jira) can be
+/// named too.
+pub fn account_source(s: &str) -> Result<String> {
+    let s = s.trim().to_lowercase();
+    ensure!(
+        !s.is_empty()
+            && s.len() <= ACCOUNT_SOURCE_MAX
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+        "a source is a short name of letters, digits, - and _ (slack, gchat, gitlab), not {:?}",
+        clip(&s, ACCOUNT_SOURCE_MAX)
+    );
+    Ok(s)
+}
+
+/// An account's user id as the source writes it (Slack `U…`, Google Chat `users/…`).
+fn account_id(s: &str) -> Result<String> {
+    let s = s.trim();
+    ensure!(!s.is_empty(), "an account needs the source's user id");
+    ensure!(
+        s.chars().count() <= NATIVE_ID_MAX
+            && !s.chars().any(|c| c.is_whitespace() || c.is_control()),
+        "a user id is one word of at most {NATIVE_ID_MAX} characters"
+    );
+    Ok(s.to_owned())
+}
+
+/// The owner's accounts on `source`, oldest first.
+pub async fn owner_account_ids(o: &Orchestrator, source: &str) -> Result<Vec<String>> {
+    Ok(sqlx::query_scalar(
+        "select native_id from owner_accounts where source = $1 and disowned_at is null
+          order by added_at, native_id",
+    )
+    .bind(source)
+    .fetch_all(&o.db)
+    .await?)
+}
+
+/// The page's section: the accounts the owner named, and the ones that look like theirs.
+pub async fn owner_accounts_json(o: &Orchestrator) -> Result<Value> {
+    type AccountRow = (
+        String,
+        String,
+        Option<String>,
+        DateTime<Utc>,
+        Option<String>,
+        i64,
+    );
+    let accounts: Vec<AccountRow> = sqlx::query_as(
+        "select a.source, a.native_id, a.label, a.added_at,
+                (select m.author from feed_messages m
+                  where m.source = a.source and m.author_id = a.native_id
+                  order by m.ts desc limit 1),
+                (select count(*) from feed_messages m
+                  where m.source = a.source and m.author_id = a.native_id)
+           from owner_accounts a where a.disowned_at is null order by a.source, a.added_at",
+    )
+    .fetch_all(&o.db)
+    .await?;
+    // Three signs that an account is the owner's, each only a suggestion the owner confirms:
+    // a source flagged its messages as the owner's; it wrote in two direct messages (each is
+    // between the owner and one other person, so nobody else can); or it goes by the very name
+    // the owner's own messages carry elsewhere. The last two look at a recent window only, so
+    // the page never reads the whole message history. An account the owner already named, or
+    // said is not theirs, is not suggested again.
+    type SuggestionRow = (
+        String,
+        String,
+        Vec<String>,
+        Option<String>,
+        i64,
+        Option<i64>,
+        Option<String>,
+    );
+    let suggestions: Vec<SuggestionRow> = sqlx::query_as(
+        "with owner_names as (
+             select distinct lower(f.author) as name from feed_messages f
+              where f.from_owner and f.author_id is not null and f.author <> f.author_id),
+         signs as (
+             select source, author_id, 'flagged' as why from feed_messages
+              where from_owner and author_id is not null
+              group by source, author_id
+             union all
+             select m.source, m.author_id, 'direct' from feed_messages m
+               join feed_conversations v on v.source = m.source and v.conversation_id = m.channel_id
+              where v.kind = 'direct' and m.author_id is not null
+                and m.created_at > now() - make_interval(days => $2::int)
+              group by m.source, m.author_id
+             having count(distinct m.channel_id) >= 2
+             union all
+             select m.source, m.author_id, 'name' from feed_messages m
+              where m.author_id is not null and m.from_owner is not true and m.author <> m.author_id
+                and m.created_at > now() - make_interval(days => $2::int)
+                and lower(m.author) in (select name from owner_names)
+              group by m.source, m.author_id)
+         select s.source, s.author_id, array_agg(distinct s.why order by s.why),
+                (select m.author from feed_messages m
+                  where m.source = s.source and m.author_id = s.author_id
+                  order by m.ts desc limit 1),
+                (select count(*) from feed_messages m
+                  where m.source = s.source and m.author_id = s.author_id),
+                max(p.id), max(p.name)
+           from signs s
+           left join person_contacts c on c.source = s.source and c.native_id = s.author_id
+           left join people p on p.id = c.person_id
+          where not exists (select 1 from owner_accounts a
+                             where a.source = s.source and a.native_id = s.author_id)
+          group by s.source, s.author_id
+          order by count(distinct s.why) desc, s.source, s.author_id
+          limit $1",
+    )
+    .bind(SUGGESTIONS_MAX)
+    .bind(SUGGESTION_DAYS)
+    .fetch_all(&o.db)
+    .await?;
+    Ok(json!({
+        "accounts": accounts.iter().map(|(source, id, label, at, name, n)| json!({
+            "source": source,
+            "native_id": id,
+            "label": label,
+            "added_at": at,
+            "name": name,
+            "messages": n,
+        })).collect::<Vec<_>>(),
+        "suggestions": suggestions.iter().map(|(source, id, why, name, n, person, person_name)| json!({
+            "source": source,
+            "native_id": id,
+            "why": why,
+            "name": name,
+            "messages": n,
+            "person": person.map(|p| json!({"id": p, "name": person_name})),
+        })).collect::<Vec<_>>(),
+    }))
+}
+
+/// The owner names an account as theirs. Its stored messages become the owner's, it is taken off
+/// any person, and a record left with nothing else is deleted unless the owner edited it
+/// ([`owner_seen`], every person touched audited): naming the account is the owner's say-so.
+pub async fn owner_account_add(
+    o: &Orchestrator,
+    source: &str,
+    native_id: &str,
+    label: Option<&str>,
+) -> Result<String> {
+    let source = account_source(source)?;
+    let native_id = account_id(native_id)?;
+    let label = label
+        .map(|l| one_line(l, ACCOUNT_LABEL_MAX))
+        .filter(|l| !l.is_empty());
+    let mut tx = o.db.begin().await?;
+    sqlx::query(
+        "insert into owner_accounts (source, native_id, label) values ($1, $2, $3)
+         on conflict (source, native_id) do update
+            set label = coalesce(excluded.label, owner_accounts.label), disowned_at = null",
+    )
+    .bind(&source)
+    .bind(&native_id)
+    .bind(&label)
+    .execute(&mut *tx)
+    .await?;
+    audit_tx(
+        &mut tx,
+        "owner.account_add",
+        json!({"source": source, "native_id": native_id, "label": label}),
+    )
+    .await?;
+    tx.commit().await?;
+    // Mended after the account is stored, in a transaction of its own (as on ingest): should it
+    // fail, the account still counts as the owner's everywhere it is checked, and the next
+    // retrospective mends it ([`mend_owner_accounts`] includes named accounts). The account is
+    // saved either way, so that is what the owner is told, not an error.
+    let mut out = format!("{source} {native_id} is yours.");
+    let m = match owner_seen(o, &source, &native_id).await {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!("marking the owner's earlier {source} messages failed: {e:#}");
+            out.push_str(
+                " Marking its earlier messages failed for now; the next retrospective tries again.",
+            );
+            return Ok(out);
+        }
+    };
+    if m.marked > 0 {
+        out.push_str(&format!(
+            " {} earlier message(s) marked as yours.",
+            m.marked
+        ));
+    }
+    if !m.unlinked.is_empty() {
+        out.push_str(&format!(
+            " Taken off {}.",
+            m.unlinked
+                .iter()
+                .map(|p| format!("#{p}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if !m.dropped.is_empty() {
+        out.push_str(&format!(
+            " Deleted, as nothing else was left of them: {}.",
+            m.dropped
+                .iter()
+                .map(|(id, name)| format!("#{id} {name}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    Ok(out)
+}
+
+/// The owner says an account is not theirs ("Not mine"): a named one by mistake, or a
+/// suggestion they turn down. The answer is kept (`disowned_at`) rather than the row deleted, so
+/// that it sticks: ingest then stores its messages as a colleague's even where the source flags
+/// them as the owner's, and neither the next flagged message nor the retrospective's mending
+/// turns it back (see the section's note). Its messages are unmarked, and the recent ones that
+/// were kept from the secretary as the owner's go to it now (outside triage channels, which the
+/// brain sees anyway). A record deleted when the account was named is not brought back; its
+/// contents are in the audit log. Naming the account again undoes this.
+pub async fn owner_account_remove(
+    o: &Orchestrator,
+    source: &str,
+    native_id: &str,
+) -> Result<String> {
+    let source = account_source(source)?;
+    let native_id = account_id(native_id)?;
+    let mut tx = o.db.begin().await?;
+    sqlx::query(
+        "insert into owner_accounts (source, native_id, disowned_at) values ($1, $2, now())
+         on conflict (source, native_id) do update set disowned_at = now()",
+    )
+    .bind(&source)
+    .bind(&native_id)
+    .execute(&mut *tx)
+    .await?;
+    let unmarked = sqlx::query(
+        "update feed_messages set from_owner = false
+          where source = $1 and author_id = $2 and from_owner",
+    )
+    .bind(&source)
+    .bind(&native_id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    let queued = sqlx::query(
+        "update feed_messages m set secretary = 'pending'
+          where m.source = $1 and m.author_id = $2 and m.secretary is null
+            and m.created_at > now() - make_interval(days => $3::int)
+            and not exists (select 1 from feed_channels f
+                             where f.source = m.source and f.channel_id = m.channel_id and f.triage)",
+    )
+    .bind(&source)
+    .bind(&native_id)
+    .bind(REQUEUE_DAYS)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    audit_tx(
+        &mut tx,
+        "owner.account_remove",
+        json!({"source": source, "native_id": native_id, "messages_unmarked": unmarked,
+               "queued_for_secretary": queued}),
+    )
+    .await?;
+    tx.commit().await?;
+    let mut out = format!(
+        "{source} {native_id} is not yours: {unmarked} message(s) no longer marked as yours."
+    );
+    if queued > 0 {
+        out.push_str(&format!(" {queued} recent one(s) handed to the secretary."));
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------- the retrospective's pass
@@ -972,6 +1300,9 @@ pub async fn digest_section(o: &Orchestrator, days: i64) -> Result<String> {
                                          where f.source = m.source and f.channel_id = m.channel_id and f.triage))
                 and not exists (select 1 from feed_messages f
                                  where f.from_owner and f.source = m.source and f.author_id = m.author_id)
+                and not exists (select 1 from owner_accounts a
+                                 where a.source = m.source and a.native_id = m.author_id
+                                   and a.disowned_at is null)
               group by m.source, m.author_id
               order by count(*) desc, m.source, m.author_id
               limit $2",
@@ -1336,11 +1667,14 @@ async fn add_contact(
 ) -> Result<()> {
     match &c.native_id {
         Some(native) => {
-            // The owner writes from this account: they are not one of the people, and their
-            // messages must never be taken for a colleague's.
+            // The owner writes from this account (or named it as theirs, before it wrote
+            // anything): they are not one of the people, and their messages must never be taken
+            // for a colleague's.
             let theirs: bool = sqlx::query_scalar(
                 "select exists(select 1 from feed_messages
-                                where from_owner and source = $1 and author_id = $2)",
+                                where from_owner and source = $1 and author_id = $2)
+                     or exists(select 1 from owner_accounts
+                                where source = $1 and native_id = $2 and disowned_at is null)",
             )
             .bind(&c.source)
             .bind(native)

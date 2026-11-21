@@ -2372,6 +2372,7 @@ async fn api_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool) {
             &["people"],
             &[],
         ),
+        ("/api/owner-accounts", &["accounts", "suggestions"], &[]),
     ] {
         let (status, body) = call("GET", uri, Some(cookie.clone()), None).await;
         assert_eq!(status, 200, "GET {uri} answered {status}: {body}");
@@ -6111,6 +6112,210 @@ async fn people_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) 
     );
     let digest = crate::retro::digest(o, "people-check-3").await.unwrap();
     assert!(!digest.contains("U0OWNER"), "{digest}");
+
+    // A source that cannot tell the owner's messages apart (Google Chat whose token-info gave no
+    // account id, with the owner in only one direct message) stores them as a colleague's, and
+    // the retrospective made a record of the owner. The owner names the account on the web.
+    sqlx::query(
+        "insert into feed_messages (source, channel_id, msg_id, author, text, ts, author_id, from_owner)
+         values ('gchat', 'spaces/G1', 'g-own-1', 'Owner', 'my own words', $1, 'users/42', false)",
+    )
+    .bind(now() - 60.0)
+    .execute(db)
+    .await
+    .unwrap();
+    let chat_twin: i64 = sqlx::query_scalar(
+        "with p as (insert into people (name) values ('Owner On Chat') returning id)
+         insert into person_contacts (person_id, source, native_id, handle)
+         select id, 'gchat', 'users/42', 'Owner' from p returning person_id",
+    )
+    .fetch_one(db)
+    .await
+    .unwrap();
+    // It goes by the name the owner's own Slack messages carry, so it is suggested, with the
+    // record it is on.
+    let page = api_get(o, "/api/owner-accounts").await;
+    let suggested = page["suggestions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["source"] == "gchat" && s["native_id"] == "users/42")
+        .unwrap_or_else(|| panic!("suggested: {page}"));
+    assert!(
+        suggested["why"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("name"))
+            && suggested["person"]["id"] == chat_twin,
+        "{suggested}"
+    );
+    let named = api_post(
+        o,
+        "/api/owner-accounts",
+        json!({"op": "add", "body": {"source": "GChat", "native_id": "users/42", "label": "me on chat"}}),
+    )
+    .await;
+    let said = named["done"].as_str().unwrap();
+    assert!(
+        said.contains("1 earlier message(s) marked") && said.contains(&format!("#{chat_twin}")),
+        "{said}"
+    );
+    assert!(
+        !exists(chat_twin).await,
+        "the record made of it is gone: {said}"
+    );
+    let mine = |id: &'static str| async move {
+        sqlx::query_as::<_, (Option<bool>, bool, Option<String>)>(
+            "select from_owner, mentions_owner, secretary from feed_messages where msg_id = $1",
+        )
+        .bind(id)
+        .fetch_one(db)
+        .await
+        .unwrap()
+    };
+    assert_eq!(
+        mine("g-own-1").await.0,
+        Some(true),
+        "its messages are the owner's"
+    );
+    assert!(
+        sqlx::query_scalar::<_, bool>(
+            "select exists(select 1 from audit_log where action = 'owner.account_add'
+                            and detail->>'native_id' = 'users/42' and actor = 'owner')"
+        )
+        .fetch_one(db)
+        .await
+        .unwrap()
+    );
+    // What the source cannot tell is settled on ingest: the owner's next message is theirs, is
+    // queued for nobody, and mentions nobody.
+    deliver_feed(
+        o,
+        vec![FeedEvent::Message(fleet_feeds::FeedMessage {
+            source: "gchat".into(),
+            author_id: Some("users/42".into()),
+            mentions_owner: true,
+            ts_unix: now(),
+            ..incoming(
+                "spaces/G1",
+                "Olya",
+                ConvKind::Direct,
+                "g-own-2",
+                "Owner",
+                "see you",
+            )
+        })],
+    )
+    .await;
+    assert_eq!(mine("g-own-2").await, (Some(true), false, None));
+    // Google Chat is handed the id, and the account can never be anyone's contact.
+    assert_eq!(
+        crate::people::owner_account_ids(o, "gchat").await.unwrap(),
+        ["users/42"]
+    );
+    let refused = crate::people::owner_edit(
+        o,
+        zed_id,
+        &json!({"contacts": [{"source": "gchat", "handle": "Owner", "native_id": "users/42"}]}),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        refused.to_string().contains("the owner's own account"),
+        "{refused:#}"
+    );
+    let page = api_get(o, "/api/owner-accounts").await;
+    assert_eq!(page["accounts"][0]["native_id"], "users/42", "{page}");
+    assert_eq!(page["accounts"][0]["label"], "me on chat", "{page}");
+    assert_eq!(page["accounts"][0]["messages"], 2, "{page}");
+    assert!(
+        !page["suggestions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["native_id"] == "users/42"),
+        "a named account is no longer suggested: {page}"
+    );
+    let digest = crate::retro::digest(o, "people-check-4").await.unwrap();
+    assert!(!digest.contains("users/42"), "{digest}");
+    // A mistake is undone with "Not mine": its messages are no longer the owner's, and the
+    // recent ones go to the secretary they were kept from.
+    let back = api_post(
+        o,
+        "/api/owner-accounts",
+        json!({"op": "remove", "body": {"source": "gchat", "native_id": "users/42"}}),
+    )
+    .await;
+    let said = back["done"].as_str().unwrap();
+    assert!(
+        said.contains("2 message(s) no longer marked") && said.contains("2 recent one(s)"),
+        "{said}"
+    );
+    assert_eq!(mine("g-own-1").await.0, Some(false));
+    assert_eq!(mine("g-own-2").await.2.as_deref(), Some("pending"));
+    // And it sticks: a source that flags the account's next message as the owner's is
+    // overruled, and the retrospective's mending leaves it alone.
+    deliver_feed(
+        o,
+        vec![FeedEvent::Message(fleet_feeds::FeedMessage {
+            source: "gchat".into(),
+            author_id: Some("users/42".into()),
+            from_owner: true,
+            ts_unix: now(),
+            ..incoming(
+                "spaces/G1",
+                "Olya",
+                ConvKind::Direct,
+                "g-own-3",
+                "Owner",
+                "again",
+            )
+        })],
+    )
+    .await;
+    assert_eq!(
+        mine("g-own-3").await.0,
+        Some(false),
+        "the owner's answer wins"
+    );
+    crate::retro::digest(o, "people-check-5").await.unwrap();
+    assert_eq!(mine("g-own-1").await.0, Some(false), "not mended back");
+    assert!(
+        crate::people::owner_account_ids(o, "gchat")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let page = api_get(o, "/api/owner-accounts").await;
+    assert!(
+        page["accounts"].as_array().unwrap().is_empty()
+            && !page["suggestions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s["native_id"] == "users/42"),
+        "a disowned account is neither listed nor suggested: {page}"
+    );
+    let (status, _) = api_post_status(
+        o,
+        "/api/owner-accounts",
+        json!({"op": "add", "body": {"source": "no spaces", "native_id": "x"}}),
+    )
+    .await;
+    assert!(status.is_client_error(), "{status}");
+    // It is the owner's after all: named again, everything is theirs again, and what was waiting
+    // for the secretary is not triaged as a colleague's.
+    api_post(
+        o,
+        "/api/owner-accounts",
+        json!({"op": "add", "body": {"source": "gchat", "native_id": "users/42"}}),
+    )
+    .await;
+    for id in ["g-own-1", "g-own-2", "g-own-3"] {
+        let (theirs, mentions, queued) = mine(id).await;
+        assert_eq!(theirs, Some(true), "{id}");
+        assert!(!mentions && queued.is_none(), "{id}");
+    }
 
     // Any agent may look him up, by a handle or by number; none but the retrospective writes.
     let alice: String = sqlx::query_scalar("select agent_id from tasks where id = 'demo-BS-1'")

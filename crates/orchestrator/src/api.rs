@@ -63,6 +63,10 @@ pub fn router() -> Router<O> {
         .route("/api/retro", get(retro).post(retro_act))
         .route("/api/people", get(people).post(people_act))
         .route("/api/people/{id}", get(person).post(person_act))
+        .route(
+            "/api/owner-accounts",
+            get(owner_accounts).post(owner_accounts_act),
+        )
         .route("/api/kit", get(kit).post(kit_act))
         .route("/api/kit/{id}", get(kit_item))
         .route("/api/invite", post(invite))
@@ -1653,6 +1657,32 @@ async fn person_act(
     let done = match a.op.as_str() {
         "edit" => crate::people::owner_edit(&o, id, &a.body).await?,
         "delete" => crate::people::owner_delete(&o, id).await?,
+        other => {
+            return Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                format!("unknown operation {other:?}"),
+            ));
+        }
+    };
+    Ok(Json(json!({"done": done})))
+}
+
+/// The owner's own accounts on each source, and the ones that look like theirs.
+async fn owner_accounts(State(o): State<O>, h: HeaderMap) -> Api {
+    guard!(o, h);
+    Ok(Json(crate::people::owner_accounts_json(&o).await?))
+}
+
+/// The owner names an account as theirs (`add`), or takes one back (`remove`).
+async fn owner_accounts_act(State(o): State<O>, h: HeaderMap, Json(a): Json<Act>) -> Api {
+    guard!(o, h, write);
+    let (source, id) = (need(&a.body, "source")?, need(&a.body, "native_id")?);
+    let done = match a.op.as_str() {
+        "add" => {
+            crate::people::owner_account_add(&o, &source, &id, s(&a.body, "label").as_deref())
+                .await?
+        }
+        "remove" => crate::people::owner_account_remove(&o, &source, &id).await?,
         other => {
             return Err(ApiError(
                 StatusCode::BAD_REQUEST,
