@@ -5503,6 +5503,39 @@ async fn people_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) 
         !read.contains("Prefers short"),
         "one line, not the card: {read}"
     );
+    // The retrospective writes these records from what colleagues wrote, so it reads every
+    // conversation too, though its project maps none. (It once read nothing, and made records
+    // of names alone.)
+    let seen = call_as(
+        o,
+        crate::model::RETRO_AGENT,
+        crate::model::RETRO_TASK,
+        "feed_read",
+        json!({"channel": "C-notes"}),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        seen.ok && seen.result.contains("notes API moved to v2"),
+        "{}",
+        seen.result
+    );
+    let found = call_as(
+        o,
+        crate::model::RETRO_AGENT,
+        crate::model::RETRO_TASK,
+        "feed_search",
+        json!({"query": "notes"}),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        found.ok && found.result.contains("notes API"),
+        "{}",
+        found.result
+    );
     let about = crate::people::about_refs(
         o,
         &[crate::feeds::msg_ref("slack", "C-notes", "p1")],
@@ -5511,8 +5544,59 @@ async fn people_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) 
     .await;
     assert!(about.contains("Works only on backend parts"), "{about}");
 
+    // A record made from messages stored earlier takes its last interaction from them: `touch`
+    // only sees messages that arrive once the contact exists.
+    let quinn_wrote = now() - 120.0;
+    sqlx::query(
+        "insert into feed_messages (source, channel_id, msg_id, author, text, ts, author_id, from_owner)
+         values ('slack', 'C-notes', 'q-old', 'Quinn', 'an older message', $1, 'U0QUINN', false)",
+    )
+    .bind(quinn_wrote)
+    .execute(db)
+    .await
+    .unwrap();
+    let quinn = crate::people::owner_create(o, "Quinn").await.unwrap();
+    crate::people::owner_edit(
+        o,
+        quinn,
+        &json!({"contacts": [{"source": "slack", "handle": "@quinn", "native_id": "U0QUINN"}]}),
+    )
+    .await
+    .unwrap();
+    let caught: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("select last_interaction from people where id = $1")
+            .bind(quinn)
+            .fetch_one(db)
+            .await
+            .unwrap();
+    assert!(
+        caught.is_some_and(|t| (t.timestamp_millis() as f64 / 1000.0 - quinn_wrote).abs() < 1.0),
+        "the stored message's time: {caught:?}"
+    );
+
+    // Messages stored before `from_owner` existed say nothing of whose they are, so the first
+    // retrospectives took the owner for a colleague. Here, one such message of the owner's and
+    // the record made of their account alone.
+    sqlx::query(
+        "insert into feed_messages (source, channel_id, msg_id, author, text, ts, author_id, from_owner)
+         values ('slack', 'C-notes', 'legacy-own', 'Owner', 'an old message of mine', 1763000000, 'U0OWNER', null),
+                ('slack', 'C-notes', 'legacy-zed', 'Zed', 'an old message of his', 1763000000, 'U0ZED', null)",
+    )
+    .execute(db)
+    .await
+    .unwrap();
+    let twin: i64 = sqlx::query_scalar(
+        "with p as (insert into people (name) values ('Owner Twin') returning id)
+         insert into person_contacts (person_id, source, native_id, handle)
+         select id, 'slack', 'U0OWNER', 'Owner' from p returning person_id",
+    )
+    .fetch_one(db)
+    .await
+    .unwrap();
+
     // The owner is never one of the people: their own messages are marked as theirs, touch
-    // nobody, and their account cannot become anyone's contact.
+    // nobody, and their account cannot become anyone's contact. Their first marked message also
+    // settles the older ones and drops the record made of them.
     deliver_feed(
         o,
         vec![FeedEvent::Message(fleet_feeds::FeedMessage {
@@ -5528,6 +5612,130 @@ async fn people_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) 
             .await
             .unwrap();
     assert_eq!(marked, Some(true));
+    let shown = crate::feeds::read(
+        o,
+        "fleet",
+        true,
+        &json!({"refs": [crate::feeds::msg_ref("slack", "C-notes", "p3"), crate::feeds::msg_ref("slack", "C-notes", "p2")]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        shown.matches("\"from_owner\": true").count(),
+        1,
+        "the owner's line says so, the colleague's does not: {shown}"
+    );
+    let legacy: Option<bool> =
+        sqlx::query_scalar("select from_owner from feed_messages where msg_id = 'legacy-own'")
+            .fetch_one(db)
+            .await
+            .unwrap();
+    assert_eq!(
+        legacy,
+        Some(true),
+        "the owner's older message is theirs now"
+    );
+    assert!(
+        !sqlx::query_scalar::<_, bool>("select exists(select 1 from people where id = $1)")
+            .bind(twin)
+            .fetch_one(db)
+            .await
+            .unwrap(),
+        "the record made of the owner's account is gone"
+    );
+    let audited: Value = sqlx::query_scalar(
+        "select detail from audit_log where action = 'person.owner_account'
+          and detail->>'person' = $1::text",
+    )
+    .bind(twin)
+    .fetch_one(db)
+    .await
+    .unwrap();
+    assert!(
+        audited["dropped"] == true && audited["record"]["name"] == "Owner Twin",
+        "the dropped record is kept in its audit row: {audited}"
+    );
+    let theirs: Option<bool> =
+        sqlx::query_scalar("select from_owner from feed_messages where msg_id = 'legacy-zed'")
+            .fetch_one(db)
+            .await
+            .unwrap();
+    assert_eq!(
+        theirs, None,
+        "a colleague's unmarked message stays unmarked (the owner may have other accounts)"
+    );
+    assert!(
+        sqlx::query_scalar::<_, bool>("select exists(select 1 from people where id = $1)")
+            .bind(quinn)
+            .fetch_one(db)
+            .await
+            .unwrap(),
+        "nobody else's record is touched"
+    );
+    // Quinn was only here for these two checks.
+    sqlx::query("delete from people where id = $1")
+        .bind(quinn)
+        .execute(db)
+        .await
+        .unwrap();
+
+    // Not only the first flagged message mends: an account already known to be the owner's is
+    // mended before every retrospective, so a failed or missed mend is never lost. A record the
+    // owner edited keeps everything but the account.
+    let owner_twin = |name: &'static str, owner_edited: bool| async move {
+        sqlx::query_scalar::<_, i64>(
+            "with p as (insert into people (name, owner_edited_at)
+                        values ($1, case when $2 then now() end) returning id)
+             insert into person_contacts (person_id, source, native_id, handle)
+             select id, 'slack', 'U0OWNER', 'Owner' from p returning person_id",
+        )
+        .bind(name)
+        .bind(owner_edited)
+        .fetch_one(db)
+        .await
+        .unwrap()
+    };
+    let exists = |id: i64| async move {
+        sqlx::query_scalar::<_, bool>("select exists(select 1 from people where id = $1)")
+            .bind(id)
+            .fetch_one(db)
+            .await
+            .unwrap()
+    };
+    sqlx::query(
+        "insert into feed_messages (source, channel_id, msg_id, author, text, ts, author_id, from_owner)
+         values ('slack', 'C-notes', 'legacy-own-2', 'Owner', 'another old one', 1763000001, 'U0OWNER', false)",
+    )
+    .execute(db)
+    .await
+    .unwrap();
+    let late = owner_twin("Owner Twin Again", false).await;
+    crate::retro::digest(o, "people-mend").await.unwrap();
+    assert!(!exists(late).await, "mended at the next retrospective");
+    let fixed: Option<bool> =
+        sqlx::query_scalar("select from_owner from feed_messages where msg_id = 'legacy-own-2'")
+            .fetch_one(db)
+            .await
+            .unwrap();
+    assert_eq!(
+        fixed,
+        Some(true),
+        "even a message a feed stamped as not the owner's"
+    );
+    let edited = owner_twin("Owner Kept This", true).await;
+    crate::retro::digest(o, "people-mend-2").await.unwrap();
+    assert!(exists(edited).await, "the owner's own edit stands");
+    let left: i64 = sqlx::query_scalar("select count(*) from person_contacts where person_id = $1")
+        .bind(edited)
+        .fetch_one(db)
+        .await
+        .unwrap();
+    assert_eq!(left, 0, "but not with the owner's account");
+    sqlx::query("delete from people where id = $1")
+        .bind(edited)
+        .execute(db)
+        .await
+        .unwrap();
     let refused = crate::people::owner_edit(
         o,
         zed_id,

@@ -724,6 +724,18 @@ pub async fn ingest(o: &Arc<Orchestrator>, messages: &[Incoming]) -> Result<()> 
         .bind(&m.conversation_id)
         .fetch_one(&o.db)
         .await?;
+        // The first message known to be the owner's on this account settles who the owner is
+        // for everything stored before messages were marked (see `people::owner_seen`).
+        let owner_first = match (&m.author_id, m.from_owner) {
+            (Some(author), true) => !sqlx::query_scalar::<_, bool>(
+                "select exists(select 1 from feed_messages where from_owner and source = $1 and author_id = $2)",
+            )
+            .bind(&m.source)
+            .bind(author)
+            .fetch_one(&o.db)
+            .await?,
+            _ => false,
+        };
         let inserted = sqlx::query(
             "insert into feed_messages (source, channel_id, msg_id, thread_id, author, text, ts, permalink, author_id, subject, mentions_owner, secretary, from_owner)
              values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
@@ -748,6 +760,14 @@ pub async fn ingest(o: &Arc<Orchestrator>, messages: &[Incoming]) -> Result<()> 
         .bind(m.from_owner)
         .execute(&o.db)
         .await?;
+        if let (true, Some(author)) = (owner_first, &m.author_id)
+            && let Err(e) = crate::people::owner_seen(o, &m.source, author).await
+        {
+            tracing::warn!(
+                "marking the owner's earlier {} messages failed: {e:#}",
+                m.source
+            );
+        }
         // A repeat of a message already stored (a backfill, a redelivery) changes nothing and
         // is not mirrored or shown again.
         if inserted.rows_affected() > 0 {
@@ -931,6 +951,7 @@ type FeedRow = (
     Option<String>,
     Option<String>,
     Option<String>,
+    bool,
 );
 
 /// Columns of a [`FeedRow`], over `feed_messages m` with its channel mapping `c` and its
@@ -938,7 +959,7 @@ type FeedRow = (
 const FEED_COLUMNS: &str =
     "m.source, m.channel_id, coalesce(nullif(c.name, ''), nullif(v.name, ''), m.channel_id),
      coalesce(v.kind, 'channel'), m.msg_id, m.thread_id, m.author, m.text, m.ts, m.permalink, m.edited_text,
-     m.author_id
+     m.author_id, coalesce(m.from_owner, false)
      from feed_messages m
      left join feed_channels c on c.source = m.source and c.channel_id = m.channel_id
      left join feed_conversations v on v.source = m.source and v.conversation_id = m.channel_id";
@@ -954,8 +975,8 @@ async fn render(o: &Orchestrator, rows: Vec<FeedRow>) -> String {
     let out: Vec<Value> = rows
         .into_iter()
         .map(
-            |(source, conv_id, conv, kind, id, thread, author, text, ts, link, edit, _)| {
-                json!({
+            |(source, conv_id, conv, kind, id, thread, author, text, ts, link, edit, _, mine)| {
+                let mut v = json!({
                     "ref": msg_ref(&source, &conv_id, &id),
                     "source": source,
                     "conversation": conv,
@@ -968,7 +989,13 @@ async fn render(o: &Orchestrator, rows: Vec<FeedRow>) -> String {
                     "ts": ts,
                     "link": link,
                     "edited_to": edit,
-                })
+                });
+                // The owner's own words, so nobody credits them to the colleague they answer
+                // (messages stored before this was recorded are unmarked).
+                if mine {
+                    v["from_owner"] = json!(true);
+                }
+                v
             },
         )
         .collect();
@@ -979,7 +1006,8 @@ async fn render(o: &Orchestrator, rows: Vec<FeedRow>) -> String {
 }
 
 /// Recent messages, or the messages given by `refs`. `everything`: every conversation the owner
-/// is in (the brain, the secretary); otherwise only channels mapped to `project`.
+/// is in (the brain, the secretary, the retrospective); otherwise only channels mapped to
+/// `project`.
 pub async fn read(
     o: &Orchestrator,
     project: &str,

@@ -471,13 +471,23 @@ pub async fn handle(
         "memory_retain" | "memory_recall" | "memory_reflect" | "memory_banks" => {
             ok(memory(o, &agent, &task.project, &call.tool, &args).await?)
         }
-        // The brain and the secretary see every conversation; other agents their project's.
-        "feed_read" => {
-            ok(crate::feeds::read(o, &task.project, is_brain || is_secretary, &args).await?)
-        }
-        "feed_search" => {
-            ok(crate::feeds::search(o, &task.project, is_brain || is_secretary, &args).await?)
-        }
+        // The brain, the secretary and the retrospective see every conversation; other agents
+        // their project's. The retrospective keeps the people records from what colleagues
+        // wrote, and its project (the fleet's own) maps no channel, so without this it saw none.
+        "feed_read" => ok(crate::feeds::read(
+            o,
+            &task.project,
+            is_brain || is_secretary || is_retro,
+            &args,
+        )
+        .await?),
+        "feed_search" => ok(crate::feeds::search(
+            o,
+            &task.project,
+            is_brain || is_secretary || is_retro,
+            &args,
+        )
+        .await?),
         // Who a colleague is, before writing to them: every agent's, read-only. The records are
         // the retrospective's to write (`retro_person`, gated below with its other tools).
         "people" => ok(crate::people::tool(o, &args).await?),

@@ -803,6 +803,134 @@ pub async fn touch(o: &Orchestrator, source: &str, author_id: &str, ts_unix: f64
     }
 }
 
+/// When a person was last in touch, from the messages already stored. [`touch`] sees only
+/// messages that arrive once a contact exists, so a record made from older history (the first
+/// retrospectives' are all of that kind) would otherwise carry no date until they wrote again.
+/// Called after a person's contacts changed (`Some`), and for everyone (`None`) before each
+/// retrospective's People section, which also mends the records made before this existed. Never
+/// moves a date back.
+async fn catch_up_last_interaction(tx: &mut sqlx::PgConnection, person: Option<i64>) -> Result<()> {
+    sqlx::query(
+        "update people p set last_interaction = h.last
+           from (select c.person_id, least(to_timestamp(max(m.ts)), now()) as last
+                   from person_contacts c
+                   join feed_messages m on m.source = c.source and m.author_id = c.native_id
+                  where ($1::int8 is null or c.person_id = $1) and m.from_owner is not true
+                    and not exists (select 1 from feed_messages f
+                                     where f.from_owner and f.source = c.source
+                                       and f.author_id = c.native_id)
+                  group by c.person_id) h
+          where p.id = h.person_id
+            and (p.last_interaction is null or p.last_interaction < h.last)",
+    )
+    .bind(person)
+    .execute(&mut *tx)
+    .await?;
+    Ok(())
+}
+
+/// The owner writes from `author_id` on `source`. Messages stored before `from_owner` existed
+/// (and the ones a feed could not yet tell were the owner's) say otherwise, so the owner's older
+/// messages looked like a colleague's and the retrospective may have made a record of the owner.
+/// This marks the account's messages as the owner's, takes the account off any person, and
+/// deletes a record left with no contact at all, unless the owner edited it themselves. Other
+/// authors' unmarked messages stay unmarked: the owner may write from more than one account.
+///
+/// Idempotent, and cheap when there is nothing to mend. Called when the first message flagged
+/// as the owner's arrives on an account, and for every such account before each retrospective
+/// ([`mend_owner_accounts`]), so a failure is retried and nothing depends on which came first.
+/// Every person it touches gets an audit row of their own (their history shows it), and a
+/// dropped record's last contents are in it, so nothing is lost for good.
+pub async fn owner_seen(o: &Orchestrator, source: &str, author_id: &str) -> Result<()> {
+    let mut tx = o.db.begin().await?;
+    let marked = sqlx::query(
+        "update feed_messages set from_owner = true
+          where source = $1 and author_id = $2 and from_owner is not true",
+    )
+    .bind(source)
+    .bind(author_id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    let mut held: Vec<i64> = sqlx::query_scalar(
+        "delete from person_contacts where source = $1 and native_id = $2 returning person_id",
+    )
+    .bind(source)
+    .bind(author_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    held.sort_unstable();
+    held.dedup();
+    let dropped: Vec<Person> = sqlx::query_as(
+        "delete from people p
+          where p.id = any($1) and p.owner_edited_at is null
+            and not exists (select 1 from person_contacts c where c.person_id = p.id)
+          returning p.*",
+    )
+    .bind(&held)
+    .fetch_all(&mut *tx)
+    .await?;
+    for person in &held {
+        let gone = dropped.iter().find(|p| p.id == *person);
+        sqlx::query(
+            "insert into audit_log (actor, action, detail) values ('orchestrator', 'person.owner_account', $1)",
+        )
+        .bind(json!({
+            "person": person,
+            "source": source,
+            "contact_removed": author_id,
+            "dropped": gone.is_some(),
+            "record": gone.map(|p| json(p, &[])),
+        }))
+        .execute(&mut *tx)
+        .await?;
+    }
+    if marked > 0 && held.is_empty() {
+        sqlx::query(
+            "insert into audit_log (actor, action, detail) values ('orchestrator', 'person.owner_account', $1)",
+        )
+        .bind(json!({"source": source, "messages_marked": marked}))
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    if !held.is_empty() {
+        tracing::info!(
+            "{source}: the owner's own account was a person's contact ({held:?}); removed, records dropped: {:?}",
+            dropped.iter().map(|p| p.id).collect::<Vec<_>>()
+        );
+    }
+    Ok(())
+}
+
+/// [`owner_seen`] for every account the owner is known to write from, where something is left
+/// to mend. Best-effort: a failure is logged, and the next retrospective tries again.
+pub async fn mend_owner_accounts(o: &Orchestrator) {
+    let accounts: Vec<(String, String)> = match sqlx::query_as(
+        "select distinct f.source, f.author_id from feed_messages f
+          where f.from_owner and f.author_id is not null
+            and (exists (select 1 from feed_messages m
+                          where m.source = f.source and m.author_id = f.author_id
+                            and m.from_owner is not true)
+                 or exists (select 1 from person_contacts c
+                             where c.source = f.source and c.native_id = f.author_id))",
+    )
+    .fetch_all(&o.db)
+    .await
+    {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!("finding the owner's accounts to mend failed: {e:#}");
+            return;
+        }
+    };
+    for (source, author) in accounts {
+        if let Err(e) = owner_seen(o, &source, &author).await {
+            tracing::warn!("marking the owner's earlier {source} messages failed: {e:#}");
+        }
+    }
+}
+
 // ---------------------------------------------------------------- the retrospective's pass
 
 /// The most the digest's People section takes, so a busy day's other sections cannot push it
@@ -814,6 +942,17 @@ pub const DIGEST_SECTION_MAX: usize = 3000;
 /// (authors are listed while they fit, the instruction always comes last), and the names are
 /// framed as the third-party data they are.
 pub async fn digest_section(o: &Orchestrator, days: i64) -> Result<String> {
+    // Before the retrospective reads the records: none of them is the owner, and their dates are
+    // as current as the stored messages. Both best-effort; neither may cost the day's review.
+    mend_owner_accounts(o).await;
+    match o.db.acquire().await {
+        Ok(mut conn) => {
+            if let Err(e) = catch_up_last_interaction(&mut conn, None).await {
+                tracing::warn!("catching up when people were last in touch failed: {e:#}");
+            }
+        }
+        Err(e) => tracing::warn!("catching up when people were last in touch failed: {e:#}"),
+    }
     let records: i64 = sqlx::query_scalar("select count(*) from people")
         .fetch_one(&o.db)
         .await?;
@@ -870,7 +1009,12 @@ pub fn people_section(records: i64, lines: &[String], max_writes: i64) -> String
         "After your review, keep these records with `fleet agent retro person` (at most \
          {max_writes} writes this run): create or update the people above and anyone the \
          material or your memory (`fleet agent memory recall`) tells you about, recording only \
-         what the material supports. Never message anyone about it.\n"
+         what the material supports. Read what each of them wrote (`fleet agent feed search` \
+         with their name, `fleet agent feed read`) for their position, what they work on, their \
+         projects, the language they write in and how they like to work: a record of a name \
+         alone helps nobody, so prefer fewer, fuller records. A message marked `from_owner` is \
+         the owner's own words, never material about the person they answer. Never message \
+         anyone about it.\n"
     );
     let mut s = head;
     if lines.is_empty() {
@@ -990,6 +1134,9 @@ pub async fn retro_write(o: &Orchestrator, run: i64, args: &Value) -> Result<Str
     // so a retrospective repeating itself cannot write without end.
     if created || !changed.is_empty() {
         save(&mut tx, &p, "retro").await?;
+    }
+    if was != is {
+        catch_up_last_interaction(&mut tx, Some(p.id)).await?;
     }
     sqlx::query(
         "insert into audit_log (actor, action, detail) values ('retro', 'person.upsert', $1)",
@@ -1429,6 +1576,9 @@ pub async fn owner_edit(o: &Orchestrator, id: i64, body: &Value) -> Result<Strin
         changed.push("contacts");
     }
     save(&mut tx, &p, "owner").await?;
+    if was != is {
+        catch_up_last_interaction(&mut tx, Some(id)).await?;
+    }
     let mut fields = p.owner_fields.clone();
     for f in changed.iter().filter(|f| **f != "last_interaction") {
         if !fields.iter().any(|x| x == f) {
@@ -1972,7 +2122,7 @@ mod tests {
         assert!(s.contains("## People") && s.contains("4 people record(s) exist"));
         assert!(s.contains("more.\n"), "what did not fit is counted");
         assert!(s.ends_with(
-            "recording only what the material supports. Never message anyone about it.\n"
+            "never material about the person they answer. Never message anyone about it.\n"
         ));
         assert!(s.contains("at most 30 writes this run"));
         assert!(people_section(0, &[], 5).contains("Nobody did."));

@@ -1,4 +1,4 @@
-log
+# Changelog
 
 Every merge to `main` is a release (CI tags it with the next patch version and publishes it; the
 VPS rolls it out), except one that changes only docs, which waits for the next. Each section
@@ -6,6 +6,24 @@ below is one release. How to add to this file is in `CLAUDE.md`
 (*Conventions*). Newest first.
 
 ## Unreleased
+
+- **People records get filled in.** The retrospective now reads every conversation, not only
+  those mapped to its own project (none), so it writes position, brief, language and
+  observations from what colleagues wrote instead of names alone.
+- **The owner is never taken for a colleague.** Messages stored before v0.2.6 carry no "this is
+  the owner's" mark, so the first retrospective recorded the owner's own Google Chat account as
+  a person. Once a message of the owner's is flagged on an account, that account's older
+  messages are marked as the owner's, and the account is taken off the records (a record made of
+  it alone is deleted, never one the owner edited). This runs on that first flagged message and
+  again before every retrospective, so a failure is retried. Audited per person as
+  `person.owner_account`, with a deleted record's contents. The retrospective also sees which
+  messages are the owner's own (`from_owner` in what it reads) and never takes them as material
+  about the person they answer.
+- A record's **last interaction** is taken from the messages already stored, both when a contact
+  is added and before each retrospective, instead of staying empty until the person writes again.
+- Migration `0026_feed_messages_author` (an index, add-only).
+
+## v0.2.9 — 2026-11-21
 
 - **Docs-only changes make no release.** A push or merge that changes only Markdown files and
   `docs/` runs no CI, so nothing is tagged or rolled out to the nodes; it ships with the next
