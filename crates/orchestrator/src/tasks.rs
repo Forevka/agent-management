@@ -1751,6 +1751,226 @@ pub async fn stop(o: &Orchestrator, task: &TaskRow, graceful: bool) -> Result<()
     stop_run(o, &task, graceful)
 }
 
+/// What the owner changes about a task on the web. `None` leaves a field as it is; an empty model
+/// or effort goes back to the agent's default, as it does for an agent's own settings.
+#[derive(Debug, Default)]
+pub struct TaskEdit {
+    pub title: Option<String>,
+    pub brief: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
+/// What [`owner_edit`] did.
+pub struct Edited {
+    pub task: TaskRow,
+    /// The fields that really changed, by name.
+    pub changed: Vec<&'static str>,
+    /// Where the new brief went, when the agent had to be told (its session already read the
+    /// old one); `None` when the next fresh session reads it anyway.
+    pub brief_sent: Option<Delivered>,
+}
+
+/// The one task the owner names from the web: any of the fleet's work, never one of its own
+/// standing sessions (the brain, the secretary, the retrospective), which have their own resets.
+async fn owner_task(o: &Orchestrator, id: &str) -> Result<TaskRow> {
+    let task = o.task(id).await?.with_context(|| format!("no task {id}"))?;
+    ensure!(
+        !crate::model::is_builtin_task(&task.id),
+        "{} is one of the fleet's own sessions, not a task to change from here",
+        task.id
+    );
+    Ok(task)
+}
+
+/// The owner edits a task's title, brief, model or effort.
+///
+/// The model and effort are read at every dispatch, so they apply from the task's next run; the
+/// run going now keeps what it started with. The brief is read only by a fresh session (see
+/// `dispatch_locked`): a task whose session already started is told of the new one as the owner's
+/// message, and a finished task with a session is refused a new brief, because telling it would
+/// resume work the owner ended — a message does that on purpose. The title is the record's, and
+/// the topic is renamed to match.
+pub async fn owner_edit(o: &Arc<Orchestrator>, id: &str, edit: TaskEdit) -> Result<Edited> {
+    let title = edit.title.as_deref().map(str::trim);
+    ensure!(title != Some(""), "a task needs a title");
+    let brief = edit.brief.as_deref().map(str::trim);
+    ensure!(brief != Some(""), "a task needs a brief");
+    // Checked exactly as at creation: any valid value, since the brain's allow-list is the
+    // brain's and this is the owner's own hand.
+    let (model, effort) =
+        crate::admin::agent_settings_values(edit.model.as_deref(), edit.effort.as_deref())?;
+    let id = owner_task(o, id).await?.id;
+    let (before, task) = {
+        // Under the task's lock and on a fresh copy, like every other change to a task: a run
+        // being claimed meanwhile must see either the old fields or the new, never half.
+        let lock = o.task_lock(&id);
+        let _held = lock.lock().await;
+        let before = o.task(&id).await?.context("task vanished")?;
+        let title = title.filter(|t| *t != before.title);
+        let brief = brief.filter(|b| *b != before.brief.trim());
+        let model = model.filter(|m| *m != before.model);
+        let effort = effort.filter(|e| *e != before.effort);
+        ensure!(
+            title.is_some() || brief.is_some() || model.is_some() || effort.is_some(),
+            "nothing changed"
+        );
+        let finished = matches!(
+            before.status.as_str(),
+            status::DONE | status::STOPPED | status::FAILED
+        );
+        ensure!(
+            brief.is_none() || !finished || before.session_id.is_none(),
+            "{} is {} and its agent has already read its brief; send it a message instead, \
+             which resumes it",
+            before.key(),
+            before.status
+        );
+        sqlx::query(
+            "update tasks set title = coalesce($2, title), brief = coalesce($3, brief),
+                    model = case when $4 then $5 else model end,
+                    effort = case when $6 then $7 else effort end,
+                    updated_at = now()
+             where id = $1",
+        )
+        .bind(&id)
+        .bind(title)
+        .bind(brief)
+        .bind(model.is_some())
+        .bind(model.clone().flatten())
+        .bind(effort.is_some())
+        .bind(effort.clone().flatten())
+        .execute(&o.db)
+        .await?;
+        (before, o.task(&id).await?.context("task vanished")?)
+    };
+    let mut changed = Vec::new();
+    if task.title != before.title {
+        changed.push("title");
+    }
+    if task.brief != before.brief {
+        changed.push("brief");
+    }
+    if task.model != before.model {
+        changed.push("model");
+    }
+    if task.effort != before.effort {
+        changed.push("effort");
+    }
+    // What changed, not the brief's text: it is the owner's prose and may quote anything.
+    o.audit(
+        crate::admin::Actor::Owner.audit_name(),
+        "task.edit",
+        json!({
+            "task": task.id,
+            "changed": changed,
+            "title": changed.contains(&"title").then_some(&task.title),
+            "model": changed.contains(&"model").then_some(&task.model),
+            "effort": changed.contains(&"effort").then_some(&task.effort),
+        }),
+    )
+    .await;
+    if let (true, Some(topic)) = (changed.contains(&"title"), task.topic_id)
+        && let Err(e) = o
+            .chat
+            .rename_topic(topic, &topic_name(&task.id, &task.title))
+            .await
+    {
+        tracing::info!("renaming {}'s topic failed: {e:#}", task.id);
+    }
+    if task.topic_id.is_some() {
+        let note = format!(
+            "✏️ You changed this task's {} on the web.{}",
+            changed.join(", "),
+            if changed.contains(&"model") || changed.contains(&"effort") {
+                " The model and effort apply from its next run."
+            } else {
+                ""
+            }
+        );
+        o.chat
+            .send(
+                From::Orchestrator,
+                task.topic_id,
+                &esc(&note),
+                vec![],
+                None,
+                Notify::Silent,
+            )
+            .await
+            .ok();
+    }
+    // A session that already began (or a first run already given the old brief) has to be told;
+    // one that has not starts from the new brief by itself.
+    let brief_sent = if changed.contains(&"brief") && (task.session_id.is_some() || task.running) {
+        let text = format!(
+            "The owner updated this task's brief. Work to the new one from here on:\n\n{}",
+            task.brief
+        );
+        Some(
+            deliver_as(
+                o,
+                &task,
+                format!("[Message from the human] {text}"),
+                Origin::Owner(text),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    Ok(Edited {
+        task: o.task(&task.id).await?.unwrap_or(task),
+        changed,
+        brief_sent,
+    })
+}
+
+/// The owner stops a task from the web, as `/stop` in its topic does.
+pub async fn owner_stop(o: &Orchestrator, id: &str) -> Result<TaskRow> {
+    let task = owner_task(o, id).await?;
+    stop(o, &task, false).await?;
+    o.audit(
+        crate::admin::Actor::Owner.audit_name(),
+        "task.stop",
+        json!({"task": task.id}),
+    )
+    .await;
+    Ok(task)
+}
+
+/// The owner writes to a task from the web: delivered exactly as their message in its Telegram
+/// topic is (see `tg::owner_message`), and shown in that topic, so the conversation there still
+/// reads whole when the agent answers it.
+pub async fn owner_send(o: &Arc<Orchestrator>, id: &str, text: &str) -> Result<Delivered> {
+    let text = text.trim();
+    ensure!(!text.is_empty(), "write something to send");
+    let task = owner_task(o, id).await?;
+    let delivered = deliver_as(
+        o,
+        &task,
+        format!("[Message from the human] {text}"),
+        Origin::Owner(text.to_owned()),
+    )
+    .await?;
+    // Read again: a follow-up to a task whose topic was pruned gave it a new one.
+    let topic = o.task(&task.id).await?.and_then(|t| t.topic_id);
+    if topic.is_some() {
+        o.chat
+            .send(
+                From::Orchestrator,
+                topic,
+                &format!("💬 <i>You, on the web:</i>\n{}", esc(&clip(text, 3000))),
+                vec![],
+                None,
+                Notify::Silent,
+            )
+            .await
+            .ok();
+    }
+    Ok(delivered)
+}
+
 /// Starts one of the fleet's own sessions (brain, secretary) afresh: forgets its session and
 /// stops its run, in one step under the task's lock, so neither a message in between nor the
 /// stopped run reporting its session late brings the old session back. Its next text starts a

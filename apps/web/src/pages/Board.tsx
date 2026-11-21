@@ -3,7 +3,7 @@ import { Link, useSearchParams } from 'react-router-dom'
 import { SegmentedControl } from '@/components/ui/segmented-control'
 import { Board, BoardCard, BoardColumn, BoardDot } from '@/components/fx/board'
 import type { BoardTone } from '@/components/fx/board'
-import { Page, PageHeader, Stack, Text } from '@/components/fx/layout'
+import { Page, PageHeader, Row, Stack, Text } from '@/components/fx/layout'
 import { Table } from '@/components/fx/table'
 import {
   BoardIcon,
@@ -270,9 +270,15 @@ function BoardList({ tasks }: { tasks: BoardTask[] }) {
               <Link to={`/tasks/${t.id}`} className="fx-link">
                 {t.title || t.id}
               </Link>
-              <Text size="1" tone="muted" mono>
-                {t.key} · {t.id}
-              </Text>
+              <Row gap="2">
+                <Text size="1" tone="muted" mono>
+                  {t.key} · {t.id}
+                </Text>
+                {/* Straight to the task page's edit form, which is part of its URL. */}
+                <Link to={`/tasks/${t.id}?edit=1`} className="fx-link" data-muted="">
+                  <Text size="1">Edit</Text>
+                </Link>
+              </Row>
             </Stack>
           ),
         },

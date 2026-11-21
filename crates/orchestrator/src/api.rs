@@ -7,7 +7,7 @@
 //!   things the browser must never see (`nodes.auth_secret` is the sharp one), so every
 //!   response is built field by field. A new column is then invisible until someone adds it
 //!   here on purpose.
-//! - **No new authority.** Every mutation goes through the same `admin`, `human` and
+//! - **No new authority.** Every mutation goes through the same `admin`, `human`, `tasks` and
 //!   `secretary` entry points the Telegram side uses, with `Actor::Owner`. This module parses
 //!   and validates; it never decides.
 //!
@@ -45,7 +45,7 @@ pub fn router() -> Router<O> {
         .route("/api/board", get(board))
         .route("/api/items/{id}", get(item).post(item_answer))
         .route("/api/tasks", get(tasks))
-        .route("/api/tasks/{id}", get(task))
+        .route("/api/tasks/{id}", get(task).post(task_act))
         .route("/api/tasks/{id}/events", get(task_events))
         .route("/api/tasks/{id}/links", post(task_link))
         .route("/api/tasks/{id}/attachments", post(task_attach))
@@ -568,6 +568,86 @@ async fn task(State(o): State<O>, h: HeaderMap, Path(id): Path<String>) -> Api {
         })).collect::<Vec<_>>(),
         "items": items.iter().map(item_json).collect::<Vec<_>>(),
     })))
+}
+
+/// Where a text handed to a task went, as the UI says it.
+fn delivered_json(d: crate::tasks::Delivered) -> &'static str {
+    match d {
+        crate::tasks::Delivered::ToRun => "to_run",
+        crate::tasks::Delivered::Queued => "queued",
+    }
+}
+
+/// The owner's own changes to a task: its fields, stopping it, and writing to it. Each one is a
+/// `tasks::owner_*` entry point, the same delivery and stop Telegram's topic and `/stop` use.
+async fn task_act(
+    State(o): State<O>,
+    h: HeaderMap,
+    Path(id): Path<String>,
+    Json(a): Json<Act>,
+) -> Api {
+    guard!(o, h, write);
+    match a.op.as_str() {
+        "edit" => {
+            // Absent or null: unchanged. Anything else must be a string (empty model or effort:
+            // back to the agent's default).
+            let field = |k: &str| -> Result<Option<String>> {
+                match &a.body[k] {
+                    Value::Null => Ok(None),
+                    Value::String(v) => Ok(Some(v.clone())),
+                    other => anyhow::bail!("{k} must be a string, not {other}"),
+                }
+            };
+            let e = crate::tasks::owner_edit(
+                &o,
+                &id,
+                crate::tasks::TaskEdit {
+                    title: field("title")?,
+                    brief: field("brief")?,
+                    model: field("model")?,
+                    effort: field("effort")?,
+                },
+            )
+            .await?;
+            let mut task = task_json(&e.task);
+            task["brief"] = json!(e.task.brief);
+            task["model"] = json!(e.task.model);
+            task["effort"] = json!(e.task.effort);
+            let mut done = String::from("Saved.");
+            if e.brief_sent.is_some() {
+                done.push_str(" The agent was sent the new brief.");
+            }
+            if e.changed.iter().any(|c| *c == "model" || *c == "effort") {
+                done.push_str(" The model and effort apply from the task's next run.");
+            }
+            Ok(Json(json!({
+                "task": task,
+                "changed": e.changed,
+                "brief_sent": e.brief_sent.map(delivered_json),
+                "done": done,
+            })))
+        }
+        "stop" => {
+            let t = crate::tasks::owner_stop(&o, &id).await?;
+            Ok(Json(json!({"done": format!("Stopping {}.", t.key())})))
+        }
+        "send" => {
+            let d = crate::tasks::owner_send(&o, &id, &need(&a.body, "text")?).await?;
+            Ok(Json(json!({
+                "delivered": delivered_json(d),
+                "done": match d {
+                    crate::tasks::Delivered::ToRun => "Sent to the agent.",
+                    crate::tasks::Delivered::Queued => {
+                        "Kept for the agent: no node can take the task right now."
+                    }
+                },
+            })))
+        }
+        other => Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("unknown operation {other:?}"),
+        )),
+    }
 }
 
 /// Attaches or removes one of a task's outside references. The owner's own hand: an agent does

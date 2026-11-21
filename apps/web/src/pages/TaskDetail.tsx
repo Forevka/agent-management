@@ -1,18 +1,279 @@
 import { useState } from 'react'
-import { Link, useParams } from 'react-router-dom'
+import { Link, useParams, useSearchParams } from 'react-router-dom'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { Card, CardContent } from '@/components/ui/card'
+import { Card, CardContent, CardHeader } from '@/components/ui/card'
 import { EmptyState } from '@/components/ui/empty-state'
 import { SegmentedControl } from '@/components/ui/segmented-control'
-import { Page, PageHeader, Row, Section, Stack, Text } from '@/components/fx/layout'
+import { Select } from '@/components/ui/select'
+import { TextArea } from '@/components/ui/text-area'
+import { TextField } from '@/components/ui/text-field'
+import { Grid, Page, PageHeader, Row, Section, Stack, Text } from '@/components/fx/layout'
 import { Facts, Table } from '@/components/fx/table'
-import { ArrowLeftIcon, CheckIcon } from '@/components/fx/icons'
+import { ArrowLeftIcon, CheckIcon, ExternalIcon } from '@/components/fx/icons'
 import { AttachForm, AttachmentList } from '@/components/fx/attachments'
 import { Note } from '@/components/fx/note'
-import { act } from '../api'
-import type { Events, Item, TaskDetail as Detail } from '../api'
-import { Duration, Loaded, Pre, StatusBadge, When, useApi } from '../ui'
+import * as api from '../api'
+import type { Agents, Events, Item, Task, TaskDetail as Detail, TaskLink } from '../api'
+import { ActionButton, Duration, ErrorNote, Loaded, Pre, StatusBadge, When, useApi } from '../ui'
+
+/// The fleet's own standing sessions. They are not work the owner edits, stops or writes to from
+/// here (the server refuses it too); they have their own resets in Telegram.
+const BUILTIN = ['brain', 'secretary', 'retro']
+
+/// Over, as far as the fleet is concerned: a message resumes it, an edit does not.
+const FINISHED = ['done', 'stopped', 'failed']
+
+const message = (e: unknown) => (e instanceof Error ? e.message : String(e))
+
+/// A link's URL, only when it is one a browser should open. The server only ever stores http(s)
+/// URLs, but a link is text someone else wrote, so the page checks again rather than trust it.
+const safeUrl = (url: string | null) => (url && /^https?:\/\//i.test(url) ? url : null)
+
+const LINK_KINDS: Record<string, string> = { jira: 'ticket', mr: 'merge request', pr: 'pull request', url: 'page' }
+
+/// The owner's edit of a task. The brief only reaches a session that has not started yet, so a
+/// finished task whose agent already read it cannot take a new one: a message is the way to
+/// resume it, and the form says so instead of offering a field that would be refused.
+function EditTask({ task, onSaved, onCancel }: { task: Task; onSaved: (done: string) => void; onCancel: () => void }) {
+  // The same lists the agents page offers: any effort level, and the model as free text with the
+  // fleet's suggestions (the owner is not held to the brain's allow-list).
+  const agents = useApi<Agents>('/api/agents')
+  const [effort, setEffort] = useState(task.effort ?? '')
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const briefLocked = FINISHED.includes(task.status) && task.session !== null
+
+  return (
+    <Card>
+      <CardHeader
+        title="Edit task"
+        description="The model and effort apply from its next run. A new brief is sent to its agent if its session has already started."
+      />
+      <CardContent>
+        <form
+          onSubmit={(e) => {
+            e.preventDefault()
+            const f = new FormData(e.currentTarget)
+            setSaving(true)
+            setError(null)
+            api
+              .act<{ done: string }>(`/api/tasks/${encodeURIComponent(task.id)}`, 'edit', {
+                title: f.get('title'),
+                ...(briefLocked ? {} : { brief: f.get('brief') }),
+                model: f.get('model'),
+                effort,
+              })
+              .then((r) => onSaved(r.done))
+              .catch((err) => setError(message(err)))
+              .finally(() => setSaving(false))
+          }}
+        >
+          <Stack gap="3">
+            <TextField name="title" label="Title" defaultValue={task.title} size="sm" required />
+            <TextArea
+              name="brief"
+              label="Brief"
+              defaultValue={task.brief ?? ''}
+              minRows={4}
+              maxRows={16}
+              disabled={briefLocked}
+              hint={
+                briefLocked
+                  ? `This task is ${task.status} and its agent has read the brief; send it a message instead, which resumes it.`
+                  : undefined
+              }
+            />
+            <Grid min={200} gap="3">
+              <div>
+                <TextField
+                  name="model"
+                  label="Model"
+                  size="sm"
+                  defaultValue={task.model ?? ''}
+                  placeholder="the agent’s model"
+                  list="task-models"
+                  hint="Empty: the agent’s own."
+                />
+                <datalist id="task-models">
+                  {(agents.data?.suggested_models ?? []).map((m) => (
+                    <option key={m} value={m} />
+                  ))}
+                </datalist>
+              </div>
+              <Select
+                label="Effort"
+                size="sm"
+                value={effort || 'default'}
+                onChange={(v) => setEffort(v === 'default' ? '' : v)}
+                options={[
+                  { value: 'default', label: 'the agent’s effort' },
+                  // The task's current value stays selectable while the list loads.
+                  ...Array.from(new Set([...(agents.data?.efforts ?? []), ...(task.effort ? [task.effort] : [])])).map(
+                    (e) => ({ value: e, label: e }),
+                  ),
+                ]}
+              />
+            </Grid>
+            {error && <ErrorNote>{error}</ErrorNote>}
+            <Row gap="2">
+              <Button type="submit" loading={saving}>
+                Save
+              </Button>
+              <Button type="button" variant="ghost" onClick={onCancel}>
+                Cancel
+              </Button>
+            </Row>
+          </Stack>
+        </form>
+      </CardContent>
+    </Card>
+  )
+}
+
+/// Writing to the task's agent, as a message in its Telegram topic does (it is shown there too).
+function MessageBox({ task, onSent }: { task: Task; onSent: () => void }) {
+  const [text, setText] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [done, setDone] = useState<string | null>(null)
+  const send = () => {
+    if (!text.trim()) return
+    setBusy(true)
+    setError(null)
+    setDone(null)
+    api
+      .act<{ done: string }>(`/api/tasks/${encodeURIComponent(task.id)}`, 'send', { text })
+      .then((r) => {
+        setText('')
+        setDone(r.done)
+        onSent()
+      })
+      .catch((err) => setError(message(err)))
+      .finally(() => setBusy(false))
+  }
+  return (
+    <Stack gap="2">
+      <TextArea
+        aria-label="Message to the agent"
+        placeholder={FINISHED.includes(task.status) ? 'A follow-up resumes the task…' : 'Write to the agent…'}
+        value={text}
+        minRows={2}
+        maxRows={10}
+        onChange={(e) => setText(e.currentTarget.value)}
+        onSubmitShortcut={() => send()}
+      />
+      <Row gap="2">
+        <Button size="sm" variant="secondary" onClick={send} loading={busy} disabled={!text.trim()}>
+          Send
+        </Button>
+        {done && (
+          <Text size="1" tone="success">
+            {done}
+          </Text>
+        )}
+      </Row>
+      {error && (
+        <Text size="1" tone="danger">
+          {error}
+        </Text>
+      )}
+    </Stack>
+  )
+}
+
+/// What the task is about elsewhere: a ticket, a merge request, a page. A link the fleet could
+/// resolve opens in a new tab; one it could not (a merge request number in a repository the
+/// orchestrator was never told about) is shown as the reference it is.
+function Links({ task, onChanged }: { task: Task; onChanged: () => void }) {
+  const links = task.links ?? []
+  const [ref, setRef] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const path = `/api/tasks/${encodeURIComponent(task.id)}/links`
+  const add = () => {
+    if (!ref.trim()) return
+    setBusy(true)
+    setError(null)
+    api
+      .act(path, 'add', { ref })
+      .then(() => {
+        setRef('')
+        onChanged()
+      })
+      .catch((err) => setError(message(err)))
+      .finally(() => setBusy(false))
+  }
+  return (
+    <Stack gap="3">
+      {links.length === 0 ? (
+        <Text size="1" tone="muted">
+          Nothing linked yet.
+        </Text>
+      ) : (
+        <Stack gap="2">
+          {links.map((l: TaskLink) => {
+            const url = safeUrl(l.url)
+            return (
+              <Row key={l.id} gap="2" justify="between">
+                <Row gap="2">
+                  <Badge>{LINK_KINDS[l.kind] ?? l.kind}</Badge>
+                  {url ? (
+                    <a href={url} target="_blank" rel="noopener noreferrer" className="fx-link fx-taskdetail__link">
+                      {l.ref} <ExternalIcon />
+                    </a>
+                  ) : (
+                    <Text size="2" mono breakAll>
+                      {l.ref}
+                    </Text>
+                  )}
+                  <Text size="1" tone="muted">
+                    by {l.added_by}
+                  </Text>
+                </Row>
+                <ActionButton
+                  path={path}
+                  op="remove"
+                  body={{ ref: l.ref }}
+                  variant="ghost"
+                  onDone={onChanged}
+                >
+                  Remove
+                </ActionButton>
+              </Row>
+            )
+          })}
+        </Stack>
+      )}
+      <form
+        onSubmit={(e) => {
+          e.preventDefault()
+          add()
+        }}
+      >
+        <Row gap="2" align="end">
+          <div style={{ flexGrow: 1, minWidth: '14rem' }}>
+            <TextField
+              size="sm"
+              aria-label="Link to add"
+              placeholder="BIOINS-12, !940, #482 or a URL"
+              value={ref}
+              onChange={(e) => setRef(e.currentTarget.value)}
+            />
+          </div>
+          <Button type="submit" size="sm" variant="secondary" loading={busy} disabled={!ref.trim()}>
+            Link
+          </Button>
+        </Row>
+      </form>
+      {error && (
+        <Text size="1" tone="danger">
+          {error}
+        </Text>
+      )}
+    </Stack>
+  )
+}
 
 /// Whether an item is still waiting for the owner. An item from an older build of the API may
 /// carry no state at all; it is then treated as settled rather than as a false alarm, because
@@ -72,6 +333,20 @@ export default function TaskDetail() {
   const events = useApi<Events>(`/api/tasks/${encodeURIComponent(id)}/events?limit=200`)
   const [tab, setTab] = useState<Tab>('sessions')
   const attachPath = `/api/tasks/${encodeURIComponent(id)}/attachments`
+  // The edit form is part of the URL (`?edit=1`), so the board can link straight to it.
+  const [params, setParams] = useSearchParams()
+  const editing = params.get('edit') === '1'
+  const setEditing = (on: boolean) => {
+    const next = new URLSearchParams(params)
+    if (on) next.set('edit', '1')
+    else next.delete('edit')
+    setParams(next, { replace: true })
+  }
+  const [saved, setSaved] = useState<string | null>(null)
+  const reload = () => {
+    void state.reload()
+    void events.reload()
+  }
 
   return (
     <Page>
@@ -90,7 +365,53 @@ export default function TaskDetail() {
                 </Link>
               }
               meta={<StatusBadge status={d.task.status} running={d.task.running} />}
+              action={
+                BUILTIN.includes(d.task.id) ? undefined : (
+                  <Row gap="2">
+                    {!editing && (
+                      <Button size="sm" variant="secondary" onClick={() => setEditing(true)}>
+                        Edit
+                      </Button>
+                    )}
+                    {/* A finished task has nothing to stop; a live run of one (a follow-up) does. */}
+                    {(d.task.running || !FINISHED.includes(d.task.status)) && (
+                      <ActionButton
+                        path={`/api/tasks/${encodeURIComponent(d.task.id)}`}
+                        op="stop"
+                        variant="destructive"
+                        confirm={`Stop ${d.task.key}? Its agent is stopped now; a message resumes the task later.`}
+                        onDone={(r) => {
+                          setSaved(typeof r.done === 'string' ? r.done : null)
+                          reload()
+                        }}
+                      >
+                        Stop
+                      </ActionButton>
+                    )}
+                  </Row>
+                )
+              }
             />
+
+            {saved && (
+              <Text size="1" tone="success" as="p">
+                {saved}
+              </Text>
+            )}
+
+            {editing && !BUILTIN.includes(d.task.id) && (
+              <EditTask
+                // Not keyed on the task's `updated_at`: the page polls, and an agent at work
+                // touches its task often enough to wipe a draft the owner is still writing.
+                task={d.task}
+                onCancel={() => setEditing(false)}
+                onSaved={(done) => {
+                  setSaved(done)
+                  setEditing(false)
+                  reload()
+                }}
+              />
+            )}
 
             <Card>
               <CardContent>
@@ -135,7 +456,7 @@ export default function TaskDetail() {
                         items={d.task.attachments ?? []}
                         onRemove={(a) => {
                           if (!window.confirm(`Remove ${a.ref} “${a.title}” from this task?`)) return
-                          void act(attachPath, 'remove', { id: a.id })
+                          void api.act(attachPath, 'remove', { id: a.id })
                             .then(() => void state.reload())
                             .catch((e: unknown) =>
                               window.alert(`Could not remove it: ${e instanceof Error ? e.message : String(e)}`),
@@ -152,6 +473,27 @@ export default function TaskDetail() {
                 </CardContent>
               </Card>
             </Section>
+
+            <Section title="Links" description="What this task is about outside the fleet.">
+              <Card>
+                <CardContent>
+                  <Links task={d.task} onChanged={reload} />
+                </CardContent>
+              </Card>
+            </Section>
+
+            {!BUILTIN.includes(d.task.id) && (
+              <Section
+                title="Message the agent"
+                description="Delivered as your message in the task’s Telegram topic is, and shown there."
+              >
+                <Card>
+                  <CardContent>
+                    <MessageBox task={d.task} onSent={reload} />
+                  </CardContent>
+                </Card>
+              </Section>
+            )}
 
             {/* Open items only: a task keeps its answered questions, and showing those under
                 "Waiting on you" told the owner they were holding up work they had already
@@ -305,6 +647,13 @@ export default function TaskDetail() {
 }
 
 const css = /* css */ `
+.fx-taskdetail__link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
 .fx-event {
   display: flex;
   flex-direction: column;

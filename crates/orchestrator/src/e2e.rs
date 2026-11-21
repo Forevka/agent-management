@@ -2226,6 +2226,17 @@ async fn api_get(o: &Arc<Orchestrator>, uri: &str) -> Value {
 
 /// A POST through the real router, with a fresh session, as the web UI's actions make it.
 async fn api_post(o: &Arc<Orchestrator>, uri: &str, body: Value) -> Value {
+    let (status, json) = api_post_status(o, uri, body).await;
+    assert_eq!(status, 200, "POST {uri}: {json}");
+    json
+}
+
+/// [`api_post`] for a request that may be refused: the status and the body, unchecked.
+async fn api_post_status(
+    o: &Arc<Orchestrator>,
+    uri: &str,
+    body: Value,
+) -> (axum::http::StatusCode, Value) {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
@@ -2251,8 +2262,7 @@ async fn api_post(o: &Arc<Orchestrator>, uri: &str, body: Value) -> Value {
     let status = res.status();
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
     let json: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-    assert_eq!(status, 200, "POST {uri}: {json}");
-    json
+    (status, json)
 }
 
 /// The JSON API the web UI is built on, driven through the real axum router so routing, the
@@ -2692,6 +2702,275 @@ async fn api_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool) {
 /// Waiting without a session (CLAUDE.md: new tool/flow needs e2e coverage): an agent asks the
 /// orchestrator to wake it, and is woken by the same delivery a follow-up uses. A condition in
 /// plain words goes to the brain, which writes the Rhai for it.
+/// How many times the task's agent has answered a message starting with `prefix` (the fake
+/// echoes each one).
+async fn task_heard(db: &sqlx::PgPool, task: &str, prefix: &str) -> usize {
+    let echo = format!("got: {prefix}");
+    events(db, task)
+        .await
+        .iter()
+        .filter(|e| {
+            e["type"] == "assistant"
+                && e["message"]["content"][0]["text"]
+                    .as_str()
+                    .is_some_and(|t| t.starts_with(&echo))
+        })
+        .count()
+}
+
+/// The owner's hand on a task from the web: editing its fields, stopping it, writing to it and
+/// linking it, all through the real router and the same `tasks` entry points Telegram's topic and
+/// `/stop` use.
+async fn task_edit_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) {
+    let task = tasks::create_task(
+        o,
+        CreateTask {
+            project: "demo".into(),
+            title: "Oil the hinges".into(),
+            brief: "Oil them.".into(),
+            ticket: Some("TE-1".into()),
+            agent: Some("Alice".into()),
+            new_agent: None,
+            model: None,
+            effort: None,
+        },
+    )
+    .await
+    .unwrap();
+    let id = task.id.clone();
+    let uri = format!("/api/tasks/{id}");
+    let inits = || async {
+        events(db, &id)
+            .await
+            .into_iter()
+            .filter(|e| e["subtype"] == "init")
+            .collect::<Vec<_>>()
+    };
+    wait_for(&format!("{id} starts"), || async {
+        (!inits().await.is_empty()).then_some(())
+    })
+    .await;
+    let started = wait_for("its session is known", || async {
+        o.task(&id)
+            .await
+            .unwrap()
+            .filter(|t| t.session_id.is_some())
+    })
+    .await;
+    let topic = started.topic_id.expect("a task has a topic");
+
+    // Model and effort are checked exactly as at creation: any valid value (the brain's
+    // allow-list is the brain's), and nothing that is not one.
+    for (body, why) in [
+        (json!({"model": "--dangerously"}), "is not a model name"),
+        (json!({"effort": "turbo"}), "is not one of"),
+        (json!({"title": "Oil the hinges"}), "nothing changed"),
+        (json!({"title": "   "}), "a task needs a title"),
+    ] {
+        let (status, r) = api_post_status(o, &uri, json!({"op": "edit", "body": body})).await;
+        assert_eq!(status, 400, "{body} must be refused: {r}");
+        assert!(
+            r["error"].as_str().unwrap_or_default().contains(why),
+            "{body}: {r}"
+        );
+    }
+    let r = api_post(
+        o,
+        &uri,
+        json!({"op": "edit", "body": {
+            "title": "Oil the door hinges", "model": "claude-sonnet-4-5", "effort": "max",
+        }}),
+    )
+    .await;
+    assert_eq!(r["changed"], json!(["title", "model", "effort"]), "{r}");
+    assert!(r["brief_sent"].is_null(), "the brief did not change: {r}");
+    assert!(
+        r["done"].as_str().unwrap_or_default().contains("next run"),
+        "the owner is told when a model applies: {r}"
+    );
+    assert_eq!(r["task"]["title"], "Oil the door hinges", "{r}");
+    let t = o.task(&id).await.unwrap().unwrap();
+    assert_eq!(
+        (t.title.as_str(), t.model.as_deref(), t.effort.as_deref()),
+        (
+            "Oil the door hinges",
+            Some("claude-sonnet-4-5"),
+            Some("max")
+        )
+    );
+    let audit: Value = sqlx::query_scalar(
+        "select detail from audit_log where actor = 'owner' and action = 'task.edit'
+         and detail->>'task' = $1 order by id desc limit 1",
+    )
+    .bind(&id)
+    .fetch_one(db)
+    .await
+    .unwrap();
+    assert_eq!(
+        audit["changed"],
+        json!(["title", "model", "effort"]),
+        "{audit}"
+    );
+    assert_eq!(audit["model"], "claude-sonnet-4-5", "{audit}");
+    assert!(
+        chat.ops
+            .lock()
+            .unwrap()
+            .contains(&Op::Rename(topic, format!("{id} · Oil the door hinges"))),
+        "the topic is renamed with the task"
+    );
+
+    // Stop, as `/stop` in the topic does.
+    let r = api_post(o, &uri, json!({"op": "stop"})).await;
+    assert!(
+        r["done"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("Stopping"),
+        "{r}"
+    );
+    let stopped = wait_for("the run stops", || async {
+        o.task(&id).await.unwrap().filter(|t| !t.running)
+    })
+    .await;
+    assert_eq!(stopped.status, "stopped");
+    // Its agent read the brief already, and telling it of a new one would undo the stop.
+    let (status, r) = api_post_status(
+        o,
+        &uri,
+        json!({"op": "edit", "body": {"brief": "Oil them twice."}}),
+    )
+    .await;
+    assert_eq!(status, 400, "{r}");
+    assert!(
+        r["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("send it a message instead"),
+        "{r}"
+    );
+
+    // A message resumes it, exactly as the owner's message in its topic does — and the resumed
+    // run uses the model and effort the owner set, the run it replaced did not.
+    let r = api_post(
+        o,
+        &uri,
+        json!({"op": "send", "body": {"text": "any news on the hinges?"}}),
+    )
+    .await;
+    assert_eq!(r["delivered"], "to_run", "{r}");
+    wait_for("the agent hears the owner", || async {
+        (task_heard(db, &id, "[Message from the human] any news on the hinges?").await > 0)
+            .then_some(())
+    })
+    .await;
+    assert!(
+        chat.sent().iter().any(|(_, t, h, _)| *t == Some(topic)
+            && h.contains("on the web")
+            && h.contains("any news on the hinges?")),
+        "the topic shows what the owner wrote, so the agent's answer there reads in order"
+    );
+    let resumed = wait_for("the resumed run starts", || async {
+        let all = inits().await;
+        (all.len() == 2).then(|| all[1].clone())
+    })
+    .await;
+    assert_eq!(
+        resumed["models"].as_array().unwrap().last().unwrap(),
+        "claude-sonnet-4-5",
+        "{resumed}"
+    );
+    assert_eq!(resumed["effort"], "max", "{resumed}");
+
+    // A new brief for a task whose session already began is sent to it, as the owner's message.
+    let r = api_post(
+        o,
+        &uri,
+        json!({"op": "edit", "body": {"brief": "Oil them twice, then wipe."}}),
+    )
+    .await;
+    assert_eq!(r["changed"], json!(["brief"]), "{r}");
+    assert!(r["brief_sent"].is_string(), "{r}");
+    wait_for("the agent hears of the new brief", || async {
+        (task_heard(
+            db,
+            &id,
+            "[Message from the human] The owner updated this task's brief",
+        )
+        .await
+            > 0)
+        .then_some(())
+    })
+    .await;
+    assert_eq!(
+        o.task(&id).await.unwrap().unwrap().brief,
+        "Oil them twice, then wipe."
+    );
+
+    // The fleet's own sessions are not edited, stopped or written to from here.
+    for body in [
+        json!({"op": "edit", "body": {"title": "x"}}),
+        json!({"op": "stop"}),
+        json!({"op": "send", "body": {"text": "x"}}),
+    ] {
+        let (status, r) = api_post_status(o, "/api/tasks/brain", body.clone()).await;
+        assert_eq!(status, 400, "{body}: {r}");
+        assert!(
+            r["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("the fleet's own sessions"),
+            "{body}: {r}"
+        );
+    }
+    let (status, r) = api_post_status(o, &uri, json!({"op": "rename"})).await;
+    assert_eq!(status, 400, "{r}");
+
+    // Links, through the route the task page uses: a URL opens, a merge request number stays a
+    // reference, and a link taken back is gone.
+    let links = format!("{uri}/links");
+    let r = api_post(o, &links, json!({"op": "add", "body": {"ref": "!77"}})).await;
+    assert_eq!(r["link"]["kind"], "mr", "{r}");
+    assert!(r["link"]["url"].is_null(), "{r}");
+    let r = api_post(
+        o,
+        &links,
+        json!({"op": "add", "body": {"ref": "https://example.test/hinges"}}),
+    )
+    .await;
+    assert_eq!(r["link"]["url"], "https://example.test/hinges", "{r}");
+    let shown = api_get(o, &uri).await;
+    let refs: Vec<&str> = shown["task"]["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|l| l["ref"].as_str())
+        .collect();
+    assert!(
+        refs.contains(&"TE-1")
+            && refs.contains(&"!77")
+            && refs.contains(&"https://example.test/hinges"),
+        "{refs:?}"
+    );
+    let r = api_post(o, &links, json!({"op": "remove", "body": {"ref": "!77"}})).await;
+    assert_eq!(r["removed"], true, "{r}");
+    let shown = api_get(o, &uri).await;
+    assert!(
+        !shown["task"]["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l["ref"] == "!77"),
+        "{shown}"
+    );
+
+    api_post(o, &uri, json!({"op": "stop"})).await;
+    wait_for("the run stops again", || async {
+        o.task(&id).await.unwrap().filter(|t| !t.running)
+    })
+    .await;
+}
+
 async fn wakeup_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool) {
     let worker = o.task("demo-BS-1").await.unwrap().unwrap();
     let agent = worker.agent_id.clone().unwrap();
@@ -9580,6 +9859,9 @@ async fn lifecycle() {
     // 21. The JSON API the web UI runs on, including the session history the UI now shows.
     //     Last, so it reads a fleet that has really done work.
     Box::pin(api_flow(&o, &db)).await;
+
+    // 21a. The owner edits, stops, writes to and links a task from the web.
+    Box::pin(task_edit_flow(&o, &db, &chat)).await;
 
     // 21b. The kit: imported from a node, installed there without touching the owner's own
     //      items, the exact MCP allowlist of a worker's session, and the owner's alone. On node

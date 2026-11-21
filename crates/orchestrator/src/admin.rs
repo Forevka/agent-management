@@ -223,7 +223,7 @@ pub enum AdminAction {
 }
 
 /// An agent setting as given (None: unchanged; empty: back to the default), checked.
-fn agent_settings_values(
+pub(crate) fn agent_settings_values(
     model: Option<&str>,
     effort: Option<&str>,
 ) -> Result<(Option<Option<String>>, Option<Option<String>>)> {
