@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { Card, CardContent, CardFooter, CardHeader } from '@/components/ui/card'
+import { Card, CardContent, CardFooter } from '@/components/ui/card'
 import { TextArea } from '@/components/ui/text-area'
 import { TextField } from '@/components/ui/text-field'
 import { Page, PageHeader, Row, Section, Stack, Text } from '@/components/fx/layout'
@@ -182,16 +182,15 @@ function SkillEditor({ item, onSaved }: { item: KitItemDetail; onSaved: () => vo
 }
 
 function McpEditor({ item, onSaved }: { item: KitItemDetail; onSaved: () => void }) {
-  const [text, setText] = useState(JSON.stringify(item.spec, null, 2))
+  const [text, setText] = useState(JSON.stringify(item.config ?? {}, null, 2))
   const { busy, error, done, save } = useSave(onSaved)
-  useEffect(() => setText(JSON.stringify(item.spec, null, 2)), [item])
+  useEffect(() => setText(JSON.stringify(item.config ?? {}, null, 2)), [item])
   return (
     <Section
       title="Config"
-      description="As Claude Code takes it: command, args and env, or type, url and headers. A ${secret:NAME} placeholder stands for a value in the vault; a new value typed here moves into the vault when you save."
+      description="As Claude Code takes it: command, args and env, or type, url and headers. Shown masked: a value you leave reading [masked] keeps the one in the vault; type over it to replace it. The whole config is sealed again when you save."
     >
       <Card>
-        <CardHeader title="Secrets" description="Set or replace a value on the kit page, under Secrets. Values are never shown." />
         <CardContent>
           <Stack gap="3">
             <TextArea

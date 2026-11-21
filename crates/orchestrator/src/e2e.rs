@@ -6375,14 +6375,6 @@ async fn kit_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, node_id: &str, cfg: 
         SOURCE_PASS,
     ];
 
-    // The owner's own secret folder that happens to be called `kit`: never the kit's.
-    let owners_kit: i64 = sqlx::query_scalar(
-        "insert into secret_folders (name, preset) values ('kit', 'custom') returning id",
-    )
-    .fetch_one(db)
-    .await
-    .unwrap();
-
     // 1. What the node has: a skill, user-scope MCP servers holding secrets, plugins; and the
     //    account's own state in .claude.json, which must never be read.
     std::fs::create_dir_all(cfg.join("skills/seeded/ref")).unwrap();
@@ -6443,7 +6435,7 @@ async fn kit_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, node_id: &str, cfg: 
     assert_eq!(got["skills"][0]["name"], "seeded", "{got:#}");
     assert_eq!(
         got["plugins"],
-        json!([{"name": "tool@market", "in_kit": false, "marketplace_source": "o/market", "importable": true}])
+        json!([{"name": "tool@market", "in_kit": false, "marketplace_source": "o/market"}])
     );
     assert!(
         got["skipped"]
@@ -6456,7 +6448,8 @@ async fn kit_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, node_id: &str, cfg: 
     assert_eq!(got["mcp"][0]["name"], "demo-mcp");
     assert_eq!(
         got["mcp"][0]["config"]["env"]["DEMO_TOKEN"],
-        "${secret:DEMO_MCP_DEMO_TOKEN}"
+        fleet_proto::kit::MASK,
+        "shown masked"
     );
     let capture = got["capture"].as_str().unwrap().to_owned();
     api_post(
@@ -6467,18 +6460,36 @@ async fn kit_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, node_id: &str, cfg: 
         }}),
     )
     .await;
-    // Postgres holds placeholders; the values are in the vault and nowhere else.
-    let spec: String = sqlx::query_scalar(
-        "select spec::text from kit_items where kind = 'mcp' and name = 'demo-mcp'",
-    )
-    .fetch_one(db)
-    .await
-    .unwrap();
-    assert!(spec.contains("${secret:DEMO_MCP_DEMO_TOKEN}"), "{spec}");
+    // Postgres holds a summary only; the config is sealed whole.
+    let stored: Vec<(String, sqlx::types::Json<Value>, Vec<u8>)> =
+        sqlx::query_as("select name, spec, config from kit_items where kind = 'mcp' order by name")
+            .fetch_all(db)
+            .await
+            .unwrap();
+    assert_eq!(
+        stored[0].1.0,
+        json!({"type": "stdio", "command": "demo-server"})
+    );
+    assert_eq!(
+        stored[1].1.0,
+        json!({"type": "http", "endpoint": "https://mcp.example"})
+    );
+    let opened: Value = serde_json::from_str(&o.vault.decrypt(&stored[0].2).unwrap()).unwrap();
+    assert_eq!(opened, demo_config, "the vault holds the config exactly");
     let nothing_raw = |when: &'static str| async move {
+        // What the owner's browser sees: the page, and each MCP server's editor.
+        let mut seen = api_get(o, "/api/kit").await.to_string();
+        let ids: Vec<i64> = sqlx::query_scalar("select id from kit_items where kind = 'mcp'")
+            .fetch_all(db)
+            .await
+            .unwrap();
+        for id in ids {
+            seen.push_str(&api_get(o, &format!("/api/kit/{id}")).await.to_string());
+        }
         for raw in raws {
+            assert!(!seen.contains(raw), "{raw} reached the page ({when})");
             let leaks: i64 = sqlx::query_scalar(
-                "select (select count(*) from kit_items where spec::text like $1 or coalesce(files::text, '') like $1)
+                "select (select count(*) from kit_items where spec::text like $1 or coalesce(files::text, '') like $1 or encode(coalesce(config, ''), 'escape') like $1)
                       + (select count(*) from audit_log where detail::text like $1)
                       + (select count(*) from node_kit where detail like $1)
                       + (select count(*) from nodes where kit_note like $1)",
@@ -6491,38 +6502,6 @@ async fn kit_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, node_id: &str, cfg: 
         }
     };
     nothing_raw("after the import").await;
-    let vaulted: Vec<(String, Vec<u8>)> = sqlx::query_as(
-        "select i.key, i.value from secret_items i join secret_folders f on f.id = i.folder_id
-         where f.preset = 'kit'",
-    )
-    .fetch_all(db)
-    .await
-    .unwrap();
-    let vaulted: std::collections::HashMap<String, String> = vaulted
-        .into_iter()
-        .map(|(k, v)| (k, o.vault.decrypt(&v).unwrap()))
-        .collect();
-    for raw in [SECRET, DOCKER, QUERY] {
-        assert!(
-            vaulted.values().any(|v| v == raw),
-            "{raw} not in the vault: {vaulted:?}"
-        );
-    }
-    for userinfo in [format!("dbuser:{DSN_PASS}"), format!("bot:{URL_PASS}")] {
-        assert!(
-            vaulted.values().any(|v| *v == userinfo),
-            "{userinfo} not in the vault"
-        );
-    }
-    let owners: i64 = sqlx::query_scalar("select count(*) from secret_items where folder_id = $1")
-        .bind(owners_kit)
-        .fetch_one(db)
-        .await
-        .unwrap();
-    assert_eq!(
-        owners, 0,
-        "the owner's own folder named `kit` is not the kit's"
-    );
     // A capture is imported from once; its raw values are gone after that.
     assert!(
         crate::kit::import(o, Actor::Owner, &capture, &Default::default())
@@ -6647,12 +6626,7 @@ async fn kit_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, node_id: &str, cfg: 
     );
     // The kit reaches the node again (any change, and every connect, sends it): nothing the CLI
     // stored is taken for a change, so nothing is removed and added again.
-    api_post(
-        o,
-        "/api/kit",
-        json!({"op": "secret_set", "body": {"key": "UNUSED", "value": "  kept as typed \r\n"}}),
-    )
-    .await;
+    crate::kit::push_all(o).await.unwrap();
     settled().await;
     let calls = std::fs::read_to_string(cfg.join("fake-cli.log")).unwrap();
     assert_eq!(
@@ -6663,18 +6637,6 @@ async fn kit_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, node_id: &str, cfg: 
         "no remove-and-add loop: {calls}"
     );
     assert!(!calls.contains(r#"["mcp", "remove""#), "{calls}");
-    let unused: Vec<u8> = sqlx::query_scalar(
-        "select i.value from secret_items i join secret_folders f on f.id = i.folder_id
-         where f.preset = 'kit' and i.key = 'UNUSED'",
-    )
-    .fetch_one(db)
-    .await
-    .unwrap();
-    assert_eq!(
-        o.vault.decrypt(&unused).unwrap(),
-        "  kept as typed \r\n",
-        "a kit secret is stored verbatim"
-    );
 
     // 5. A worker's session gets exactly the fleet's server and the kit's, secrets resolved, in
     //    a per-run file outside the project that goes with the run; the transcript never shows
@@ -6862,8 +6824,40 @@ async fn kit_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, node_id: &str, cfg: 
     );
     nothing_raw("at the end").await;
 
-    // 7. The kit is the owner's alone: the brain can neither change it nor propose a change, and
-    //    cannot reach its secrets through the secret folders either.
+    // 6b. The owner edits a server in its masked view: a value left masked keeps its secret, a
+    //     changed one is taken, and a masked view is never saved over a secret by accident.
+    let demo_id = id_of("mcp", "demo-mcp").await;
+    let view = api_get(o, &format!("/api/kit/{demo_id}")).await;
+    let mut edited = view["config"].clone();
+    edited["args"][0] = json!("--y");
+    api_post(
+        o,
+        "/api/kit",
+        json!({"op": "mcp_save", "body": {"name": "demo-mcp", "config": edited.to_string()}}),
+    )
+    .await;
+    let sealed: Vec<u8> =
+        sqlx::query_scalar("select config from kit_items where kind = 'mcp' and name = 'demo-mcp'")
+            .fetch_one(db)
+            .await
+            .unwrap();
+    let saved: Value = serde_json::from_str(&o.vault.decrypt(&sealed).unwrap()).unwrap();
+    let mut expected_config = demo_config.clone();
+    expected_config["args"][0] = json!("--y");
+    assert_eq!(
+        saved, expected_config,
+        "the masked values kept their secrets"
+    );
+    let mut stray = view["config"].clone();
+    stray["env"]["NEW"] = json!(fleet_proto::kit::MASK);
+    assert!(
+        crate::kit::save_mcp(o, Actor::Owner, "demo-mcp", stray)
+            .await
+            .is_err()
+    );
+    nothing_raw("after the edit").await;
+
+    // 7. The kit is the owner's alone: the brain can neither change it nor propose a change.
     let demo = id_of("mcp", "demo-mcp").await;
     assert!(
         crate::kit::set_enabled(o, Actor::Brain, demo, true)
@@ -6875,23 +6869,10 @@ async fn kit_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, node_id: &str, cfg: 
             .await
             .is_err()
     );
-    assert!(
-        crate::kit::set_secret(o, Actor::Brain, "X", "y")
-            .await
-            .is_err()
-    );
     assert!(crate::kit::delete(o, Actor::Brain, demo).await.is_err());
-    let kit_folder: String =
-        sqlx::query_scalar("select name from secret_folders where preset = 'kit'")
-            .fetch_one(db)
-            .await
-            .unwrap();
-    assert_ne!(kit_folder, "kit", "the owner's folder kept its name");
     for proposal in [
         json!({"action": "kit_disable", "params": {"id": demo}}),
-        json!({"action": "project_bind_folder", "params": {"project": "demo", "folder": kit_folder}}),
-        json!({"action": "secret_unset", "params": {"folder": kit_folder, "key": "UNUSED"}}),
-        json!({"action": "folder_delete", "params": {"folder": kit_folder}}),
+        json!({"action": "kit_delete", "params": {"id": demo}}),
     ] {
         let proposed = call_as(
             o,
@@ -6909,18 +6890,14 @@ async fn kit_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, node_id: &str, cfg: 
             "{proposal}: {proposed:?}"
         );
     }
-    let (enabled, evil, bound): (bool, i64, i64) = sqlx::query_as(
-        "select (select enabled from kit_items where id = $1), (select count(*) from kit_items where name = 'evil'),
-                (select count(*) from project_secrets p join secret_folders f on f.id = p.folder_id where f.preset = 'kit')",
+    let (enabled, evil): (bool, i64) = sqlx::query_as(
+        "select (select enabled from kit_items where id = $1), (select count(*) from kit_items where name = 'evil')",
     )
     .bind(demo)
     .fetch_one(db)
     .await
     .unwrap();
-    assert!(
-        !enabled && evil == 0 && bound == 0,
-        "nothing the brain tried took effect"
-    );
+    assert!(!enabled && evil == 0, "nothing the brain tried took effect");
 }
 
 async fn events(db: &sqlx::PgPool, task: &str) -> Vec<Value> {

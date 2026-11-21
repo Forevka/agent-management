@@ -129,6 +129,9 @@ pub struct Node {
     /// The newest complete kit not yet applied, and whether an apply is under way: one at a
     /// time, and a kit that arrives meanwhile replaces any other still waiting.
     kit_queue: Mutex<(Option<(KitContent, u64)>, bool)>,
+    /// The last whole kit received, to apply again when the node learns something that changes
+    /// its status (its CLI cannot enforce the allowlist).
+    kit_last: Mutex<Option<KitContent>>,
     /// Counts connects and disconnects. A kit answer (a capture, a status) goes out only on the
     /// connection it was asked on: after a reconnect the orchestrator may be an older release
     /// that cannot decode it, and an undecodable frame drops the link. The orchestrator asks
@@ -175,6 +178,7 @@ impl Node {
             claude_config: Mutex::new(None),
             kit_parts: Mutex::new(Default::default()),
             kit_queue: Mutex::new((None, false)),
+            kit_last: Mutex::new(None),
             link_gen: AtomicU64::new(0),
             strict_mcp: Mutex::new(None),
         });
@@ -217,7 +221,12 @@ impl Node {
     }
 
     /// Asks the configured claude CLI, once per command, whether it knows `--strict-mcp-config`.
-    async fn probe_cli(&self) {
+    ///
+    /// In a task of its own: a `--help` that hangs must not hold up the link's events (spawns,
+    /// stops, tool answers). Until it answers the CLI counts as able, and whatever it answers,
+    /// "could not tell" included, is kept for that command, so a reconnect does not ask again.
+    /// An answer of "no" sends the last kit through again, so the node's status says so at once.
+    async fn probe_cli(self: Arc<Self>) {
         let Some(command) = self
             .config
             .lock()
@@ -228,16 +237,30 @@ impl Node {
         else {
             return;
         };
-        if matches!(&*self.strict_mcp.lock().unwrap(), Some((c, Some(_))) if *c == command) {
-            return;
+        {
+            let mut known = self.strict_mcp.lock().unwrap();
+            if matches!(&*known, Some((c, _)) if *c == command) {
+                return;
+            }
+            *known = Some((command.clone(), None));
         }
         let known = kit::probe_strict_mcp(&command, self.kit_paths().as_ref()).await;
+        {
+            let mut cached = self.strict_mcp.lock().unwrap();
+            // The settings may have changed meanwhile; an answer for an old command is dropped.
+            if matches!(&*cached, Some((c, _)) if *c == command) {
+                *cached = Some((command, known));
+            }
+        }
         if known == Some(false) {
             tracing::warn!(
                 "the claude CLI here has no --strict-mcp-config: agent sessions run without the kit's MCP allowlist until it is updated"
             );
+            let last = self.kit_last.lock().unwrap().clone();
+            if let Some(kit) = last {
+                self.queue_kit(kit);
+            }
         }
-        *self.strict_mcp.lock().unwrap() = Some((command, known));
     }
 
     /// Whether the connection `generation` an answer was asked on is still the live one.
@@ -501,10 +524,10 @@ impl Node {
                 Inbound::Message { body, .. } => {
                     let settings = matches!(body, Body::NodeSettings(_));
                     self.handle(body);
-                    // Before anything after the settings (a spawn) is handled: whether this CLI
-                    // can hold a session to the kit's MCP servers decides its arguments.
+                    // Whether this CLI can hold a session to the kit's MCP servers decides its
+                    // arguments; asked off the event loop (see `probe_cli`).
                     if settings {
-                        self.probe_cli().await;
+                        tokio::spawn(self.clone().probe_cli());
                     }
                 }
             }
@@ -961,10 +984,16 @@ impl Node {
         else {
             return;
         };
+        *self.kit_last.lock().unwrap() = Some(whole.clone());
+        self.queue_kit(whole);
+    }
+
+    /// Queues a whole kit for applying, answered on the connection that is live now.
+    fn queue_kit(self: &Arc<Self>, kit: KitContent) {
         let generation = self.link_gen.load(Ordering::Acquire);
         let start = {
             let mut q = self.kit_queue.lock().unwrap();
-            q.0 = Some((whole, generation));
+            q.0 = Some((kit, generation));
             !std::mem::replace(&mut q.1, true)
         };
         if start {

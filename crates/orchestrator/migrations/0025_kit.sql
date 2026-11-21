@@ -9,13 +9,15 @@ create table kit_items (
     -- A skill's directory name, `plugin@marketplace`, or an MCP server's name.
     name       text not null,
     enabled    boolean not null default true,
-    -- A plugin: {plugin, marketplace, marketplace_source}. An MCP server: its config
-    -- (command/args/env, or type/url/headers) with every secret value replaced by a
-    -- `${secret:NAME}` placeholder; the values are in the vault (the `kit` secret folder),
-    -- never here. A skill: {}.
+    -- A plugin: {plugin, marketplace, marketplace_source} (a source with no credential in it).
+    -- An MCP server: only a summary that holds no secret, {type, command (its name, no path or
+    -- arguments) or endpoint (scheme and host)}. A skill: {}.
     spec       jsonb not null default '{}',
     -- A skill's files, {relative path: text}. Text only: binary files are not taken into the kit.
     files      jsonb,
+    -- An MCP server's whole config, sealed with the vault (FLEET_MASTER_KEY): a config is a secret
+    -- as a whole, so none of it is kept in the clear. Null for skills and plugins.
+    config     bytea,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now(),
     unique (kind, name)
@@ -32,6 +34,7 @@ create table node_kit (
     primary key (node_id, item_id)
 );
 
--- Why a node cannot hold its agent sessions to the kit's MCP servers (its claude CLI has no
--- --strict-mcp-config), as the node last said; null when it can.
+-- What a node says about its own kit, when something is wrong: its claude CLI cannot hold agent
+-- sessions to the kit's MCP servers (no --strict-mcp-config), or its record of what it installed
+-- was unreadable. Null when all is well.
 alter table nodes add column kit_note text;

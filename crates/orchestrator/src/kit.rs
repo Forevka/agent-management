@@ -5,13 +5,15 @@
 //!   [`Actor::Owner`], signed in on the web. None of it is an [`crate::admin::AdminAction`],
 //!   which is the surface the brain proposes from: what runs in every agent session on every
 //!   machine is not something an agent may suggest, even for the owner's approval.
-//! - **Secrets in the vault.** An MCP server's env and header values are moved into the `kit`
-//!   secret folder the moment they arrive (from an import, or typed into the config editor), and
-//!   `kit_items.spec` keeps a `${secret:NAME}` placeholder in their place. They are resolved only
-//!   to go to a node over the authenticated link: in the [`Kit`] (installed for the owner's own
-//!   Claude Code) and in an agent's spawn (its per-run MCP config). Never logged, never in a
-//!   response.
-//! - **The import** asks a node what it has ([`capture`]); the answer, raw secrets included,
+//! - **An MCP server's config is a secret, whole.** Secrets take too many shapes in a config (an
+//!   env value, a header in an argument, a token as a URL's user, a DSN, JSON inside an argument)
+//!   for any rule to find them all, so none is attempted for storage: the config is sealed with
+//!   the [`crate::vault::Vault`] into `kit_items.config`, and `kit_items.spec` holds only
+//!   [`fleet_proto::kit::config_summary`] (its type, its command's name, its endpoint's host). It
+//!   is opened only to go to a node over the authenticated link, in the [`Kit`] and in an agent's
+//!   spawn, and to be shown to the owner *masked* ([`fleet_proto::kit::mask_config`]). Nothing of
+//!   it reaches a log, the audit log or a status.
+//! - **The import** asks a node what it has ([`capture`]); the answer, raw configs included,
 //!   stays in memory only, under an id, until the owner imports from it or it expires.
 //! - **Installing** is the node's (`fleet_node::kit`); this side sends the desired state to
 //!   every node that is current ([`fleet_proto::node_is_current`]) on connect and after every
@@ -29,8 +31,8 @@ use fleet_proto::{
     Body, Kit, KitCapture, KitCaptureRequest, KitContent, KitFile, KitItemStatus, KitMcp,
     KitPlugin, KitSkill, KitSkipped,
     kit::{
-        MAX_SKILL_BYTES, MAX_SKILL_FILE_BYTES, MAX_SKILL_FILES, PART_BUDGET, Parts,
-        safe_skill_path, valid_name,
+        MASK, MAX_SKILL_BYTES, MAX_SKILL_FILE_BYTES, MAX_SKILL_FILES, PART_BUDGET, Parts,
+        clean_source, config_summary, mask_config, safe_skill_path, valid_name,
     },
 };
 use serde_json::{Value, json};
@@ -38,18 +40,16 @@ use tokio::sync::oneshot;
 
 use crate::{admin::Actor, core::Orchestrator};
 
-/// The secret folder that holds the kit's MCP secrets.
-pub const KIT_FOLDER: &str = "kit";
-/// The preset that marks the kit's secret folder. No folder the owner creates can have it (it is
-/// not in `admin::PRESETS`), and the brain cannot propose binding, unsetting or deleting it.
-pub const KIT_PRESET: &str = "kit";
 /// How long the owner waits for a node to report what it has.
 const CAPTURE_WAIT: Duration = Duration::from_secs(60);
-/// How long a finished capture (with its raw secrets) is kept for the owner to import from.
+/// How long a finished capture (with its raw configs) is kept for the owner to import from.
 const CAPTURE_KEEP: Duration = Duration::from_secs(30 * 60);
 const KINDS: [&str; 3] = ["skill", "plugin", "mcp"];
+/// The longest MCP server config the kit takes: far more than any real one, and small enough
+/// that a kit of them always fits its messages.
+const MAX_MCP_CONFIG_BYTES: usize = 64 * 1024;
 
-/// Captures asked for and not yet imported. In memory only: they hold raw secret values.
+/// Captures asked for and not yet imported. In memory only: they hold raw configs.
 #[derive(Default)]
 pub struct Captures {
     pending: HashMap<String, Pending>,
@@ -78,253 +78,9 @@ fn owner_only(actor: Actor) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------- secrets
+// ---------------------------------------------------------------- MCP configs, sealed
 
-/// `${secret:NAME}`.
-pub fn placeholder(key: &str) -> String {
-    format!("${{secret:{key}}}")
-}
-
-/// The vault key an MCP server's env or header value is kept under: `SLACK_SLACK_TOKEN`.
-fn secret_key(server: &str, field: &str) -> String {
-    format!("{server}_{field}")
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c.to_ascii_uppercase()
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
-/// Moves every secret of an MCP server's config out, leaving placeholders: each env and header
-/// value, a URL's password and query values, and in `args` a DSN's password, a `NAME=value` or a
-/// flag named like a secret ([`fleet_proto::kit::secret_spots`]). A value that already holds a
-/// placeholder (the owner wrote `Bearer ${secret:X}`) stays as it is. `taken` are vault keys in
-/// use elsewhere: a new key avoids them. Returns `(key, value)` pairs.
-pub fn extract_secrets(
-    server: &str,
-    config: &mut Value,
-    taken: &BTreeSet<String>,
-) -> Vec<(String, String)> {
-    use fleet_proto::kit::SpotAt;
-    let mut out: Vec<(String, String)> = Vec::new();
-    for spot in fleet_proto::kit::secret_spots(config) {
-        if spot.value.contains("${secret:") {
-            continue;
-        }
-        let base = secret_key(server, &spot.name);
-        let mut key = base.clone();
-        let mut n = 2;
-        while taken.contains(&key) || out.iter().any(|(k, _)| *k == key) {
-            key = format!("{base}_{n}");
-            n += 1;
-        }
-        let target = match &spot.at {
-            SpotAt::Env => config.get_mut("env").and_then(|m| m.get_mut(&spot.name)),
-            SpotAt::Header => config
-                .get_mut("headers")
-                .and_then(|m| m.get_mut(&spot.name)),
-            SpotAt::Url => config.get_mut("url"),
-            SpotAt::Arg(i) => config.get_mut("args").and_then(|a| a.get_mut(*i)),
-        };
-        let Some(Value::String(s)) = target else {
-            continue;
-        };
-        let (from, to) = (
-            format!("{}{}{}", spot.prefix, spot.value, spot.suffix),
-            format!("{}{}{}", spot.prefix, placeholder(&key), spot.suffix),
-        );
-        if !s.contains(&from) {
-            continue;
-        }
-        *s = s.replacen(&from, &to, 1);
-        out.push((key, spot.value));
-    }
-    out
-}
-
-/// The vault keys a config's placeholders name.
-pub fn placeholders(config: &Value) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    walk_strings(config, &mut |s| {
-        let mut rest = s;
-        while let Some(i) = rest.find("${secret:") {
-            rest = &rest[i + 9..];
-            if let Some(end) = rest.find('}') {
-                out.insert(rest[..end].to_owned());
-                rest = &rest[end + 1..];
-            } else {
-                break;
-            }
-        }
-    });
-    out
-}
-
-fn walk_strings(v: &Value, f: &mut impl FnMut(&str)) {
-    match v {
-        Value::String(s) => f(s),
-        Value::Array(a) => a.iter().for_each(|x| walk_strings(x, f)),
-        Value::Object(m) => m.values().for_each(|x| walk_strings(x, f)),
-        _ => {}
-    }
-}
-
-/// The config with every placeholder replaced by its value, wherever it is (env, headers, args,
-/// a URL). A placeholder whose secret is not set is an error naming the key, never a silent "".
-pub fn resolve(config: &Value, secrets: &HashMap<String, String>) -> Result<Value> {
-    Ok(match config {
-        Value::String(s) => {
-            let mut out = String::with_capacity(s.len());
-            let mut rest = s.as_str();
-            while let Some(i) = rest.find("${secret:") {
-                out.push_str(&rest[..i]);
-                let after = &rest[i + 9..];
-                let end = after
-                    .find('}')
-                    .context("a ${secret: placeholder is not closed")?;
-                let key = &after[..end];
-                out.push_str(
-                    secrets
-                        .get(key)
-                        .with_context(|| format!("the secret {key} is not set"))?,
-                );
-                rest = &after[end + 1..];
-            }
-            out.push_str(rest);
-            Value::String(out)
-        }
-        Value::Array(a) => Value::Array(
-            a.iter()
-                .map(|x| resolve(x, secrets))
-                .collect::<Result<_>>()?,
-        ),
-        Value::Object(m) => Value::Object(
-            m.iter()
-                .map(|(k, x)| Ok((k.clone(), resolve(x, secrets)?)))
-                .collect::<Result<_>>()?,
-        ),
-        other => other.clone(),
-    })
-}
-
-/// The kit's secret folder: the one folder with the reserved preset [`KIT_PRESET`], created on
-/// first use. A folder the owner made, whatever its name, is never taken for it: it is named
-/// `kit`, or `kit-…` when the owner already has a folder called that.
-async fn kit_folder(o: &Orchestrator) -> Result<i64> {
-    if let Some(id) = kit_folder_id(o).await? {
-        return Ok(id);
-    }
-    for name in [
-        KIT_FOLDER.to_owned(),
-        format!(
-            "{KIT_FOLDER}-{}",
-            &crate::web::random_token()[..6].to_lowercase()
-        ),
-    ] {
-        let made: Option<i64> = sqlx::query_scalar(
-            "insert into secret_folders (name, preset) values ($1, $2)
-             on conflict (name) do nothing returning id",
-        )
-        .bind(&name)
-        .bind(KIT_PRESET)
-        .fetch_optional(&o.db)
-        .await?;
-        if let Some(id) = made {
-            return Ok(id);
-        }
-    }
-    bail!("could not create the kit's secret folder")
-}
-
-async fn kit_folder_id(o: &Orchestrator) -> Result<Option<i64>> {
-    Ok(
-        sqlx::query_scalar("select id from secret_folders where preset = $1 order by id limit 1")
-            .bind(KIT_PRESET)
-            .fetch_optional(&o.db)
-            .await?,
-    )
-}
-
-/// Every kit secret, decrypted. Only ever used to resolve configs that go to a node.
-async fn secrets(o: &Orchestrator) -> Result<HashMap<String, String>> {
-    let rows: Vec<(String, Vec<u8>)> = sqlx::query_as(
-        "select i.key, i.value from secret_items i join secret_folders f on f.id = i.folder_id
-         where f.preset = $1",
-    )
-    .bind(KIT_PRESET)
-    .fetch_all(&o.db)
-    .await?;
-    rows.into_iter()
-        .map(|(k, v)| Ok((k, o.vault.decrypt(&v)?)))
-        .collect()
-}
-
-/// The names of the kit's secrets.
-async fn secret_keys(o: &Orchestrator) -> Result<BTreeSet<String>> {
-    Ok(sqlx::query_scalar(
-        "select i.key from secret_items i join secret_folders f on f.id = i.folder_id where f.preset = $1",
-    )
-    .bind(KIT_PRESET)
-    .fetch_all(&o.db)
-    .await?
-    .into_iter()
-    .collect())
-}
-
-/// Vault keys a new secret of MCP server `name` must not take: every key in the kit's folder
-/// (one the owner set by hand is never overwritten) and every key another item refers to, except
-/// the server's own, which a new import of it replaces.
-async fn taken_keys(o: &Orchestrator, name: &str) -> Result<BTreeSet<String>> {
-    let specs: Vec<(String, sqlx::types::Json<Value>)> =
-        sqlx::query_as("select name, spec from kit_items where kind = 'mcp'")
-            .fetch_all(&o.db)
-            .await?;
-    let own: BTreeSet<String> = specs
-        .iter()
-        .filter(|(n, _)| n == name)
-        .flat_map(|(_, s)| placeholders(&s.0))
-        .collect();
-    let others: BTreeSet<String> = specs
-        .iter()
-        .filter(|(n, _)| n != name)
-        .flat_map(|(_, s)| placeholders(&s.0))
-        .collect();
-    let mut taken: BTreeSet<String> = secret_keys(o).await?.difference(&own).cloned().collect();
-    taken.extend(others);
-    Ok(taken)
-}
-
-/// Stores one kit secret, encrypted, exactly as given: a token is not text to tidy up.
-async fn store_secret(o: &Orchestrator, folder: i64, key: &str, value: &str) -> Result<()> {
-    ensure!(
-        !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
-        "a secret's name is letters, digits and '_'"
-    );
-    sqlx::query(
-        "insert into secret_items (folder_id, key, value) values ($1, $2, $3)
-         on conflict (folder_id, key) do update set value = $3",
-    )
-    .bind(folder)
-    .bind(key)
-    .bind(o.vault.encrypt(value))
-    .execute(&o.db)
-    .await?;
-    o.audit("owner", "kit.secret.set", json!({"key": key}))
-        .await;
-    Ok(())
-}
-
-/// The longest MCP server config the kit takes: far more than any real one, and small enough
-/// that a kit of them always fits its messages.
-const MAX_MCP_CONFIG_BYTES: usize = 64 * 1024;
-
-/// Stores an MCP server's config: its raw env and header values go into the vault first, and
-/// only the config with placeholders reaches the database.
-async fn store_mcp(o: &Orchestrator, name: &str, mut config: Value) -> Result<Vec<String>> {
+fn check_mcp(name: &str, config: &Value) -> Result<()> {
     ensure!(valid_name(name), "{name:?} is not a usable MCP server name");
     ensure!(
         config.is_object(),
@@ -335,26 +91,84 @@ async fn store_mcp(o: &Orchestrator, name: &str, mut config: Value) -> Result<Ve
         "an MCP server's config is at most {} KB",
         MAX_MCP_CONFIG_BYTES / 1024
     );
-    let taken = taken_keys(o, name).await?;
-    let moved = extract_secrets(name, &mut config, &taken);
-    if !moved.is_empty() {
-        let folder = kit_folder(o).await?;
-        for (key, value) in &moved {
-            store_secret(o, folder, key, value).await?;
-        }
-    }
-    sqlx::query(
-        "insert into kit_items (kind, name, spec) values ('mcp', $1, $2)
-         on conflict (kind, name) do update set spec = $2, updated_at = now()",
-    )
-    .bind(name)
-    .bind(sqlx::types::Json(&config))
-    .execute(&o.db)
-    .await?;
-    Ok(moved.into_iter().map(|(k, _)| k).collect())
+    Ok(())
 }
 
-// ---------------------------------------------------------------- skills
+/// Stores an MCP server: the whole config sealed, and only its summary in the clear.
+async fn store_mcp(o: &Orchestrator, name: &str, config: &Value) -> Result<()> {
+    check_mcp(name, config)?;
+    sqlx::query(
+        "insert into kit_items (kind, name, spec, config) values ('mcp', $1, $2, $3)
+         on conflict (kind, name) do update set spec = $2, config = $3, updated_at = now()",
+    )
+    .bind(name)
+    .bind(sqlx::types::Json(config_summary(config)))
+    .bind(o.vault.encrypt(&config.to_string()))
+    .execute(&o.db)
+    .await?;
+    Ok(())
+}
+
+/// An MCP item's sealed config, opened.
+fn open_config(o: &Orchestrator, sealed: Option<&[u8]>) -> Result<Value> {
+    let sealed = sealed.context("the server has no stored config")?;
+    let text = o
+        .vault
+        .decrypt(sealed)
+        .context("its config cannot be decrypted (was FLEET_MASTER_KEY changed?)")?;
+    Ok(serde_json::from_str(&text)?)
+}
+
+/// The config the owner saved in the editor, which shows the current one masked: a value still
+/// reading as the mask, exactly where the masked view had it, keeps the current value; one the
+/// owner changed is taken as typed. A mask anywhere else stands for nothing and is refused, so a
+/// masked view can never be saved over a real secret by accident.
+pub fn merge_masked(new: &Value, old: &Value) -> Result<Value> {
+    fn walk(new: &Value, old: Option<&Value>, masked: Option<&Value>, at: &str) -> Result<Value> {
+        Ok(match new {
+            Value::String(s) if s.contains(MASK) => match (masked, old) {
+                (Some(Value::String(m)), Some(o @ Value::String(_))) if m == s => o.clone(),
+                _ => bail!(
+                    "{at} still reads {MASK}, but nothing was masked there: type the value, or paste the whole config"
+                ),
+            },
+            Value::Object(m) => Value::Object(
+                m.iter()
+                    .map(|(k, v)| {
+                        let next = format!("{at}.{k}");
+                        Ok((
+                            k.clone(),
+                            walk(
+                                v,
+                                old.and_then(|o| o.get(k)),
+                                masked.and_then(|x| x.get(k)),
+                                &next,
+                            )?,
+                        ))
+                    })
+                    .collect::<Result<_>>()?,
+            ),
+            Value::Array(a) => Value::Array(
+                a.iter()
+                    .enumerate()
+                    .map(|(i, v)| {
+                        walk(
+                            v,
+                            old.and_then(|o| o.get(i)),
+                            masked.and_then(|x| x.get(i)),
+                            &format!("{at}[{i}]"),
+                        )
+                    })
+                    .collect::<Result<_>>()?,
+            ),
+            other => other.clone(),
+        })
+    }
+    let masked = mask_config(old).0;
+    walk(new, Some(old), Some(&masked), "config")
+}
+
+// ---------------------------------------------------------------- skills and plugins
 
 /// Checks a skill's files: safe paths, a `SKILL.md`, text only, and the size caps the nodes
 /// apply too.
@@ -406,14 +220,9 @@ fn check_plugin(p: &KitPlugin) -> Result<()> {
         valid_name(&p.plugin) && valid_name(&p.marketplace),
         "a plugin and its marketplace are named with letters, digits, '-', '_' and '.'"
     );
-    let source = p.marketplace_source.trim();
     ensure!(
-        !source.is_empty() && !source.starts_with('-') && !source.contains(char::is_whitespace),
-        "the marketplace source is `owner/repo`, a git URL or a path"
-    );
-    ensure!(
-        !fleet_proto::kit::has_credentials(source),
-        "the marketplace source carries a password; give the node access another way (a git credential helper, an SSH key)"
+        clean_source(&p.marketplace_source),
+        "the marketplace source is `owner/repo`, a URL or a path, with no user, password, token or query in it; give the node access another way (a git credential helper, an SSH key)"
     );
     Ok(())
 }
@@ -456,8 +265,8 @@ pub async fn save_skill(
     Ok(format!("skill {name} saved"))
 }
 
-/// An MCP server, created or replaced with this config. Raw env and header values in it go into
-/// the vault; placeholders already there stay.
+/// An MCP server, created or replaced with this config. For a server already in the kit, values
+/// left masked keep their current ones ([`merge_masked`]).
 pub async fn save_mcp(
     o: &Arc<Orchestrator>,
     actor: Actor,
@@ -465,13 +274,24 @@ pub async fn save_mcp(
     config: Value,
 ) -> Result<String> {
     owner_only(actor)?;
-    let moved = store_mcp(o, name, config).await?;
-    o.audit(
-        actor.audit_name(),
-        "kit.mcp.save",
-        json!({"mcp": name, "secrets_stored": moved}),
-    )
-    .await;
+    let current: Option<Option<Vec<u8>>> =
+        sqlx::query_scalar("select config from kit_items where kind = 'mcp' and name = $1")
+            .bind(name)
+            .fetch_optional(&o.db)
+            .await?;
+    let config = match current {
+        Some(sealed) => merge_masked(&config, &open_config(o, sealed.as_deref())?)?,
+        None => {
+            ensure!(
+                !config.to_string().contains(MASK),
+                "the config still reads {MASK}: type the values"
+            );
+            config
+        }
+    };
+    store_mcp(o, name, &config).await?;
+    o.audit(actor.audit_name(), "kit.mcp.save", json!({"mcp": name}))
+        .await;
     changed(o).await;
     Ok(format!("MCP server {name} saved"))
 }
@@ -487,20 +307,6 @@ pub async fn add_plugin(o: &Arc<Orchestrator>, actor: Actor, p: &KitPlugin) -> R
     .await;
     changed(o).await;
     Ok(format!("plugin {} added", p.id()))
-}
-
-/// Sets (or replaces) one kit secret. Write-only, like every other secret.
-pub async fn set_secret(
-    o: &Arc<Orchestrator>,
-    actor: Actor,
-    key: &str,
-    value: &str,
-) -> Result<String> {
-    owner_only(actor)?;
-    let folder = kit_folder(o).await?;
-    store_secret(o, folder, key, value).await?;
-    changed(o).await;
-    Ok(format!("{key} is set"))
 }
 
 pub async fn set_enabled(
@@ -531,8 +337,8 @@ pub async fn set_enabled(
     ))
 }
 
-/// Deletes an item. The nodes remove what they installed of it when the new kit reaches them.
-/// Its secrets stay in the `kit` folder until the owner removes them there.
+/// Deletes an item, its sealed config with it. The nodes remove what they installed of it when
+/// the new kit reaches them.
 pub async fn delete(o: &Arc<Orchestrator>, actor: Actor, id: i64) -> Result<String> {
     owner_only(actor)?;
     let row: Option<(String, String)> =
@@ -632,7 +438,7 @@ pub fn capture_part(o: &Orchestrator, peer: EndpointId, c: KitCapture) {
     );
 }
 
-/// Drops captures nobody imported from, with their raw secrets. Housekeeping calls it.
+/// Drops captures nobody imported from, with their raw configs. Housekeeping calls it.
 pub fn forget_stale(o: &Orchestrator) {
     o.kit_captures
         .lock()
@@ -651,22 +457,10 @@ async fn in_kit(o: &Orchestrator) -> Result<BTreeSet<(String, String)>> {
     )
 }
 
-/// What a capture offers, with every secret value replaced by the placeholder it would get.
+/// What a capture offers. An MCP server's config only masked, a plugin with an unusable source
+/// not at all (the node leaves those out).
 async fn candidates(o: &Orchestrator, id: &str) -> Result<Value> {
     let have = in_kit(o).await?;
-    let names: Vec<String> = o
-        .kit_captures
-        .lock()
-        .unwrap()
-        .ready
-        .get(id)
-        .map(|r| r.content.mcp.iter().map(|m| m.name.clone()).collect())
-        .unwrap_or_default();
-    let mut taken = HashMap::new();
-    for name in names {
-        let t = taken_keys(o, &name).await?;
-        taken.insert(name, t);
-    }
     let caps = o.kit_captures.lock().unwrap();
     let r = caps
         .ready
@@ -681,23 +475,21 @@ async fn candidates(o: &Orchestrator, id: &str) -> Result<Value> {
             "in_kit": has("skill", &s.name),
             "files": s.files.iter().map(|f| json!({"path": f.path, "bytes": f.text.len()})).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
-        "plugins": r.content.plugins.iter().map(|p| json!({
+        "plugins": r.content.plugins.iter().filter(|p| clean_source(&p.marketplace_source)).map(|p| json!({
             "name": p.id(),
             "in_kit": has("plugin", &p.id()),
-            // A source with a password is never shown, and cannot be imported (`check_plugin`).
-            "marketplace_source": if fleet_proto::kit::has_credentials(&p.marketplace_source) {
-                "(its source carries a password; it cannot be imported)".to_owned()
-            } else {
-                p.marketplace_source.clone()
-            },
-            "importable": !fleet_proto::kit::has_credentials(&p.marketplace_source),
+            "marketplace_source": p.marketplace_source,
         })).collect::<Vec<_>>(),
         "mcp": r.content.mcp.iter().map(|m| {
-            let mut config: Value = serde_json::from_str(&m.config).unwrap_or(Value::Null);
-            let none = BTreeSet::new();
-            let secrets: Vec<String> = extract_secrets(&m.name, &mut config, taken.get(&m.name).unwrap_or(&none))
-                .into_iter().map(|(k, _)| k).collect();
-            json!({"name": m.name, "in_kit": has("mcp", &m.name), "config": config, "secrets": secrets})
+            let config: Value = serde_json::from_str(&m.config).unwrap_or(Value::Null);
+            let (masked, found) = mask_config(&config);
+            json!({
+                "name": m.name,
+                "in_kit": has("mcp", &m.name),
+                "summary": config_summary(&config),
+                "config": masked,
+                "masked": found.len(),
+            })
         }).collect::<Vec<_>>(),
         "skipped": r.skipped.iter().map(|s| json!({"kind": s.kind, "name": s.name, "reason": s.reason})).collect::<Vec<_>>(),
     }))
@@ -715,7 +507,7 @@ pub struct Selection {
 }
 
 /// Takes the chosen items of a capture into the kit (replacing items of the same name). The
-/// capture is gone afterwards, raw secrets and all.
+/// capture is gone afterwards, raw configs and all.
 pub async fn import(
     o: &Arc<Orchestrator>,
     actor: Actor,
@@ -731,8 +523,15 @@ pub async fn import(
         .remove(capture_id)
         .context("that capture has expired; ask the node again")?;
     let pick = |names: &[String], name: &str| names.iter().any(|n| n == name);
+    let skill_files = |s: &KitSkill| -> BTreeMap<String, String> {
+        s.files
+            .iter()
+            .map(|f| (f.path.clone(), f.text.clone()))
+            .collect()
+    };
     // All of it checked before anything is stored, so a bad item leaves nothing half imported,
     // and the capture stays for another try.
+    let mut configs = Vec::new();
     let checked = (|| -> Result<()> {
         for s in r
             .content
@@ -740,12 +539,7 @@ pub async fn import(
             .iter()
             .filter(|s| pick(&sel.skills, &s.name))
         {
-            let files: BTreeMap<String, String> = s
-                .files
-                .iter()
-                .map(|f| (f.path.clone(), f.text.clone()))
-                .collect();
-            check_skill(&s.name, &files).with_context(|| format!("skill {}", s.name))?;
+            check_skill(&s.name, &skill_files(s)).with_context(|| format!("skill {}", s.name))?;
         }
         for p in r
             .content
@@ -756,18 +550,10 @@ pub async fn import(
             check_plugin(p).with_context(|| format!("plugin {}", p.id()))?;
         }
         for m in r.content.mcp.iter().filter(|m| pick(&sel.mcp, &m.name)) {
-            ensure!(
-                valid_name(&m.name),
-                "{:?} is not a usable MCP server name",
-                m.name
-            );
             let v: Value = serde_json::from_str(&m.config)
                 .with_context(|| format!("the config of {} is not JSON", m.name))?;
-            ensure!(
-                v.is_object(),
-                "the config of {} is not a JSON object",
-                m.name
-            );
+            check_mcp(&m.name, &v).with_context(|| format!("MCP server {}", m.name))?;
+            configs.push((m.name.clone(), v));
         }
         Ok(())
     })();
@@ -786,14 +572,7 @@ pub async fn import(
         .iter()
         .filter(|s| pick(&sel.skills, &s.name))
     {
-        let files: BTreeMap<String, String> = s
-            .files
-            .iter()
-            .map(|f| (f.path.clone(), f.text.clone()))
-            .collect();
-        store_skill(o, &s.name, &files)
-            .await
-            .with_context(|| format!("skill {}", s.name))?;
+        store_skill(o, &s.name, &skill_files(s)).await?;
         done.push(format!("skill {}", s.name));
     }
     for p in r
@@ -802,18 +581,12 @@ pub async fn import(
         .iter()
         .filter(|p| pick(&sel.plugins, &p.id()))
     {
-        store_plugin(o, p)
-            .await
-            .with_context(|| format!("plugin {}", p.id()))?;
+        store_plugin(o, p).await?;
         done.push(format!("plugin {}", p.id()));
     }
-    for m in r.content.mcp.iter().filter(|m| pick(&sel.mcp, &m.name)) {
-        let config: Value = serde_json::from_str(&m.config)
-            .with_context(|| format!("the config of {} is not JSON", m.name))?;
-        store_mcp(o, &m.name, config)
-            .await
-            .with_context(|| format!("MCP server {}", m.name))?;
-        done.push(format!("MCP server {}", m.name));
+    for (name, config) in &configs {
+        store_mcp(o, name, config).await?;
+        done.push(format!("MCP server {name}"));
     }
     o.audit(
         actor.audit_name(),
@@ -840,23 +613,25 @@ struct ItemRow {
     enabled: bool,
     spec: sqlx::types::Json<Value>,
     files: Option<sqlx::types::Json<BTreeMap<String, String>>>,
+    config: Option<Vec<u8>>,
     updated_at: chrono::DateTime<chrono::Utc>,
 }
 
+const ITEM_COLUMNS: &str = "id, kind, name, enabled, spec, files, config, updated_at";
+
 async fn items(o: &Orchestrator) -> Result<Vec<ItemRow>> {
-    Ok(sqlx::query_as(
-        "select id, kind, name, enabled, spec, files, updated_at from kit_items order by kind, name",
-    )
+    Ok(sqlx::query_as(&format!(
+        "select {ITEM_COLUMNS} from kit_items order by kind, name"
+    ))
     .fetch_all(&o.db)
     .await?)
 }
 
-/// The enabled kit with its secrets resolved, and the MCP items that could not be resolved
-/// (with why), which are left out.
+/// The enabled kit with its configs opened, and the MCP items that could not be opened (with
+/// why), which are left out.
 async fn desired(o: &Orchestrator) -> Result<(KitContent, Vec<(i64, String)>)> {
-    let secrets = secrets(o).await?;
     let mut kit = KitContent::default();
-    let mut unresolved = Vec::new();
+    let mut unopened = Vec::new();
     for it in items(o).await?.into_iter().filter(|i| i.enabled) {
         match it.kind.as_str() {
             "skill" => kit.skills.push(KitSkill {
@@ -878,46 +653,42 @@ async fn desired(o: &Orchestrator) -> Result<(KitContent, Vec<(i64, String)>)> {
                     marketplace_source: field("marketplace_source"),
                 });
             }
-            "mcp" => match resolve(&it.spec.0, &secrets) {
+            "mcp" => match open_config(o, it.config.as_deref()) {
                 Ok(config) => kit.mcp.push(KitMcp {
                     name: it.name,
                     config: config.to_string(),
                 }),
-                Err(e) => unresolved.push((it.id, format!("{e:#}"))),
+                Err(e) => unopened.push((it.id, format!("{e:#}"))),
             },
             _ => {}
         }
     }
-    Ok((kit, unresolved))
+    Ok((kit, unopened))
 }
 
-/// The kit's enabled MCP servers, secrets resolved, as the JSON object a spawn carries in
-/// `extra_mcp_servers`; `None` when there are none. A server whose secret is not set is left
-/// out (its install status already says why).
+/// The kit's enabled MCP servers, as the JSON object a spawn carries in `extra_mcp_servers`;
+/// `None` when there are none. A server whose config cannot be opened is left out (its install
+/// status already says why).
 ///
-/// Never fails a run: a kit it cannot read (a database hiccup, a secret that no longer decrypts)
-/// is logged and the session starts with the fleet's server alone.
+/// Never fails a run: a kit it cannot read (a database hiccup, a config that no longer
+/// decrypts) is logged and the session starts with the fleet's server alone.
 pub async fn agent_servers(o: &Orchestrator) -> Option<String> {
     let read = async {
-        let specs: Vec<(String, sqlx::types::Json<Value>)> = sqlx::query_as(
-            "select name, spec from kit_items where kind = 'mcp' and enabled order by name",
+        let rows: Vec<(String, Option<Vec<u8>>)> = sqlx::query_as(
+            "select name, config from kit_items where kind = 'mcp' and enabled order by name",
         )
         .fetch_all(&o.db)
         .await?;
-        if specs.is_empty() {
-            return Ok::<_, anyhow::Error>(None);
-        }
-        let secrets = secrets(o).await?;
         let mut servers = serde_json::Map::new();
-        for (name, spec) in specs {
-            match resolve(&spec.0, &secrets) {
+        for (name, sealed) in rows {
+            match open_config(o, sealed.as_deref()) {
                 Ok(config) => {
                     servers.insert(name, config);
                 }
                 Err(e) => tracing::warn!("kit MCP server {name} left out of a session: {e:#}"),
             }
         }
-        Ok((!servers.is_empty()).then(|| Value::Object(servers).to_string()))
+        Ok::<_, anyhow::Error>((!servers.is_empty()).then(|| Value::Object(servers).to_string()))
     };
     read.await.unwrap_or_else(|e| {
         tracing::warn!("the kit's MCP servers are left out of a session: {e:#}");
@@ -939,7 +710,7 @@ pub async fn push(o: &Orchestrator, node_id: &str) -> Result<()> {
 
 async fn push_locked(o: &Orchestrator, node_id: &str) -> Result<()> {
     let peer: EndpointId = node_id.parse()?;
-    let (kit, unresolved) = desired(o).await?;
+    let (kit, unopened) = desired(o).await?;
     // Only what the node is to have is waited on. A disabled item's row stays until the node's
     // report says what became of it (see [`statuses`]).
     sqlx::query(
@@ -950,7 +721,7 @@ async fn push_locked(o: &Orchestrator, node_id: &str) -> Result<()> {
     .bind(node_id)
     .execute(&o.db)
     .await?;
-    for (id, why) in unresolved {
+    for (id, why) in unopened {
         sqlx::query(
             "update node_kit set state = 'failed', detail = $3, at = now() where node_id = $1 and item_id = $2",
         )
@@ -1020,7 +791,9 @@ pub async fn push_all(o: &Orchestrator) -> Result<()> {
 ///
 /// A report is the whole outcome of one apply. So a disabled item it does not mention is not on
 /// the node at all (the kit never had it there, or removed it before), and its row goes; a
-/// `removed` row stays, so the owner sees what was taken off.
+/// `removed` row stays, so the owner sees what was taken off. What the node says about itself
+/// (`kind = "node"`: its CLI cannot enforce the allowlist, its record of what it installed was
+/// unreadable) becomes the node's `kit_note`.
 pub async fn statuses(o: &Orchestrator, peer: EndpointId, list: Vec<KitItemStatus>) -> Result<()> {
     let node = peer.to_string();
     let (kinds, names): (Vec<String>, Vec<String>) = list
@@ -1038,18 +811,20 @@ pub async fn statuses(o: &Orchestrator, peer: EndpointId, list: Vec<KitItemStatu
     .bind(&names)
     .execute(&o.db)
     .await?;
-    for s in list {
-        // What the node says about itself: whether its claude CLI enforces the allowlist.
-        if s.kind == "node" && s.name == "allowlist" {
-            let note =
-                (s.state != "installed").then(|| s.detail.chars().take(500).collect::<String>());
-            sqlx::query("update nodes set kit_note = $2 where id = $1")
-                .bind(&node)
-                .bind(note)
-                .execute(&o.db)
-                .await?;
-            continue;
-        }
+    let about_node: Vec<&KitItemStatus> = list.iter().filter(|s| s.kind == "node").collect();
+    if !about_node.is_empty() {
+        let notes: Vec<String> = about_node
+            .iter()
+            .filter(|s| s.state != "installed")
+            .map(|s| s.detail.chars().take(500).collect())
+            .collect();
+        sqlx::query("update nodes set kit_note = $2 where id = $1")
+            .bind(&node)
+            .bind((!notes.is_empty()).then(|| notes.join("; ")))
+            .execute(&o.db)
+            .await?;
+    }
+    for s in &list {
         if !KINDS.contains(&s.kind.as_str()) {
             continue;
         }
@@ -1062,8 +837,8 @@ pub async fn statuses(o: &Orchestrator, peer: EndpointId, list: Vec<KitItemStatu
             "insert into node_kit (node_id, item_id, state, detail, at)
              select $1, id, $4, $5, now() from kit_items where kind = $2 and name = $3
              on conflict (node_id, item_id) do update set
-               -- An enabled item the node took off was left out of its kit: its secret is not
-               -- set. The row keeps saying so rather than a bare `removed`.
+               -- An enabled item the node took off was left out of its kit: its config could not
+               -- be opened. The row keeps saying so rather than a bare `removed`.
                state = case when $4 = 'removed' and node_kit.state = 'failed'
                              and exists (select 1 from kit_items k where k.id = node_kit.item_id and k.enabled)
                             then 'failed' else $4 end,
@@ -1085,7 +860,7 @@ pub async fn statuses(o: &Orchestrator, peer: EndpointId, list: Vec<KitItemStatu
 
 // ---------------------------------------------------------------- the web UI's view
 
-/// The kit page: items, nodes, the install matrix and the names of the kit's secrets. Skill
+/// The kit page: items (an MCP server by its summary only), nodes and the install matrix. Skill
 /// files are listed (path and size), not sent; [`item_json`] has them.
 pub async fn json(o: &Orchestrator) -> Result<Value> {
     let items = items(o).await?;
@@ -1097,57 +872,45 @@ pub async fn json(o: &Orchestrator) -> Result<Value> {
         sqlx::query_as("select node_id, item_id, state, detail, at from node_kit")
             .fetch_all(&o.db)
             .await?;
-    let keys: Vec<String> = sqlx::query_scalar(
-        "select i.key from secret_items i join secret_folders f on f.id = i.folder_id where f.preset = $1 order by i.key",
-    )
-    .bind(KIT_PRESET)
-    .fetch_all(&o.db)
-    .await?;
-    let set: BTreeSet<&String> = keys.iter().collect();
     Ok(json!({
-        "items": items.iter().map(|i| {
-            let missing: Vec<String> = if i.kind == "mcp" {
-                placeholders(&i.spec.0).into_iter().filter(|k| !set.contains(k)).collect()
-            } else {
-                vec![]
-            };
-            json!({
-                "id": i.id,
-                "kind": i.kind,
-                "name": i.name,
-                "enabled": i.enabled,
-                "spec": i.spec.0,
-                "files": i.files.as_ref().map(|f| f.0.iter().map(|(p, t)| json!({"path": p, "bytes": t.len()})).collect::<Vec<_>>()),
-                "missing_secrets": missing,
-                "updated_at": i.updated_at,
-            })
-        }).collect::<Vec<_>>(),
+        "items": items.iter().map(|i| json!({
+            "id": i.id,
+            "kind": i.kind,
+            "name": i.name,
+            "enabled": i.enabled,
+            "spec": i.spec.0,
+            "files": i.files.as_ref().map(|f| f.0.iter().map(|(p, t)| json!({"path": p, "bytes": t.len()})).collect::<Vec<_>>()),
+            "updated_at": i.updated_at,
+        })).collect::<Vec<_>>(),
         "nodes": nodes.iter().map(|(id, name, online, version, note)| json!({
             "id": id,
             "name": name,
             "online": online,
             "version": version,
             "current": fleet_proto::node_is_current(version),
-            // Set when the node cannot hold its sessions to the kit (its claude CLI is too old).
+            // Set when the node cannot hold its sessions to the kit, or lost track of it.
             "note": note,
         })).collect::<Vec<_>>(),
         "status": status.iter().map(|(node, item, state, detail, at)| json!({
             "node": node, "item": item, "state": state, "detail": detail, "at": at,
         })).collect::<Vec<_>>(),
-        "secrets": keys,
     }))
 }
 
 /// One item with everything the editor needs: a skill's files in full, an MCP server's config
-/// (placeholders, never values).
+/// masked (never a secret value).
 pub async fn item_json(o: &Orchestrator, id: i64) -> Result<Value> {
-    let i: ItemRow = sqlx::query_as(
-        "select id, kind, name, enabled, spec, files, updated_at from kit_items where id = $1",
-    )
+    let i: ItemRow = sqlx::query_as(&format!(
+        "select {ITEM_COLUMNS} from kit_items where id = $1"
+    ))
     .bind(id)
     .fetch_optional(&o.db)
     .await?
     .context("no such kit item")?;
+    let config = match i.kind.as_str() {
+        "mcp" => Some(mask_config(&open_config(o, i.config.as_deref())?).0),
+        _ => None,
+    };
     Ok(json!({
         "id": i.id,
         "kind": i.kind,
@@ -1155,6 +918,7 @@ pub async fn item_json(o: &Orchestrator, id: i64) -> Result<Value> {
         "enabled": i.enabled,
         "spec": i.spec.0,
         "files": i.files.map(|f| f.0),
+        "config": config,
         "updated_at": i.updated_at,
     }))
 }
@@ -1164,80 +928,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_env_and_header_value_leaves_for_the_vault() {
-        let mut config = json!({
-            "type": "http",
-            "url": "https://mcp.example/api",
-            "headers": {"Authorization": "Bearer xoxp-raw-1", "X-Team": "${secret:TEAM}"},
-            "env": {"SLACK_TOKEN": "xoxp-raw-2", "DEBUG": "1"},
-            "args": ["--flag"],
-        });
-        let taken = BTreeSet::from(["SLACK_SLACK_TOKEN".to_owned()]);
-        let moved = extract_secrets("slack", &mut config, &taken);
-        let keys: Vec<&str> = moved.iter().map(|(k, _)| k.as_str()).collect();
-        assert_eq!(
-            keys,
-            ["SLACK_DEBUG", "SLACK_SLACK_TOKEN_2", "SLACK_AUTHORIZATION"]
-        );
-        let stored = config.to_string();
-        for raw in ["xoxp-raw-1", "xoxp-raw-2"] {
-            assert!(!stored.contains(raw), "{raw} survived in {stored}");
-        }
-        assert_eq!(
-            config["env"]["SLACK_TOKEN"],
-            "${secret:SLACK_SLACK_TOKEN_2}"
-        );
-        assert_eq!(
-            config["headers"]["X-Team"], "${secret:TEAM}",
-            "a placeholder the owner wrote stays"
-        );
-        assert_eq!(
-            placeholders(&config),
-            BTreeSet::from([
-                "SLACK_DEBUG".to_owned(),
-                "SLACK_SLACK_TOKEN_2".to_owned(),
-                "SLACK_AUTHORIZATION".to_owned(),
-                "TEAM".to_owned()
-            ])
-        );
-
-        // Resolved only for a node, everywhere a placeholder is, and never as an empty string.
-        let mut secrets: HashMap<String, String> = moved.into_iter().collect();
-        assert!(
-            resolve(&config, &secrets)
-                .unwrap_err()
-                .to_string()
-                .contains("TEAM"),
-            "a missing secret is named"
-        );
-        secrets.insert("TEAM".into(), "t1".into());
-        let resolved = resolve(&config, &secrets).unwrap();
-        assert_eq!(resolved["headers"]["Authorization"], "Bearer xoxp-raw-1");
-        assert_eq!(resolved["headers"]["X-Team"], "t1");
-        assert_eq!(resolved["env"]["SLACK_TOKEN"], "xoxp-raw-2");
-        let in_url = json!({"url": "https://h/?k=${secret:TEAM}&x=1"});
-        assert_eq!(
-            resolve(&in_url, &secrets).unwrap()["url"],
-            "https://h/?k=t1&x=1"
-        );
-        assert!(resolve(&json!({"url": "${secret:TEAM"}), &secrets).is_err());
-
-        // A token in a flag or a URL goes too, and comes back where it was.
-        let mut config = json!({
+    fn a_masked_value_left_as_it_was_keeps_its_secret_and_nothing_else_does() {
+        let old = json!({
             "command": "npx",
-            "args": ["-y", "srv", "--api-key", "a-raw-1", "--token=t-raw-2", "--port", "80"],
-            "url": "https://h/mcp?team=x&access_token=q-raw-3",
+            "args": ["-y", "srv", "--api-key", "a-raw-1", "postgresql://u:p-raw-2@db/app"],
+            "env": {"TOKEN": "t-raw-3", "MODE": "fast"},
         });
-        let original = config.clone();
-        let moved = extract_secrets("srv", &mut config, &BTreeSet::new());
-        let stored = config.to_string();
-        for raw in ["a-raw-1", "t-raw-2", "q-raw-3"] {
-            assert!(!stored.contains(raw), "{raw} survived in {stored}");
-        }
-        assert_eq!(config["args"][4], "--token=${secret:SRV_TOKEN}");
-        assert_eq!(config["args"][6], "80", "an ordinary flag stays");
-        let secrets: HashMap<String, String> = moved.into_iter().collect();
-        assert_eq!(resolve(&config, &secrets).unwrap(), original);
+        let (masked, _) = mask_config(&old);
+        // Saved untouched: exactly the old config.
+        assert_eq!(merge_masked(&masked, &old).unwrap(), old);
+        // One value changed, the masked ones left: the change, and the old secrets.
+        let mut edited = masked.clone();
+        edited["env"]["MODE"] = json!("slow");
+        edited["env"]["TOKEN"] = json!("t-new-4");
+        let merged = merge_masked(&edited, &old).unwrap();
+        assert_eq!(merged["env"]["MODE"], "slow");
+        assert_eq!(merged["env"]["TOKEN"], "t-new-4");
+        assert_eq!(merged["args"][3], "a-raw-1");
+        assert_eq!(merged["args"][4], "postgresql://u:p-raw-2@db/app");
+        // A mask moved somewhere it stands for nothing is refused.
+        let mut moved = masked.clone();
+        moved["env"]["NEW"] = json!(MASK);
+        assert!(merge_masked(&moved, &old).is_err());
+        let mut shifted = masked;
+        shifted["args"]
+            .as_array_mut()
+            .unwrap()
+            .insert(0, json!("--new"));
+        assert!(
+            merge_masked(&shifted, &old).is_err(),
+            "a mask at another index stands for nothing"
+        );
     }
 
     #[test]
@@ -1279,7 +1000,7 @@ mod tests {
     }
 
     #[test]
-    fn a_plugin_source_cannot_pass_for_a_flag() {
+    fn a_plugin_source_carries_no_credential_and_cannot_pass_for_a_flag() {
         let p = |source: &str| KitPlugin {
             plugin: "p".into(),
             marketplace: "m".into(),
@@ -1287,7 +1008,13 @@ mod tests {
         };
         assert!(check_plugin(&p("owner/repo")).is_ok());
         assert!(check_plugin(&p("https://github.com/o/r.git")).is_ok());
-        for bad in ["", "--scope=project", "a b"] {
+        for bad in [
+            "",
+            "--scope=project",
+            "a b",
+            "https://ghp_x@github.com/o/r",
+            "https://h/r?token=x",
+        ] {
             assert!(check_plugin(&p(bad)).is_err(), "{bad:?}");
         }
     }
