@@ -119,17 +119,14 @@ fn open_config(o: &Orchestrator, sealed: Option<&[u8]>) -> Result<Value> {
     Ok(serde_json::from_str(&text)?)
 }
 
-/// The config the owner saved in the editor, which shows the current one masked: a value still
-/// reading as the mask, exactly where the masked view had it, keeps the current value; one the
-/// owner changed is taken as typed. A mask anywhere else stands for nothing and is refused, so a
-/// masked view can never be saved over a real secret by accident.
+/// The config the owner saved in the editor, which shows the current one masked.
 ///
-/// A kept secret must also stay where it was meant to go:
-/// - in a list (the args), only if the list keeps its length and every other value in it is as it
-///   was: deleting `--github-token <masked>` before `--slack-token <masked>` would otherwise hand
-///   the GitHub token to the Slack flag;
-/// - nowhere, once the server's `url` or `command` changed: whoever can edit the config must not
-///   be able to send the existing secrets to another host unseen. The owner types them again.
+/// A masked value is kept only when nothing else changed: the saved config is the masked view
+/// exactly, so it is the current config. Any change at all, outside the masked values or by
+/// typing over one of them, keeps no secret, and every `[masked]` must be typed again (or the
+/// whole config pasted): a server whose package, host, URL or any other setting changed may send
+/// its secrets somewhere else, and a value typed over its mask may be the host they go to. So no
+/// edit can redirect the existing secrets unseen, and a masked view is never saved over one.
 pub fn merge_masked(new: &Value, old: &Value) -> Result<Value> {
     fn has_mask(v: &Value) -> bool {
         match v {
@@ -139,85 +136,14 @@ pub fn merge_masked(new: &Value, old: &Value) -> Result<Value> {
             _ => false,
         }
     }
-    fn walk(
-        new: &Value,
-        old: Option<&Value>,
-        masked: Option<&Value>,
-        at: &str,
-        moved: bool,
-    ) -> Result<Value> {
-        Ok(match new {
-            Value::String(s) if s.contains(MASK) && moved => bail!(
-                "the server's command or URL changed, so no secret is kept: type the value of {at} again"
-            ),
-            Value::Array(a) if has_mask(new) => {
-                let same_shape = matches!(masked, Some(Value::Array(m))
-                    if m.len() == a.len()
-                        && a.iter().zip(m).all(|(n, m)| has_mask(n) || n == m));
-                ensure!(
-                    same_shape,
-                    "re-type the secrets in {at}: its other values changed, so a kept secret could end up beside the wrong flag"
-                );
-                Value::Array(
-                    a.iter()
-                        .enumerate()
-                        .map(|(i, v)| {
-                            walk(
-                                v,
-                                old.and_then(|o| o.get(i)),
-                                masked.and_then(|x| x.get(i)),
-                                &format!("{at}[{i}]"),
-                                moved,
-                            )
-                        })
-                        .collect::<Result<_>>()?,
-                )
-            }
-            Value::String(s) if s.contains(MASK) => match (masked, old) {
-                (Some(Value::String(m)), Some(o @ Value::String(_))) if m == s => o.clone(),
-                _ => bail!(
-                    "{at} still reads {MASK}, but nothing was masked there: type the value, or paste the whole config"
-                ),
-            },
-            Value::Object(m) => Value::Object(
-                m.iter()
-                    .map(|(k, v)| {
-                        let next = format!("{at}.{k}");
-                        Ok((
-                            k.clone(),
-                            walk(
-                                v,
-                                old.and_then(|o| o.get(k)),
-                                masked.and_then(|x| x.get(k)),
-                                &next,
-                                moved,
-                            )?,
-                        ))
-                    })
-                    .collect::<Result<_>>()?,
-            ),
-            Value::Array(a) => Value::Array(
-                a.iter()
-                    .enumerate()
-                    .map(|(i, v)| {
-                        walk(
-                            v,
-                            old.and_then(|o| o.get(i)),
-                            masked.and_then(|x| x.get(i)),
-                            &format!("{at}[{i}]"),
-                            moved,
-                        )
-                    })
-                    .collect::<Result<_>>()?,
-            ),
-            other => other.clone(),
-        })
+    if !has_mask(new) {
+        return Ok(new.clone());
     }
-    let masked = mask_config(old).0;
-    let moved = ["url", "command"]
-        .iter()
-        .any(|k| new.get(k) != masked.get(k));
-    walk(new, Some(old), Some(&masked), "config", moved)
+    ensure!(
+        *new == mask_config(old).0,
+        "the server changed, so no secret is kept: type every {MASK} value again, or paste the whole config"
+    );
+    Ok(old.clone())
 }
 
 // ---------------------------------------------------------------- skills and plugins
@@ -980,75 +906,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_masked_value_left_as_it_was_keeps_its_secret_and_nothing_else_does() {
+    fn a_masked_value_is_kept_only_when_nothing_else_changed() {
         let old = json!({
             "command": "npx",
-            "args": ["-y", "srv", "--api-key", "a-raw-1", "postgresql://u:p-raw-2@db/app"],
-            "env": {"TOKEN": "t-raw-3", "MODE": "fast"},
+            "args": ["-y", "@good/mcp-server", "--api-key", "a-raw-1"],
+            "env": {"API_TOKEN": "t-raw-3", "API_BASE": "https://api.good.example"},
         });
         let (masked, _) = mask_config(&old);
         // Saved untouched: exactly the old config.
         assert_eq!(merge_masked(&masked, &old).unwrap(), old);
-        // One value changed, the masked ones left: the change, and the old secrets.
-        let mut edited = masked.clone();
-        edited["env"]["MODE"] = json!("slow");
-        edited["env"]["TOKEN"] = json!("t-new-4");
-        let merged = merge_masked(&edited, &old).unwrap();
-        assert_eq!(merged["env"]["MODE"], "slow");
-        assert_eq!(merged["env"]["TOKEN"], "t-new-4");
-        assert_eq!(merged["args"][3], "a-raw-1");
-        assert_eq!(merged["args"][4], "postgresql://u:p-raw-2@db/app");
-        // A mask moved somewhere it stands for nothing is refused.
-        let mut moved = masked.clone();
-        moved["env"]["NEW"] = json!(MASK);
-        assert!(merge_masked(&moved, &old).is_err());
-        let mut shifted = masked.clone();
-        shifted["args"]
-            .as_array_mut()
-            .unwrap()
-            .insert(0, json!("--new"));
-        assert!(
-            merge_masked(&shifted, &old).is_err(),
-            "a mask at another index stands for nothing"
-        );
-    }
-
-    #[test]
-    fn a_kept_secret_never_lands_beside_another_flag_or_goes_to_another_host() {
-        let old = json!({
-            "command": "srv",
-            "args": ["--github-token", "ghp_AAAAAAAAAAAAAAAA1", "--slack-token", "xoxp-BBBBBBBBBBBB-2"],
-        });
-        let masked = mask_config(&old).0;
-        assert_eq!(
-            masked["args"],
-            json!(["--github-token", MASK, "--slack-token", MASK])
-        );
-        // The owner deletes the first pair: by position, the GitHub token would now follow
-        // `--slack-token`. Refused; the secrets in that list are typed again.
-        let deleted = json!({"command": "srv", "args": ["--slack-token", MASK]});
-        let e = merge_masked(&deleted, &old).unwrap_err().to_string();
-        assert!(e.contains("re-type the secrets in config.args"), "{e}");
-        // Renaming a flag beside a kept secret is refused the same way.
-        let renamed =
-            json!({"command": "srv", "args": ["--gitlab-token", MASK, "--slack-token", MASK]});
-        assert!(merge_masked(&renamed, &old).is_err());
-        // Typing the secrets again after a change works.
-        let retyped = json!({"command": "srv", "args": ["--slack-token", "xoxp-NEW"]});
-        assert_eq!(merge_masked(&retyped, &old).unwrap(), retyped);
-
-        // A changed command or URL keeps no secret anywhere, not even in env.
-        let http = json!({"type": "http", "url": "https://mcp.example/x", "headers": {"Authorization": "Bearer t-raw-1"}});
-        let mut moved = mask_config(&http).0;
-        moved["url"] = json!("https://evil.example/x");
-        let e = merge_masked(&moved, &http).unwrap_err().to_string();
-        assert!(e.contains("command or URL changed"), "{e}");
-        let mut cmd = mask_config(&old).0;
+        // Everything typed: taken as typed.
+        let typed = json!({"command": "npx", "args": ["-y", "@good/mcp-server"], "env": {"API_TOKEN": "t-new"}});
+        assert_eq!(merge_masked(&typed, &old).unwrap(), typed);
+        let refused = |edited: &Value| {
+            let e = merge_masked(edited, &old).unwrap_err().to_string();
+            assert!(e.contains("no secret is kept"), "{e}");
+        };
+        // Another package, the token still masked: it would go to the other package.
+        let mut package = masked.clone();
+        package["args"][1] = json!("evil-package");
+        refused(&package);
+        // Another host typed over its mask, the key still masked: it would go to that host.
+        let mut host = masked.clone();
+        host["env"]["API_BASE"] = json!("https://evil.example");
+        refused(&host);
+        // A pair of args deleted: the next secret would move beside another flag.
+        let mut deleted = masked.clone();
+        deleted["args"].as_array_mut().unwrap().drain(2..4);
+        refused(&deleted);
+        // A changed command or URL, a mask added where there was none.
+        let mut cmd = masked.clone();
         cmd["command"] = json!("other");
-        assert!(merge_masked(&cmd, &old).is_err());
-        // The same URL, masked part and all, is no change.
-        let same = mask_config(&http).0;
-        assert_eq!(merge_masked(&same, &http).unwrap(), http);
+        refused(&cmd);
+        let mut stray = masked.clone();
+        stray["env"]["NEW"] = json!(MASK);
+        refused(&stray);
+        // A URL masked in part is no change when left as shown.
+        let http = json!({"type": "http", "url": "https://bot:pw-raw@mcp.example/x", "headers": {"Authorization": "Bearer t-raw-1"}});
+        assert_eq!(merge_masked(&mask_config(&http).0, &http).unwrap(), http);
     }
 
     #[test]

@@ -188,7 +188,7 @@ function McpEditor({ item, onSaved }: { item: KitItemDetail; onSaved: () => void
   return (
     <Section
       title="Config"
-      description="As Claude Code takes it: command, args and env, or type, url and headers. Shown masked: a value you leave reading [masked] keeps the one in the vault; type over it to replace it. The whole config is sealed again when you save."
+      description="As Claude Code takes it: command, args and env, or type, url and headers. Shown masked. Saved as shown, it keeps its secrets; to change anything, type every [masked] value again, or paste the whole config: a changed server keeps none of its old secrets, so none can be sent somewhere new unseen. The whole config is sealed again when you save."
     >
       <Card>
         <CardContent>

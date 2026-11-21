@@ -724,6 +724,21 @@ fn leftover(paths: &KitPaths, name: &str) -> Option<PathBuf> {
         .map(|e| e.path())
 }
 
+/// Deletes something this apply set aside in staging. It is renamed to `trash~…` first, so if
+/// the deletion fails (a file held open on Windows) it is no longer taken for a copy a person
+/// must look at (`leftover`), and the skill is not held up by it.
+fn discard(paths: &KitPaths, ours: &Path) {
+    let trash = staged(paths, "trash", "x");
+    let target = if std::fs::rename(ours, &trash).is_ok() {
+        trash
+    } else {
+        ours.to_path_buf()
+    };
+    if let Err(e) = std::fs::remove_dir_all(&target) {
+        tracing::warn!("could not delete {}: {e}", target.display());
+    }
+}
+
 /// Moves `rel` from under `from` to under `to`.
 fn carry(from: &Path, to: &Path, rel: &str) -> std::io::Result<()> {
     let dest = to.join(rel);
@@ -744,9 +759,7 @@ fn take_away(paths: &KitPaths, dir: &Path, name: &str, marker: &Marker) -> Resul
         let old = staged(paths, "old", name);
         std::fs::create_dir_all(staging(paths))?;
         std::fs::rename(dir, &old).with_context(|| format!("moving {} aside", dir.display()))?;
-        if let Err(e) = std::fs::remove_dir_all(&old) {
-            tracing::warn!("could not delete {}: {e}", old.display());
-        }
+        discard(paths, &old);
         return Ok(());
     }
     // SKILL.md first, so a half-finished removal leaves no skill behind.
@@ -855,14 +868,14 @@ fn write_skill(paths: &KitPaths, skill: &KitSkill, hash: &str) -> Result<Written
                 });
             }
             // Only the new files the kit just wrote are in `failed` now: this apply's own.
-            let _ = std::fs::remove_dir_all(&failed);
+            discard(paths, &failed);
             return Err(e).with_context(|| {
                 format!("could not keep the owner's {rel}; the old copy of the skill stays")
             });
         }
     }
-    if had_old && let Err(e) = std::fs::remove_dir_all(&old) {
-        tracing::warn!("could not delete {}: {e}", old.display());
+    if had_old {
+        discard(paths, &old);
     }
     Ok(Written::Done)
 }
@@ -1948,6 +1961,15 @@ mod tests {
         let mut out = Vec::new();
         apply_skills(&paths, &mut state, &[], &mut out);
         assert_eq!(out[0].state, "removed", "{out:?}");
+        // What an apply could not delete of its own is trash, never a leftover.
+        std::fs::create_dir_all(staging(&paths).join("trash~x~abcd1234")).unwrap();
+        let again = KitSkill {
+            name: "held".into(),
+            files: vec![file("SKILL.md", "v3")],
+        };
+        let mut out = Vec::new();
+        apply_skills(&paths, &mut state, &[again], &mut out);
+        assert_eq!(out[0].state, "installed", "{out:?}");
         std::fs::remove_dir_all(&root).unwrap();
     }
 

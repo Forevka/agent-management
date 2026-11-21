@@ -6828,20 +6828,11 @@ async fn kit_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, node_id: &str, cfg: 
     //     changed one is taken, and a masked view is never saved over a secret by accident.
     let demo_id = id_of("mcp", "demo-mcp").await;
     let view = api_get(o, &format!("/api/kit/{demo_id}")).await;
-    let mut edited = view["config"].clone();
-    edited["env"]["LOG_LEVEL"] = json!("debug");
-    // A list holding kept secrets may not change around them (see `kit::merge_masked`).
-    let mut shifted = view["config"].clone();
-    shifted["args"][0] = json!("--y");
-    assert!(
-        crate::kit::save_mcp(o, Actor::Owner, "demo-mcp", shifted)
-            .await
-            .is_err()
-    );
+    // Saved as shown: the server keeps every secret.
     api_post(
         o,
         "/api/kit",
-        json!({"op": "mcp_save", "body": {"name": "demo-mcp", "config": edited.to_string()}}),
+        json!({"op": "mcp_save", "body": {"name": "demo-mcp", "config": view["config"].to_string()}}),
     )
     .await;
     let sealed: Vec<u8> =
@@ -6850,11 +6841,21 @@ async fn kit_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, node_id: &str, cfg: 
             .await
             .unwrap();
     let saved: Value = serde_json::from_str(&o.vault.decrypt(&sealed).unwrap()).unwrap();
-    let mut expected_config = demo_config.clone();
-    expected_config["env"]["LOG_LEVEL"] = json!("debug");
-    assert_eq!(
-        saved, expected_config,
-        "the masked values kept their secrets"
+    assert_eq!(saved, demo_config, "the masked values kept their secrets");
+    // Any change with masked values left keeps no secret: refused, and nothing changes.
+    let mut edited = view["config"].clone();
+    edited["env"]["LOG_LEVEL"] = json!("debug");
+    assert!(
+        crate::kit::save_mcp(o, Actor::Owner, "demo-mcp", edited)
+            .await
+            .is_err()
+    );
+    let mut shifted = view["config"].clone();
+    shifted["args"][0] = json!("--y");
+    assert!(
+        crate::kit::save_mcp(o, Actor::Owner, "demo-mcp", shifted)
+            .await
+            .is_err()
     );
     let mut stray = view["config"].clone();
     stray["env"]["NEW"] = json!(fleet_proto::kit::MASK);

@@ -397,12 +397,15 @@ impl Node {
                 return Ok(());
             }
             // A run waiting for its project's clone is about to start, and a clone half done
-            // would be left for the next start to clear up: both count.
+            // would be left for the next start to clear up: both count. So does a kit being
+            // applied: an exit between its renames, or in the middle of `claude plugin install`,
+            // would leave a skill or a plugin half installed.
             let running = {
                 let agents = self.agents.lock().unwrap();
                 agents.len()
                     + self.preparing.lock().unwrap().len()
                     + self.clones.in_flight.load(Ordering::SeqCst)
+                    + usize::from(self.kit_queue.lock().unwrap().1)
             };
             if running == 0 {
                 // What this node still owes the orchestrator (a finished run's last events) is
@@ -416,11 +419,14 @@ impl Node {
                     return Ok(());
                 }
                 // Held across the swap and the exit, so no agent can start in between (see
-                // `spawn_agent`).
+                // `spawn_agent`), and no kit apply either (`queue_kit` takes the kit queue's lock
+                // to start one). Lock order: `agents`, then `kit_queue`.
                 let agents = self.agents.lock().unwrap();
+                let kit = self.kit_queue.lock().unwrap();
                 if agents.is_empty()
                     && self.preparing.lock().unwrap().is_empty()
                     && self.clones.in_flight.load(Ordering::SeqCst) == 0
+                    && !kit.1
                 {
                     update::swap(&self.exe, &staged)?;
                     tracing::info!("now {}; restarting into it", u.version);

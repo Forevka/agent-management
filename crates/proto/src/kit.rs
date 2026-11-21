@@ -373,23 +373,47 @@ fn mask_value(v: &serde_json::Value, secret: bool, found: &mut Vec<String>) -> s
             Value::String(MASK.into())
         }
         Value::String(s) => Value::String(mask_string(s, found)),
-        Value::Array(a) if !secret => Value::Array(mask_args(a, found)),
+        Value::Array(a) if !secret => Value::Array(mask_args(a, false, found)),
         Value::Array(a) => Value::Array(a.iter().map(|x| mask_value(x, true, found)).collect()),
-        Value::Object(m) => Value::Object(
-            m.iter()
-                .map(|(k, x)| {
-                    let inner =
-                        secret || SECRET_SECTIONS.contains(&k.as_str()) || sensitive_name(k);
-                    (k.clone(), mask_value(x, inner, found))
+        Value::Object(m) => {
+            // mysql and mariadb take a password glued to `-p`; other programs' `-project` is a flag.
+            let mysqlish = m
+                .get("command")
+                .and_then(Value::as_str)
+                .map(|c| {
+                    c.rsplit(['/', '\\'])
+                        .next()
+                        .unwrap_or(c)
+                        .to_ascii_lowercase()
                 })
-                .collect(),
-        ),
+                .is_some_and(|c| c.starts_with("mysql") || c.starts_with("mariadb"));
+            Value::Object(
+                m.iter()
+                    .map(|(k, x)| {
+                        let inner =
+                            secret || SECRET_SECTIONS.contains(&k.as_str()) || sensitive_name(k);
+                        let masked = match x {
+                            Value::Array(a) if k == "args" && !inner => {
+                                Value::Array(mask_args(a, mysqlish, found))
+                            }
+                            _ => mask_value(x, inner, found),
+                        };
+                        (k.clone(), masked)
+                    })
+                    .collect(),
+            )
+        }
         other => other.clone(),
     }
 }
 
-/// A list of arguments, where a flag decides what its next one is.
-fn mask_args(args: &[serde_json::Value], found: &mut Vec<String>) -> Vec<serde_json::Value> {
+/// A list of arguments, where a flag decides what its next one is. `mysqlish`: the command is
+/// mysql or mariadb, which take a password glued to `-p`.
+fn mask_args(
+    args: &[serde_json::Value],
+    mysqlish: bool,
+    found: &mut Vec<String>,
+) -> Vec<serde_json::Value> {
     use serde_json::Value;
     enum Next {
         Plain,
@@ -410,7 +434,13 @@ fn mask_args(args: &[serde_json::Value], found: &mut Vec<String>) -> Vec<serde_j
                 MASK.to_owned()
             }
             Next::Header => mask_header(s, true, found).unwrap_or_else(|| mask_string(s, found)),
-            Next::Plain if s.len() > 2 && s.starts_with("-p") && !s.contains('=') => {
+            Next::Plain
+                if s.len() > 2
+                    && s.starts_with("-p")
+                    && !s.starts_with("--")
+                    && !s.contains('=')
+                    && (mysqlish || !s[2..].chars().all(|c| c.is_ascii_lowercase())) =>
+            {
                 found.push(s[2..].to_owned());
                 format!("-p{MASK}")
             }
@@ -1171,6 +1201,14 @@ mod tests {
                 "{raw} not scrubbed: {transcript}"
             );
         }
+
+        // `-project demo` is a Go-style flag, not mysql's `-p<password>`.
+        let go = json!({"command": "gcloud-mcp", "args": ["-project", "demo"]});
+        assert_eq!(mask_config(&go).0, go);
+        assert!(!scrub_values(&go).iter().any(|v| v == "roject"));
+        // mysql's lowercase password is still masked.
+        let mysql = json!({"command": "/usr/bin/mysql", "args": ["-proot-secret"]});
+        assert!(!mask_config(&mysql).0.to_string().contains("root-secret"));
 
         // A config stays readable where it holds no secret.
         let plain = json!({"type": "stdio", "command": "/usr/bin/npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "--port", "8080"], "env": {}});
