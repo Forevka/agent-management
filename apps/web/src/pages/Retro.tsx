@@ -22,7 +22,7 @@ export default function Retro() {
     <Page>
       <PageHeader
         title="Retrospective"
-        description="Once a day the fleet reads its own day — what it did, what you decided, what went wrong — and proposes how to be better. A proposal is words until you take it up; then it becomes a task on the fleet’s own code, on a branch, nothing pushed."
+        description="Once a day the fleet reads its own day — what it did, what you decided, what went wrong — and proposes how to be better. A proposal is words until you take it up; then it becomes a task on the fleet’s own code, pushed as its own branch proposal-p-n for you to review, never merged."
       />
 
       <Loaded state={state}>

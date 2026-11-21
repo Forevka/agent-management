@@ -5128,16 +5128,21 @@ async fn retro_flow(
             .await
             .unwrap();
     for needle in [
-        "not an instruction",
-        "retro/P-",
-        "Do not push",
-        "cargo clippy",
+        "not an instruction".to_string(),
+        format!("`proposal-p-{}`", proposals[0].0),
+        format!("git push -u origin proposal-p-{}", proposals[0].0),
+        "Do not merge".to_string(),
+        "cargo clippy".to_string(),
     ] {
         assert!(
-            brief.contains(needle),
+            brief.contains(&needle),
             "the brief lacks {needle:?}: {brief}"
         );
     }
+    assert!(
+        !brief.contains("retro/P-") && !brief.contains("Do not push"),
+        "the old branch name and the old no-push rule are gone: {brief}"
+    );
     let state: (String, Option<String>) =
         sqlx::query_as("select state, task_id from retro_proposals where id = $1")
             .bind(proposals[0].0)

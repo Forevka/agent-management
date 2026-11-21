@@ -7,6 +7,15 @@ below is one release. How to add to this file is in `CLAUDE.md`
 
 ## Unreleased
 
+- **A retro proposal's branch is `proposal-p-{n}`, and the agent pushes it.** The brief a tapped
+  proposal becomes now says to work on `proposal-p-{n}` cut from `origin/main` and push it to
+  origin as its own branch, never merging, opening a PR, force-pushing or deploying; it used to
+  say `retro/P-{n}` and "do not push", so each proposal cost a question or a follow-up. Those
+  branches get CI when pushed. The push uses whatever git credentials the clone has on its node:
+  protect `main` on the remote (no direct pushes) so a wrong push cannot become a release.
+
+## v0.2.10 — 2026-11-21
+
 - **People records get filled in.** The retrospective now reads every conversation, not only
   those mapped to its own project (none), so it writes position, brief, language and
   observations from what colleagues wrote instead of names alone.
