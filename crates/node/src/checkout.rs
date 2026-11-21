@@ -762,7 +762,9 @@ async fn clone(
             String::new()
         }
     };
-    // On Windows, closing the job ends whatever is still in it.
+    // On Windows, closing the job ends whatever is still in it. (On unix the group was killed
+    // above, and the handle holds nothing to release.)
+    #[cfg(windows)]
     drop(tree);
     if succeeded {
         return Ok(());
