@@ -128,22 +128,7 @@ impl Hindsight {
             }
             Err(e) => return Err(e),
         };
-        let results = v["results"].as_array().cloned().unwrap_or_default();
-        if results.is_empty() {
-            return Ok(format!("No memories in {bank} match."));
-        }
-        let lines: Vec<String> = results
-            .iter()
-            .take(limit)
-            .map(|r| {
-                let ctx = r["context"]
-                    .as_str()
-                    .map(|c| format!(" ({c})"))
-                    .unwrap_or_default();
-                format!("- {}{ctx}", r["text"].as_str().unwrap_or_default())
-            })
-            .collect();
-        Ok(format!("Memories from {bank}:\n{}", lines.join("\n")))
+        Ok(recall_text(bank, &v, limit))
     }
 
     pub async fn reflect(&self, bank: &str, query: &str) -> Result<String> {
@@ -228,12 +213,19 @@ impl Hindsight {
     }
 
     /// Asks for a refresh now, on top of whatever schedule it has. Asynchronous on Hindsight's
-    /// side: it answers with an operation, not the new content.
-    pub async fn mental_model_refresh(&self, bank: &str, id: &str) -> Result<()> {
+    /// side: it answers with an operation, not the new content. `full` regenerates the document
+    /// from scratch this once, whatever its own mode is: a `delta` model only ever edits what it
+    /// has, and can grow well past its `max_tokens` doing so.
+    pub async fn mental_model_refresh(&self, bank: &str, id: &str, full: bool) -> Result<()> {
+        let body = if full {
+            json!({"mode": "full"})
+        } else {
+            json!({})
+        };
         self.call(
             reqwest::Method::POST,
             &format!("/v1/default/banks/{bank}/mental-models/{id}/refresh"),
-            Some(json!({})),
+            Some(body),
         )
         .await
         .map(drop)
@@ -259,6 +251,68 @@ impl Hindsight {
             })
             .collect())
     }
+}
+
+/// How relevant a recalled memory must be to be shown, on the reranker's scale (0 to 1).
+///
+/// Hindsight ranks every memory it finds and returns the lot, and a bank always "matches"
+/// something: asked about something it knows nothing of, it still answers with a hundred rows. The
+/// reranker's score is what tells the two apart, and on the fleet's own banks it does so by orders
+/// of magnitude — a question the bank cannot answer tops out around 0.004, while one it can scores
+/// 0.7 to 1.0 at the top and keeps useful, broader matches down to about 0.05. This sits in the gap.
+const MIN_RELEVANCE: f64 = 0.02;
+
+/// A memory's relevance: the reranker's score, else Hindsight's combined one. `None` when the
+/// result carries neither (reranking turned off), and then nothing is filtered on it.
+fn relevance(r: &Value) -> Option<f64> {
+    r["scores"]["reranker"]
+        .as_f64()
+        .or_else(|| r["scores"]["final"].as_f64())
+}
+
+/// What an agent is shown for a recall: the relevant memories, best first, at most `limit`, each
+/// text once (Hindsight keeps a fact and the observation it became side by side, and they often
+/// read the same). When nothing is relevant enough it says so, rather than handing over the
+/// closest of what is unrelated.
+pub fn recall_text(bank: &str, v: &Value, limit: usize) -> String {
+    let results = v["results"].as_array().cloned().unwrap_or_default();
+    if results.is_empty() {
+        return format!("No memories in {bank} match.");
+    }
+    let mut seen = std::collections::HashSet::new();
+    let lines: Vec<String> = results
+        .iter()
+        .filter(|r| relevance(r).is_none_or(|s| s >= MIN_RELEVANCE))
+        .filter(|r| {
+            let text = r["text"].as_str().unwrap_or_default().trim();
+            !text.is_empty() && seen.insert(text.to_lowercase())
+        })
+        .take(limit)
+        .map(|r| {
+            let ctx = r["context"]
+                .as_str()
+                .map(|c| format!(" ({c})"))
+                .unwrap_or_default();
+            format!("- {}{ctx}", r["text"].as_str().unwrap_or_default().trim())
+        })
+        .collect();
+    // Only a duplicate of something kept is ever dropped as one, so nothing left means every
+    // result was a weak match or had no text.
+    if lines.is_empty() {
+        if results
+            .iter()
+            .any(|r| relevance(r).is_some_and(|s| s < MIN_RELEVANCE))
+        {
+            return format!(
+                "Nothing in {bank} scored as relevant to that ({} memories came closest, all of \
+                 them weak matches). Try other words, or another bank, before concluding it was \
+                 never remembered.",
+                results.len()
+            );
+        }
+        return format!("No memories in {bank} match.");
+    }
+    format!("Memories from {bank}:\n{}", lines.join("\n"))
 }
 
 pub fn agent_prefix(agent: &AgentRow) -> String {
@@ -408,6 +462,44 @@ mod tests {
         let long = "x".repeat(10_000);
         let m = outcome_memory("demo-1", "Paint it", "Alice", Outcome::Failed, &long);
         assert!(m.contains("failed.\nWhat happened: ") && m.chars().count() < 4200);
+    }
+
+    #[test]
+    fn a_recall_shows_only_what_is_relevant_and_says_when_nothing_is() {
+        let hit = |text: &str, reranker: f64| json!({"text": text, "context": "c", "scores": {"reranker": reranker, "final": 1.0}});
+        // Relevant first, a broader match kept, the unrelated tail dropped, a repeat shown once.
+        let v = json!({"results": [
+            hit("Run the e2e with a real python3.exe.", 0.99),
+            hit("run the e2e with a real python3.exe.", 0.98),
+            hit("The e2e needs Postgres 16.", 0.06),
+            hit("MR !997 was approved.", 0.003),
+        ]});
+        assert_eq!(
+            recall_text("project-p", &v, 10),
+            "Memories from project-p:\n- Run the e2e with a real python3.exe. (c)\n- The e2e needs Postgres 16. (c)"
+        );
+        assert_eq!(
+            recall_text("project-p", &v, 1),
+            "Memories from project-p:\n- Run the e2e with a real python3.exe. (c)"
+        );
+        // A question the bank knows nothing about: no closest-of-the-unrelated.
+        let v = json!({"results": [hit("MR !997 was approved.", 0.0001), hit("dap-3 left 3 comments.", 0.00009)]});
+        let t = recall_text("project-p", &v, 10);
+        assert!(
+            t.starts_with("Nothing in project-p scored as relevant") && !t.contains("!997"),
+            "{t}"
+        );
+        // Without a reranker score Hindsight's combined one decides; with neither, nothing is cut.
+        let v = json!({"results": [
+            {"text": "a", "scores": {"final": 0.5}},
+            {"text": "b", "scores": {"final": 0.001}},
+            {"text": "c"},
+        ]});
+        assert_eq!(recall_text("x", &v, 10), "Memories from x:\n- a\n- c");
+        assert_eq!(
+            recall_text("x", &json!({"results": []}), 10),
+            "No memories in x match."
+        );
     }
 
     fn agent(id: &str) -> AgentRow {

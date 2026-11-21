@@ -46,7 +46,7 @@ services:
   # the API alone. The full (non -slim) image runs embeddings and reranking
   # locally, so only the fact-extraction LLM is external (Anthropic, Haiku).
   hindsight:
-    image: ghcr.io/vectorize-io/hindsight:${HINDSIGHT_VERSION:-1.2.1}
+    image: ghcr.io/vectorize-io/hindsight:${HINDSIGHT_VERSION:-1.2.3}
     restart: unless-stopped
     depends_on:
       postgres:

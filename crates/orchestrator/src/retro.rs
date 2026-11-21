@@ -69,6 +69,56 @@ const LESSONS_QUERY: &str = "What has this agent fleet learned about itself? Cov
      Group by area (harness, agents, flows, features). Cite the proposal ids and task ids the \
      evidence comes from, and be plain about what is still unknown.";
 
+/// How long the lessons document is meant to be, in tokens (Hindsight's `max_tokens`).
+const LESSONS_MAX_TOKENS: u64 = 1200;
+
+/// The most of the lessons document the retrospective reads, in characters: half again its
+/// intended length (about four characters a token). A `delta` refresh only ever edits what is
+/// there, and Hindsight lets such a document grow to several times its `max_tokens` (it reached
+/// 12.8k characters in three days, of which the retrospective read the first 4k). Past this it
+/// is asked for one full rewrite, which brings it back to size.
+fn lessons_ceiling(max_tokens: u64) -> usize {
+    (max_tokens as usize) * 4 * 3 / 2
+}
+
+/// How often, at most, the lessons document is asked for a full rewrite, and the `kv` key that
+/// remembers when it last was.
+const REWRITE_EVERY_SECS: i64 = 6 * 3600;
+const REWRITE_KEY: &str = "retro_lessons_rewrite_at";
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Whether a full rewrite was asked for within `REWRITE_EVERY_SECS`.
+async fn rewrite_recent(o: &Orchestrator) -> bool {
+    let at = o
+        .kv_get(REWRITE_KEY)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.as_i64());
+    at.is_some_and(|at| now_secs() - at < REWRITE_EVERY_SECS)
+}
+
+/// Whether to ask for a full rewrite now, recording it if so. A failure to record is logged and
+/// treated as "no": better a document read long for a day than a rewrite on every tick.
+async fn rewrite_due(o: &Orchestrator) -> bool {
+    if rewrite_recent(o).await {
+        return false;
+    }
+    match o.kv_set(REWRITE_KEY, json!(now_secs())).await {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!("not rewriting the lessons document: recording it failed: {e:#}");
+            false
+        }
+    }
+}
+
 /// And for one section of it.
 const SECTION_ROWS: i64 = 12;
 
@@ -272,7 +322,41 @@ async fn lessons(o: &Orchestrator) -> Option<String> {
                 tracing::warn!("re-scheduling the lessons document failed: {e:#}");
             }
             let content = model["content"].as_str().unwrap_or_default().trim();
-            (!content.is_empty()).then(|| clip(content, 4000))
+            let ceiling =
+                lessons_ceiling(model["max_tokens"].as_u64().unwrap_or(LESSONS_MAX_TOKENS));
+            let length = content.chars().count();
+            if content.is_empty() {
+                return None;
+            }
+            if length <= ceiling {
+                return Some(content.to_owned());
+            }
+            // Too long: asked for a rewrite at most once in REWRITE_EVERY, because a run that
+            // fails is retried on every housekeeping tick and reads this each time, while the
+            // rewrite it already asked for is still running.
+            if rewrite_due(o).await {
+                tracing::info!(
+                    "the lessons document has grown to {length} characters (ceiling {ceiling}); \
+                     asking Hindsight to rewrite it in full"
+                );
+                let hs = hs.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = hs
+                        .mental_model_refresh(LESSONS_BANK, LESSONS_MODEL, true)
+                        .await
+                    {
+                        tracing::warn!("rewriting the fleet's lessons failed: {e:#}");
+                    }
+                });
+            }
+            // Said, not only cut: a delta edit tends to add at the end, so what is missing is
+            // likely the newest.
+            Some(format!(
+                "{}\n\n(This document has outgrown its intended length; only its first {ceiling} \
+                 of {length} characters are shown, and the most recent lessons may be among \
+                 those left out. A full rewrite has been asked for.)",
+                clip(content, ceiling)
+            ))
         }
         Ok(None) => {
             // First time: ask Hindsight to start keeping it. It refreshes itself an hour before
@@ -282,7 +366,7 @@ async fn lessons(o: &Orchestrator) -> Option<String> {
                 "id": LESSONS_MODEL,
                 "name": "What this fleet has learned about itself",
                 "source_query": LESSONS_QUERY,
-                "max_tokens": 1200,
+                "max_tokens": LESSONS_MAX_TOKENS,
                 "trigger": trigger(&cron),
             });
             // How what the fleet retains about itself should be read: a standing instruction for
@@ -762,9 +846,16 @@ async fn finish(o: &Arc<Orchestrator>, args: &Value) -> Result<String> {
         format!("Retrospective of {day}: {verdict} ({made} proposal(s) made.)"),
         "retrospective verdict",
     );
-    if let Some(hs) = o.memory.clone() {
+    // Not while a full rewrite asked for today may still be running: a delta begun from the old,
+    // overgrown text and finishing after it would put the length back.
+    if let Some(hs) = o.memory.clone()
+        && !rewrite_recent(o).await
+    {
         tokio::spawn(async move {
-            if let Err(e) = hs.mental_model_refresh(LESSONS_BANK, LESSONS_MODEL).await {
+            if let Err(e) = hs
+                .mental_model_refresh(LESSONS_BANK, LESSONS_MODEL, false)
+                .await
+            {
                 tracing::warn!("refreshing the fleet's lessons failed: {e:#}");
             }
         });

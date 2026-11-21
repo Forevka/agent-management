@@ -7,6 +7,24 @@ below is one release. How to add to this file is in `CLAUDE.md`
 
 ## Unreleased
 
+- **A memory recall shows only what is relevant.** Hindsight answers every recall with all it
+  ranked (80-130 rows), so an agent asking a bank about something it was never told still got ten
+  unrelated memories as if they were the answer. Results its reranker scores below 0.02 are now
+  dropped, a text Hindsight holds twice (a fact and the observation made of it) is shown once,
+  and a bank with nothing relevant says so.
+- **The retrospective's lessons document is kept to size.** Hindsight edits it in `delta` mode,
+  which let it grow to 12.8k characters against a 1,200-token limit, and the retrospective read
+  only its first 4k. It now reads up to half again the intended length, and asks Hindsight for a
+  full rewrite whenever the document is longer than that, at most every six hours (and says
+  so to the retrospective when what it reads was cut; the first one, done by hand on the
+  VPS, brought it to 6k).
+- **Hindsight 1.2.3** (from 1.2.1) is the pinned version (`HINDSIGHT_VERSION`). Its three
+  migrations touch only knowledge-bank tables, which the fleet does not use. The VPS runs it
+  already (raised by hand on 2026-11-21, database backed up first); an operator elsewhere raises
+  `HINDSIGHT_VERSION` in `.env` and runs `docker compose up -d hindsight`.
+
+## v0.2.14 — 2026-11-21
+
 - **Watch any agent session live, and continue it, from the web.** A task's page has **Watch
   live** / **Open session** (`/tasks/<id>/session`), and every row on **Sessions** opens one, as
   do the fleet's own sessions (brain, secretary, retrospective) from the links on that page. The
