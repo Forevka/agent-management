@@ -145,6 +145,9 @@ export type AssignmentStatus = 'mapped' | 'cloning' | 'failed' | 'waiting' | 'no
 export type NodeAssignment = {
   project: string
   name: string
+  node_id: string
+  node: string
+  online: boolean
   repo_url: string | null
   status: AssignmentStatus
   path: string | null
@@ -222,6 +225,8 @@ export type ProjectDetail = {
   folders: { id: number; name: string; bound: boolean }[]
   channels: { source: string; channel_id: string; name: string; triage: boolean }[]
   nodes: { id: string; name: string; online: boolean; path: string | null }[]
+  /** The nodes it is assigned to (cloned there on demand), and how it stands on each. */
+  assigned?: NodeAssignment[]
   tasks: Task[]
   sessions: number
   open_tasks: number

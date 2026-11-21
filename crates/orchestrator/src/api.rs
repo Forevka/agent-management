@@ -794,6 +794,8 @@ async fn project(State(o): State<O>, h: HeaderMap, Path(slug): Path<String>) -> 
             "id": n.id, "name": n.name, "online": n.online,
             "path": n.projects.0.iter().find(|m| m.project == slug).map(|m| m.path.clone()),
         })).collect::<Vec<_>>(),
+        // The nodes it is assigned to (cloned there on demand), and how it stands on each.
+        "assigned": crate::node_projects::project_json(&o, &slug).await?,
         "tasks": tasks.iter().map(task_json).collect::<Vec<_>>(),
         "sessions": sessions,
         "open_tasks": open,
@@ -1081,6 +1083,11 @@ async fn node_act(
             let done =
                 admin::set_projects_root(&o, Actor::Owner, &id, s(&a.body, "root").as_deref())
                     .await?;
+            Ok(Json(json!({"done": done})))
+        }
+        "retry" => {
+            let done =
+                admin::retry_assignment(&o, Actor::Owner, &id, &need(&a.body, "project")?).await?;
             Ok(Json(json!({"done": done})))
         }
         "assign" | "unassign" => {

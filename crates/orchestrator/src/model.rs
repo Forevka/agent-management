@@ -45,6 +45,11 @@ impl NodeRow {
     /// clone it first (assigned with a repository URL, and the node reads its assignments). The
     /// one rule for every placement decision; [`NodeRow::has_project`] is the stronger "already
     /// there", which placement prefers.
+    ///
+    /// For a project it would clone, `disk::held` sees only the volume of the node's Claude
+    /// config dir: the orchestrator learns about a volume through the mapped projects on it, so
+    /// the projects root is not measured until something is cloned there. The node checks that
+    /// one itself and refuses to clone with less than 1 GB free (`fleet_node::checkout`).
     pub fn can_run(&self, slug: &str) -> bool {
         self.has_project(slug)
             || (self.clonable.iter().any(|p| p == slug)

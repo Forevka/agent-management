@@ -31,8 +31,8 @@ use std::{
 use anyhow::Result;
 use fleet_net::{Client, Inbound};
 use fleet_proto::{
-    AgentEvent, AgentEventKind, Body, NodeInfo, NodeSettings, ProjectAssignments,
-    ProjectSetupReport, ProjectSummary, SpawnAgent, ToolCall, ToolResult,
+    AgentEvent, AgentEventKind, Body, NodeInfo, NodeSettings, ProjectAssignments, ProjectSummary,
+    SpawnAgent, ToolCall, ToolResult,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -61,15 +61,6 @@ struct PendingCall {
     /// Kept for permission prompts: they are sent again after every reconnect, because a
     /// restarted orchestrator may have lost them (it answers duplicates idempotently).
     resend: Option<ToolCall>,
-}
-
-/// A run whose project is being cloned before it can start (see `Node::prepare_then_spawn`).
-struct Preparing {
-    task_id: String,
-    run_id: String,
-    /// Messages for the run that arrived while it waited: delivered once it has started, as they
-    /// would have been had it been running.
-    texts: Vec<String>,
 }
 
 /// What `status.json` reports besides the node's identity.
@@ -123,12 +114,12 @@ pub struct Node {
     /// The orchestrator on the current connection sent assignments, so it reads setup reports.
     /// Cleared on every disconnect, like `disk_wanted`: the next one may be an older release.
     assignments_heard: AtomicBool,
-    /// One lock per project, so a project is cloned once however many spawns wait for it.
-    clones: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Clones under way, per project (see `checkout`).
+    clones: checkout::Clones,
     /// Runs waiting for their project to be cloned, by agent. They count as running (in
     /// `NodeInfo`, and for a self-update), so neither the orchestrator nor an update takes them
-    /// for gone. Lock order: `agents` before this.
-    preparing: Mutex<HashMap<String, Preparing>>,
+    /// for gone. Lock order: `agents`, then this, then `clones`' own locks.
+    preparing: Mutex<HashMap<String, checkout::Preparing>>,
 }
 
 impl Node {
@@ -159,7 +150,7 @@ impl Node {
             disk_wanted: AtomicBool::new(false),
             assignments: Mutex::new(None),
             assignments_heard: AtomicBool::new(false),
-            clones: Mutex::new(HashMap::new()),
+            clones: checkout::Clones::default(),
             preparing: Mutex::new(HashMap::new()),
         });
         // Replaces whatever a previous node process left, so the tray sees this pid at once.
@@ -289,10 +280,13 @@ impl Node {
                 let _ = std::fs::remove_file(&staged);
                 return Ok(());
             }
-            // A run waiting for its project's clone is about to start: it counts.
+            // A run waiting for its project's clone is about to start, and a clone half done
+            // would be left for the next start to clear up: both count.
             let running = {
                 let agents = self.agents.lock().unwrap();
-                agents.len() + self.preparing.lock().unwrap().len()
+                agents.len()
+                    + self.preparing.lock().unwrap().len()
+                    + self.clones.in_flight.load(Ordering::SeqCst)
             };
             if running == 0 {
                 // What this node still owes the orchestrator (a finished run's last events) is
@@ -308,7 +302,10 @@ impl Node {
                 // Held across the swap and the exit, so no agent can start in between (see
                 // `spawn_agent`).
                 let agents = self.agents.lock().unwrap();
-                if agents.is_empty() && self.preparing.lock().unwrap().is_empty() {
+                if agents.is_empty()
+                    && self.preparing.lock().unwrap().is_empty()
+                    && self.clones.in_flight.load(Ordering::SeqCst) == 0
+                {
                     update::swap(&self.exe, &staged)?;
                     tracing::info!("now {}; restarting into it", u.version);
                     self.mark_stopped();
@@ -427,26 +424,10 @@ impl Node {
                     h.stop(stop.graceful);
                     return;
                 }
-                // A run still waiting for its clone never starts; it ends as a killed one does.
-                let mut preparing = self.preparing.lock().unwrap();
-                let Some(run_id) = preparing
-                    .get(&stop.agent_id)
-                    .filter(|p| p.task_id == stop.task_id)
-                    .filter(|p| stop.run_id.is_empty() || p.run_id == stop.run_id)
-                    .map(|p| p.run_id.clone())
-                else {
-                    return;
-                };
-                preparing.remove(&stop.agent_id);
-                drop(preparing);
                 drop(agents);
-                self.event(
-                    &stop.agent_id,
-                    &stop.task_id,
-                    &run_id,
-                    AgentEventKind::Exited { code: None },
-                );
-                self.send_info();
+                // A run still waiting for its clone never starts; it ends as a killed one does,
+                // once the git it alone was waiting for is stopped.
+                self.stop_waiting(&stop);
             }
             Body::SendToAgent {
                 agent_id,
@@ -541,175 +522,37 @@ impl Node {
     fn spawn_agent(self: &Arc<Self>, spawn: SpawnAgent) {
         match self.clone_source(&spawn.project) {
             Some((root, url)) => self.prepare_then_spawn(spawn, root, url),
-            None => self.start_agent(spawn, false),
+            None => self.start_agent(spawn),
         }
     }
 
-    /// Where to clone `project` from and into, when it is not mapped here but assigned to this
-    /// node with a repository URL; `None` otherwise (the spawn then goes ahead, and fails as an
-    /// unmapped project always has). The root is `None` when there is neither one set for this
-    /// node nor a home directory to default to.
-    fn clone_source(&self, project: &str) -> Option<(Option<PathBuf>, String)> {
-        if self.config.lock().unwrap().project_dir(project).is_some() {
-            return None;
-        }
-        let assignments = self.assignments.lock().unwrap();
-        let a = assignments.as_ref()?;
-        let url = a
-            .projects
-            .iter()
-            .find(|p| p.slug == project)?
-            .repo_url
-            .clone()?;
-        let root = match &a.root {
-            Some(r) => Some(PathBuf::from(r)),
-            None => checkout::default_root(),
-        };
-        Some((root, url))
-    }
-
-    /// Clones an assigned project (off the agents lock: it takes minutes), then starts the run
-    /// as usual. Until then the run counts as running here, takes the messages sent to it, and
-    /// can be stopped.
-    fn prepare_then_spawn(self: &Arc<Self>, spawn: SpawnAgent, root: Option<PathBuf>, url: String) {
-        // Replaces a run of the same agent still waiting: the orchestrator only respawns an
-        // agent it believes is gone, so that run never starts.
-        self.preparing.lock().unwrap().insert(
-            spawn.agent_id.clone(),
-            Preparing {
-                task_id: spawn.task_id.clone(),
-                run_id: spawn.run_id.clone(),
-                texts: vec![],
-            },
-        );
-        self.send_info();
-        let this = self.clone();
-        tokio::spawn(async move {
-            match this.clone_project(&spawn.project, root, &url).await {
-                Ok(()) => this.start_agent(spawn, true),
-                Err(reason) => {
-                    let ours = {
-                        let mut preparing = this.preparing.lock().unwrap();
-                        let ours = preparing
-                            .get(&spawn.agent_id)
-                            .is_some_and(|p| p.run_id == spawn.run_id);
-                        if ours {
-                            preparing.remove(&spawn.agent_id);
-                        }
-                        ours
-                    };
-                    if ours {
-                        this.event(
-                            &spawn.agent_id,
-                            &spawn.task_id,
-                            &spawn.run_id,
-                            AgentEventKind::SpawnFailed { reason },
-                        );
-                        this.send_info();
-                    }
-                }
-            }
-        });
-    }
-
-    /// Clones `project` into `<root>/<project>` (or adopts a checkout of it already there) and
-    /// maps it, once: a second spawn for the same project waits for the first clone and then
-    /// finds it mapped. The error says what the owner can do about it.
-    async fn clone_project(
-        &self,
-        project: &str,
-        root: Option<PathBuf>,
-        url: &str,
-    ) -> Result<(), String> {
-        let lock = self
-            .clones
-            .lock()
-            .unwrap()
-            .entry(project.to_owned())
-            .or_default()
-            .clone();
-        let _held = lock.lock().await;
-        if self.config.lock().unwrap().project_dir(project).is_some() {
-            return Ok(());
-        }
-        let result = self.clone_and_map(project, root, url).await;
-        match &result {
-            Ok(dir) => {
-                // NodeInfo first, so the orchestrator has the mapping when it reads "cloned".
-                self.send_info();
-                self.report_setup(project, fleet_proto::node::SETUP_CLONED, dir);
-            }
-            Err(why) => self.report_setup(project, fleet_proto::node::SETUP_FAILED, why),
-        }
-        result.map(|_| ())
-    }
-
-    /// [`clone_project`](Self::clone_project) without the lock: returns the mapped directory.
-    async fn clone_and_map(
-        &self,
-        project: &str,
-        root: Option<PathBuf>,
-        url: &str,
-    ) -> Result<String, String> {
-        let root = root.ok_or(
-            "this machine has no home directory for the default projects root \
-             (~/fleet-projects); set a projects root on the node's page",
-        )?;
-        self.report_setup(
-            project,
-            fleet_proto::node::SETUP_CLONING,
-            &root.join(project).display().to_string(),
-        );
-        tracing::info!("cloning {project} from {url} into {}", root.display());
-        let dir = checkout::ensure(&root, project, url).await?;
-        // Under `node.json.lock`, like every writer of the file (the tray app maps projects
-        // too); off the runtime, since that lock may wait on another process.
-        let data_dir = self.data_dir.clone();
-        let (slug, at) = (project.to_owned(), dir.clone());
-        let (saved, ()) = tokio::task::spawn_blocking(move || {
-            NodeConfig::update(&data_dir, |c| c.map_project(&slug, &at))
-        })
-        .await
-        .map_err(|e| format!("mapping {project} failed: {e}"))?
-        .map_err(|e| {
-            format!(
-                "{project} was cloned into {}, but mapping it failed: {e:#}",
-                dir.display()
-            )
-        })?;
-        let path = {
-            let mut cfg = self.config.lock().unwrap();
-            cfg.projects = saved.projects;
-            cfg.project_dir(project)
-        };
-        tracing::info!("{project} is ready in {}", dir.display());
-        Ok(path.unwrap_or(dir).display().to_string())
-    }
-
-    /// Tells the orchestrator how setting up an assigned project goes, if it can read that: it
-    /// sent assignments on this connection, and `project` is among them.
-    fn report_setup(&self, project: &str, state: &str, detail: &str) {
-        let assigned = self.assignments_heard.load(Ordering::Acquire)
-            && self
-                .assignments
-                .lock()
-                .unwrap()
-                .as_ref()
-                .is_some_and(|a| a.projects.iter().any(|p| p.slug == project));
-        if assigned {
-            self.client
-                .send(Body::ProjectSetupReport(ProjectSetupReport {
-                    project: project.to_owned(),
-                    state: state.to_owned(),
-                    detail: detail.to_owned(),
-                }));
+    /// Starts a run whose project is here.
+    fn start_agent(self: &Arc<Self>, spawn: SpawnAgent) {
+        // Held from before the process starts until it is registered, so a self-update (which
+        // swaps the binary and exits while holding this lock once it finds no agent) can never
+        // exit between the two and kill an agent nobody knew had started.
+        let agents = self.agents.lock().unwrap();
+        // A newer run of an agent whose earlier one still waits for a clone: that one never
+        // starts, and ends as a replaced process does.
+        let replaced = self.preparing.lock().unwrap().remove(&spawn.agent_id);
+        let agent_id = spawn.agent_id.clone();
+        self.start_locked(agents, spawn, vec![]);
+        if let Some(old) = replaced {
+            self.end_waiting(&agent_id, old, AgentEventKind::Exited { code: None });
         }
     }
 
-    /// Starts a run's agent process and registers it. `prepared`: the run waited for a clone,
-    /// so it starts only if it is still waiting (not stopped or replaced meanwhile), and then
-    /// gets the messages that arrived in the meantime.
-    fn start_agent(self: &Arc<Self>, spawn: SpawnAgent, prepared: bool) {
+    /// Starts a run's agent process and registers it, with the agents lock held from before the
+    /// process starts until it is registered. `texts` arrived for the run while it waited for its
+    /// clone: they follow its first prompt, or go back to the orchestrator if it cannot start.
+    /// `runner::start` is synchronous and takes no node lock; what it spawns only waits for this
+    /// one briefly.
+    fn start_locked(
+        self: &Arc<Self>,
+        mut agents: std::sync::MutexGuard<'_, HashMap<String, AgentHandle>>,
+        spawn: SpawnAgent,
+        texts: Vec<String>,
+    ) {
         let (agent_id, task_id) = (spawn.agent_id.clone(), spawn.task_id.clone());
         let run_id = spawn.run_id.clone();
         let cfg = self.config.lock().unwrap().clone();
@@ -718,29 +561,6 @@ impl Node {
             .lock()
             .unwrap()
             .expect("ipc server starts before the link");
-        // Held from before the process starts until it is registered, so a self-update (which
-        // swaps the binary and exits while holding this lock once it finds no agent) can never
-        // exit between the two and kill an agent nobody knew had started. `runner::start` is
-        // synchronous and takes no node lock; what it spawns only waits for this one briefly.
-        let mut agents = self.agents.lock().unwrap();
-        let mut texts = vec![];
-        if prepared {
-            let mut preparing = self.preparing.lock().unwrap();
-            match preparing.get(&agent_id) {
-                Some(p) if p.run_id == run_id => {
-                    texts = preparing
-                        .remove(&agent_id)
-                        .map(|p| p.texts)
-                        .unwrap_or_default();
-                }
-                // Stopped (and reported as ended) or replaced by a newer run while it waited.
-                _ => return,
-            }
-        } else {
-            // A newer run of an agent whose earlier one still waits for a clone: that one must
-            // not start over this one when its clone is done.
-            self.preparing.lock().unwrap().remove(&agent_id);
-        }
         if let Some(old) = agents.remove(&agent_id) {
             // The orchestrator only respawns an agent it believes is gone; stop a stale process.
             old.stop(false);
@@ -761,14 +581,26 @@ impl Node {
                 drop(agents);
                 self.send_info();
             }
-            Err(e) => self.event(
-                &agent_id,
-                &task_id,
-                &run_id,
-                AgentEventKind::SpawnFailed {
-                    reason: format!("{e:#}"),
-                },
-            ),
+            Err(e) => {
+                drop(agents);
+                self.event(
+                    &agent_id,
+                    &task_id,
+                    &run_id,
+                    AgentEventKind::SpawnFailed {
+                        reason: format!("{e:#}"),
+                    },
+                );
+                for text in texts {
+                    self.event(
+                        &agent_id,
+                        &task_id,
+                        &run_id,
+                        AgentEventKind::Undelivered { text },
+                    );
+                }
+                self.send_info();
+            }
         }
     }
 
@@ -780,24 +612,23 @@ impl Node {
     /// Stops every agent and waits (up to `limit`) for them to exit, which also removes their
     /// secrets files. For when this node must not keep working: the orchestrator refused it.
     pub async fn stop_all(&self, limit: std::time::Duration) {
-        let waiting: Vec<(String, Preparing)> = {
+        {
             let agents = self.agents.lock().unwrap();
             for h in agents.values() {
                 h.stop(false);
             }
-            // Runs still waiting for a clone never start; they end as killed ones do.
-            self.preparing.lock().unwrap().drain().collect()
-        };
-        for (agent_id, p) in waiting {
-            self.event(
-                &agent_id,
-                &p.task_id,
-                &p.run_id,
-                AgentEventKind::Exited { code: None },
-            );
+            // Runs still waiting for a clone never start: their git is stopped, and each ends as a
+            // killed run does once it is gone.
+            self.stop_all_waiting();
         }
         let deadline = tokio::time::Instant::now() + limit;
-        while !self.agents.lock().unwrap().is_empty() && tokio::time::Instant::now() < deadline {
+        while tokio::time::Instant::now() < deadline {
+            {
+                let agents = self.agents.lock().unwrap();
+                if agents.is_empty() && self.preparing.lock().unwrap().is_empty() {
+                    break;
+                }
+            }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
     }

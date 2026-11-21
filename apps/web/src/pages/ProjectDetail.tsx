@@ -15,6 +15,16 @@ import * as api from '../api'
 import type { ProjectDetail as Detail } from '../api'
 import { ActionButton, ErrorNote, Loaded, StatusBadge, When, useApi } from '../ui'
 
+/** How the project stands on a node it is assigned to; the node's page has the details. */
+const ASSIGNMENT_LABELS: Record<string, string> = {
+  mapped: 'ready',
+  cloning: 'cloning',
+  failed: 'clone failed',
+  waiting: 'clones when a task needs it',
+  no_url: 'needs a repository URL',
+  node_behind: 'node must update',
+}
+
 export default function ProjectDetail() {
   const { slug = '' } = useParams()
   const path = `/api/projects/${encodeURIComponent(slug)}`
@@ -317,6 +327,37 @@ export default function ProjectDetail() {
                 </CardContent>
               </Card>
             </Section>
+
+            {(d.assigned ?? []).length > 0 && (
+              <Section title="Assigned to">
+                <Stack gap="2">
+                  {(d.assigned ?? []).map((a) => (
+                    <Card key={a.node_id}>
+                      <CardContent>
+                        <Row gap="2" justify="between">
+                          <Link to={`/nodes/${a.node_id}`} className="fx-link">
+                            {a.node}
+                          </Link>
+                          <Badge
+                            tone={
+                              a.status === 'mapped'
+                                ? 'success'
+                                : a.status === 'failed'
+                                  ? 'danger'
+                                  : a.status === 'cloning'
+                                    ? 'info'
+                                    : 'neutral'
+                            }
+                          >
+                            {ASSIGNMENT_LABELS[a.status] ?? a.status}
+                          </Badge>
+                        </Row>
+                      </CardContent>
+                    </Card>
+                  ))}
+                </Stack>
+              </Section>
+            )}
 
             {d.nodes.length > 0 && (
               <Section title="Nodes with a checkout">

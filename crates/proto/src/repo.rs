@@ -3,7 +3,9 @@
 //! `git` with them, so a value that got past one is still refused by the other.
 
 /// Refuses anything that is not a plain git URL: `https://host/path`, `ssh://[user@]host/path`,
-/// `user@host:path`, `file://path` or an absolute local path.
+/// `user@host:path`, `host:path` (an ssh config alias, like `github-work:org/repo`; the host is
+/// at least two characters, so `C:repo` stays a Windows drive path, which is refused as
+/// relative), `file://path` or an absolute local path.
 ///
 /// **A URL with credentials in it is refused** (`https://user:token@host/...`, and any user
 /// before an https host, since a token works as a user name there): the fleet never holds git
@@ -11,7 +13,8 @@
 /// key). The error never repeats the URL, so a token typed by mistake goes no further.
 ///
 /// Everything else is refused too, notably git's `<transport>::<address>` form (`ext::` runs a
-/// command) and anything starting with `-` (an option to `git clone`).
+/// command), anything starting with `-` (an option to `git clone`), an ssh host starting with
+/// `-` (an option to ssh), and `?` or `#` anywhere (a query string can carry a token).
 pub fn check_repo_url(url: &str) -> Result<(), String> {
     const KINDS: &str =
         "use https://host/path, ssh://host/path, user@host:path, file://path or an absolute path";
@@ -30,6 +33,14 @@ pub fn check_repo_url(url: &str) -> Result<(), String> {
             "the repository URL must not start with '-'; {KINDS}"
         ));
     }
+    if u.contains(['?', '#']) {
+        return Err(
+            "the repository URL must not contain '?' or '#': a query string can carry a token, \
+             and git needs neither. Log in to git on the node instead, and give the plain URL"
+                .into(),
+        );
+    }
+    let bad_host = |host: &str| host.is_empty() || host.starts_with('-');
     let credentials = || {
         Err(
             "the repository URL carries credentials (a user or token before the host). The fleet \
@@ -52,9 +63,10 @@ pub fn check_repo_url(url: &str) -> Result<(), String> {
             }
             "ssh" => {
                 let (user, host) = authority.rsplit_once('@').unwrap_or(("", authority));
+                let host = host.split(':').next().unwrap_or_default();
                 if user.contains(':') {
                     credentials()
-                } else if host.is_empty() || rest.len() <= authority.len() + 1 {
+                } else if bad_host(host) || rest.len() <= authority.len() + 1 {
                     Err(format!("the repository URL names no host or path; {KINDS}"))
                 } else {
                     Ok(())
@@ -75,22 +87,33 @@ pub fn check_repo_url(url: &str) -> Result<(), String> {
     if is_absolute_path(u) {
         return Ok(());
     }
-    // `user@host:path`, git's scp-like form.
-    if let Some((head, path)) = u.split_once(':')
-        && let Some((user, host)) = head.split_once('@')
-    {
-        if user.is_empty() || host.is_empty() || host.contains('/') || path.is_empty() {
-            return Err(format!("the repository URL is not a git URL; {KINDS}"));
-        }
-        return Ok(());
-    }
     // `user:password@host:path`: a password where git's scp-like form has only a user.
     if u.split_once('@')
         .is_some_and(|(user, _)| user.contains(':'))
     {
         return credentials();
     }
-    Err(format!("the repository URL is not a git URL; {KINDS}"))
+    let Some((head, path)) = u.split_once(':') else {
+        return Err(format!("the repository URL is not a git URL; {KINDS}"));
+    };
+    if path.is_empty() || head.contains('/') {
+        return Err(format!("the repository URL is not a git URL; {KINDS}"));
+    }
+    match head.split_once('@') {
+        // `user@host:path`, git's scp-like form.
+        Some((user, host)) if !user.is_empty() && !bad_host(host) => Ok(()),
+        Some(_) => Err(format!("the repository URL is not a git URL; {KINDS}")),
+        // `alias:path`, an ssh config host.
+        None if head.len() >= 2
+            && !bad_host(head)
+            && head
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')) =>
+        {
+            Ok(())
+        }
+        None => Err(format!("the repository URL is not a git URL; {KINDS}")),
+    }
 }
 
 /// Refuses a projects root that is not an absolute path, on either kind of machine: the
@@ -138,6 +161,8 @@ mod tests {
             "ssh://git@github.com/owner/repo.git",
             "ssh://host.example:2222/srv/repo",
             "git@github.com:owner/repo.git",
+            "github-work:org/repo.git",
+            "gitlab.example.com:group/repo",
             "file:///tmp/repo.git",
             "/srv/git/repo.git",
             r"C:\Users\me\AppData\Local\Temp\bare.git",
@@ -188,6 +213,16 @@ mod tests {
             "@host:repo",
             "git@host:",
             "https://github.com/owner/repo\n--config",
+            "https://github.com/owner/repo.git?private_token=glpat-x",
+            "https://github.com/owner/repo.git#frag",
+            "ssh://-oProxyCommand=touch%20x/repo",
+            "ssh://git@-oProxyCommand=x/repo",
+            "git@-oProxyCommand=x:repo",
+            "-alias:repo",
+            "x:repo",
+            "C:repo",
+            "al ias:repo",
+            "a/b:repo",
         ] {
             assert!(check_repo_url(bad).is_err(), "{bad:?}");
         }

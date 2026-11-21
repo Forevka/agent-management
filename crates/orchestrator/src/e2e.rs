@@ -3700,12 +3700,17 @@ async fn habit_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) {
         (answered.0.as_str(), &answered.1["approved"]),
         ("answered", &json!(true))
     );
-    let actor: String = sqlx::query_scalar(
-        "select actor from audit_log where action = 'habit.apply' order by id desc limit 1",
-    )
-    .fetch_one(db)
-    .await
-    .unwrap();
+    // Waited for: the habit writes its audit row after its approval has taken effect, and a fast
+    // run can be done by then.
+    let actor: String = wait_for("the habit's audit row", || async {
+        sqlx::query_scalar(
+            "select actor from audit_log where action = 'habit.apply' order by id desc limit 1",
+        )
+        .fetch_optional(db)
+        .await
+        .unwrap()
+    })
+    .await;
     assert_eq!(actor, format!("owner (via habit {})", habit.id));
     assert!(
         chat.ops.lock().unwrap().iter().any(|op| matches!(
@@ -4205,25 +4210,13 @@ fn git(dir: &std::path::Path, args: &[&str]) {
     );
 }
 
-/// Projects assigned to a node: the owner records where a project's code lives and assigns it to
-/// a node, and the first task for it there clones it (with the machine's own git login), maps it
-/// and starts in the clone. A project nobody assigned is never placed on a node that lacks it,
-/// a clone that fails fails the run with what to do, and the brain cannot assign anything.
-async fn node_projects_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) {
-    use crate::admin::{self, Actor};
-
-    // 1. A real repository to clone: a bare one with one commit, in a temp dir. Never the
-    //    developer's home: the node's projects root is set to another temp dir below.
-    let base = std::env::temp_dir().join(format!("fleet-e2e-git-{}", crate::web::random_token()));
-    let (bare, work, root) = (
-        base.join("origin.git"),
-        base.join("work"),
-        base.join("clones"),
-    );
+/// A bare repository with one commit (a README without a line ending, so `core.autocrlf` changes
+/// nothing) at `<base>/origin.git`, its default branch `main`.
+fn bare_repo(base: &std::path::Path) -> PathBuf {
+    let (bare, work) = (base.join("origin.git"), base.join("work"));
     std::fs::create_dir_all(&work).unwrap();
-    git(&base, &["init", "-q", "--bare", "origin.git"]);
+    git(base, &["init", "-q", "--bare", "origin.git"]);
     git(&work, &["init", "-q"]);
-    // No line ending: a machine with `core.autocrlf` would check one out differently.
     std::fs::write(work.join("README.md"), "the assigned project").unwrap();
     git(&work, &["add", "README.md"]);
     git(
@@ -4249,6 +4242,428 @@ async fn node_projects_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &Fak
         ],
     );
     git(&bare, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    bare
+}
+
+/// The node's temporary clone directories for `slug` under `root` (`.fleet-clone-<slug>-*`).
+fn temp_clones(root: &std::path::Path, slug: &str) -> Vec<String> {
+    let prefix = format!(".fleet-clone-{slug}-");
+    std::fs::read_dir(root)
+        .map(|d| {
+            d.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with(&prefix))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Runs that wait for their project's clone: a message sent meanwhile is delivered once the run
+/// starts, or handed back when it never does (stopped, or the clone failed); a stop stops git and
+/// leaves nothing behind; two runs share one clone; a node that has the project beats one that
+/// would clone it; and a clone that failed takes no more work there until the owner retries.
+async fn clone_waits_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) {
+    let base = std::env::temp_dir().join(format!("fleet-e2e-wait-{}", crate::web::random_token()));
+    let (bare, root) = (bare_repo(&base), base.join("clones"));
+    let good = bare.display().to_string();
+    let missing = base.join("no-such-repo.git").display().to_string();
+    // A server that takes connections and never answers: a clone from it hangs until it is
+    // stopped (well inside git's own five-minute connect timeout).
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let held = Arc::new(std::sync::Mutex::new(Vec::new()));
+    {
+        let held = held.clone();
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                held.lock().unwrap().push(socket);
+            }
+        });
+    }
+    let hang = |name: &str| format!("https://127.0.0.1:{port}/{name}.git");
+
+    let node: String = sqlx::query_scalar("select id from nodes where name = 'e2e-node-3'")
+        .fetch_one(db)
+        .await
+        .unwrap();
+    // Earlier flows leave sessions of their own idling on this node; room for this flow's runs.
+    let running_before: Vec<String> =
+        sqlx::query_scalar("select id from tasks where node_id = $1 and running and id <> all($2)")
+            .bind(&node)
+            .bind(crate::model::BUILTIN_TASKS)
+            .fetch_all(db)
+            .await
+            .unwrap();
+    sqlx::query("update nodes set max_agents = $2 where id = $1")
+        .bind(&node)
+        .bind(running_before.len() as i32 + 4)
+        .execute(db)
+        .await
+        .unwrap();
+    // The node reports its limit back (`NodeInfo`): it must have it, or it would undo this.
+    o.push_node_settings(&node).await.unwrap();
+    wait_for("the node runs with the new limit", || async {
+        o.node(&node)
+            .await
+            .unwrap()
+            .filter(|n| n.max_agents == running_before.len() as i32 + 4)
+    })
+    .await;
+    api_post(
+        o,
+        &format!("/api/nodes/{node}"),
+        json!({"op": "projects_root", "body": {"root": root.display().to_string()}}),
+    )
+    .await;
+    let set_url = |slug: &str, url: String| {
+        let slug = slug.to_owned();
+        async move {
+            api_post(
+                o,
+                &format!("/api/projects/{slug}"),
+                json!({"op": "repo_url", "body": {"url": url}}),
+            )
+            .await;
+        }
+    };
+    for slug in ["slow", "later", "doomed", "shared"] {
+        sqlx::query("insert into projects (slug, name) values ($1, $1)")
+            .bind(slug)
+            .execute(db)
+            .await
+            .unwrap();
+        api_post(
+            o,
+            &format!("/api/nodes/{node}"),
+            json!({"op": "assign", "body": {"project": slug}}),
+        )
+        .await;
+    }
+    // The run that waits behind another clone plans first; approved for the owner, so its first
+    // turn ends and the message that waited with it is read next.
+    sqlx::query("update projects set plan_gate = 'auto' where slug = 'later'")
+        .execute(db)
+        .await
+        .unwrap();
+    let new_task = |project: &str, ticket: &str, agent: &str, brief: &str| {
+        let (project, ticket, agent, brief) = (
+            project.to_owned(),
+            ticket.to_owned(),
+            agent.to_owned(),
+            brief.to_owned(),
+        );
+        async move {
+            let t = tasks::create_task(
+                o,
+                CreateTask {
+                    project,
+                    title: "Work in a clone".into(),
+                    brief,
+                    ticket: Some(ticket),
+                    agent: None,
+                    new_agent: Some(NewAgent {
+                        name: agent,
+                        role: "implementor".into(),
+                    }),
+                    model: None,
+                    effort: None,
+                },
+            )
+            .await
+            .unwrap();
+            match try_wait_for(Duration::from_secs(30), || async {
+                o.task(&t.id).await.unwrap().filter(|t| t.running)
+            })
+            .await
+            {
+                Some(t) => t,
+                None => panic!(
+                    "{} was not placed: {:?}; said: {:?}",
+                    t.id,
+                    o.task(&t.id).await.unwrap(),
+                    chat.sent()
+                        .iter()
+                        .filter(|(_, topic, _, _)| *topic == t.topic_id)
+                        .map(|(_, _, html, _)| html.clone())
+                        .collect::<Vec<_>>()
+                ),
+            }
+        }
+    };
+    let state = |project: &str| {
+        let project = project.to_owned();
+        let node = node.clone();
+        async move {
+            sqlx::query_scalar::<_, Option<String>>(
+                "select state from node_projects where node_id = $1 and project = $2",
+            )
+            .bind(&node)
+            .bind(&project)
+            .fetch_one(db)
+            .await
+            .unwrap()
+        }
+    };
+    let wait_state = |project: &'static str, want: Option<&'static str>| async move {
+        wait_for(&format!("{project} is {want:?} on the node"), || async {
+            (state(project).await.as_deref() == want).then_some(())
+        })
+        .await
+    };
+    let handed_back = |task: &str, text: &str| {
+        let (task, text) = (task.to_owned(), text.to_owned());
+        async move {
+            sqlx::query_scalar::<_, bool>(
+                "select exists(select 1 from task_events where task_id = $1 and kind = 'undelivered' and data = $2)",
+            )
+            .bind(&task)
+            .bind(&text)
+            .fetch_one(db)
+            .await
+            .unwrap()
+        }
+    };
+    let cwd_of = |task: &str| {
+        let task = task.to_owned();
+        async move {
+            wait_for("the run reports where it works", || async {
+                events(db, &task)
+                    .await
+                    .into_iter()
+                    .find(|e| e["type"] == "skill")
+                    .and_then(|e| e["cwd"].as_str().map(str::to_owned))
+            })
+            .await
+        }
+    };
+    let same = |a: &str, b: &std::path::Path| {
+        std::path::Path::new(a).canonicalize().unwrap() == b.canonicalize().unwrap()
+    };
+    let stop = |t: TaskRow| async move {
+        let t = o.task(&t.id).await.unwrap().unwrap();
+        tasks::stop(o, &t, false).await.unwrap();
+        wait_for("the run ends", || async {
+            o.task(&t.id).await.unwrap().filter(|t| !t.running)
+        })
+        .await
+    };
+
+    // 1. Stopped while it clones: git is stopped and leaves nothing, and the message sent to the
+    //    waiting run comes back to the orchestrator instead of being lost. (The project loses its
+    //    URL first, so the message that comes back waits in the queue rather than starting
+    //    another clone.)
+    set_url("slow", hang("slow")).await;
+    let a = new_task("slow", "SL-1", "Waiter", "Wait for the clone.").await;
+    wait_state("slow", Some("cloning")).await;
+    wait_for("git is cloning into its temporary directory", || async {
+        (!temp_clones(&root, "slow").is_empty()).then_some(())
+    })
+    .await;
+    let m1 = "[Message from the human] sent while it clones";
+    tasks::deliver(o, &a, m1.into()).await.unwrap();
+    set_url("slow", String::new()).await;
+    let a_now = o.task(&a.id).await.unwrap().unwrap();
+    tasks::stop(o, &a_now, false).await.unwrap();
+    wait_for("the message comes back", || async {
+        handed_back(&a.id, m1).await.then_some(())
+    })
+    .await;
+    wait_for("git is stopped and its directory removed", || async {
+        temp_clones(&root, "slow").is_empty().then_some(())
+    })
+    .await;
+    wait_state("slow", None).await;
+    assert!(
+        !root.join("slow").exists(),
+        "nothing of a stopped clone is left"
+    );
+    let kept: i64 =
+        sqlx::query_scalar("select count(*) from messages where task_id = $1 and text = $2")
+            .bind(&a.id)
+            .bind(m1)
+            .fetch_one(db)
+            .await
+            .unwrap();
+    assert_eq!(kept, 1, "the message waits for the task's next run");
+
+    // 2. A run waiting behind another clone of its project (the owner changed the URL while it
+    //    ran) keeps the message it is sent and gets it once its own clone is done; the first
+    //    clone, wanted by nobody once its run is stopped, is stopped with it.
+    set_url("later", hang("later")).await;
+    let b = new_task("later", "LA-1", "First", "Wait for the clone.").await;
+    wait_state("later", Some("cloning")).await;
+    set_url("later", good.clone()).await;
+    let c = new_task(
+        "later",
+        "LA-2",
+        "Second",
+        "plan-gate: work in the fresh clone.",
+    )
+    .await;
+    let m2 = "[Message from the human] sent while it waited";
+    tasks::deliver(o, &c, m2.into()).await.unwrap();
+    stop(b).await;
+    wait_for(
+        "the waiting run gets its message once it starts",
+        || async {
+            events(db, &c.id).await.into_iter().find(|e| {
+                e["message"]["content"][0]["text"]
+                    .as_str()
+                    .is_some_and(|t| t.starts_with(&format!("got: {m2}")))
+            })
+        },
+    )
+    .await;
+    assert!(same(&cwd_of(&c.id).await, &root.join("later")));
+    assert!(!handed_back(&c.id, m2).await);
+    wait_state("later", Some("cloned")).await;
+    assert!(temp_clones(&root, "later").is_empty());
+    stop(c).await;
+
+    // 3. A clone that fails ends the run waiting for it with the reason, and the message it was
+    //    sent comes back. The failed assignment takes no more work (the message waits, and the
+    //    topic says why) until the owner presses Retry.
+    set_url("doomed", hang("doomed")).await;
+    let e = new_task("doomed", "DO-1", "Opener", "Wait for the clone.").await;
+    wait_state("doomed", Some("cloning")).await;
+    set_url("doomed", missing.clone()).await;
+    let f = new_task("doomed", "DO-2", "Doomed", "Wait for the clone.").await;
+    let m3 = "[Message from the human] sent before the clone failed";
+    tasks::deliver(o, &f, m3.into()).await.unwrap();
+    stop(e).await;
+    wait_for(
+        "the failure ends the run and hands the message back",
+        || async { handed_back(&f.id, m3).await.then_some(()) },
+    )
+    .await;
+    let failures = || async {
+        sqlx::query_scalar::<_, i64>(
+            "select count(*) from task_events where task_id = $1 and kind = 'spawn_failed'",
+        )
+        .bind(&f.id)
+        .fetch_one(db)
+        .await
+        .unwrap()
+    };
+    assert_eq!(failures().await, 1);
+    wait_state("doomed", Some("failed")).await;
+    let waiting = wait_for(
+        "the handed-back message waits instead of failing again",
+        || async {
+            o.task(&f.id)
+                .await
+                .unwrap()
+                .filter(|t| t.status == "queued" && !t.running)
+        },
+    )
+    .await;
+    assert!(
+        chat.sent()
+            .iter()
+            .any(|(_, topic, html, _)| *topic == waiting.topic_id
+                && html.contains("cloning it failed on <b>e2e-node-3</b>")
+                && html.contains("Retry")),
+        "the topic says the clone failed and how to retry"
+    );
+    let page = api_get(o, &format!("/api/nodes/{node}")).await;
+    let doomed = page["assignments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["project"] == "doomed")
+        .cloned()
+        .unwrap();
+    assert_eq!(doomed["status"], "failed", "{doomed:#}");
+    assert!(
+        doomed["detail"]
+            .as_str()
+            .unwrap()
+            .contains("git could not clone")
+    );
+    api_post(
+        o,
+        &format!("/api/nodes/{node}"),
+        json!({"op": "retry", "body": {"project": "doomed"}}),
+    )
+    .await;
+    wait_for(
+        "after a retry the task is placed and tries again",
+        || async { (failures().await == 2).then_some(()) },
+    )
+    .await;
+    wait_state("doomed", Some("failed")).await;
+    let retried: i64 = sqlx::query_scalar(
+        "select count(*) from audit_log where actor = 'owner' and action = 'node.retry_project'",
+    )
+    .fetch_one(db)
+    .await
+    .unwrap();
+    assert_eq!(retried, 1, "the retry is audited");
+
+    // 4. Two tasks at once, one clone: the second waits for the first's and starts in it.
+    set_url("shared", good.clone()).await;
+    let g = new_task("shared", "SH-1", "One", "Share the clone.").await;
+    let h = new_task("shared", "SH-2", "Two", "Share the clone.").await;
+    for t in [&g, &h] {
+        assert!(same(&cwd_of(&t.id).await, &root.join("shared")));
+    }
+    wait_state("shared", Some("cloned")).await;
+    assert!(temp_clones(&root, "shared").is_empty());
+    stop(g).await;
+    stop(h).await;
+
+    // 5. A node that has the project mapped is preferred over one that would have to clone it,
+    //    however idle that one is.
+    let idle = SecretKey::generate().public().to_string();
+    sqlx::query(
+        "insert into nodes (id, name, online, app_version, max_agents) values ($1, 'e2e-clone-node', true, $2, 8)",
+    )
+    .bind(&idle)
+    .bind(fleet_proto::BUILD_VERSION)
+    .execute(db)
+    .await
+    .unwrap();
+    api_post(
+        o,
+        &format!("/api/nodes/{idle}"),
+        json!({"op": "assign", "body": {"project": "demo"}}),
+    )
+    .await;
+    set_url("demo", good.clone()).await;
+    let d = new_task("demo", "PR-1", "Picky", "Go where the checkout is.").await;
+    assert_eq!(
+        d.node_id.as_deref(),
+        Some(node.as_str()),
+        "the mapped node wins"
+    );
+    stop(d).await;
+    sqlx::query("update nodes set online = false where id = $1")
+        .bind(&idle)
+        .execute(db)
+        .await
+        .unwrap();
+
+    // The messages of (1) and (3) still wait; nothing should pick them up after this flow.
+    for t in [&a, &f] {
+        tasks::stop(o, &o.task(&t.id).await.unwrap().unwrap(), false)
+            .await
+            .unwrap();
+    }
+    drop(held);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Projects assigned to a node: the owner records where a project's code lives and assigns it to
+/// a node, and the first task for it there clones it (with the machine's own git login), maps it
+/// and starts in the clone. A project nobody assigned is never placed on a node that lacks it,
+/// a clone that fails fails the run with what to do, and the brain cannot assign anything.
+async fn node_projects_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) {
+    use crate::admin::{self, Actor};
+
+    // 1. A real repository to clone: a bare one with one commit, in a temp dir. Never the
+    //    developer's home: the node's projects root is set to another temp dir below.
+    let base = std::env::temp_dir().join(format!("fleet-e2e-git-{}", crate::web::random_token()));
+    let (bare, root) = (bare_repo(&base), base.join("clones"));
 
     let node: (String,) = sqlx::query_as("select id from nodes where name = 'e2e-node-3'")
         .fetch_one(db)
@@ -7585,6 +8000,7 @@ async fn lifecycle() {
     //     unassigned is placed there, a clone that fails says what to do, and only the owner
     //     assigns.
     Box::pin(node_projects_flow(&o, &db, &chat)).await;
+    Box::pin(clone_waits_flow(&o, &db, &chat)).await;
 
     stop_brain().await;
     let _ = std::fs::remove_dir_all(&data_dir);

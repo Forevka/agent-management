@@ -6,16 +6,27 @@ VPS rolls it out), so each section below is one merge. How to add to this file i
 
 ## Unreleased
 
-- **Projects assigned to a node, cloned on demand.** A project records its git URL (one with
-  credentials in it is refused), and on a node's page the owner assigns projects to it and may
-  set where clones go (default `~/fleet-projects`). A task for an assigned project can be placed
-  on that node, after nodes that already have it mapped; the node clones it with the machine's own
-  git login (non-interactive, one clone per project at a time, at most 20 minutes), maps it and
-  starts the run. A checkout of the same repository already there is adopted; anything else is
-  left alone, and nothing is ever deleted, unassigning included. A clone that fails fails the run
-  with what to do, and the node's page shows each assignment as ready, cloning, failed (why) or
-  not cloned yet. Only the owner sets URLs, roots and assignments; the brain reads them. Nodes
-  clone only once they run this release. Migration `0024_node_projects` (add-only).
+- **Projects assigned to a node, cloned on demand.** A project records its git URL; a URL with
+  credentials, a query string or a fragment in it is refused. On a node's page the owner assigns
+  projects to it and may set where clones go (default `~/fleet-projects`); only the owner can, and
+  each change is audited. A task for an assigned project can be placed on that node, after nodes
+  that already have it mapped. The node clones it with the machine's own git login and maps it,
+  then starts the run; messages sent to the run meanwhile are delivered once it starts.
+  - Git never prompts: no terminal prompt, no askpass, no credential-manager dialog. ssh runs in
+    batch mode unless the machine set its own ssh command (`GIT_SSH_COMMAND`, `GIT_SSH` or
+    `core.sshCommand`), which is left exactly as it is. One clone per project runs at a time,
+    stopped after 20 minutes together with every process it started.
+  - The clone is made in a temporary `.fleet-clone-<slug>-*` directory and renamed into place
+    only when git succeeds; the node removes only such directories of its own. A finished checkout
+    of the same repository already at the target is adopted; anything else is left alone, and
+    unassigning deletes nothing.
+  - The node refuses to clone onto a volume with less than 1 GB free.
+  - Stopping a waiting task stops its git. A run that never starts hands its messages back to the
+    task's queue.
+  - A failed clone fails the run with what to do, and the assignment takes no more tasks until
+    the owner presses **Retry** (or changes the URL, the root or the assignment); the task's topic
+    says so.
+  - A node clones only once it runs this release. Migration `0024_node_projects` (add-only).
 
 ## v0.2.6 — 2026-11-21
 

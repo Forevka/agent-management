@@ -293,10 +293,20 @@ a restart.
      on the same page), maps it and starts. The node clones with **its own
      machine's git login**, so log in to git there once (`gh auth login`, the
      Git credential manager, or an ssh key); the fleet never holds git
-     credentials. A directory already at the target is used if it is a checkout
-     of the same repository and refused otherwise; nothing is ever deleted,
-     unassigning included. Nothing assigned is never cloned. A node must run the
-     orchestrator's release to clone (it updates itself).
+     credentials. Git runs without ever prompting (no terminal, askpass or
+     credential dialog); ssh runs in batch mode unless the machine set its own
+     ssh command (`GIT_SSH_COMMAND`, `GIT_SSH` or `core.sshCommand`), which is
+     kept as it is. A clone is stopped after 20 minutes, with everything git
+     started. It is made in `<root>/.fleet-clone-<slug>-<random>` and renamed to
+     `<root>/<slug>` only when it succeeded; those temporary directories are the
+     only thing the node ever removes. A finished checkout of the same
+     repository already at the target is used as it is; anything else there is
+     refused, and nothing is deleted, unassigning included. The node does not
+     clone onto a volume with less than 1 GB free. A clone that failed shows its
+     reason on the node's page and takes no more tasks until you press
+     **Retry** there (or change the URL, the root or the assignment). Nothing
+     assigned is never cloned. A node must run the orchestrator's release to
+     clone (it updates itself).
    - Or **map** a checkout by hand: `fleet project map <slug> <directory>`, or
      on Windows, from the tray app.
 

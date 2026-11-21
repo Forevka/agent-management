@@ -163,6 +163,12 @@ impl Orchestrator {
         self.lock(format!("project:{project}"))
     }
 
+    /// Held while a node's project assignments are read and sent (`node_projects`), so two
+    /// pushes never overtake each other. Taken alone, never with the locks above.
+    pub(crate) fn node_push_lock(&self, node_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.lock(format!("node-push:{node_id}"))
+    }
+
     /// Locks nobody else holds are dropped as new ones are made, so the map stays as small as
     /// the set of busy tasks and agents.
     fn lock(&self, key: String) -> Arc<tokio::sync::Mutex<()>> {
@@ -281,7 +287,18 @@ impl Orchestrator {
             .fetch_all(&self.db)
             .await?;
             crate::human::retire_copies(self, cancelled, "cancelled: the agent's node restarted");
+            // A clone that was under way died with the process (the node clears what it left
+            // the next time it clones): nothing is being cloned there any more.
+            sqlx::query(
+                "update node_projects set state = null, detail = null where node_id = $1 and state = 'cloning'",
+            )
+            .bind(&id)
+            .execute(&self.db)
+            .await?;
         }
+        // The projects it may clone go out before it is marked online, so nothing can be placed
+        // on it (and sent ahead of them) before it knows what it may clone.
+        crate::node_projects::on_connect(self, peer, &hello.app_version).await?;
         sqlx::query("update nodes set incarnation = $2 where id = $1")
             .bind(&id)
             .bind(&incarnation)
@@ -299,9 +316,6 @@ impl Orchestrator {
         .await?;
         self.push_node_settings(&id).await?;
         self.push_project_list(Some(peer)).await?;
-        // The projects it may clone, before anything is placed on it (a node reports its
-        // projects after this, and that report is what starts queued work).
-        crate::node_projects::on_connect(self, peer, &hello.app_version).await?;
         // This orchestrator reads disk reports; a node that can read the request starts sending
         // them (one now, then every few minutes). An older node is never asked: it could not
         // decode the request.

@@ -139,6 +139,9 @@ function AssignmentState({ a }: { a: NodeAssignment }) {
               {a.detail}
             </Text>
           )}
+          <Text size="1" tone="muted">
+            Takes no tasks until you fix that and press Retry.
+          </Text>
         </Stack>
       )
     case 'no_url':
@@ -274,6 +277,18 @@ function AssignedProjects({ n, path, reload }: { n: Node; path: string; reload: 
             align: 'end',
             cell: (p) =>
               assigned.has(p.slug) ? (
+                <Row gap="2" justify="end">
+                  {assigned.get(p.slug)?.status === 'failed' && (
+                    <ActionButton
+                      path={path}
+                      op="retry"
+                      body={{ project: p.slug }}
+                      size="sm"
+                      onDone={() => void reload()}
+                    >
+                      Retry
+                    </ActionButton>
+                  )}
                 <ActionButton
                   path={path}
                   op="unassign"
@@ -285,6 +300,7 @@ function AssignedProjects({ n, path, reload }: { n: Node; path: string; reload: 
                 >
                   Unassign
                 </ActionButton>
+                </Row>
               ) : (
                 <ActionButton
                   path={path}

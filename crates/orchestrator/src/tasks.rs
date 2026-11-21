@@ -669,13 +669,31 @@ async fn dispatch_locked(
                 .execute(&o.db)
                 .await?;
             }
-            Some(format!(
-                "⏳ Waiting for a node with project <b>{}</b>: assign it to a node on the node's page \
-                 in the web UI (with the project's repository URL set, the node clones it), or run \
-                 <code>fleet project map {} &lt;dir&gt;</code> on a host.",
-                esc(&task.project),
-                esc(&task.project)
-            ))
+            // A clone that failed holds the project off that node until the owner retries: say
+            // so, rather than send them to assign what is assigned.
+            let failed = crate::node_projects::failed_on(o, &task.project).await?;
+            Some(if failed.is_empty() {
+                format!(
+                    "⏳ Waiting for a node with project <b>{}</b>: assign it to a node on the node's page \
+                     in the web UI (with the project's repository URL set, the node clones it), or run \
+                     <code>fleet project map {} &lt;dir&gt;</code> on a host.",
+                    esc(&task.project),
+                    esc(&task.project)
+                )
+            } else {
+                let names = failed
+                    .iter()
+                    .map(|(n, _)| esc(n))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "⏳ Waiting for a node with project <b>{}</b>: cloning it failed on <b>{names}</b> \
+                     (the reason is on the node's page in the web UI). Fix that and press Retry there, \
+                     or run <code>fleet project map {} &lt;dir&gt;</code> on a host.",
+                    esc(&task.project),
+                    esc(&task.project)
+                )
+            })
         };
         return queue(o, task, &holder, prompt.as_deref(), origin, note).await;
     }

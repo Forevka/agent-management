@@ -1186,7 +1186,8 @@ fn owner_only(actor: Actor) -> Result<()> {
 
 /// Sets (or with `None` or blank, clears) where a project's code lives. Refuses a URL with
 /// credentials in it: nodes clone with their own machine's git login. The nodes it is assigned
-/// to hear of it at once.
+/// to hear of it at once, and a clone that failed there is tried again (with the new URL) by the
+/// next task.
 pub async fn set_repo_url(
     o: &Arc<Orchestrator>,
     actor: Actor,
@@ -1204,6 +1205,7 @@ pub async fn set_repo_url(
         .bind(url)
         .execute(&o.db)
         .await?;
+    reset_assignments(o, None, Some(&p.slug)).await?;
     o.audit(
         actor.audit_name(),
         "project.repo_url",
@@ -1225,9 +1227,10 @@ pub async fn set_repo_url(
 }
 
 /// Sets (or with `None` or blank, clears) where a node puts the projects it clones. Must be an
-/// absolute path; the node checks it again against its own OS.
+/// absolute path; the node checks it again against its own OS. A clone that failed there is
+/// tried again (in the new place) by the next task.
 pub async fn set_projects_root(
-    o: &Orchestrator,
+    o: &Arc<Orchestrator>,
     actor: Actor,
     node_ref: &str,
     root: Option<&str>,
@@ -1243,6 +1246,7 @@ pub async fn set_projects_root(
         .bind(root)
         .execute(&o.db)
         .await?;
+    reset_assignments(o, Some(&n.id), None).await?;
     o.audit(
         actor.audit_name(),
         "node.projects_root",
@@ -1250,6 +1254,7 @@ pub async fn set_projects_root(
     )
     .await;
     crate::node_projects::push(o, &n.id).await?;
+    dispatch_queued_soon(o);
     Ok(match root {
         Some(r) => format!("{} clones projects into {r}.", n.name),
         None => format!(
@@ -1261,7 +1266,8 @@ pub async fn set_projects_root(
 
 /// Assigns a project to a node (`assign`), or takes it back. An assigned project with a
 /// repository URL is cloned there when a task for it is placed on that node; taking it back
-/// stops that and never deletes anything the node already cloned.
+/// stops that and never deletes anything the node already cloned. Assigning one that is assigned
+/// already clears a failed clone, like [`retry_assignment`].
 pub async fn assign_project(
     o: &Arc<Orchestrator>,
     actor: Actor,
@@ -1274,7 +1280,9 @@ pub async fn assign_project(
     let p = tasks::project(o, slug).await?;
     let changed = if assign {
         sqlx::query(
-            "insert into node_projects (node_id, project) values ($1, $2) on conflict do nothing",
+            "insert into node_projects (node_id, project) values ($1, $2)
+             on conflict (node_id, project) do update set state = null, detail = null
+             where node_projects.state is not null",
         )
     } else {
         sqlx::query("delete from node_projects where node_id = $1 and project = $2")
@@ -1315,6 +1323,65 @@ pub async fn assign_project(
             p.slug, n.name
         ),
     })
+}
+
+/// Lets an assignment whose clone failed take tasks again, so the next one tries the clone
+/// anew (after the owner fixed what the failure said: a login on the machine, a URL, space).
+pub async fn retry_assignment(
+    o: &Arc<Orchestrator>,
+    actor: Actor,
+    node_ref: &str,
+    slug: &str,
+) -> Result<String> {
+    owner_only(actor)?;
+    let n = node(o, node_ref).await?;
+    let p = tasks::project(o, slug).await?;
+    let retried = sqlx::query(
+        "update node_projects set state = null, detail = null
+         where node_id = $1 and project = $2 and state = 'failed'",
+    )
+    .bind(&n.id)
+    .bind(&p.slug)
+    .execute(&o.db)
+    .await?
+    .rows_affected()
+        == 1;
+    if !retried {
+        return Ok(format!(
+            "{} has no failed clone on {}; nothing to retry.",
+            p.slug, n.name
+        ));
+    }
+    o.audit(
+        actor.audit_name(),
+        "node.retry_project",
+        json!({"node": n.id, "project": p.slug}),
+    )
+    .await;
+    dispatch_queued_soon(o);
+    Ok(format!(
+        "{} will be cloned on {} again when a task needs it.",
+        p.slug, n.name
+    ))
+}
+
+/// Forgets what nodes last reported about assignments (of one node, or of one project): what
+/// the owner just changed may well be what made a clone fail.
+async fn reset_assignments(
+    o: &Orchestrator,
+    node_id: Option<&str>,
+    project: Option<&str>,
+) -> Result<()> {
+    sqlx::query(
+        "update node_projects set state = null, detail = null
+         where state is distinct from 'cloning'
+           and ($1::text is null or node_id = $1) and ($2::text is null or project = $2)",
+    )
+    .bind(node_id)
+    .bind(project)
+    .execute(&o.db)
+    .await?;
+    Ok(())
 }
 
 /// Tries queued work in the background: a change just made a node able to run more of it.
@@ -2877,7 +2944,13 @@ pub async fn projects_json(o: &Orchestrator) -> Result<Value> {
         .bind(&slug)
         .fetch_one(&o.db)
         .await?;
-        out.push(json!({"slug": slug, "name": name, "description": description, "nodes": on, "open_tasks": open, "jira": jira}));
+        // The nodes it is assigned to (cloned there on demand), and how each stands.
+        let assigned: Vec<Value> = crate::node_projects::project_json(o, &slug)
+            .await?
+            .iter()
+            .map(|a| json!({"node": a["node"], "online": a["online"], "status": a["status"]}))
+            .collect();
+        out.push(json!({"slug": slug, "name": name, "description": description, "nodes": on, "assigned_nodes": assigned, "open_tasks": open, "jira": jira}));
     }
     Ok(Value::Array(out))
 }
@@ -2941,6 +3014,18 @@ pub(crate) async fn project_json(o: &Orchestrator, slug: &str) -> Result<Value> 
         "plan_gate": p.plan_gate,
         // Where its code lives, for nodes it is assigned to that clone it; only the owner sets it.
         "repo_url": p.repo_url,
+        // The nodes it is assigned to and how it stands there; a node's words framed as data.
+        "assigned_nodes": crate::node_projects::project_json(o, &p.slug)
+            .await?
+            .iter()
+            .map(|a| json!({
+                "node": a["node"],
+                "online": a["online"],
+                "status": a["status"],
+                "path": a["path"],
+                "detail": a["detail"].as_str().map(|d| tasks::untrusted(d, 600)),
+            }))
+            .collect::<Vec<_>>(),
         "secret_folders": folders,
         "slack_channels": channels.iter().map(|(s, id, n, t)| json!({"source": s, "channel_id": id, "name": n, "triage": t})).collect::<Vec<_>>(),
         "nodes": on,
@@ -3007,7 +3092,15 @@ fn node_json(n: &NodeRow) -> Value {
 async fn node_read_json(o: &Orchestrator, n: &NodeRow) -> Result<Value> {
     let mut v = node_json(n);
     v["projects_root"] = json!(n.projects_root);
-    v["assigned_projects"] = json!(crate::node_projects::node_json(o, n).await?);
+    let mut assigned = crate::node_projects::node_json(o, n).await?;
+    // The node's report quotes git, and git quotes the remote (`remote:` lines): data to read,
+    // never instructions.
+    for a in &mut assigned {
+        if let Some(d) = a["detail"].as_str() {
+            a["detail"] = json!(tasks::untrusted(d, 600));
+        }
+    }
+    v["assigned_projects"] = json!(assigned);
     Ok(v)
 }
 

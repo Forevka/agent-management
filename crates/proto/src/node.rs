@@ -120,7 +120,7 @@ pub struct AssignedProject {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProjectSetupReport {
     pub project: String,
-    /// One of [`SETUP_CLONING`], [`SETUP_CLONED`], [`SETUP_FAILED`]. Text rather than an enum, so
+    /// One of [`SETUP_CLONING`], [`SETUP_CLONED`], [`SETUP_FAILED`], [`SETUP_STOPPED`]. Text rather than an enum, so
     /// a state added later reads as unknown instead of breaking the frame.
     pub state: String,
     /// Where it was cloned to, or why it failed.
@@ -130,6 +130,9 @@ pub struct ProjectSetupReport {
 pub const SETUP_CLONING: &str = "cloning";
 pub const SETUP_CLONED: &str = "cloned";
 pub const SETUP_FAILED: &str = "failed";
+/// The clone was stopped before it finished (its task was stopped); nothing was left behind,
+/// and the next task clones it again.
+pub const SETUP_STOPPED: &str = "stopped";
 
 /// How a node runs Claude Code, configured per node in the orchestrator's web UI.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

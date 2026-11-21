@@ -219,8 +219,12 @@ message:
 > repository URL on its page if it has none), or is it already cloned here (and where)?
 
 Projects the owner assigns in the web UI need nothing more here: the first task for one clones it
-into `~/fleet-projects/<slug>` (or the node's projects root, set on its page) and maps it. For each
-project the owner wants mapped by hand instead:
+into `~/fleet-projects/<slug>` (or the node's projects root, set on its page) and maps it. Git is
+run so it never prompts; if this machine has its own ssh command set (`core.sshCommand`,
+`GIT_SSH_COMMAND`), it is used as it is, so set it up so that `git ls-remote` works without a
+prompt.
+
+For each project the owner wants mapped by hand instead:
 
 1. If it is not cloned yet, clone it where the owner said. If the clone asks for credentials,
    **ASK THE OWNER** to sign in rather than handling a password or token yourself.

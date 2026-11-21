@@ -154,6 +154,11 @@ fn tree_size(dir: &Path, mut budget: usize, deadline: std::time::Instant) -> u64
     total
 }
 
+/// Bytes this user may still write on the volume `path` is (or would be) on.
+pub fn free_at(path: &Path) -> std::io::Result<u64> {
+    probe(path).map(|p| p.free)
+}
+
 /// The volume `path` is on and its space. A path that does not exist yet (a fresh node has no
 /// `~/.claude`) is measured at its nearest existing ancestor, where it would be created.
 fn probe(path: &Path) -> std::io::Result<Probe> {

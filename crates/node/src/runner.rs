@@ -430,8 +430,9 @@ pub fn start(
     Ok(handle)
 }
 
-/// Everything an agent process started, so a stop can end all of it.
-struct ProcessTree {
+/// Everything an agent process (or a clone's git) started, so a stop can end all of it. The
+/// process must be started in its own process group on unix (`process_group(0)`).
+pub(crate) struct ProcessTree {
     #[cfg(unix)]
     pgid: Option<i32>,
     #[cfg(windows)]
@@ -439,7 +440,7 @@ struct ProcessTree {
 }
 
 impl ProcessTree {
-    fn adopt(child: &tokio::process::Child) -> Self {
+    pub(crate) fn adopt(child: &tokio::process::Child) -> Self {
         #[cfg(unix)]
         {
             Self {
@@ -465,7 +466,7 @@ impl ProcessTree {
         }
     }
 
-    async fn kill(&self, child: &mut tokio::process::Child) {
+    pub(crate) async fn kill(&self, child: &mut tokio::process::Child) {
         #[cfg(unix)]
         if let Some(pgid) = self.pgid {
             // SAFETY: killpg only sends a signal; the group was created for this child.
