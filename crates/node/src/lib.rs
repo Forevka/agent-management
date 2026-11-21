@@ -5,6 +5,7 @@
 //! `fleet mcp` shim inside each agent uses to reach the orchestrator.
 
 pub mod agent_cli;
+pub mod automemory;
 pub mod checkout;
 pub mod disk;
 /// `node.json` and `status.json` live in their own crate so the tray app can use them without
@@ -289,6 +290,12 @@ impl Node {
     }
 
     /// The `CLAUDE_CONFIG_DIR` the agents must be given, when the node was pointed elsewhere.
+    /// The Claude config folder this node's sessions use: the one it was pointed at, else
+    /// `CLAUDE_CONFIG_DIR` or `~/.claude`. Where Claude's own per-project memory is found.
+    pub(crate) fn claude_home(&self) -> Option<PathBuf> {
+        self.kit_paths().map(|p| p.config_dir)
+    }
+
     pub(crate) fn claude_config_env(&self) -> Option<PathBuf> {
         self.claude_config
             .lock()

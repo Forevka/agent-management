@@ -7,6 +7,26 @@ below is one release. How to add to this file is in `CLAUDE.md`
 
 ## Unreleased
 
+- **What an agent notes in Claude Code's own memory now reaches the fleet's memory.** Claude
+  keeps notes for itself between sessions (the owner's rules, a project's gotchas), and the
+  fleet's sessions were already writing them — the brain eight of the owner's rules — but they
+  stayed in a folder on one machine, out of Hindsight. Worse, a worker's folder was the one the
+  owner's own Claude Code uses in that repository, so the agents' rules loaded into the owner's
+  sessions and the owner's notes into theirs. Every worker and the brain now keep their notes in
+  a folder of the node's (`<data>/memory/`: one per project, one for the brain; the secretary and
+  the retrospective are sealed and unchanged), which starts as a copy of what Claude's folder
+  held for that directory, so nothing is lost. After every turn the node sends the notes the
+  fleet's sessions wrote or changed, and the orchestrator keeps each as one document per node in
+  the project's shared bank (the brain's in `fleet`), replaced when the note changes and removed
+  when it is deleted, secrets removed. The notes copied from the owner's own folder are the
+  owner's: the sessions keep reading them, but they are not sent; the brain's starting notes are
+  the fleet's and are. **Needs the nodes on this release** (they update themselves); with an
+  older node nothing changes. The notes agents already wrote into the owner's own folders stay
+  there until the owner deletes them: on this PC, `bioinsight/ai-workspace` holds four
+  (auto-merge on approval, post MRs to #code-reviews, no plan for review feedback, bullet lists).
+
+## v0.2.15 — 2026-11-21
+
 - **A memory recall shows only what is relevant.** Hindsight answers every recall with all it
   ranked (80-130 rows), so an agent asking a bank about something it was never told still got ten
   unrelated memories as if they were the answer. Results its reranker scores below 0.02 are now

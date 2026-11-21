@@ -27,7 +27,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::{Node, config::NodeConfig, secrets, tools};
+use crate::{Node, automemory, config::NodeConfig, secrets, tools};
 
 /// Forwarded output lines are capped so one huge tool result cannot exceed the frame limit.
 const MAX_LINE: usize = 512 * 1024;
@@ -39,6 +39,9 @@ pub(crate) const STRICT_MCP: &str = "--strict-mcp-config";
 /// Claude writes each token as it comes (`stream_event` lines; checked against the real CLI,
 /// 2.1.268).
 pub(crate) const PARTIAL_MESSAGES: &str = "--include-partial-messages";
+
+/// How long a run's exit waits to send what its last turn wrote to Claude's memory.
+const MEMORY_SYNC_AT_EXIT: Duration = Duration::from_secs(10);
 /// How often a watched run's block in progress is sent on: often enough to read as typing,
 /// rarely enough that a long answer is not a frame per token.
 const PARTIAL_EVERY: Duration = Duration::from_millis(100);
@@ -292,6 +295,52 @@ pub fn start(
     if !node.partial_messages_supported(&settings.claude_command) {
         args.retain(|a| a != PARTIAL_MESSAGES);
     }
+    // Claude's own memory goes to a folder of the node's, not the one the owner's Claude Code
+    // shares for this directory, and what it holds is sent on after every turn (see
+    // `automemory`). Not for the sealed sessions (the secretary's and the retrospective's take
+    // no settings at all), and not when the node's command already brings settings of its own:
+    // two `--settings` would leave which one wins to the CLI.
+    let node_settings = base_args
+        .iter()
+        .any(|a| a == "--settings" || a.starts_with("--settings="));
+    if node_settings {
+        tracing::info!(
+            "the node's claude command has --settings of its own; sessions keep Claude's own \
+             memory folder, which is not sent to the fleet's memory"
+        );
+    }
+    let memory_key = automemory::key(&spawn).filter(|_| !node_settings);
+    let memory = memory_key.as_deref().and_then(|key| {
+        let seed = node
+            .claude_home()
+            .map(|home| automemory::claude_default(&home, &work_dir));
+        let folder = automemory::dir(data_dir, key);
+        automemory::prepare(
+            data_dir,
+            key,
+            seed.as_deref(),
+            automemory::sends_seeded(&spawn),
+        )
+        .and_then(|()| automemory::settings_file(&agent_dir, &folder))
+        .inspect_err(|e| tracing::warn!("the session keeps Claude's own memory folder: {e:#}"))
+        .ok()
+    });
+    if let Some(path) = &memory {
+        args.extend(["--settings".into(), path.display().to_string()]);
+    }
+    let sync_memory = {
+        let (node, data_dir, token) = (node.clone(), data_dir.to_path_buf(), ipc_token.clone());
+        let key = memory.as_ref().and(memory_key);
+        move || {
+            let (node, data_dir, key, token) =
+                (node.clone(), data_dir.clone(), key.clone(), token.clone());
+            async move {
+                if let Some(key) = key {
+                    automemory::sync(&node, &data_dir, &key, &token).await;
+                }
+            }
+        }
+    };
     let mut cmd = Command::new(&program);
     cmd.args(base_args)
         .args(args)
@@ -388,6 +437,7 @@ pub fn start(
     let stdout = child.stdout.take().context("no stdout")?;
     let (ev_out, act, red) = (ev.clone(), activity.clone(), redact.clone());
     let (live_node, live_task, live_run) = (node.clone(), task_id.clone(), run_id.clone());
+    let sync_after_turn = sync_memory.clone();
     let out_task = tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
         let mut session_sent = false;
@@ -418,7 +468,12 @@ pub fn start(
             // A finished line (the whole block, a tool result, the turn's end) supersedes
             // whatever was being written.
             live.reset();
-            act.touch(is_turn_result(&line));
+            let turn_ended = is_turn_result(&line);
+            act.touch(turn_ended);
+            // Whatever the turn wrote to Claude's memory is sent on now, in the background.
+            if turn_ended {
+                tokio::spawn(sync_after_turn());
+            }
             redact_secrets(&mut line, &red);
             truncate(&mut line);
             ev_out(AgentEventKind::Output { json: line });
@@ -494,6 +549,10 @@ pub fn start(
         watchdog.abort();
         let _ = out_task.await;
         let _ = err_task.await;
+        // A last look at the run's memory, while the node still knows the run (its token is how
+        // the note is sent): a run stopped mid-turn never reached a turn's end. Bounded, so an
+        // unreachable orchestrator does not hold up the exit.
+        let _ = tokio::time::timeout(MEMORY_SYNC_AT_EXIT, sync_memory()).await;
         secrets::remove(&data_dir, &secrets_key);
         ev(AgentEventKind::Exited {
             code: status.and_then(|s| s.code()),
@@ -758,7 +817,7 @@ fn truncate(line: &mut String) {
     }
 }
 
-fn sanitize(s: &str) -> String {
+pub(crate) fn sanitize(s: &str) -> String {
     s.chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' || c == '_' {

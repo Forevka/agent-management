@@ -470,6 +470,15 @@ pub async fn handle(
             }
             ok("Workflow set up. The topic stays open: write into it any time, or set a schedule with its buttons.".into())
         }
+        // Claude Code's own memory notes, sent on by the node that runs the session.
+        "memory_note" => ok(crate::memory::note(
+            o,
+            &node.fmt_short().to_string(),
+            &agent,
+            &task.project,
+            &args,
+        )
+        .await?),
         "memory_retain" | "memory_recall" | "memory_reflect" | "memory_banks" => {
             ok(memory(o, &agent, &task.project, &call.tool, &args).await?)
         }

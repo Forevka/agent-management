@@ -60,6 +60,13 @@ async fn handle(node: Arc<Node>, stream: TcpStream) -> Result<()> {
     let mut line = String::new();
     reader.read_line(&mut line).await?;
     let resp = match serde_json::from_str::<IpcRequest>(&line) {
+        // The node's own report of a session's memory notes (see `automemory`): an agent saves
+        // what it wants with `memory retain`, and may not replace or delete the notes the node
+        // keeps for its project.
+        Ok(req) if req.tool == crate::automemory::NOTE_TOOL => IpcResponse {
+            ok: false,
+            result: format!("{} is the node's, not an agent's", req.tool),
+        },
         Ok(req) => {
             let r = node.call_tool(&req.token, req.tool, req.args).await;
             IpcResponse {

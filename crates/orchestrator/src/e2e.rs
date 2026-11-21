@@ -8721,6 +8721,13 @@ async fn lifecycle() {
     // Every node here works on a Claude config dir of its own: the kit installs into it, and
     // nothing ever reaches the developer's own `~/.claude`.
     node.use_claude_config_dir(data_dir.join("claude-config"));
+    // What Claude Code's own memory already held for the project's directory, before the fleet
+    // gave its sessions a folder of their own: the first session's folder starts as a copy.
+    let seeded =
+        fleet_node::automemory::claude_default(&data_dir.join("claude-config"), &project_dir);
+    std::fs::create_dir_all(&seeded).unwrap();
+    std::fs::write(seeded.join("MEMORY.md"), "- [Dry days](seeded-rule.md)").unwrap();
+    std::fs::write(seeded.join("seeded-rule.md"), "Paint only on dry days.").unwrap();
     tokio::spawn(node.clone().run(link_events));
     let cfg = ClientConfig {
         orchestrator: orch_addr.clone(),
@@ -9056,7 +9063,9 @@ async fn lifecycle() {
             .lock()
             .unwrap()
             .iter()
-            .filter(|(path, _)| path == "project-demo/memories")
+            .filter(|(path, body)| {
+                path == "project-demo/memories" && body["items"][0]["document_id"].is_null()
+            })
             .map(|(_, body)| body.clone())
             .collect::<Vec<_>>()
     };
@@ -9091,6 +9100,51 @@ async fn lifecycle() {
     assert!(again.is_some());
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(outcome_saves().len(), 1, "saved once per finish");
+    // Claude Code's own memory: the note the session wrote is kept as one document of the
+    // project's shared bank, without the secret, and the session wrote it into the node's
+    // folder, not the one Claude shares with the owner.
+    let notes = || {
+        hindsight_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(path, _)| path == "project-demo/memories")
+            .filter_map(|(_, body)| {
+                let item = &body["items"][0];
+                Some((
+                    item["document_id"].as_str()?.to_owned(),
+                    item["content"].as_str()?.to_owned(),
+                ))
+            })
+            .collect::<Vec<_>>()
+    };
+    let kept = wait_for(
+        "the session's memory note reaches the fleet's memory",
+        || async {
+            let n = notes();
+            (!n.is_empty()).then_some(n)
+        },
+    )
+    .await;
+    let (id, note) = &kept[0];
+    assert!(
+        id.starts_with("claude-memory-") && id.ends_with("-bikeshed-colour"),
+        "one document per node and note: {id}"
+    );
+    assert!(
+        note.contains("the agents of project demo")
+            && note.contains("The owner wants it blue. Token [secret]")
+            && !note.contains("t0k-jira-secret"),
+        "{note}"
+    );
+    let note_folder = data_dir.join("memory").join("project-demo");
+    assert!(note_folder.join("bikeshed-colour.md").is_file());
+    assert!(!seeded.join("bikeshed-colour.md").exists());
+    // The owner's note was copied in, so the sessions still read it, but it is the owner's and
+    // stays on the node; and the session's own went out once: a later look finds nothing new.
+    assert!(note_folder.join("seeded-rule.md").is_file());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(notes().len(), 1, "{:#?}", notes());
 
     // 5. `complete` ends the session (it frees the node); a follow-up resumes it, as a new run
     //    on the same node, in the same Claude session.

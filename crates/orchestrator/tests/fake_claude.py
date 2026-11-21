@@ -370,6 +370,13 @@ for line in sys.stdin:
         tool("milestone_skip", {"index": 1, "reason": "already <primed>"})
         tool("memory_retain", {"content": "Bikeshed is blue", "bank": "notes"})
         token = jira_token()
+        # Claude Code's own memory, in the folder the node's --settings points it at: a note with
+        # a secret in it, which must reach the fleet's memory without the secret.
+        settings = arg("--settings")
+        if settings:
+            folder = json.load(open(settings))["autoMemoryDirectory"]
+            with open(os.path.join(folder, "bikeshed-colour.md"), "w") as f:
+                f.write("---\nname: bikeshed-colour\n---\nThe owner wants it blue. Token " + token + "\n")
         tool("post", {"text": "Pushed with token " + token})
         # Left behind on purpose: finishing the task must close it, so nothing of a task that is
         # over still waits on the owner.

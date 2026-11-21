@@ -131,6 +131,39 @@ impl Hindsight {
         Ok(recall_text(bank, &v, limit))
     }
 
+    /// Stores `content` as the document `id`, replacing whatever that document held before
+    /// (Hindsight's default `update_mode`), so a source that changes is kept once, as it now
+    /// reads, rather than piling up versions.
+    pub async fn retain_document(
+        &self,
+        bank: &str,
+        id: &str,
+        content: &str,
+        context: &str,
+    ) -> Result<()> {
+        self.call(
+            reqwest::Method::POST,
+            &format!("/v1/default/banks/{bank}/memories"),
+            Some(json!({
+                "items": [{"content": content, "context": context, "document_id": id}],
+                "async": true,
+            })),
+        )
+        .await
+        .map(drop)
+    }
+
+    /// Removes the document `id` and what was learned from it. Gone already is fine.
+    pub async fn delete_document(&self, bank: &str, id: &str) -> Result<()> {
+        self.maybe(
+            reqwest::Method::DELETE,
+            &format!("/v1/default/banks/{bank}/documents/{id}"),
+            None,
+        )
+        .await
+        .map(drop)
+    }
+
     pub async fn reflect(&self, bank: &str, query: &str) -> Result<String> {
         let v = self
             .call(
@@ -371,6 +404,82 @@ pub fn visible(agent: &AgentRow, project: &str, bank: &str) -> bool {
         || bank.starts_with(&format!("{}--", agent_prefix(agent)))
 }
 
+/// Where a session's own Claude Code memory notes are kept: its project's shared bank for a
+/// worker (what one agent of a project learned, every other one should know), and for the
+/// fleet's standing sessions their usual bank (the brain's is `fleet`; the secretary's and the
+/// retrospective's are their own, since what they learn comes from third parties).
+pub fn note_bank(agent: &AgentRow, project: &str) -> Result<String> {
+    if crate::model::is_builtin_agent(&agent.id) {
+        resolve_bank(agent, project, None, false)
+    } else {
+        Ok(project_bank(project))
+    }
+}
+
+/// The Hindsight document a note is kept as, from the node that keeps it and its file name: one
+/// per note, node and bank, so a rewritten note replaces itself, and two nodes with a note of
+/// the same name (each has its own folder) neither overwrite nor delete each other's. `None` for
+/// a name that is not a plain Markdown file name (the node's `is_note_name` is the same rule).
+pub fn note_document(node: &str, name: &str) -> Option<String> {
+    let stem = name.strip_suffix(".md")?;
+    let plain = !stem.is_empty()
+        && stem.len() <= 120
+        && !stem.starts_with('.')
+        && stem
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    let node: String = node
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(16)
+        .collect();
+    (plain && name != "MEMORY.md" && !node.is_empty())
+        .then(|| format!("claude-memory-{node}-{stem}"))
+}
+
+/// `memory_note`, sent by a node, not an agent: a note Claude Code wrote to its own memory in
+/// one of the fleet's sessions (see the node's `automemory`), kept in Hindsight as a document
+/// that is replaced when the note changes and removed when it is deleted. Its text has already
+/// lost the project's secrets, as every tool call's arguments do.
+pub async fn note(
+    o: &crate::core::Orchestrator,
+    node: &str,
+    agent: &AgentRow,
+    project: &str,
+    args: &Value,
+) -> Result<String> {
+    let name = args["name"].as_str().context("name required")?;
+    let id = note_document(node, name).with_context(|| format!("{name:?} is not a memory note"))?;
+    // Refused rather than accepted, so the node offers it again once memory is configured.
+    let mem = o
+        .memory
+        .as_ref()
+        .context("long-term memory is not configured on this fleet")?;
+    let bank = note_bank(agent, project)?;
+    if args["deleted"].as_bool().unwrap_or(false) {
+        mem.delete_document(&bank, &id).await?;
+        return Ok(format!("Forgot {name} in {bank}."));
+    }
+    let content = args["content"].as_str().context("content required")?.trim();
+    if content.is_empty() {
+        mem.delete_document(&bank, &id).await?;
+        return Ok(format!("{name} is empty; forgot it in {bank}."));
+    }
+    // Whose, not who wrote it: a project's agents on a node share one folder, and the run that
+    // happens to send a note need not be the one that wrote it.
+    let text = format!(
+        "A note kept in Claude Code's own memory by {whose} ({name}):\n{content}",
+        whose = if crate::model::is_builtin_agent(&agent.id) {
+            format!("the fleet's {} session", agent.id)
+        } else {
+            format!("the agents of project {project}")
+        },
+    );
+    mem.retain_document(&bank, &id, &text, "memory note")
+        .await?;
+    Ok(format!("Kept {name} in {bank}."))
+}
+
 /// How a task ended, for the memory saved about it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -513,6 +622,38 @@ mod tests {
             model: None,
             effort: None,
         }
+    }
+
+    #[test]
+    fn a_memory_note_is_one_document_in_the_bank_its_session_shares() {
+        assert_eq!(
+            note_document("8f2c1a9e7b", "owner-address-informal.md").as_deref(),
+            Some("claude-memory-8f2c1a9e7b-owner-address-informal")
+        );
+        assert_eq!(
+            note_document("8f2c1a9e7b", "feedback_v2.0.md").as_deref(),
+            Some("claude-memory-8f2c1a9e7b-feedback_v2.0")
+        );
+        for bad in [
+            "MEMORY.md",
+            "notes.txt",
+            ".md",
+            "../x.md",
+            "a b.md",
+            ".hidden.md",
+        ] {
+            assert_eq!(note_document("8f2c1a9e7b", bad), None, "{bad}");
+        }
+        assert_eq!(note_document("", "x.md"), None);
+        assert_eq!(
+            note_bank(&agent("alice-x1"), "bioins").unwrap(),
+            "project-bioins"
+        );
+        assert_eq!(note_bank(&agent(BRAIN_AGENT), "fleet").unwrap(), "fleet");
+        assert_eq!(
+            note_bank(&agent(SECRETARY_AGENT), "fleet").unwrap(),
+            "agent-secretary"
+        );
     }
 
     #[test]
