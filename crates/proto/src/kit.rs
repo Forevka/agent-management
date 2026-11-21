@@ -328,6 +328,7 @@ pub fn sensitive_name(name: &str) -> bool {
         "cookie",
         "session",
         "dsn",
+        "pass",
     ]
     .iter()
     .any(|w| n.contains(w))
@@ -409,6 +410,10 @@ fn mask_args(args: &[serde_json::Value], found: &mut Vec<String>) -> Vec<serde_j
                 MASK.to_owned()
             }
             Next::Header => mask_header(s, true, found).unwrap_or_else(|| mask_string(s, found)),
+            Next::Plain if s.len() > 2 && s.starts_with("-p") && !s.contains('=') => {
+                found.push(s[2..].to_owned());
+                format!("-p{MASK}")
+            }
             Next::Plain if s.starts_with('-') => match s.split_once('=') {
                 Some((flag, v)) if HEADER_FLAGS.contains(&flag) => {
                     let v = mask_header(v, true, found).unwrap_or_else(|| mask_string(v, found));
@@ -543,6 +548,27 @@ fn mask_url(url: &str, scheme_end: usize, found: &mut Vec<String>) -> String {
     let rest = &url[start..];
     let auth_end = rest.find(['/', '?', '#']).map_or(rest.len(), |i| i);
     let authority = &rest[..auth_end];
+    // A token can ride as a subdomain (`https://<token>.tunnel.example`).
+    let masked_host;
+    let authority = {
+        let (info, host) = match authority.rfind('@') {
+            Some(at) => (&authority[..=at], &authority[at + 1..]),
+            None => ("", authority),
+        };
+        let labels: Vec<String> = host
+            .split('.')
+            .map(|l| {
+                if looks_like_token(l) {
+                    found.push(l.to_owned());
+                    MASK.to_owned()
+                } else {
+                    l.to_owned()
+                }
+            })
+            .collect();
+        masked_host = format!("{info}{}", labels.join("."));
+        masked_host.as_str()
+    };
     let mut out = url[..start].to_owned();
     match authority.rfind('@') {
         Some(at) if &authority[..at] != "git" => {
@@ -559,12 +585,26 @@ fn mask_url(url: &str, scheme_end: usize, found: &mut Vec<String>) -> String {
     }
     let tail = &rest[auth_end..];
     let (before_frag, frag) = match tail.find('#') {
-        Some(i) => (&tail[..i], &tail[i..]),
+        Some(i) => (&tail[..i], &tail[i + 1..]),
         None => (tail, ""),
+    };
+    // A token can be a path segment (`/mcp/sk-ak-…/sse`).
+    let mask_path = |path: &str, found: &mut Vec<String>| -> String {
+        path.split('/')
+            .map(|seg| {
+                if looks_like_token(seg) {
+                    found.push(seg.to_owned());
+                    MASK.to_owned()
+                } else {
+                    seg.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("/")
     };
     match before_frag.split_once('?') {
         Some((path, query)) => {
-            out.push_str(path);
+            out.push_str(&mask_path(path, found));
             out.push('?');
             let pairs: Vec<String> = query
                 .split('&')
@@ -578,9 +618,28 @@ fn mask_url(url: &str, scheme_end: usize, found: &mut Vec<String>) -> String {
                 .collect();
             out.push_str(&pairs.join("&"));
         }
-        None => out.push_str(before_frag),
+        None => out.push_str(&mask_path(before_frag, found)),
     }
-    out.push_str(frag);
+    // A fragment is read like a query (`#token=…`), and a bare one by its look.
+    if !tail.contains('#') {
+        return out;
+    }
+    out.push('#');
+    let parts: Vec<String> = frag
+        .split('&')
+        .map(|part| match part.split_once('=') {
+            Some((k, v)) if !v.is_empty() => {
+                found.push(v.to_owned());
+                format!("{k}={MASK}")
+            }
+            _ if looks_like_token(part) => {
+                found.push(part.to_owned());
+                MASK.to_owned()
+            }
+            _ => part.to_owned(),
+        })
+        .collect();
+    out.push_str(&parts.join("&"));
     out
 }
 
@@ -657,7 +716,8 @@ pub fn config_summary(config: &serde_json::Value) -> serde_json::Value {
             && name
                 .chars()
                 .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
-            && !looks_like_token(name);
+            && !looks_like_token(name)
+            && !name.split(['.', '-', '_']).any(looks_like_token);
         out.insert(
             "command".into(),
             Value::String(if plain {
@@ -680,11 +740,15 @@ pub fn config_summary(config: &serde_json::Value) -> serde_json::Value {
                 && s.chars()
                     .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-'))
         };
-        if plain(scheme) && plain(host) {
+        // A token can ride as a subdomain: then only the scheme is said.
+        let hidden = host.split('.').any(looks_like_token);
+        if plain(scheme) && plain(host) && !hidden {
             out.insert(
                 "endpoint".into(),
                 Value::String(format!("{scheme}://{host}")),
             );
+        } else if plain(scheme) {
+            out.insert("endpoint".into(), Value::String(format!("{scheme}://")));
         }
     }
     Value::Object(out)
@@ -706,7 +770,14 @@ pub fn scrub_values(config: &serde_json::Value) -> Vec<String> {
     fn walk(v: &Value, key: Option<&str>, out: &mut Vec<String>) {
         match v {
             Value::String(s) if !matches!(key, Some("type" | "command")) => {
-                for part in std::iter::once(s.as_str()).chain(s.split_whitespace()) {
+                let pieces = s.split(|c: char| {
+                    c.is_whitespace()
+                        || matches!(c, '/' | '?' | '&' | '=' | ':' | '@' | '#' | ',' | ';')
+                });
+                for part in std::iter::once(s.as_str())
+                    .chain(s.split_whitespace())
+                    .chain(pieces)
+                {
                     if part.len() >= 8 && !plain(part) {
                         out.push(part.to_owned());
                     }
@@ -1051,6 +1122,30 @@ mod tests {
             (
                 "RAWBASIC34",
                 json!({"command": "x", "args": ["--auth", "Basic RAWBASIC34"]}),
+            ),
+            (
+                "sk-ak-RAWZAPIER35abc",
+                json!({"type": "sse", "url": "https://actions.zapier.com/mcp/sk-ak-RAWZAPIER35abc/sse"}),
+            ),
+            (
+                "RAWFRAG036",
+                json!({"type": "http", "url": "https://h/x#token=RAWFRAG036"}),
+            ),
+            (
+                "RAWMYSQL37",
+                json!({"command": "mysql-mcp", "args": ["-uroot", "-pRAWMYSQL37"]}),
+            ),
+            (
+                "RAWPASS038",
+                json!({"command": "x", "args": ["--db-pass", "RAWPASS038"]}),
+            ),
+            (
+                "ghp_RAWSUBDOMAIN39x",
+                json!({"type": "http", "url": "https://ghp_RAWSUBDOMAIN39x.tunnel.example/mcp"}),
+            ),
+            (
+                "RAWPIECE40",
+                json!({"command": "x", "args": ["--url=https://h/x?team=a;session=RAWPIECE40"]}),
             ),
         ];
         for (raw, config) in shapes {

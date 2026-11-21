@@ -123,9 +123,56 @@ fn open_config(o: &Orchestrator, sealed: Option<&[u8]>) -> Result<Value> {
 /// reading as the mask, exactly where the masked view had it, keeps the current value; one the
 /// owner changed is taken as typed. A mask anywhere else stands for nothing and is refused, so a
 /// masked view can never be saved over a real secret by accident.
+///
+/// A kept secret must also stay where it was meant to go:
+/// - in a list (the args), only if the list keeps its length and every other value in it is as it
+///   was: deleting `--github-token <masked>` before `--slack-token <masked>` would otherwise hand
+///   the GitHub token to the Slack flag;
+/// - nowhere, once the server's `url` or `command` changed: whoever can edit the config must not
+///   be able to send the existing secrets to another host unseen. The owner types them again.
 pub fn merge_masked(new: &Value, old: &Value) -> Result<Value> {
-    fn walk(new: &Value, old: Option<&Value>, masked: Option<&Value>, at: &str) -> Result<Value> {
+    fn has_mask(v: &Value) -> bool {
+        match v {
+            Value::String(s) => s.contains(MASK),
+            Value::Array(a) => a.iter().any(has_mask),
+            Value::Object(m) => m.values().any(has_mask),
+            _ => false,
+        }
+    }
+    fn walk(
+        new: &Value,
+        old: Option<&Value>,
+        masked: Option<&Value>,
+        at: &str,
+        moved: bool,
+    ) -> Result<Value> {
         Ok(match new {
+            Value::String(s) if s.contains(MASK) && moved => bail!(
+                "the server's command or URL changed, so no secret is kept: type the value of {at} again"
+            ),
+            Value::Array(a) if has_mask(new) => {
+                let same_shape = matches!(masked, Some(Value::Array(m))
+                    if m.len() == a.len()
+                        && a.iter().zip(m).all(|(n, m)| has_mask(n) || n == m));
+                ensure!(
+                    same_shape,
+                    "re-type the secrets in {at}: its other values changed, so a kept secret could end up beside the wrong flag"
+                );
+                Value::Array(
+                    a.iter()
+                        .enumerate()
+                        .map(|(i, v)| {
+                            walk(
+                                v,
+                                old.and_then(|o| o.get(i)),
+                                masked.and_then(|x| x.get(i)),
+                                &format!("{at}[{i}]"),
+                                moved,
+                            )
+                        })
+                        .collect::<Result<_>>()?,
+                )
+            }
             Value::String(s) if s.contains(MASK) => match (masked, old) {
                 (Some(Value::String(m)), Some(o @ Value::String(_))) if m == s => o.clone(),
                 _ => bail!(
@@ -143,6 +190,7 @@ pub fn merge_masked(new: &Value, old: &Value) -> Result<Value> {
                                 old.and_then(|o| o.get(k)),
                                 masked.and_then(|x| x.get(k)),
                                 &next,
+                                moved,
                             )?,
                         ))
                     })
@@ -157,6 +205,7 @@ pub fn merge_masked(new: &Value, old: &Value) -> Result<Value> {
                             old.and_then(|o| o.get(i)),
                             masked.and_then(|x| x.get(i)),
                             &format!("{at}[{i}]"),
+                            moved,
                         )
                     })
                     .collect::<Result<_>>()?,
@@ -165,7 +214,10 @@ pub fn merge_masked(new: &Value, old: &Value) -> Result<Value> {
         })
     }
     let masked = mask_config(old).0;
-    walk(new, Some(old), Some(&masked), "config")
+    let moved = ["url", "command"]
+        .iter()
+        .any(|k| new.get(k) != masked.get(k));
+    walk(new, Some(old), Some(&masked), "config", moved)
 }
 
 // ---------------------------------------------------------------- skills and plugins
@@ -950,7 +1002,7 @@ mod tests {
         let mut moved = masked.clone();
         moved["env"]["NEW"] = json!(MASK);
         assert!(merge_masked(&moved, &old).is_err());
-        let mut shifted = masked;
+        let mut shifted = masked.clone();
         shifted["args"]
             .as_array_mut()
             .unwrap()
@@ -959,6 +1011,44 @@ mod tests {
             merge_masked(&shifted, &old).is_err(),
             "a mask at another index stands for nothing"
         );
+    }
+
+    #[test]
+    fn a_kept_secret_never_lands_beside_another_flag_or_goes_to_another_host() {
+        let old = json!({
+            "command": "srv",
+            "args": ["--github-token", "ghp_AAAAAAAAAAAAAAAA1", "--slack-token", "xoxp-BBBBBBBBBBBB-2"],
+        });
+        let masked = mask_config(&old).0;
+        assert_eq!(
+            masked["args"],
+            json!(["--github-token", MASK, "--slack-token", MASK])
+        );
+        // The owner deletes the first pair: by position, the GitHub token would now follow
+        // `--slack-token`. Refused; the secrets in that list are typed again.
+        let deleted = json!({"command": "srv", "args": ["--slack-token", MASK]});
+        let e = merge_masked(&deleted, &old).unwrap_err().to_string();
+        assert!(e.contains("re-type the secrets in config.args"), "{e}");
+        // Renaming a flag beside a kept secret is refused the same way.
+        let renamed =
+            json!({"command": "srv", "args": ["--gitlab-token", MASK, "--slack-token", MASK]});
+        assert!(merge_masked(&renamed, &old).is_err());
+        // Typing the secrets again after a change works.
+        let retyped = json!({"command": "srv", "args": ["--slack-token", "xoxp-NEW"]});
+        assert_eq!(merge_masked(&retyped, &old).unwrap(), retyped);
+
+        // A changed command or URL keeps no secret anywhere, not even in env.
+        let http = json!({"type": "http", "url": "https://mcp.example/x", "headers": {"Authorization": "Bearer t-raw-1"}});
+        let mut moved = mask_config(&http).0;
+        moved["url"] = json!("https://evil.example/x");
+        let e = merge_masked(&moved, &http).unwrap_err().to_string();
+        assert!(e.contains("command or URL changed"), "{e}");
+        let mut cmd = mask_config(&old).0;
+        cmd["command"] = json!("other");
+        assert!(merge_masked(&cmd, &old).is_err());
+        // The same URL, masked part and all, is no change.
+        let same = mask_config(&http).0;
+        assert_eq!(merge_masked(&same, &http).unwrap(), http);
     }
 
     #[test]

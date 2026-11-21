@@ -701,6 +701,29 @@ fn staging(paths: &KitPaths) -> PathBuf {
     paths.config_dir.join(".fleet-kit-staging")
 }
 
+/// A place in staging that is this apply's alone (`old~<skill>~<random>`): staging is never
+/// cleared wholesale, so a copy an earlier apply could not put back is never deleted by a later
+/// one.
+fn staged(paths: &KitPaths, what: &str, name: &str) -> PathBuf {
+    staging(paths).join(format!(
+        "{what}~{name}~{}",
+        &crate::runner::random_token()[..8]
+    ))
+}
+
+/// A copy of skill `name` an earlier apply set aside and could not put back (`old~…`,
+/// `failed~…`): until a person looks at it, the kit leaves that skill alone.
+fn leftover(paths: &KitPaths, name: &str) -> Option<PathBuf> {
+    std::fs::read_dir(staging(paths))
+        .ok()?
+        .flatten()
+        .find(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            n.starts_with(&format!("old~{name}~")) || n.starts_with(&format!("failed~{name}~"))
+        })
+        .map(|e| e.path())
+}
+
 /// Moves `rel` from under `from` to under `to`.
 fn carry(from: &Path, to: &Path, rel: &str) -> std::io::Result<()> {
     let dest = to.join(rel);
@@ -718,8 +741,7 @@ fn take_away(paths: &KitPaths, dir: &Path, name: &str, marker: &Marker) -> Resul
     let listed: BTreeSet<String> = marker.files.iter().cloned().collect();
     let own = extras(dir, &listed);
     if own.is_empty() {
-        let old = staging(paths).join(format!("old-{name}"));
-        let _ = std::fs::remove_dir_all(&old);
+        let old = staged(paths, "old", name);
         std::fs::create_dir_all(staging(paths))?;
         std::fs::rename(dir, &old).with_context(|| format!("moving {} aside", dir.display()))?;
         if let Err(e) = std::fs::remove_dir_all(&old) {
@@ -777,25 +799,38 @@ fn write_skill(paths: &KitPaths, skill: &KitSkill, hash: &str) -> Result<Written
     {
         return Ok(Written::Collides(p.clone()));
     }
-    let tmp = staging(paths).join(format!("new-{}", skill.name));
-    let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(&tmp)?;
-    for f in &skill.files {
-        let path = tmp.join(&f.path);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+    let tmp = staged(paths, "new", &skill.name);
+    let staged_new = (|| -> Result<()> {
+        std::fs::create_dir_all(&tmp)?;
+        for f in &skill.files {
+            let path = tmp.join(&f.path);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&path, &f.text).with_context(|| format!("writing {}", f.path))?;
         }
-        std::fs::write(&path, &f.text).with_context(|| format!("writing {}", f.path))?;
+        std::fs::write(tmp.join(SKILL_MARKER), marker_text(skill, hash))?;
+        Ok(())
+    })();
+    if let Err(e) = staged_new {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err(e);
     }
-    std::fs::write(tmp.join(SKILL_MARKER), marker_text(skill, hash))?;
-    let old = staging(paths).join(format!("old-{}", skill.name));
-    let _ = std::fs::remove_dir_all(&old);
-    if had_old {
-        std::fs::rename(&dir, &old).with_context(|| format!("moving {} aside", dir.display()))?;
+    let old = staged(paths, "old", &skill.name);
+    if had_old && let Err(e) = std::fs::rename(&dir, &old) {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err(e).with_context(|| format!("moving {} aside", dir.display()));
     }
     if let Err(e) = std::fs::rename(&tmp, &dir) {
-        if had_old {
-            let _ = std::fs::rename(&old, &dir);
+        let _ = std::fs::remove_dir_all(&tmp);
+        if had_old && std::fs::rename(&old, &dir).is_err() {
+            return Err(e).with_context(|| {
+                format!(
+                    "putting {} in place failed, and so did putting the old copy back: it is at {}",
+                    dir.display(),
+                    old.display()
+                )
+            });
         }
         return Err(e).with_context(|| format!("putting {} in place", dir.display()));
     }
@@ -806,12 +841,21 @@ fn write_skill(paths: &KitPaths, skill: &KitSkill, hash: &str) -> Result<Written
             for back in &keep[..i] {
                 let _ = carry(&dir, &old, back);
             }
-            let failed = staging(paths).join(format!("failed-{}", skill.name));
-            let _ = std::fs::remove_dir_all(&failed);
-            if std::fs::rename(&dir, &failed).is_ok() {
-                let _ = std::fs::rename(&old, &dir);
-                let _ = std::fs::remove_dir_all(&failed);
+            let failed = staged(paths, "failed", &skill.name);
+            let restored =
+                std::fs::rename(&dir, &failed).is_ok() && std::fs::rename(&old, &dir).is_ok();
+            if !restored {
+                // Both copies stay where they are for a person to sort out; the next apply
+                // sees them (`leftover`) and leaves the skill alone until then.
+                return Err(e).with_context(|| {
+                    format!(
+                        "could not keep the owner's {rel}, nor put the old copy back: it is at {}",
+                        old.display()
+                    )
+                });
             }
+            // Only the new files the kit just wrote are in `failed` now: this apply's own.
+            let _ = std::fs::remove_dir_all(&failed);
             return Err(e).with_context(|| {
                 format!("could not keep the owner's {rel}; the old copy of the skill stays")
             });
@@ -863,6 +907,18 @@ fn apply_skills(
     for s in skills {
         if let Err(why) = check_skill(s) {
             out.push(status("skill", &s.name, "failed", why));
+            continue;
+        }
+        if let Some(at) = leftover(paths, &s.name) {
+            out.push(status(
+                "skill",
+                &s.name,
+                "failed",
+                format!(
+                    "an earlier copy of this skill was set aside and not put back: it is at {}; put it back or delete it, and the kit tries again",
+                    at.display()
+                ),
+            ));
             continue;
         }
         let hash = skill_hash(&s.files);
@@ -932,6 +988,18 @@ fn apply_skills(
         }
     }
     for name in gone.into_iter().filter(|n| !wanted.contains(n.as_str())) {
+        if let Some(at) = leftover(paths, &name) {
+            out.push(status(
+                "skill",
+                &name,
+                "failed",
+                format!(
+                    "an earlier copy of this skill was set aside and not put back: it is at {}; put it back or delete it, and the kit tries again",
+                    at.display()
+                ),
+            ));
+            continue;
+        }
         let target = dir.join(&name);
         match (inspect(&target, &name), read_marker(&target, &name)) {
             (Found::Kit(_), Some(marker)) => match take_away(paths, &target, &name, &marker) {
@@ -1064,19 +1132,25 @@ impl Cli {
         let tree = crate::runner::ProcessTree::adopt(&child);
         let mut stdout = child.stdout.take();
         let mut stderr = child.stderr.take();
-        let read = async {
-            let (mut a, mut b) = (Vec::new(), Vec::new());
+        // Both pipes at once: a call that fills one while the other is being read to its end
+        // would stall until the timeout.
+        let read_out = async {
+            let mut a = Vec::new();
             if let Some(o) = stdout.as_mut() {
                 let _ = o.read_to_end(&mut a).await;
             }
+            a
+        };
+        let read_err = async {
+            let mut b = Vec::new();
             if let Some(e) = stderr.as_mut() {
                 let _ = e.read_to_end(&mut b).await;
             }
-            (a, b)
+            b
         };
         let ran = tokio::time::timeout(limit, async {
-            let (out, status) = tokio::join!(read, child.wait());
-            (out, status)
+            let (out, err, status) = tokio::join!(read_out, read_err, child.wait());
+            ((out, err), status)
         })
         .await;
         let ((out, err), status) = match ran {
@@ -1652,11 +1726,11 @@ mod tests {
         let marker = read_marker(&paths.skills().join("mine"), "mine").unwrap();
         assert_eq!(marker.hash, skill_hash(&mine.files));
         assert_eq!(marker.files, ["SKILL.md"]);
-        assert!(
-            !paths
-                .config_dir
-                .join(".fleet-kit-staging/new-mine")
-                .exists(),
+        assert_eq!(
+            std::fs::read_dir(staging(&paths))
+                .map(|d| d.count())
+                .unwrap_or(0),
+            0,
             "nothing staged is left behind"
         );
         assert!(
@@ -1833,6 +1907,48 @@ mod tests {
         for plain in ["production", "--api-key"] {
             assert!(!v.iter().any(|s| s == plain), "{plain} scrubbed: {v:?}");
         }
+    }
+
+    #[test]
+    fn a_copy_left_in_staging_is_never_deleted_and_holds_its_skill() {
+        let root = temp("leftover");
+        let paths = KitPaths::at(root.join("cfg"));
+        let mut state = State::default();
+        let v1 = KitSkill {
+            name: "held".into(),
+            files: vec![file("SKILL.md", "v1")],
+        };
+        apply_skills(&paths, &mut state, &[v1], &mut Vec::new());
+        // An earlier apply could not put a copy back: it sits in staging.
+        let left = staging(&paths).join("old~held~abcd1234");
+        std::fs::create_dir_all(&left).unwrap();
+        std::fs::write(left.join("SKILL.md"), "the only copy").unwrap();
+        let v2 = KitSkill {
+            name: "held".into(),
+            files: vec![file("SKILL.md", "v2")],
+        };
+        let mut out = Vec::new();
+        apply_skills(&paths, &mut state, &[v2], &mut out);
+        assert_eq!(out[0].state, "failed", "{out:?}");
+        assert!(
+            out[0].detail.contains("old~held~abcd1234"),
+            "says where it is: {out:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(left.join("SKILL.md")).unwrap(),
+            "the only copy"
+        );
+        // Removing the skill from the kit leaves it alone too.
+        let mut out = Vec::new();
+        apply_skills(&paths, &mut state, &[], &mut out);
+        assert_eq!(out[0].state, "failed", "{out:?}");
+        assert!(left.join("SKILL.md").exists() && paths.skills().join("held/SKILL.md").exists());
+        // Once a person deletes it, the kit carries on.
+        std::fs::remove_dir_all(&left).unwrap();
+        let mut out = Vec::new();
+        apply_skills(&paths, &mut state, &[], &mut out);
+        assert_eq!(out[0].state, "removed", "{out:?}");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

@@ -6829,7 +6829,15 @@ async fn kit_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, node_id: &str, cfg: 
     let demo_id = id_of("mcp", "demo-mcp").await;
     let view = api_get(o, &format!("/api/kit/{demo_id}")).await;
     let mut edited = view["config"].clone();
-    edited["args"][0] = json!("--y");
+    edited["env"]["LOG_LEVEL"] = json!("debug");
+    // A list holding kept secrets may not change around them (see `kit::merge_masked`).
+    let mut shifted = view["config"].clone();
+    shifted["args"][0] = json!("--y");
+    assert!(
+        crate::kit::save_mcp(o, Actor::Owner, "demo-mcp", shifted)
+            .await
+            .is_err()
+    );
     api_post(
         o,
         "/api/kit",
@@ -6843,7 +6851,7 @@ async fn kit_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, node_id: &str, cfg: 
             .unwrap();
     let saved: Value = serde_json::from_str(&o.vault.decrypt(&sealed).unwrap()).unwrap();
     let mut expected_config = demo_config.clone();
-    expected_config["args"][0] = json!("--y");
+    expected_config["env"]["LOG_LEVEL"] = json!("debug");
     assert_eq!(
         saved, expected_config,
         "the masked values kept their secrets"
