@@ -415,7 +415,15 @@ export type KitItem = {
 
 export type Kit = {
   items: KitItem[]
-  nodes: { id: string; name: string; online: boolean; version: string; current: boolean }[]
+  nodes: {
+    id: string
+    name: string
+    online: boolean
+    version: string
+    current: boolean
+    /** Why the node cannot hold agent sessions to the kit's MCP servers (an old claude CLI). */
+    note: string | null
+  }[]
   status: { node: string; item: number; state: KitState; detail: string; at: string }[]
   /** Names of the kit's secrets. Values are never read back. */
   secrets: string[]
@@ -430,7 +438,7 @@ export type KitCapture = {
   capture: string
   node: string
   skills: { name: string; in_kit: boolean; files: { path: string; bytes: number }[] }[]
-  plugins: { name: string; in_kit: boolean; marketplace_source: string }[]
+  plugins: { name: string; in_kit: boolean; marketplace_source: string; importable: boolean }[]
   mcp: { name: string; in_kit: boolean; config: Record<string, unknown>; secrets: string[] }[]
   skipped: { kind: string; name: string; reason: string }[]
 }

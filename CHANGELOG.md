@@ -16,8 +16,12 @@ VPS rolls it out), so each section below is one merge. How to add to this file i
   (workers only; the brain, the secretary and the retrospective get none), from a per-run config
   under the node's data dir that is deleted when the run exits. MCP servers configured on a
   machine some other way no longer load in agent sessions — add the ones agents need to the kit.
+- The allowlist needs a claude CLI with `--strict-mcp-config` (2.1.268 verified). On an older one
+  a node starts its sessions without it, and the Kit page says the allowlist is not enforced there
+  until the CLI is updated.
 - New messages (`KitCaptureRequest`, `KitCapture`, `Kit`, `KitStatus`), sent only to nodes level
-  with the orchestrator's release; no protocol bump. Migration `0025_kit` (add-only).
+  with the orchestrator's release; no protocol bump. Migration `0025_kit` (two new tables and a
+  nullable `nodes.kit_note`).
 
 ## v0.2.7 — 2026-11-21
 

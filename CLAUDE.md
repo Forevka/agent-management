@@ -91,8 +91,8 @@ cargo fmt --all
   - every token produces a `stream_event` line, which the node drops;
   - `--plugin-dir` loads the skill (it shows as `fleet:fleet`);
   - `--append-system-prompt-file` works;
-  - `--strict-mcp-config` with `--mcp-config` connects exactly that file's servers: no user or project servers, no plugin's own servers, no claude.ai connectors, and the permission hook still fires (2.1.268);
-  - with `CLAUDE_CONFIG_DIR` set, user-scope MCP servers live in `$CLAUDE_CONFIG_DIR/.claude.json` (else `~/.claude.json`); `claude mcp add-json --scope user` refuses an existing name; `claude plugin marketplace add` and `claude plugin install --scope user` are idempotent.
+  - `--strict-mcp-config` (2.1.268 verified; a node asks `claude --help` and leaves the flag out on an older CLI, reported on the Kit page) with `--mcp-config` connects exactly that file's servers: no user or project servers, no plugin's own servers, no claude.ai connectors, and the permission hook still fires (2.1.268);
+  - with `CLAUDE_CONFIG_DIR` set, user-scope MCP servers live in `$CLAUDE_CONFIG_DIR/.claude.json` (else `~/.claude.json`); `claude mcp add-json --scope user` refuses an existing name and stores the config normalised (`args: []` added, unknown keys dropped); `claude plugin marketplace add` and `claude plugin install --scope user` are idempotent.
 
   Re-verify with a small real run after changing any of it.
 

@@ -282,7 +282,7 @@ function ImportSection({ kit, onImported }: { kit: KitT; onImported: () => void 
   return (
     <Section
       title="Import from a node"
-      description="Reads the skills, plugins and user-scope MCP servers a machine has. Claude.ai connectors belong to the account, not a machine, so they are not offered. An MCP server's env and header values, and URL parameters and flags named like a secret (access_token, --api-key), go into the vault; any other secret in a config, replace with ${secret:NAME} on the server's page."
+      description="Reads the skills, plugins and user-scope MCP servers a machine has. Claude.ai connectors belong to the account, not a machine, so they are not offered. An MCP server's env and header values, a URL's password and query, a password in a database URL, NAME=value pairs and flags named like a secret (API_TOKEN=…, --api-key …) go into the vault; any other secret in a config, replace with ${secret:NAME} on the server's page."
     >
       <Card>
         <CardContent>
@@ -566,8 +566,20 @@ function SecretsSection({ keys, onChange }: { keys: string[]; onChange: () => vo
 function MatrixSection({ kit }: { kit: KitT }) {
   const items = kit.items.filter((i) => i.enabled || kit.status.some((s) => s.item === i.id))
   const cell = (node: string, item: number) => kit.status.find((s) => s.node === node && s.item === item)
+  const unenforced = kit.nodes.filter((n) => n.note)
   return (
     <Section title="On the nodes" description="Hover a state for its reason. A node gets the kit once it runs this release.">
+      {unenforced.length > 0 && (
+        <Note tone="warning" title="MCP allowlist not enforced">
+          <Stack gap="1">
+            {unenforced.map((n) => (
+              <Text key={n.id} size="2">
+                <Text weight="medium">{n.name}</Text>: {n.note}
+              </Text>
+            ))}
+          </Stack>
+        </Note>
+      )}
       <Table
         rows={items}
         rowKey={(i) => String(i.id)}

@@ -325,7 +325,8 @@ a restart.
    installs, for your own Claude Code there and for the agents. *Import from a
    node* reads what one machine has (its user-scope MCP servers, the skills in
    its Claude config dir, its user-scope plugins) and lets you tick what to take;
-   MCP env and header values go into the vault's `kit` secret folder and the kit
+   MCP secrets (env and header values, passwords in URLs, secret-named args) go
+   into the vault's `kit` secret folder and the kit
    keeps `${secret:NAME}` placeholders. Every node level with the orchestrator's
    release then installs the kit — skills next to your own (a skill or user MCP
    server of the same name that the kit did not install is reported as a
