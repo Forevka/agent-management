@@ -6,9 +6,11 @@
 //! (`BIOINS-5068`, `!940`, its URL) or an attachment (title, URL, file name). "maestro
 //! comparison" finds the task titled "Maestro prompts" whose artifact is called "comparison".
 //!
-//! Archived tasks are hidden from a plain list, which is what archiving is for, and included as
-//! soon as somebody is looking for something: a query, the `archived` status, or `archived`
-//! asked for explicitly. A word that matches nothing (a null anywhere included) excludes the task:
+//! Archived tasks (done, with `archived_at` set) are hidden from a plain list, which is what
+//! archiving is for, and included as soon as somebody is looking for something: a query,
+//! `archived` asked for explicitly, or the status `archived`, which is not a status a task has but
+//! a filter for exactly the archived ones (the word `archived` in a query matches them the same
+//! way). A word that matches nothing (a null anywhere included) excludes the task:
 //! the whole test is wrapped in `coalesce(.., false)` so that an unkeyed task's null key cannot
 //! make `not (..)` null and let everything through.
 //! The words reach SQL as a bound array and are matched with `ilike`
@@ -54,10 +56,13 @@ pub fn words(q: &str) -> Vec<String> {
 /// `$1` project, `$2` status, `$3` agent, `$4` words, `$5` builtin, `$6` archived, `$7` the
 /// builtin task ids, `$8` the task-key prefix.
 const WHERE: &str = "where ($1::text is null or tasks.project = $1)
-   and ($2::text is null or tasks.status = $2)
+   and ($2::text is null
+        or ($2 = 'archived' and tasks.status = 'done' and tasks.archived_at is not null)
+        or tasks.status = $2)
    and ($3::text is null or tasks.agent_id = $3)
    and ($5 or tasks.id <> all($7))
-   and (tasks.status <> 'archived' or $6 or $2::text = 'archived' or cardinality($4::text[]) > 0)
+   and (tasks.archived_at is null or tasks.status <> 'done'
+        or $6 or $2::text = 'archived' or cardinality($4::text[]) > 0)
    and not exists (
      select 1 from unnest($4::text[]) w
      where not coalesce((
@@ -66,6 +71,7 @@ const WHERE: &str = "where ($1::text is null or tasks.project = $1)
        or tasks.brief ilike '%' || w || '%'
        or coalesce(tasks.summary, '') ilike '%' || w || '%'
        or tasks.status ilike w
+       or (w ilike 'archived' and tasks.status = 'done' and tasks.archived_at is not null)
        or upper(w) = upper($8) || '-' || tasks.key_no
        or exists (select 1 from agents a where a.id = tasks.agent_id
                   and (a.id ilike '%' || w || '%' or a.name ilike '%' || w || '%'))

@@ -108,6 +108,8 @@ export type Task = {
   session: string | null
   created_at: string
   updated_at: string
+  /** When the nightly archive put this done task off the board; it is still `done`. */
+  archived_at?: string | null
   sessions?: number
   brief?: string
   model?: string | null

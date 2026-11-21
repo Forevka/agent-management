@@ -111,6 +111,9 @@ pub struct TaskRow {
     /// The fleet's own short handle for this task, as a number (see [`task_key`]). The fleet's
     /// standing sessions have none: they are not work.
     pub key_no: Option<i64>,
+    /// When the nightly archive put this done task out of the board's way (see `archive`). The
+    /// task stays `done`; working on it again clears this.
+    pub archived_at: Option<DateTime<Utc>>,
 }
 
 impl TaskRow {
@@ -235,15 +238,6 @@ pub mod status {
     pub const DONE: &str = "done";
     pub const STOPPED: &str = "stopped";
     pub const FAILED: &str = "failed";
-    /// A done task moved out of sight by the nightly archive (see `archive`). It is still done in
-    /// every sense that matters, which is why [`is_done`] says so: anything that treats a done
-    /// task as finished treats an archived one the same way.
-    pub const ARCHIVED: &str = "archived";
-
-    /// Done, archived or not.
-    pub fn is_done(status: &str) -> bool {
-        status == DONE || status == ARCHIVED
-    }
 }
 
 /// The brain's pseudo task and agent ids.
@@ -399,6 +393,7 @@ mod tests {
             effort: effort.map(Into::into),
             plan_approved: true,
             key_no: Some(1),
+            archived_at: None,
         }
     }
 

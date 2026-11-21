@@ -47,6 +47,8 @@ pub struct Config {
     pub archive: ArchiveConfig,
     /// The largest file a task may carry as an attachment (see `attachments`).
     pub attachment_max_bytes: i64,
+    /// The most bytes all of one task's files may add up to, uploads in progress included.
+    pub attachment_task_max_bytes: i64,
 }
 
 /// When finished tasks are moved out of sight (see `archive`).
@@ -106,6 +108,9 @@ pub fn parse_time_of_day(s: &str) -> Result<Option<u32>> {
 
 /// 50 MiB unless `FLEET_ATTACHMENT_MAX_MB` says otherwise.
 const DEFAULT_ATTACHMENT_MAX_MB: i64 = 50;
+/// 200 MiB per task unless `FLEET_ATTACHMENT_TASK_MAX_MB` says otherwise: a few large files, and
+/// a bound on what one task (or an agent gone wrong on it) can put in the database.
+const DEFAULT_ATTACHMENT_TASK_MAX_MB: i64 = 200;
 
 impl Config {
     /// Whether the brain may give a task this model and effort.
@@ -330,6 +335,13 @@ impl Config {
                 .clamp(1, 4096)
                 * 1024
                 * 1024,
+            attachment_task_max_bytes: env_num(
+                "FLEET_ATTACHMENT_TASK_MAX_MB",
+                DEFAULT_ATTACHMENT_TASK_MAX_MB,
+            )
+            .clamp(1, 16384)
+                * 1024
+                * 1024,
         })
     }
 
@@ -362,6 +374,8 @@ impl Config {
             // Small, so the e2e can show a file over the limit being refused without making one
             // of 50 MiB.
             attachment_max_bytes: 4 * 1024 * 1024,
+            // Room for what the e2e attaches, and small enough to show the cap refusing.
+            attachment_task_max_bytes: 9 * 1024 * 1024,
         }
     }
 }

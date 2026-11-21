@@ -178,6 +178,8 @@ fn task_json(t: &TaskRow) -> Value {
         "session": t.session_id,
         "created_at": t.created_at,
         "updated_at": t.updated_at,
+        // Set while the nightly archive keeps this done task off the board.
+        "archived_at": t.archived_at,
     })
 }
 
@@ -239,7 +241,7 @@ async fn overview(State(o): State<O>, h: HeaderMap) -> Api {
     guard!(o, h);
     let items = human::open_items(&o).await?;
     let tasks: Vec<TaskRow> = sqlx::query_as(
-        "select * from tasks where id <> all($1) and status not in ('done', 'archived') order by updated_at desc limit 50",
+        "select * from tasks where id <> all($1) and status <> 'done' order by updated_at desc limit 50",
     )
     .bind(crate::model::BUILTIN_TASKS)
     .fetch_all(&o.db)
@@ -251,7 +253,7 @@ async fn overview(State(o): State<O>, h: HeaderMap) -> Api {
     // opening anything.
     let per_project: Vec<(String, String, i64, i64, i64)> = sqlx::query_as(
         "select p.slug, p.name,
-                count(t.id) filter (where t.status not in ('done','archived','stopped','failed')) as open,
+                count(t.id) filter (where t.status not in ('done','stopped','failed')) as open,
                 count(t.id) filter (where t.running) as running,
                 count(t.id) as total
          from projects p left join tasks t on t.project = p.slug and t.id not in ('brain','secretary','retro')
@@ -286,13 +288,14 @@ async fn board(State(o): State<O>, h: HeaderMap) -> Api {
     guard!(o, h);
     // Open work always, finished work only while it is still news, and never what the nightly
     // archive has put away: that is the point of archiving. (The archive leaves `updated_at`
-    // alone, so without the explicit test a task done at 20:59 would stay on the board for a day
-    // after it was archived.) `limit` is a backstop: a fleet that somehow has hundreds of open
+    // alone, so without the explicit test a task archived in the evening would stay on the board
+    // until the next one.) A task counts as archived only while it is still done, so one worked
+    // on again is never hidden. `limit` is a backstop: a fleet that somehow has hundreds of open
     // tasks should still render.
     let rows: Vec<TaskRow> = sqlx::query_as(
         "select * from tasks
          where id <> all($1)
-           and status <> 'archived'
+           and (archived_at is null or status <> 'done')
            and (status not in ('done', 'stopped', 'failed')
                 or updated_at > now() - interval '24 hours')
          order by updated_at desc limit 120",
@@ -389,8 +392,8 @@ struct TaskQuery {
     /// hidden by default because they are never "work".
     #[serde(default)]
     builtin: bool,
-    /// Include archived tasks without searching. A query, or `status=archived`, includes them
-    /// anyway: someone looking for a task should find it however old it is.
+    /// Include archived tasks without searching. A query, or `status=archived` (only the archived
+    /// ones), includes them anyway: someone looking for a task should find it however old it is.
     #[serde(default)]
     archived: bool,
     limit: Option<i64>,
@@ -961,7 +964,7 @@ async fn project(State(o): State<O>, h: HeaderMap, Path(slug): Path<String>) -> 
     .await?;
     let (sessions, open): (i64, i64) = sqlx::query_as(
         "select (select count(*) from runs where project = $1),
-                (select count(*) from tasks where project = $1 and status not in ('done','archived','stopped','failed') and id not in ('brain','secretary','retro'))",
+                (select count(*) from tasks where project = $1 and status not in ('done','stopped','failed') and id not in ('brain','secretary','retro'))",
     )
     .bind(&slug)
     .fetch_one(&o.db)

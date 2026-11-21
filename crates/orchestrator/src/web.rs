@@ -220,17 +220,18 @@ async fn spa(uri: Uri) -> Response {
 
 async fn security_headers(mut resp: Response) -> Response {
     let h = resp.headers_mut();
-    h.insert(
-        header::CONTENT_SECURITY_POLICY,
-        header::HeaderValue::from_static(
+    // A response that set its own policy keeps it: that is a download of a file an agent made
+    // (`api::attachment_file`), whose `sandbox` policy is stricter than the app's and must not be
+    // replaced by one under which a same-origin script may run.
+    h.entry(header::CONTENT_SECURITY_POLICY)
+        .or_insert(header::HeaderValue::from_static(
             // Everything is served from here, so every source is 'self' and nothing may be
             // fetched from elsewhere. `style-src` needs 'unsafe-inline' because the UI's
             // components set style attributes; scripts do not, so they stay strict.
             "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
              img-src 'self' data:; font-src 'self'; connect-src 'self'; form-action 'self'; \
              frame-ancestors 'none'; base-uri 'none'",
-        ),
-    );
+        ));
     h.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         header::HeaderValue::from_static("nosniff"),

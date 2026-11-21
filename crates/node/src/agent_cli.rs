@@ -1262,20 +1262,70 @@ async fn call(addr: &str, token: &str, tool: &str, args: &Value) -> Result<ipc::
     .context("the fleet node is unreachable")
 }
 
-/// Refuses what must never leave the machine as an attachment: a `.env` file, or anything under
-/// the node's secrets directory. The orchestrator also refuses a file that contains a secret
-/// value; this catches the obvious case before a byte is sent.
+/// Whether a file's name is one credentials are kept under: `.env` files, keys and certificates,
+/// SSH identities, credential stores.
+fn is_credentials_name(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n == ".env"
+        || n.starts_with(".env.")
+        || n.ends_with(".env")
+        || n.ends_with(".pem")
+        || n.ends_with(".key")
+        || ["id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", "credentials"]
+            .iter()
+            .any(|p| n.starts_with(p))
+}
+
+/// The private directory `file` is in, if any, unless it is also inside `project` and that
+/// project lives inside the private directory (a project kept under `~/.claude` is still the
+/// agent's work). All paths canonical.
+fn private_dir_of(
+    file: &std::path::Path,
+    private: impl IntoIterator<Item = std::path::PathBuf>,
+    project: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    private.into_iter().find(|dir| {
+        file.starts_with(dir) && !project.is_some_and(|p| p.starts_with(dir) && file.starts_with(p))
+    })
+}
+
+/// Refuses what must never leave the machine as an attachment: a file named like credentials,
+/// anything under the node's secrets directory, and anything under `~/.ssh` or Claude Code's
+/// config dir (`~/.claude`, which holds its login) unless it is inside the project the agent works
+/// in. The orchestrator also refuses a file that contains a secret value; this catches the
+/// obvious cases, including credentials the fleet does not know, before a byte is sent.
 fn check_attachable(path: &std::path::Path) -> Result<()> {
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if name == ".env" || name.starts_with(".env.") || name.ends_with(".env") {
+        .unwrap_or_default();
+    if is_credentials_name(name) {
         bail!(
             "{} looks like a secrets file; attach what the work produced, never credentials",
             path.display()
         );
+    }
+    if let Ok(file) = path.canonicalize() {
+        let home = if cfg!(windows) {
+            std::env::var_os("USERPROFILE")
+        } else {
+            std::env::var_os("HOME")
+        }
+        .filter(|h| !h.is_empty())
+        .map(std::path::PathBuf::from);
+        let private = home
+            .iter()
+            .flat_map(|h| [h.join(".ssh"), h.join(".claude")])
+            .chain(crate::disk::claude_dir())
+            .filter_map(|d| d.canonicalize().ok());
+        let project = std::env::current_dir().and_then(|d| d.canonicalize()).ok();
+        if let Some(dir) = private_dir_of(&file, private, project.as_deref()) {
+            bail!(
+                "{} is under {}, which holds this machine's credentials; it cannot be attached",
+                path.display(),
+                dir.display()
+            );
+        }
     }
     if let Ok(dir) = std::env::var("FLEET_SECRETS_DIR") {
         // The whole `secrets` directory of the node, not only this run's: another task's files
@@ -1453,13 +1503,68 @@ mod tests {
 
     #[test]
     fn secrets_files_are_not_attachable() {
-        for name in [".env", ".env.local", "prod.env"] {
+        for name in [
+            ".env",
+            ".env.local",
+            "prod.env",
+            "server.pem",
+            "tls.KEY",
+            "id_rsa",
+            "id_rsa.pub",
+            "id_ed25519",
+            "credentials",
+            "credentials.json",
+        ] {
             assert!(
                 check_attachable(std::path::Path::new(name)).is_err(),
                 "{name}"
             );
         }
+        for name in [
+            "0021_add_index.sql",
+            "keyboard.png",
+            "my-credentials-howto.md",
+        ] {
+            assert!(!is_credentials_name(name), "{name}");
+        }
         assert!(check_attachable(std::path::Path::new("0021_add_index.sql")).is_ok());
+    }
+
+    #[test]
+    fn credential_dirs_are_not_attachable_outside_the_project() {
+        use std::path::{Path, PathBuf};
+        let private = || {
+            [
+                PathBuf::from("/home/u/.ssh"),
+                PathBuf::from("/home/u/.claude"),
+            ]
+        };
+        assert_eq!(
+            private_dir_of(Path::new("/home/u/.ssh/config"), private(), None),
+            Some(PathBuf::from("/home/u/.ssh"))
+        );
+        assert_eq!(
+            private_dir_of(
+                Path::new("/home/u/.claude/.credentials.json"),
+                private(),
+                Some(Path::new("/home/u/work/app"))
+            ),
+            Some(PathBuf::from("/home/u/.claude")),
+            "the agent's project elsewhere does not open ~/.claude"
+        );
+        assert_eq!(
+            private_dir_of(
+                Path::new("/home/u/.claude/projects/p/out.md"),
+                private(),
+                Some(Path::new("/home/u/.claude/projects/p"))
+            ),
+            None,
+            "a project kept under ~/.claude is still the agent's own work"
+        );
+        assert_eq!(
+            private_dir_of(Path::new("/home/u/work/app/report.md"), private(), None),
+            None
+        );
     }
 
     #[test]

@@ -11,12 +11,17 @@
 //! - **Uploaded in pieces.** A frame on the link and a request on the node's IPC are both capped
 //!   at 4 MiB, so a file arrives as `begin`, one `chunk` per piece, then `finish`. Only `finish`
 //!   makes it visible, after checking that every piece arrived, that the bytes hash to what the
-//!   sender said, and that none of the project's secret values is inside. An upload that never
-//!   finishes is swept after an hour.
+//!   sender said, and that none of the project's secret values is inside. An upload has a
+//!   deadline fixed when it begins: past it, it takes no more pieces and is swept.
+//! - **Bounded.** One uploader has at most [`MAX_OPEN_UPLOADS`] uploads in progress, and one
+//!   task's files (those in progress included) add up to at most `FLEET_ATTACHMENT_TASK_MAX_MB`,
+//!   so an agent gone wrong cannot fill the database.
 //! - **Secrets stay out.** A file that contains a secret value is refused, not redacted:
 //!   rewriting bytes would corrupt a binary, and a deliverable that silently differs from what the
-//!   agent made is worse than an error the agent can act on. A URL with a secret in it is refused
-//!   the same way, and titles lose secret values like every other free text an agent sends.
+//!   agent made is worse than an error the agent can act on. The value is looked for as UTF-8 and
+//!   as UTF-16 in both byte orders (what Windows PowerShell 5.1 writes when output is redirected).
+//!   A URL or a file name with a secret in it is refused the same way, and a title loses the
+//!   secret values of the task it is attached to (and of the uploader's project).
 //! - **Never rendered.** A file is served as a download (`Content-Disposition: attachment`,
 //!   `nosniff`), whatever its name says it is, so an HTML or SVG file an agent made can never run
 //!   in the owner's session. Only common raster images are shown inline, for a preview.
@@ -37,8 +42,12 @@ use crate::{
 /// comfortably inside the 4 MiB frame and IPC limits, and inside the web API's 2 MiB body limit.
 pub const CHUNK: usize = 1024 * 1024;
 
-/// How long an unfinished upload may wait for its next piece before it is thrown away.
-const STALE_UPLOAD_MINUTES: i32 = 60;
+/// How long an upload has, from `begin`, to finish. Fixed then and never extended: a piece that
+/// keeps arriving is no reason to keep bytes nobody can see.
+const UPLOAD_DEADLINE_MINUTES: i32 = 60;
+
+/// How many uploads one uploader may have in progress at once.
+pub const MAX_OPEN_UPLOADS: i64 = 3;
 
 /// Media types a browser may show inline. Everything else is only ever downloaded: an HTML or SVG
 /// file is code, and the owner's session must never run code an agent wrote.
@@ -57,11 +66,14 @@ pub struct AttachmentRow {
     pub sha256: Option<String>,
     pub complete: bool,
     pub added_by: String,
+    /// When it was attached (a file: when `finish` made it visible).
     pub created_at: DateTime<Utc>,
+    /// An upload's deadline; none once complete.
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
-const COLUMNS: &str =
-    "id, task_id, kind, title, url, file_name, mime, size, sha256, complete, added_by, created_at";
+const COLUMNS: &str = "id, task_id, kind, title, url, file_name, mime, size, sha256, complete, \
+                       added_by, created_at, expires_at";
 
 impl AttachmentRow {
     /// Whether a browser may display it rather than download it.
@@ -226,23 +238,61 @@ async fn task(o: &Orchestrator, id: &str) -> Result<TaskRow> {
     o.task(id).await?.with_context(|| format!("no task {id}"))
 }
 
-/// The secret values a file or link attached to `task` must not contain: its project's, and
-/// those of the project the uploader works in (the brain attaching to another project's task
-/// holds its own).
+/// The secret values what is attached to a task must not contain: its project's, and those of
+/// the project the uploader works in (the brain attaching to another project's task holds its
+/// own).
+pub struct Forbidden {
+    /// The values, for redacting a title.
+    values: Vec<String>,
+    /// Each value as UTF-8, UTF-16LE and UTF-16BE bytes, for looking through a file, a link or a
+    /// name.
+    needles: Vec<Vec<u8>>,
+}
+
+impl Forbidden {
+    pub fn new(values: Vec<String>) -> Self {
+        let values: Vec<String> = values
+            .into_iter()
+            .filter(|v| v.len() >= fleet_proto::redact::MIN_REDACT_LEN)
+            .collect();
+        let needles = values
+            .iter()
+            .flat_map(|v| {
+                let le: Vec<u8> = v.encode_utf16().flat_map(u16::to_le_bytes).collect();
+                let be: Vec<u8> = v.encode_utf16().flat_map(u16::to_be_bytes).collect();
+                [v.as_bytes().to_vec(), le, be]
+            })
+            .collect();
+        Self { values, needles }
+    }
+
+    /// Whether any value is in these bytes, in any of the encodings.
+    fn found_in(&self, bytes: &[u8]) -> bool {
+        self.needles
+            .iter()
+            .any(|n| memchr::memmem::find(bytes, n).is_some())
+    }
+
+    /// A title without the values, checked again: one made only of a secret is no title.
+    fn title(&self, raw: &str) -> Result<String> {
+        let mut t = check_title(raw)?;
+        fleet_proto::redact::redact_secrets(&mut t, &self.values);
+        check_title(&t)
+    }
+}
+
+/// Looked up before any transaction is opened, so no upload step holds one connection while it
+/// waits for another.
 async fn forbidden_values(
     o: &Orchestrator,
     task: &TaskRow,
     uploader_project: Option<&str>,
-) -> Result<Vec<Vec<u8>>> {
+) -> Result<Forbidden> {
     let mut values = crate::tasks::project_secret_values(o, &task.project).await?;
     if let Some(p) = uploader_project.filter(|p| *p != task.project) {
         values.extend(crate::tasks::project_secret_values(o, p).await?);
     }
-    Ok(values
-        .into_iter()
-        .filter(|v| v.len() >= fleet_proto::redact::MIN_REDACT_LEN)
-        .map(String::into_bytes)
-        .collect())
+    Ok(Forbidden::new(values))
 }
 
 /// Attaches a link with a title. The same link attached again keeps one row and takes the newer
@@ -257,12 +307,9 @@ pub async fn add_url(
 ) -> Result<AttachmentRow> {
     let task = task(o, task_id).await?;
     let url = check_url(url)?;
-    let title = check_title(title)?;
     let secrets = forbidden_values(o, &task, uploader_project).await?;
-    if secrets
-        .iter()
-        .any(|s| memchr::memmem::find(url.as_bytes(), s).is_some())
-    {
+    let title = secrets.title(title)?;
+    if secrets.found_in(url.as_bytes()) {
         bail!("that link contains one of the project's secret values; it was not attached");
     }
     // One row per link and task, however many times (or however concurrently) it is attached:
@@ -305,15 +352,12 @@ pub async fn begin(
     uploader_project: Option<&str>,
 ) -> Result<i64> {
     let task = task(o, task_id).await?;
-    let title = check_title(title)?;
+    let secrets = forbidden_values(o, &task, uploader_project).await?;
+    let title = secrets.title(title)?;
     let file_name = check_file_name(file_name)?;
     // The name is shown in Telegram, the audit log and a download header, so it is held to the
     // same rule as the bytes: no secret value in it.
-    if forbidden_values(o, &task, uploader_project)
-        .await?
-        .iter()
-        .any(|s| memchr::memmem::find(file_name.as_bytes(), s).is_some())
-    {
+    if secrets.found_in(file_name.as_bytes()) {
         bail!("that file name contains one of the project's secret values; choose another");
     }
     let max = o.cfg.attachment_max_bytes;
@@ -329,9 +373,48 @@ pub async fn begin(
         sha256.len() == 64 && sha256.chars().all(|c| c.is_ascii_hexdigit()),
         "sha256 must be the file's SHA-256 as 64 hex digits"
     );
-    Ok(sqlx::query_scalar(
-        "insert into task_attachments (task_id, kind, title, file_name, size, sha256, complete, added_by)
-         values ($1, 'file', $2, $3, $4, $5, false, $6) returning id",
+    // The caps are counted and the upload inserted under two transaction locks, the uploader's
+    // and then the task's (always in that order), so two uploads begun at the same moment cannot
+    // both pass a count that only one of them fits in.
+    let mut tx = o.db.begin().await?;
+    sqlx::query(
+        "select pg_advisory_xact_lock(hashtext('fleet.attach.uploader'), hashtext($1)),
+                pg_advisory_xact_lock(hashtext('fleet.attach.task'), hashtext($2))",
+    )
+    .bind(added_by)
+    .bind(&task.id)
+    .execute(&mut *tx)
+    .await?;
+    let (open, used): (i64, i64) = sqlx::query_as(
+        "select (select count(*) from task_attachments
+                 where added_by = $1 and not complete and expires_at > now()),
+                (select coalesce(sum(size), 0)::bigint from task_attachments
+                 where task_id = $2 and kind = 'file' and (complete or expires_at > now()))",
+    )
+    .bind(added_by)
+    .bind(&task.id)
+    .fetch_one(&mut *tx)
+    .await?;
+    ensure!(
+        open < MAX_OPEN_UPLOADS,
+        "{open} unfinished uploads are already in progress; finish one (or wait for it to expire) \
+         before starting another"
+    );
+    let task_max = o.cfg.attachment_task_max_bytes;
+    ensure!(
+        used + size <= task_max,
+        "{} would bring {}'s files to {}, more than the {} a task may carry \
+         (FLEET_ATTACHMENT_TASK_MAX_MB)",
+        file_name,
+        task.key(),
+        human_size(used + size),
+        human_size(task_max)
+    );
+    let id: i64 = sqlx::query_scalar(
+        "insert into task_attachments
+             (task_id, kind, title, file_name, size, sha256, complete, added_by, expires_at)
+         values ($1, 'file', $2, $3, $4, $5, false, $6, now() + make_interval(mins => $7::int))
+         returning id",
     )
     .bind(&task.id)
     .bind(&title)
@@ -339,8 +422,11 @@ pub async fn begin(
     .bind(size)
     .bind(&sha256)
     .bind(added_by)
-    .fetch_one(&o.db)
-    .await?)
+    .bind(UPLOAD_DEADLINE_MINUTES)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(id)
 }
 
 /// An unfinished upload, as only the one who began it may continue it.
@@ -351,13 +437,14 @@ async fn upload(
     added_by: &str,
 ) -> Result<AttachmentRow> {
     let row: Option<AttachmentRow> = sqlx::query_as(&format!(
-        "select {COLUMNS} from task_attachments where id = $1 and kind = 'file' and not complete"
+        "select {COLUMNS} from task_attachments
+         where id = $1 and kind = 'file' and not complete and expires_at > now()"
     ))
     .bind(upload_id)
     .fetch_optional(&o.db)
     .await?;
     let row = row.with_context(|| {
-        format!("no upload {upload_id} in progress (finished, abandoned, or never begun)")
+        format!("no upload {upload_id} in progress (finished, expired, or never begun)")
     })?;
     // The task is compared by its real id: `task_id` may be the key it was named by.
     let task = task(o, task_id).await?;
@@ -373,7 +460,7 @@ fn chunks_of(size: i64) -> i64 {
 }
 
 /// Stores one piece of an upload. Sending the same piece again replaces it, so a retry after a
-/// lost reply is harmless.
+/// lost reply is harmless. A piece does not extend the upload's deadline.
 ///
 /// The piece is written under a shared lock on the upload's row, taken after checking that it is
 /// still unfinished: [`finish`] holds the exclusive one while it checks and publishes, so a piece
@@ -400,14 +487,15 @@ pub async fn chunk(
     );
     let mut tx = o.db.begin().await?;
     let open: Option<i64> = sqlx::query_scalar(
-        "select id from task_attachments where id = $1 and not complete for share",
+        "select id from task_attachments
+         where id = $1 and not complete and expires_at > now() for share",
     )
     .bind(upload_id)
     .fetch_optional(&mut *tx)
     .await?;
     ensure!(
         open.is_some(),
-        "upload {upload_id} is already finished or was discarded"
+        "upload {upload_id} is already finished, was discarded or has expired"
     );
     sqlx::query(
         "insert into task_attachment_chunks (attachment_id, idx, data) values ($1, $2, $3)
@@ -419,21 +507,19 @@ pub async fn chunk(
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
-    // Every piece is a sign of life, for the sweep of abandoned uploads.
-    sqlx::query("update task_attachments set created_at = now() where id = $1 and not complete")
-        .bind(upload_id)
-        .execute(&o.db)
-        .await?;
     Ok(())
 }
 
 /// Checks a finished upload and makes it visible.
 ///
-/// The check and the publication happen under an exclusive lock on the upload's row, which no
-/// piece can be written without (see [`chunk`]): what was hashed and scanned is exactly what is
-/// published, and of two `finish` calls at once only one publishes. An upload that fails the
-/// check (a missing piece, a wrong size or hash, a secret inside) is thrown away, so the next try
-/// starts clean with `begin`; one that hits a passing database error is kept for a retry.
+/// The check and the publication happen in one transaction, under an exclusive lock on the
+/// upload's row, which no piece can be written without (see [`chunk`]): what was hashed and
+/// scanned is exactly what is published, and of two `finish` calls at once only one publishes.
+/// Everything inside runs on that one connection (the secret values are looked up before it
+/// opens), so a finish never holds a connection while it waits for a second. An upload that fails
+/// the check (a missing piece, a wrong size or hash, a secret inside) is deleted in the same
+/// transaction, so the next try starts clean with `begin`; one that hits a passing database error
+/// is kept for a retry.
 pub async fn finish(
     o: &Orchestrator,
     upload_id: i64,
@@ -443,20 +529,25 @@ pub async fn finish(
 ) -> Result<AttachmentRow> {
     let row = upload(o, upload_id, task_id, added_by).await?;
     let task = task(o, &row.task_id).await?;
+    let secrets = forbidden_values(o, &task, uploader_project).await?;
     let mut tx = o.db.begin().await?;
     let open: Option<i64> = sqlx::query_scalar(
-        "select id from task_attachments where id = $1 and not complete for update",
+        "select id from task_attachments
+         where id = $1 and not complete and expires_at > now() for update",
     )
     .bind(upload_id)
     .fetch_optional(&mut *tx)
     .await?;
     ensure!(
         open.is_some(),
-        "upload {upload_id} is already finished or was discarded"
+        "upload {upload_id} is already finished, was discarded or has expired"
     );
-    if let Some(refused) = verify(o, &row, &task, uploader_project).await? {
-        drop(tx);
-        discard(o, upload_id).await;
+    if let Some(refused) = verify(&mut tx, &row, &secrets).await? {
+        sqlx::query("delete from task_attachments where id = $1 and not complete")
+            .bind(upload_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         bail!(refused);
     }
     let name = row.file_name.clone().unwrap_or_default();
@@ -465,7 +556,7 @@ pub async fn finish(
         .map(|m| m.essence_str().to_owned())
         .unwrap_or_else(|| "application/octet-stream".into());
     sqlx::query(
-        "update task_attachments set complete = true, mime = $2, created_at = now()
+        "update task_attachments set complete = true, mime = $2, created_at = now(), expires_at = null
          where id = $1 and not complete",
     )
     .bind(upload_id)
@@ -492,25 +583,23 @@ pub async fn finish(
 /// that straddles two pieces. `Ok(Some(why))` is a refusal; `Err` is the database failing, which
 /// says nothing about the file.
 async fn verify(
-    o: &Orchestrator,
+    conn: &mut sqlx::PgConnection,
     row: &AttachmentRow,
-    task: &TaskRow,
-    uploader_project: Option<&str>,
+    secrets: &Forbidden,
 ) -> Result<Option<String>> {
     let size = row.size.unwrap_or(0);
     let n = chunks_of(size);
     let have: i64 =
         sqlx::query_scalar("select count(*) from task_attachment_chunks where attachment_id = $1")
             .bind(row.id)
-            .fetch_one(&o.db)
+            .fetch_one(&mut *conn)
             .await?;
     if have != n {
         return Ok(Some(format!(
             "only {have} of {n} chunks arrived; the upload was discarded, start again"
         )));
     }
-    let secrets = forbidden_values(o, task, uploader_project).await?;
-    let mut scan = SecretScan::new(&secrets);
+    let mut scan = SecretScan::new(&secrets.needles);
     let mut hash = Sha256::new();
     let mut total: i64 = 0;
     for idx in 0..n {
@@ -519,7 +608,7 @@ async fn verify(
         )
         .bind(row.id)
         .bind(idx as i32)
-        .fetch_one(&o.db)
+        .fetch_one(&mut *conn)
         .await?;
         total += data.len() as i64;
         hash.update(&data);
@@ -588,13 +677,6 @@ impl<'a> SecretScan<'a> {
     }
 }
 
-async fn discard(o: &Orchestrator, upload_id: i64) {
-    let _ = sqlx::query("delete from task_attachments where id = $1 and not complete")
-        .bind(upload_id)
-        .execute(&o.db)
-        .await;
-}
-
 /// Removes a visible attachment. Returns whether there was one on that task.
 ///
 /// `only_by` limits it to what that actor attached: an agent takes back its own attachments, not
@@ -644,13 +726,12 @@ pub async fn read_chunk(o: &Orchestrator, id: i64, idx: i64) -> Result<Vec<u8>> 
     .await?)
 }
 
-/// Throws away uploads that stopped arriving.
+/// Throws away uploads past their deadline, however recently a piece arrived.
 pub async fn sweep_stale(o: &Orchestrator) -> Result<u64> {
     Ok(sqlx::query(
         "delete from task_attachments
-         where not complete and created_at < now() - make_interval(mins => $1::int)",
+         where not complete and (expires_at is null or expires_at <= now())",
     )
-    .bind(STALE_UPLOAD_MINUTES)
     .execute(&o.db)
     .await?
     .rows_affected())
@@ -660,7 +741,7 @@ pub async fn sweep_stale(o: &Orchestrator) -> Result<u64> {
 /// is closed (or gone), and the web page shows the attachment either way, so nothing is posted
 /// for one. Best effort: the attachment is there whatever Telegram does.
 async fn announce(o: &Orchestrator, task: &TaskRow, a: &AttachmentRow) {
-    if task.topic_id.is_none() || crate::model::status::is_done(&task.status) {
+    if task.topic_id.is_none() || task.status == crate::model::status::DONE {
         return;
     }
     let title = esc(&clip(&a.title, 200));
@@ -721,6 +802,32 @@ mod tests {
     }
 
     #[test]
+    fn a_secret_is_found_in_utf8_and_both_utf16_orders() {
+        let f = Forbidden::new(vec!["hunter2-secret".into(), "short".into()]);
+        let utf16 = |s: &str, le: bool| -> Vec<u8> {
+            s.encode_utf16()
+                .flat_map(|u| if le { u.to_le_bytes() } else { u.to_be_bytes() })
+                .collect()
+        };
+        let text = "log: token=hunter2-secret, done";
+        assert!(f.found_in(text.as_bytes()));
+        assert!(
+            f.found_in(&utf16(text, true)),
+            "UTF-16LE, as PowerShell 5.1 writes"
+        );
+        assert!(f.found_in(&utf16(text, false)), "UTF-16BE");
+        assert!(!f.found_in(&utf16("nothing to see", true)));
+        assert!(
+            !f.found_in(b"short"),
+            "values too short to redact are not looked for either"
+        );
+        assert_eq!(
+            f.title("Notes for hunter2-secret").unwrap(),
+            "Notes for [secret]"
+        );
+    }
+
+    #[test]
     fn attachment_ids_read_either_way() {
         assert_eq!(parse_id("A-12").unwrap(), 12);
         assert_eq!(parse_id(" 7 ").unwrap(), 7);
@@ -759,6 +866,7 @@ mod tests {
             complete: true,
             added_by: "a".into(),
             created_at: Utc::now(),
+            expires_at: None,
         };
         assert!(a.inline());
         for m in ["image/svg+xml", "text/html", "application/octet-stream"] {

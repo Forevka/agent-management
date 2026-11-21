@@ -6548,12 +6548,15 @@ async fn api_download(o: &Arc<Orchestrator>, uri: &str) -> (u16, axum::http::Hea
 ///   file with a project secret inside (even split across two pieces), one over the size limit
 ///   and one whose bytes do not match its hash are all refused and leave nothing behind. The
 ///   brain attaches to another task by its F-key; an agent naming another task still attaches
-///   to its own.
+///   to its own. No session, no file; HTML and SVG are downloads, a PNG is shown under a
+///   sandboxing CSP. Uploads in progress are capped per task and per uploader, only the uploader
+///   continues one, and one past its deadline is swept however many pieces keep arriving.
 /// - **Search.** Every word must match somewhere — title, brief, summary, key, attachments — and
 ///   archived tasks are found by a search while a plain list leaves them out.
 /// - **Archive.** At 21:00 Kyiv time, summer (UTC+3), winter (UTC+2) and on the day the clocks
-///   change, done tasks become archived, once a day; a workflow never is; and a task that is
-///   written to again is no longer archived.
+///   change, done tasks finished an hour before are archived (and stay `done`), once a day; a
+///   workflow never is; and a task that is written to again plans first and is no longer
+///   archived.
 async fn attachments_search_archive_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool) {
     use sha2::Digest;
     let bs1 = o.task("demo-BS-1").await.unwrap().unwrap();
@@ -6840,6 +6843,187 @@ async fn attachments_search_archive_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPoo
         assert_eq!(card["attachments"].as_array().unwrap().len(), 4);
     }
 
+    // A file is only ever served to the owner's session.
+    {
+        use tower::ServiceExt;
+        let req = axum::http::Request::builder()
+            .uri(render["download"].as_str().unwrap())
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let res = crate::web::router(o.clone()).oneshot(req).await.unwrap();
+        assert_eq!(res.status().as_u16(), 401, "no session, no file");
+    }
+    // Whatever a file says it is, a page or a picture that can carry script is a download; only a
+    // raster image may be shown, and even that under a sandboxing CSP.
+    for (name, bytes, inline) in [
+        (
+            "page.html",
+            &b"<html><script>alert(document.cookie)</script></html>"[..],
+            false,
+        ),
+        (
+            "logo.svg",
+            &b"<svg xmlns='http://www.w3.org/2000/svg' onload='alert(1)'/>"[..],
+            false,
+        ),
+        (
+            "pixel.png",
+            &b"\x89PNG\r\n\x1a\n not really a png"[..],
+            true,
+        ),
+    ] {
+        let r = upload("Rendered output", name, bytes.to_vec(), sha(bytes))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(r.ok, "{}", r.result);
+        let a = crate::attachments::of_task(o, "demo-BS-1")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|a| a.file_name.as_deref() == Some(name))
+            .unwrap();
+        let (status, headers, got) =
+            api_download(o, &format!("/api/attachments/{}/file", a.id)).await;
+        assert_eq!(status, 200);
+        assert_eq!(got, bytes, "{name}");
+        let disposition = headers["content-disposition"].to_str().unwrap();
+        if inline {
+            assert_eq!(headers["content-type"], "image/png");
+            assert!(disposition.starts_with("inline;"), "{disposition}");
+        } else {
+            assert_eq!(
+                headers["content-type"], "application/octet-stream",
+                "{name}"
+            );
+            assert!(
+                disposition.starts_with("attachment;"),
+                "{name}: {disposition}"
+            );
+        }
+        assert_eq!(
+            headers["content-security-policy"],
+            "sandbox; default-src 'none'"
+        );
+        assert_eq!(headers["x-content-type-options"], "nosniff");
+    }
+
+    // Uploads in progress are bounded: per task, by the bytes of every file it has or is being
+    // given, and per uploader, by how many are open at once.
+    let begin = |name: &'static str, size: i64| {
+        let agent = agent.clone();
+        async move {
+            call_as(
+                o,
+                &agent,
+                "demo-BS-1",
+                "attach_begin",
+                json!({"title": "Big", "file_name": name, "size": size, "sha256": "0".repeat(64)}),
+            )
+            .await
+            .map(|r| {
+                serde_json::from_str::<Value>(&r.unwrap().result).unwrap()["upload"]
+                    .as_i64()
+                    .unwrap()
+            })
+        }
+    };
+    let four_mib = 4 * 1024 * 1024;
+    let big = begin("big-1.bin", four_mib)
+        .await
+        .expect("4 MiB fits the task");
+    let e = begin("big-2.bin", four_mib).await.unwrap_err().to_string();
+    assert!(
+        e.contains("FLEET_ATTACHMENT_TASK_MAX_MB"),
+        "an upload in progress counts toward the task's cap: {e}"
+    );
+    let second = begin("small-2.bin", 10).await.unwrap();
+    let third = begin("small-3.bin", 10).await.unwrap();
+    let e = begin("small-4.bin", 10).await.unwrap_err().to_string();
+    assert!(e.contains("unfinished uploads"), "three at a time: {e}");
+    // Nobody but the uploader continues an upload, not even the brain.
+    let e = call_as(
+        o,
+        "orchestrator",
+        "brain",
+        "attach_chunk",
+        json!({"task_id": "demo-BS-1", "upload": second, "index": 0,
+               "data": data_encoding::BASE64.encode(b"0123456789")}),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("belongs to someone else"), "{e}");
+    // A piece keeps arriving, and the deadline set at `begin` still holds: once it has passed, no
+    // piece is taken and the sweep removes the upload, pieces and all.
+    let deadline = || async {
+        sqlx::query_scalar::<_, Option<chrono::DateTime<chrono::Utc>>>(
+            "select expires_at from task_attachments where id = $1",
+        )
+        .bind(second)
+        .fetch_one(db)
+        .await
+        .unwrap()
+    };
+    let before = deadline().await;
+    let chunk = |up: i64| {
+        let agent = agent.clone();
+        async move {
+            call_as(
+                o,
+                &agent,
+                "demo-BS-1",
+                "attach_chunk",
+                json!({"upload": up, "index": 0, "data": data_encoding::BASE64.encode(b"0123456789")}),
+            )
+            .await
+        }
+    };
+    chunk(second).await.unwrap();
+    assert!(before.is_some());
+    assert_eq!(
+        deadline().await,
+        before,
+        "a piece does not extend the deadline"
+    );
+    sqlx::query(
+        "update task_attachments set expires_at = now() - interval '1 second' where id = $1",
+    )
+    .bind(second)
+    .execute(db)
+    .await
+    .unwrap();
+    let e = chunk(second).await.unwrap_err().to_string();
+    assert!(
+        e.contains("no upload"),
+        "an expired upload takes no more pieces: {e}"
+    );
+    assert_eq!(crate::attachments::sweep_stale(o).await.unwrap(), 1);
+    let gone: (i64, i64) = sqlx::query_as(
+        "select (select count(*) from task_attachments where id = $1),
+                (select count(*) from task_attachment_chunks where attachment_id = $1)",
+    )
+    .bind(second)
+    .fetch_one(db)
+    .await
+    .unwrap();
+    assert_eq!(gone, (0, 0), "swept with its pieces");
+    // The rest are let go the same way, and nothing visible is ever swept.
+    sqlx::query("update task_attachments set expires_at = now() where id = any($1)")
+        .bind(vec![big, third])
+        .execute(db)
+        .await
+        .unwrap();
+    assert_eq!(crate::attachments::sweep_stale(o).await.unwrap(), 2);
+    assert_eq!(
+        crate::attachments::of_task(o, "demo-BS-1")
+            .await
+            .unwrap()
+            .len(),
+        7,
+        "every complete attachment is still there"
+    );
+
     // Search, across every field a task is found by. Every word must match.
     let ids = |v: &Value| -> Vec<String> {
         v["tasks"]
@@ -6903,11 +7087,14 @@ async fn attachments_search_archive_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPoo
         "the summary is kept, without the secret the agent quoted: {summary:?}"
     );
 
-    // The nightly archive. A workflow that is done between runs, and two plain done tasks.
+    // The nightly archive. A workflow that is done between runs, a chore finished long ago and
+    // one finished half an hour before the evening's run. The first chore has a session and an
+    // approved plan, as any finished task does.
     sqlx::query(
-        "insert into tasks (id, project, title, brief, agent_id, status) values
-           ('demo-AR-1', 'demo', 'Archive me', 'a finished chore', $1, 'done'),
-           ('demo-AR-W', 'demo', 'Nightly report', 'a standing automation', $1, 'done')",
+        "insert into tasks (id, project, title, brief, agent_id, status, session_id, plan_approved, updated_at) values
+           ('demo-AR-1', 'demo', 'Archive me', 'a finished chore', $1, 'done', 's-ar1', true, '2026-07-01T00:00:00Z'),
+           ('demo-AR-W', 'demo', 'Nightly report', 'a standing automation', $1, 'done', null, true, '2026-07-01T00:00:00Z'),
+           ('demo-AR-2', 'demo', 'Late chore', 'finished at 20:30', $1, 'done', null, true, '2026-07-15T17:30:00Z')",
     )
     .bind(&agent)
     .execute(db)
@@ -6924,12 +7111,24 @@ async fn attachments_search_archive_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPoo
     };
     let kyiv = "Europe/Kyiv";
     let at = 21 * 60;
-    let status_of = |id: &'static str| async move {
-        sqlx::query_scalar::<_, String>("select status from tasks where id = $1")
+    // (status, archived) of a task.
+    let state_of = |id: &'static str| async move {
+        let (status, archived): (String, Option<chrono::DateTime<chrono::Utc>>) =
+            sqlx::query_as("select status, archived_at from tasks where id = $1")
+                .bind(id)
+                .fetch_one(db)
+                .await
+                .unwrap();
+        (status, archived.is_some())
+    };
+    let done = || ("done".to_owned(), false);
+    let archived = || ("done".to_owned(), true);
+    let unarchive = |id: &'static str| async move {
+        sqlx::query("update tasks set archived_at = null where id = $1")
             .bind(id)
-            .fetch_one(db)
+            .execute(db)
             .await
-            .unwrap()
+            .unwrap();
     };
     // Summer: Kyiv is UTC+3, so 20:59 there is 17:59Z — not yet.
     assert_eq!(
@@ -6938,36 +7137,29 @@ async fn attachments_search_archive_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPoo
             .unwrap(),
         None
     );
-    assert_eq!(status_of("demo-AR-1").await, "done");
-    let done_before: i64 = sqlx::query_scalar(
-        "select count(*) from tasks t where status = 'done' and not running and id <> all($1)
-         and not exists (select 1 from workflows w where w.task_id = t.id)",
-    )
-    .bind(crate::model::BUILTIN_TASKS)
-    .fetch_one(db)
-    .await
-    .unwrap();
+    assert_eq!(state_of("demo-AR-1").await, done());
     let n = crate::archive::run_at(o, ts("2026-07-15T18:00:00Z"), at, kyiv)
         .await
         .unwrap()
         .expect("21:00 sharp is time");
-    // At least the done tasks counted a moment ago (the fleet is still working around this
-    // test, and one may have finished in between).
-    assert!(
-        n >= done_before as u64 && n >= 2,
-        "21:00 sharp archives every done task: {n} of {done_before}"
-    );
-    assert_eq!(status_of("demo-AR-1").await, "archived");
+    assert!(n >= 1, "21:00 sharp archives the done tasks: {n}");
     assert_eq!(
-        status_of("demo-AR-W").await,
-        "done",
+        state_of("demo-AR-1").await,
+        archived(),
+        "archived, and still done to everything that reads its status"
+    );
+    assert_eq!(
+        state_of("demo-AR-W").await,
+        done(),
         "a workflow stays on the board, ready for its next run"
     );
+    assert_eq!(
+        state_of("demo-AR-2").await,
+        done(),
+        "what was finished half an hour ago stays in tonight's Done column"
+    );
     // Once a day, whatever the hour.
-    sqlx::query("update tasks set status = 'done' where id = 'demo-AR-1'")
-        .execute(db)
-        .await
-        .unwrap();
+    unarchive("demo-AR-1").await;
     assert_eq!(
         crate::archive::run_at(o, ts("2026-07-15T20:30:00Z"), at, kyiv)
             .await
@@ -6983,19 +7175,21 @@ async fn attachments_search_archive_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPoo
         None,
         "20:30 in a Kyiv winter is too early, though it would be 21:30 in summer"
     );
-    // At least demo-AR-1: the fleet around this test may have finished something too.
+    // At least demo-AR-1 and demo-AR-2: the fleet around this test may have finished more.
     assert!(matches!(
         crate::archive::run_at(o, ts("2026-12-15T19:00:00Z"), at, kyiv)
             .await
             .unwrap(),
-        Some(n) if n >= 1
+        Some(n) if n >= 2
     ));
-    assert_eq!(status_of("demo-AR-1").await, "archived");
+    assert_eq!(state_of("demo-AR-1").await, archived());
+    assert_eq!(
+        state_of("demo-AR-2").await,
+        archived(),
+        "the next evening puts it away"
+    );
     // The day the clocks go back (25 October 2026): 21:00 is already winter time.
-    sqlx::query("update tasks set status = 'done' where id = 'demo-AR-1'")
-        .execute(db)
-        .await
-        .unwrap();
+    unarchive("demo-AR-1").await;
     assert_eq!(
         crate::archive::run_at(o, ts("2026-10-25T18:59:00Z"), at, kyiv)
             .await
@@ -7008,9 +7202,9 @@ async fn attachments_search_archive_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPoo
             .unwrap(),
         Some(n) if n >= 1
     ));
-    assert_eq!(status_of("demo-AR-1").await, "archived");
+    assert_eq!(state_of("demo-AR-1").await, archived());
 
-    // Hidden from the board and a plain list; found by search, by status, by asking, by link.
+    // Hidden from the board and a plain list; found by search, by the filter, by asking, by link.
     let board = api_get(o, "/api/board").await;
     assert!(
         !ids(&board).contains(&"demo-AR-1".to_owned()),
@@ -7022,20 +7216,26 @@ async fn attachments_search_archive_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPoo
         plain.contains(&"demo-AR-W".to_owned()),
         "a workflow is listed"
     );
-    assert!(found("Archive me").await.contains(&"demo-AR-1".to_owned()));
     assert!(
-        ids(&api_get(o, "/api/tasks?status=archived&limit=500").await)
-            .contains(&"demo-AR-1".to_owned())
+        !ids(&api_get(o, "/api/tasks?status=done&limit=500").await)
+            .contains(&"demo-AR-1".to_owned()),
+        "the done filter is a plain list too"
+    );
+    assert!(found("Archive me").await.contains(&"demo-AR-1".to_owned()));
+    let only_archived = ids(&api_get(o, "/api/tasks?status=archived&limit=500").await);
+    assert!(only_archived.contains(&"demo-AR-1".to_owned()));
+    assert!(
+        !only_archived.contains(&"demo-AR-W".to_owned()),
+        "the archived filter shows only what was put away"
     );
     assert!(
         ids(&api_get(o, "/api/tasks?archived=true&limit=500").await)
             .contains(&"demo-AR-1".to_owned())
     );
-    assert_eq!(
-        api_get(o, "/api/tasks/demo-AR-1").await["task"]["status"],
-        "archived"
-    );
-    // The brain finds it too, by any of its words.
+    let page = api_get(o, "/api/tasks/demo-AR-1").await;
+    assert_eq!(page["task"]["status"], "done");
+    assert!(page["task"]["archived_at"].is_string(), "{page}");
+    // The brain finds it too, by any of its words, and is told it was archived.
     let r = call_as(
         o,
         "orchestrator",
@@ -7046,7 +7246,19 @@ async fn attachments_search_archive_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPoo
     .await
     .unwrap()
     .unwrap();
-    assert!(r.result.contains("demo-AR-1"), "{}", r.result);
+    // The list itself, without the framing line that may come before it.
+    let json_part = &r.result[r.result.find('[').unwrap()..=r.result.rfind(']').unwrap()];
+    let listed: Value = serde_json::from_str(json_part).unwrap();
+    let ar1 = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["id"] == "demo-AR-1")
+        .unwrap_or_else(|| panic!("{}", r.result));
+    assert_eq!(
+        (ar1["status"].clone(), ar1["archived"].clone()),
+        (json!("done"), json!(true))
+    );
     let r = call_as(
         o,
         "orchestrator",
@@ -7059,20 +7271,40 @@ async fn attachments_search_archive_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPoo
     .unwrap();
     assert!(!r.result.contains("demo-AR-1"), "{}", r.result);
 
-    // Written to again, an archived task is work again. (It may queue behind its busy agent;
-    // either way it is no longer archived.)
+    // Written to again, an archived task is work again, and like any finished task it plans
+    // first: its old plan's approval does not carry the follow-up into auto mode. It either
+    // starts at once (planning) or waits behind its busy agent (queued, with the approval taken
+    // back so it plans when it starts); either way it has left the archive.
     let task = o.task("demo-AR-1").await.unwrap().unwrap();
-    assert_eq!(task.status, "archived");
-    let _ = tasks::deliver(
+    assert!(task.archived_at.is_some());
+    let delivered = tasks::deliver(
         o,
         &task,
         "[Message from the human] one more chore, please".into(),
     )
-    .await;
-    let now = status_of("demo-AR-1").await;
+    .await
+    .unwrap();
+    let (status, archived_at, plan_approved): (
+        String,
+        Option<chrono::DateTime<chrono::Utc>>,
+        bool,
+    ) = sqlx::query_as(
+        "select status, archived_at, plan_approved from tasks where id = 'demo-AR-1'",
+    )
+    .fetch_one(db)
+    .await
+    .unwrap();
+    assert_eq!(archived_at, None, "a follow-up takes it out of the archive");
+    match delivered {
+        tasks::Delivered::ToRun => assert_eq!(status, "planning", "it plans first"),
+        tasks::Delivered::Queued => {
+            assert_eq!(status, "queued");
+            assert!(!plan_approved, "it will plan first when it starts");
+        }
+    }
     assert!(
-        now != "archived" && now != "done",
-        "a follow-up brings it back: {now}"
+        ids(&api_get(o, "/api/board").await).contains(&"demo-AR-1".to_owned()),
+        "and is back on the board"
     );
 }
 

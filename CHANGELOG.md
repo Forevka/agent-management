@@ -17,21 +17,27 @@ below is one release. How to add to this file is in `CLAUDE.md`
   its own task (`fleet agent attach <url|path> --title ...`), the brain to any task, the owner
   from the task page; the board shows a count and the task page lists them. Files are kept in
   Postgres in 1 MiB pieces (so the database backups cover them), checked whole (size, SHA-256,
-  no project secret value inside, which is refused rather than redacted) before anyone sees them,
-  and always served as downloads. Uploads left unfinished are swept by housekeeping. New setting
-  `FLEET_ATTACHMENT_MAX_MB` (default 50). `fleet agent attach` needs a node on this release.
+  no project secret value inside, as UTF-8 or UTF-16, which is refused rather than redacted)
+  before anyone sees them, and always served as downloads. `fleet agent attach` also refuses
+  files named like credentials (`*.pem`, `*.key`, `id_rsa*`, `credentials*`, `.env`) and anything
+  under `~/.ssh` or `~/.claude`. An upload has an hour to finish, an uploader at most three in
+  progress, and a task at most `FLEET_ATTACHMENT_TASK_MAX_MB` (default 200) of files; each file
+  at most `FLEET_ATTACHMENT_MAX_MB` (default 50). `fleet agent attach` needs a node on this
+  release.
 - **Tasks can be searched.** The task list's search box and `fleet agent tasks --search` share
   one filter: every word must match the id, F-key, title, brief, the agent's closing summary
   (now kept on the task), status, agent, links or attachments.
-- **A nightly archive.** Every evening at 21:00 Europe/Kyiv, done tasks become `archived`: off
-  the board and the plain lists, still found by search, their link and the status filter.
-  Workflows are never archived, and an archived task written to again runs like any finished
-  one. Settings `FLEET_ARCHIVE_AT` (`HH:MM` or `off`) and `FLEET_ARCHIVE_TIMEZONE`. Rolling back
-  past this release leaves archived tasks unknown to the older code, which counts them as open
-  work (Telegram `/tasks`, the overview, a project's open count) until they are set back:
-  `update tasks set status = 'done' where status = 'archived'`.
+- **A nightly archive.** Every evening at 21:00 Europe/Kyiv, done tasks finished at least an
+  hour earlier are archived: off the board and the plain lists, still found by search, their
+  link and the `archived` filter. They stay `done` (a mark, `archived_at`, not a status), so a
+  rollback to an older release only shows them again. Workflows are never archived, and an
+  archived task written to again runs like any finished one, through a new plan, and leaves the
+  archive. Settings `FLEET_ARCHIVE_AT` (`HH:MM` or `off`) and `FLEET_ARCHIVE_TIMEZONE`.
+- **A finished task whose follow-up has to wait still plans first.** A follow-up to a done task
+  that queued behind a busy agent used to resume in auto mode once it started; it now goes
+  through plan mode, as it does when it starts at once.
 - Migration `0027_attachments_archive` (add-only): tables `task_attachments` and
-  `task_attachment_chunks`, a nullable `tasks.summary`, and an index on `tasks.status`. No
+  `task_attachment_chunks`, and the nullable `tasks.summary` and `tasks.archived_at`. No
   constraint changes and no backfill.
 
 ## v0.2.10 — 2026-11-21

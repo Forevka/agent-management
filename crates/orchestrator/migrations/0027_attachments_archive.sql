@@ -21,10 +21,16 @@ create table task_attachments (
     -- whole was checked (size, hash, no secret inside). A link is complete at once.
     complete   boolean not null default false,
     added_by   text not null,
-    created_at timestamptz not null default now()
+    -- When it was attached: for a file, when `finish` made it visible.
+    created_at timestamptz not null default now(),
+    -- For an unfinished upload, the deadline fixed when it began: past it the upload is refused
+    -- and swept, however many pieces keep arriving. Null once complete.
+    expires_at timestamptz
 );
 
 create index task_attachments_task on task_attachments (task_id) where complete;
+-- The uploads in progress: few, counted per uploader and swept by their deadline.
+create index task_attachments_open on task_attachments (added_by, expires_at) where not complete;
 -- A link is attached to a task once; attaching it again only updates its title. Enforced here
 -- rather than by a lookup first, so two attaches at the same moment cannot both insert.
 create unique index task_attachments_url on task_attachments (task_id, url) where kind = 'url';
@@ -43,6 +49,7 @@ create table task_attachment_chunks (
 -- turned out to be, not only by what it was asked to be.
 alter table tasks add column summary text;
 
--- Task states are now: queued | planning | running | waiting | done | stopped | failed |
--- archived. `archived` is a `done` task the nightly archive moved out of the board's way.
-create index tasks_status on tasks (status);
+-- When the nightly archive put a done task out of the board's way. A column rather than a new
+-- status, so the task stays `done` to everything that reads its status (an older release after a
+-- rollback included, which then simply shows it again). Cleared when the task is worked on again.
+alter table tasks add column archived_at timestamptz;

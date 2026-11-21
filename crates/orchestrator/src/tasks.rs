@@ -794,7 +794,7 @@ async fn dispatch_locked(
     // session all belong to that agent.
     let claimed = sqlx::query(
         "update tasks set node_id = $2, run_id = $3, running = true, dispatched_at = now(), status = $4, agent_id = $5, updated_at = now(),
-                          plan_approved = plan_approved and not $6
+                          plan_approved = plan_approved and not $6, archived_at = null
          where id = $1 and not running
            and exists (select 1 from agents where id = $5 for share)
            and exists (select 1 from nodes where id = $2 for share)",
@@ -975,7 +975,7 @@ async fn dispatch_locked(
 /// back in auto and skip the approval. The fleet's own sessions never plan.
 fn plan_first(task: &TaskRow, resume: Option<&str>) -> bool {
     !crate::model::is_builtin_task(&task.id)
-        && (resume.is_none() || status::is_done(&task.status) || !task.plan_approved)
+        && (resume.is_none() || task.status == status::DONE || !task.plan_approved)
 }
 
 /// Leaves a task queued (keeping a follow-up message for when it starts) and says why.
@@ -989,10 +989,18 @@ async fn queue(
 ) -> Result<Dispatched> {
     // Nobody works on a queued task, whichever path queued it (a new message, a redelivery).
     o.stop_working(&task.id);
-    sqlx::query("update tasks set status = 'queued', updated_at = now() where id = $1")
-        .bind(&task.id)
-        .execute(&o.db)
-        .await?;
+    // Waiting is being worked on again, so an archived task leaves the archive here too. A
+    // finished task that has to wait keeps what `plan_first` would have decided for it had it
+    // started at once: once `queued`, its status no longer says it was done, so the approval of
+    // its last plan is taken back now (the right-hand side reads the status before this update).
+    sqlx::query(
+        "update tasks set status = 'queued', archived_at = null,
+                          plan_approved = plan_approved and status <> 'done', updated_at = now()
+         where id = $1",
+    )
+    .bind(&task.id)
+    .execute(&o.db)
+    .await?;
     if let Some(p) = prompt {
         // Keep the follow-up so it is not lost while the task waits.
         sqlx::query("insert into messages (task_id, to_agent, text) values ($1, $2, $3)")
@@ -1545,7 +1553,7 @@ pub async fn prune_topics(o: &Orchestrator) -> Result<()> {
     let stale: Vec<(String, i64)> = sqlx::query_as(
         "select id, topic_id from tasks
          where topic_id is not null and not running
-           and status in ('done', 'archived', 'stopped', 'failed')
+           and status in ('done', 'stopped', 'failed')
            and updated_at < now() - make_interval(mins => $1::int)
            and not exists (select 1 from human_items
                            where task_id = tasks.id and state = 'open' and blocking)
@@ -1670,7 +1678,7 @@ pub async fn deliver_as(
     }
     if matches!(
         task.status.as_str(),
-        status::DONE | status::ARCHIVED | status::STOPPED | status::FAILED
+        status::DONE | status::STOPPED | status::FAILED
     ) {
         match task.topic_id {
             Some(topic) => {
@@ -1738,7 +1746,7 @@ pub async fn stop(o: &Orchestrator, task: &TaskRow, graceful: bool) -> Result<()
     // Recorded before the node is told: the kill's exit event can arrive at once, and it must
     // find the task stopped, not running (which would read as a failure).
     if !graceful {
-        sqlx::query("update tasks set status = 'stopped', updated_at = now() where id = $1 and status not in ('done', 'archived')").bind(&task.id).execute(&o.db).await?;
+        sqlx::query("update tasks set status = 'stopped', updated_at = now() where id = $1 and status <> 'done'").bind(&task.id).execute(&o.db).await?;
     }
     stop_run(o, &task, graceful)
 }
@@ -2082,6 +2090,7 @@ mod tests {
             effort: None,
             plan_approved,
             key_no: Some(1),
+            archived_at: None,
         };
         // New work plans; so does a follow-up to finished work.
         assert!(plan_first(&task("p-1", "queued", true), None));

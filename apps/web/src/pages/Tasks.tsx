@@ -154,7 +154,14 @@ export default function Tasks() {
                   </Link>
                 ),
               },
-              { key: 'status', header: 'Status', cell: (t) => <StatusBadge status={t.status} running={t.running} /> },
+              {
+                key: 'status',
+                header: 'Status',
+                // An archived task is still done; the list says which done ones were put away.
+                cell: (t) => (
+                  <StatusBadge status={t.status === 'done' && t.archived_at ? 'archived' : t.status} running={t.running} />
+                ),
+              },
               {
                 key: 'agent',
                 header: 'Agent',

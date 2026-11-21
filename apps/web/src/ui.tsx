@@ -115,7 +115,7 @@ const TASK_TONES: Record<string, 'neutral' | 'info' | 'success' | 'warning' | 'd
   done: 'neutral',
   stopped: 'neutral',
   failed: 'danger',
-  // Done and put away by the nightly archive: as quiet as done.
+  // Not a status a task has: a done task the nightly archive put away, as the task list shows it.
   archived: 'neutral',
 }
 

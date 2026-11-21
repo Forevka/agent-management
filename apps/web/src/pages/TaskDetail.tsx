@@ -114,7 +114,7 @@ export default function TaskDetail() {
               </CardContent>
             </Card>
 
-            {d.task.status === 'archived' && (
+            {d.task.status === 'done' && d.task.archived_at && (
               <Note tone="info" title="Archived">
                 Done, and put away by the nightly archive: hidden from the board, still here. Writing to
                 the task brings it back.
