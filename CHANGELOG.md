@@ -7,12 +7,6 @@ below is one release. How to add to this file is in `CLAUDE.md`
 
 ## Unreleased
 
-- **A retro proposal's branch is `proposal-p-{n}`, and the agent pushes it.** The brief a tapped
-  proposal becomes now says to work on `proposal-p-{n}` cut from `origin/main` and push it to
-  origin as its own branch, never merging, opening a PR, force-pushing or deploying; it used to
-  say `retro/P-{n}` and "do not push", so each proposal cost a question or a follow-up. Those
-  branches get CI when pushed. The push uses whatever git credentials the clone has on its node:
-  protect `main` on the remote (no direct pushes) so a wrong push cannot become a release.
 - **A task carries what it produced.** An agent attaches a titled link or a file of any kind to
   its own task (`fleet agent attach <url|path> --title ...`), the brain to any task, the owner
   from the task page; the board shows a count and the task page lists them. Files are kept in
@@ -39,6 +33,15 @@ below is one release. How to add to this file is in `CLAUDE.md`
 - Migration `0027_attachments_archive` (add-only): tables `task_attachments` and
   `task_attachment_chunks`, and the nullable `tasks.summary` and `tasks.archived_at`. No
   constraint changes and no backfill.
+
+## v0.2.11 — 2026-11-21
+
+- **A retro proposal's branch is `proposal-p-{n}`, and the agent pushes it.** The brief a tapped
+  proposal becomes now says to work on `proposal-p-{n}` cut from `origin/main` and push it to
+  origin as its own branch, never merging, opening a PR, force-pushing or deploying; it used to
+  say `retro/P-{n}` and "do not push", so each proposal cost a question or a follow-up. Those
+  branches get CI when pushed. The push uses whatever git credentials the clone has on its node:
+  protect `main` on the remote (no direct pushes) so a wrong push cannot become a release.
 
 ## v0.2.10 — 2026-11-21
 
