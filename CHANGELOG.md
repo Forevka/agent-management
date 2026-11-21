@@ -7,6 +7,12 @@ below is one release. How to add to this file is in `CLAUDE.md`
 
 ## Unreleased
 
+- **A retro proposal's branch is `proposal-p-{n}`, and the agent pushes it.** The brief a tapped
+  proposal becomes now says to work on `proposal-p-{n}` cut from `origin/main` and push it to
+  origin as its own branch, never merging, opening a PR, force-pushing or deploying; it used to
+  say `retro/P-{n}` and "do not push", so each proposal cost a question or a follow-up. Those
+  branches get CI when pushed. The push uses whatever git credentials the clone has on its node:
+  protect `main` on the remote (no direct pushes) so a wrong push cannot become a release.
 - **Docs-only changes make no release.** A push or merge that changes only Markdown files and
   `docs/` runs no CI, so nothing is tagged or rolled out to the nodes; it ships with the next
   release. Branches named `docs/**` now get CI like the other work branches.

@@ -465,10 +465,20 @@ it has somewhere to work:
    fleet project map fleet-src C:\repos\fleet-src
    ```
 
-   Give it no secret folder: with no credentials the agent cannot push, so its
-   work stays a local branch until you look at it. That is deliberate — the
-   brief it gets says to branch, keep `fmt`, `clippy` and the tests green, and
-   never push or deploy.
+   Give it no secret folder: the work needs no fleet secret, and a secret is
+   not how it should get push rights. The brief it gets says to work on the
+   branch `proposal-p-{n}` cut from `origin/main`, keep `fmt`, `clippy` and the
+   tests green, push that branch to origin as its own branch (CI runs on it),
+   and never merge, force-push, open a PR or deploy. The push uses whatever git
+   credentials the clone already has on that node (its credential helper, an
+   SSH key); if it has none, the push fails and the work stays a local branch
+   for you to push.
+
+   **Protect `main` on the remote** (GitHub: a branch protection rule or ruleset
+   on `main` that blocks direct pushes and requires a pull request). The brief
+   is words to a model, not a barrier, and a merge to `main` is a release that
+   the VPS rolls out within minutes; branch protection is what keeps an
+   agent's wrong push from becoming one.
 
 3. **The hour**, in `.env` (`FLEET_TIMEZONE` decides the zone), plus the model
    it should think with:
