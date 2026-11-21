@@ -6,6 +6,11 @@ VPS rolls it out), so each section below is one merge. How to add to this file i
 
 ## Unreleased
 
+- Docs only: `CLAUDE.md` asks everyone working on the repo (people and agents alike) to delete
+  build folders and remove merged worktrees and clones when done. Each `target/` is 7-40 GB.
+
+## v0.2.8 — 2026-11-21
+
 - **The kit.** The owner's Claude Code skills, plugins and MCP servers, managed on the new
   **Kit** page, imported from a node (an MCP server's whole config sealed in the vault, shown
   only masked, with nothing of it in Postgres but its type and command or host), and
