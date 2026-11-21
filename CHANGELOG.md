@@ -7,6 +7,21 @@ below is one release. How to add to this file is in `CLAUDE.md`
 
 ## Unreleased
 
+- **A task can be edited, stopped and written to from the web.** Its page has an **Edit** button
+  (title, brief, model, effort; also `/tasks/<id>?edit=1`, linked from the board's list view),
+  **Stop** (asks first) and a **message box**. A message is delivered exactly as one written in
+  the task's Telegram topic, and shown in that topic. The model and effort apply from the task's
+  next run. A new brief is sent to the agent as the owner's message when its session has already
+  started; a finished task whose agent has read its brief is refused a new one (send it a message
+  instead, which resumes it); if the agent cannot be told, the edit is still saved and the page
+  says so. The topic is renamed with the title. The fleet's own sessions
+  (brain, secretary, retrospective) cannot be changed here. Audited as `task.edit` (which fields,
+  never the brief's text) and `task.stop`.
+- **A task's links are on its page**: tickets, merge requests and pages, opening in a new tab when
+  the fleet knows where they are, with add and remove.
+
+## v0.2.12 — 2026-11-21
+
 - **A task carries what it produced.** An agent attaches a titled link or a file of any kind to
   its own task (`fleet agent attach <url|path> --title ...`), the brain to any task, the owner
   from the task page; the board shows a count and the task page lists them. Files are kept in
@@ -33,18 +48,6 @@ below is one release. How to add to this file is in `CLAUDE.md`
 - Migration `0027_attachments_archive` (add-only): tables `task_attachments` and
   `task_attachment_chunks`, and the nullable `tasks.summary` and `tasks.archived_at`. No
   constraint changes and no backfill.
-- **A task can be edited, stopped and written to from the web.** Its page has an **Edit** button
-  (title, brief, model, effort; also `/tasks/<id>?edit=1`, linked from the board's list view),
-  **Stop** (asks first) and a **message box**. A message is delivered exactly as one written in
-  the task's Telegram topic, and shown in that topic. The model and effort apply from the task's
-  next run. A new brief is sent to the agent as the owner's message when its session has already
-  started; a finished task whose agent has read its brief is refused a new one (send it a message
-  instead, which resumes it); if the agent cannot be told, the edit is still saved and the page
-  says so. The topic is renamed with the title. The fleet's own sessions
-  (brain, secretary, retrospective) cannot be changed here. Audited as `task.edit` (which fields,
-  never the brief's text) and `task.stop`.
-- **A task's links are on its page**: tickets, merge requests and pages, opening in a new tab when
-  the fleet knows where they are, with add and remove.
 
 ## v0.2.11 — 2026-11-21
 
