@@ -768,6 +768,20 @@ impl Orchestrator {
                         // The secretary's next run takes it as a turn of nobody's in particular.
                         crate::secretary::run_ended(self, &run_id);
                         crate::secretary::redeliver(self, text.clone(), origin).await
+                    } else if task.status == crate::model::status::STOPPED {
+                        // The owner stopped the task, and this text comes back from the run they
+                        // stopped (one that waited for its clone, say). Resuming the task with it
+                        // would undo their stop: it waits in the task's queue instead, like any
+                        // message the run had not taken, and goes with the task's next run.
+                        sqlx::query(
+                            "insert into messages (task_id, to_agent, text) values ($1, $2, $3)",
+                        )
+                        .bind(&task.id)
+                        .bind(task.agent_id.as_deref().unwrap_or(&agent_id))
+                        .bind(&text)
+                        .execute(&self.db)
+                        .await?;
+                        Ok(crate::tasks::Delivered::Queued)
                     } else {
                         crate::tasks::deliver(self, &task, text.clone()).await
                     };

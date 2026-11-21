@@ -431,7 +431,7 @@ pub fn start(
 }
 
 /// Everything an agent process (or a clone's git) started, so a stop can end all of it. The
-/// process must be started in its own process group on unix (`process_group(0)`).
+/// process must lead its own process group on unix (`process_group(0)`, or `setsid`).
 pub(crate) struct ProcessTree {
     #[cfg(unix)]
     pgid: Option<i32>,

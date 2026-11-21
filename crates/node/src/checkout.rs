@@ -96,6 +96,13 @@ pub(crate) struct Clones {
     failures: Mutex<HashMap<String, Failure>>,
 }
 
+impl Clones {
+    /// Forgets recent failures, so the next run of each project clones again.
+    pub(crate) fn forget_failures(&self) {
+        self.failures.lock().unwrap().clear();
+    }
+}
+
 struct Running {
     url: String,
     cancel: CancellationToken,
@@ -694,10 +701,21 @@ async fn clone(
         .arg(tmp)
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    // Its own process group, so a stop or the time limit ends every process git started (the
-    // transport helpers, ssh), not only git itself.
+    // Its own session, and so its own process group with no controlling terminal: a stop or the
+    // time limit ends every process git started (the transport helpers, ssh), not only git, and
+    // an ssh the machine set up to ask on a terminal fails at once instead of being stopped
+    // in the background waiting for one.
     #[cfg(unix)]
-    cmd.process_group(0);
+    // SAFETY: `setsid` is async-signal-safe and touches no memory of the parent, which is all a
+    // `pre_exec` hook may do between fork and exec.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     let mut child = cmd.spawn().map_err(|e| {
         CloneError::Failed(format!(
             "git could not be started on this machine ({e}): install git, make sure the node finds it \

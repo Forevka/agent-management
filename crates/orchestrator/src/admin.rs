@@ -1358,6 +1358,9 @@ pub async fn retry_assignment(
         json!({"node": n.id, "project": p.slug}),
     )
     .await;
+    // The node forgets the failure when it hears its assignments again, so the next task really
+    // clones anew rather than being answered with the old reason.
+    crate::node_projects::push(o, &n.id).await?;
     dispatch_queued_soon(o);
     Ok(format!(
         "{} will be cloned on {} again when a task needs it.",

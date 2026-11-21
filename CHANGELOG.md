@@ -22,7 +22,7 @@ VPS rolls it out), so each section below is one merge. How to add to this file i
     unassigning deletes nothing.
   - The node refuses to clone onto a volume with less than 1 GB free.
   - Stopping a waiting task stops its git. A run that never starts hands its messages back to the
-    task's queue.
+    task's queue; a stopped task stays stopped, and they go with its next run.
   - A failed clone fails the run with what to do, and the assignment takes no more tasks until
     the owner presses **Retry** (or changes the URL, the root or the assignment); the task's topic
     says so.

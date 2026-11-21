@@ -512,6 +512,9 @@ impl Node {
                 self.start_update(u, false);
             }
             Body::ProjectAssignments(a) => {
+                // Whatever made a clone fail may be what the owner just changed (or retried):
+                // the next run tries again rather than being told the old reason.
+                self.clones.forget_failures();
                 *self.assignments.lock().unwrap() = Some(a);
                 self.assignments_heard.store(true, Ordering::Release);
             }

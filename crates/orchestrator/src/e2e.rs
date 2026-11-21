@@ -1371,11 +1371,15 @@ async fn secretary_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeCha
     );
     deliver_feed(o, vec![FeedEvent::Message(ship)]).await;
     assert_eq!(secretary::flush(o, true).await.unwrap(), 1);
+    // Waited for until it is posted too: the row is written first, its message id once the post
+    // has gone out.
     let dave_todo: crate::model::TodoRow = wait_for("the ship todo", || async {
-        sqlx::query_as("select * from todos where title = 'Reply to Dave about shipping'")
-            .fetch_optional(db)
-            .await
-            .unwrap()
+        sqlx::query_as(
+            "select * from todos where title = 'Reply to Dave about shipping' and tg_msg is not null",
+        )
+        .fetch_optional(db)
+        .await
+        .unwrap()
     })
     .await;
     let dave_msg = dave_todo.tg_msg.expect("the todo is posted");
@@ -4449,9 +4453,8 @@ async fn clone_waits_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeC
     };
 
     // 1. Stopped while it clones: git is stopped and leaves nothing, and the message sent to the
-    //    waiting run comes back to the orchestrator instead of being lost. (The project loses its
-    //    URL first, so the message that comes back waits in the queue rather than starting
-    //    another clone.)
+    //    waiting run comes back to the orchestrator instead of being lost. It waits in the task's
+    //    queue for the next run: the stop stands, and nothing starts another clone.
     set_url("slow", hang("slow")).await;
     let a = new_task("slow", "SL-1", "Waiter", "Wait for the clone.").await;
     wait_state("slow", Some("cloning")).await;
@@ -4461,7 +4464,6 @@ async fn clone_waits_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeC
     .await;
     let m1 = "[Message from the human] sent while it clones";
     tasks::deliver(o, &a, m1.into()).await.unwrap();
-    set_url("slow", String::new()).await;
     let a_now = o.task(&a.id).await.unwrap().unwrap();
     tasks::stop(o, &a_now, false).await.unwrap();
     wait_for("the message comes back", || async {
@@ -4477,13 +4479,30 @@ async fn clone_waits_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeC
         !root.join("slow").exists(),
         "nothing of a stopped clone is left"
     );
-    let kept: i64 =
-        sqlx::query_scalar("select count(*) from messages where task_id = $1 and text = $2")
-            .bind(&a.id)
-            .bind(m1)
-            .fetch_one(db)
-            .await
-            .unwrap();
+    // Time enough for a redelivery to have started a run and a clone, had it done so.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let after = o.task(&a.id).await.unwrap().unwrap();
+    assert!(
+        after.status == "stopped" && !after.running && after.run_id == a_now.run_id,
+        "the stop stands: {after:?}"
+    );
+    let runs: i64 = sqlx::query_scalar("select count(*) from runs where task_id = $1")
+        .bind(&a.id)
+        .fetch_one(db)
+        .await
+        .unwrap();
+    assert_eq!(runs, 1, "no new run");
+    assert!(temp_clones(&root, "slow").is_empty(), "no new clone");
+    assert_eq!(state("slow").await, None);
+    let kept: i64 = sqlx::query_scalar(
+        "select count(*) from messages where task_id = $1 and text = $2 and run_id is null and to_agent = $3",
+    )
+    .bind(&a.id)
+    .bind(m1)
+    .bind(after.agent_id.as_deref().unwrap())
+    .fetch_one(db)
+    .await
+    .unwrap();
     assert_eq!(kept, 1, "the message waits for the task's next run");
 
     // 2. A run waiting behind another clone of its project (the owner changed the URL while it
@@ -4644,7 +4663,7 @@ async fn clone_waits_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeC
         .unwrap();
 
     // The messages of (1) and (3) still wait; nothing should pick them up after this flow.
-    for t in [&a, &f] {
+    for t in [&f] {
         tasks::stop(o, &o.task(&t.id).await.unwrap().unwrap(), false)
             .await
             .unwrap();
