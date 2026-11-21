@@ -22,7 +22,8 @@ colour used only to mean something. When a new page is needed, look at their clo
 ## Licence, and what that costs us
 
 **74 of the 232 items are free and MIT; the other 158 are affectUI Pro** (a one-time purchase from
-$249). We use the free ones. `components/ui/` holds the 30 we vendored, each exactly as their
+$249). We use the free ones. `components/ui/` holds the 32 we vendored (the session page's tool calls
+are their Tool Call Card, its "working" state their Thinking Loader), each exactly as their
 registry serves it — do not reformat them, and **keep the Hugeicons (MIT) credit comments** some of
 them carry.
 

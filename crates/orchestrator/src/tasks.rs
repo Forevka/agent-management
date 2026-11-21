@@ -939,8 +939,12 @@ async fn dispatch_locked(
             return Ok(Dispatched::Waiting);
         }
     };
+    let first_text = spawn.prompt.clone();
     o.server
         .send(node.id.parse()?, Body::SpawnAgent(Box::new(spawn)));
+    // The run's first message, whole (the brief, and the texts that waited for it), under the
+    // task's lock, so the transcript has it before anything the run says.
+    o.record_in(&task.id, &first_text).await;
     // A new run takes its first message as one turn (see `working`): the new text alone, or,
     // with texts that waited before it, several at once.
     o.working.message_sent(&task.id, &run_id);
@@ -1685,6 +1689,7 @@ async fn deliver_locked(
         Ok(true)
     };
     if send(&task, text.clone())? {
+        o.record_in(&task.id, &text).await;
         return Ok(Delivered::ToRun);
     }
     if matches!(
@@ -1719,7 +1724,8 @@ async fn deliver_locked(
         // Claimed by something that did not take the lock: hand the text to that run.
         Dispatched::Lost => {
             let task = o.task(&task.id).await?.context("task vanished")?;
-            if send(&task, text)? {
+            if send(&task, text.clone())? {
+                o.record_in(&task.id, &text).await;
                 return Ok(Delivered::ToRun);
             }
             // No run took it: the claim was refused because the agent is gone.
@@ -2015,6 +2021,35 @@ pub async fn owner_send(o: &Arc<Orchestrator>, id: &str, text: &str) -> Result<D
         echo(Some(topic)).await;
     }
     Ok(delivered)
+}
+
+/// The owner writes to the brain from the web: exactly as a message of theirs in General is
+/// (see `tg::owner_message`) — kept as their request, framed as theirs, shown in General first so
+/// the brain's answer there lands below it. The brain is the only standing session the owner
+/// writes to: the secretary takes the owner's word in the Inbox topic, tied to the messages it
+/// is about, and the retrospective reads the day and takes nobody's.
+pub async fn owner_send_brain(o: &Arc<Orchestrator>, text: &str) -> Result<Delivered> {
+    let text = text.trim();
+    ensure!(!text.is_empty(), "write something to send");
+    o.chat
+        .send(
+            From::Orchestrator,
+            None,
+            &format!("💬 <i>You, on the web:</i>\n{}", esc(&clip(text, 3000))),
+            vec![],
+            None,
+            Notify::Silent,
+        )
+        .await
+        .ok();
+    o.working.show(None, From::Orchestrator, None, BRAIN_TASK);
+    o.record_owner_request(text).await;
+    to_brain_as(
+        o,
+        format!("[Message from the owner] {text}"),
+        Origin::Owner(text.to_owned()),
+    )
+    .await
 }
 
 /// Starts one of the fleet's own sessions (brain, secretary) afresh: forgets its session and

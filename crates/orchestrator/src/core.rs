@@ -58,6 +58,12 @@ pub struct Orchestrator {
     /// Kit captures asked of nodes and not yet imported (see `kit`). In memory only: they hold
     /// the raw secrets a node reported.
     pub kit_captures: std::sync::Mutex<crate::kit::Captures>,
+    /// The id of the newest transcript line recorded through [`Orchestrator::record`]. A web page
+    /// following a session live waits on it instead of polling the database (see
+    /// `api::task_events`).
+    pub events: tokio::sync::watch::Sender<i64>,
+    /// Who watches which session live, and the watched runs' text in progress (see `live`).
+    pub live: crate::live::Live,
 }
 
 /// How often one task may post with a sound (`fleet agent post --notify`).
@@ -97,6 +103,8 @@ impl Orchestrator {
             builtin_retry: Default::default(),
             builtin_runs: Default::default(),
             kit_captures: Default::default(),
+            events: tokio::sync::watch::channel(0).0,
+            live: Default::default(),
         });
         // Weak, so the consumer does not keep the orchestrator alive; the channel closes with it.
         let weak = Arc::downgrade(&o);
@@ -237,6 +245,7 @@ impl Orchestrator {
                 Body::KitCapture(c) => crate::kit::capture_part(self, peer, c),
                 Body::KitStatus(s) => crate::kit::statuses(self, peer, s).await?,
                 Body::AgentEvent(ev) => self.agent_event(peer, ev).await?,
+                Body::RunPartial(p) => crate::live::partial(self, p),
                 Body::ToolCall(call) => {
                     let this = self.clone();
                     // Tool calls may wait on Telegram or the database for a while; never block the
@@ -347,6 +356,8 @@ impl Orchestrator {
         {
             tracing::warn!(node = %hello.node_name, "sending the kit failed: {e:#}");
         }
+        // Sessions the owner is watching on the web, so this node's runs of them stream too.
+        crate::live::on_connect(self, peer, &hello.app_version);
         Ok(())
     }
 
@@ -826,14 +837,30 @@ impl Orchestrator {
         Ok(())
     }
 
-    async fn record(&self, task_id: &str, kind: &str, data: &str) -> Result<()> {
-        sqlx::query("insert into task_events (task_id, kind, data) values ($1, $2, $3)")
-            .bind(task_id)
-            .bind(kind)
-            .bind(data)
-            .execute(&self.db)
-            .await?;
+    pub(crate) async fn record(&self, task_id: &str, kind: &str, data: &str) -> Result<()> {
+        let id: i64 = sqlx::query_scalar(
+            "insert into task_events (task_id, kind, data) values ($1, $2, $3) returning id",
+        )
+        .bind(task_id)
+        .bind(kind)
+        .bind(data)
+        .fetch_one(&self.db)
+        .await?;
+        // Wakes whoever follows a session live. Never lowered: two inserts can commit out of
+        // order, and a reader only needs to know that something newer than it has seen exists.
+        self.events
+            .send_modify(|newest| *newest = (*newest).max(id));
         Ok(())
+    }
+
+    /// Keeps a text the fleet sent into a task's session (`in`), so its transcript reads as the
+    /// conversation it was: Claude's stream-json output does not repeat what it was told. Best
+    /// effort, because the text has already gone and failing the delivery would only tell the
+    /// sender something false.
+    pub(crate) async fn record_in(&self, task_id: &str, text: &str) {
+        if let Err(e) = self.record(task_id, "in", text).await {
+            tracing::warn!("keeping what was sent to {task_id} failed: {e:#}");
+        }
     }
 
     /// Keeps what the owner asked the brain for, so `habits` can notice a request of theirs

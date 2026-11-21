@@ -12,6 +12,7 @@ import json
 import os
 import socket
 import sys
+import time
 import uuid
 
 
@@ -113,6 +114,7 @@ if len(sys.argv) > 1 and sys.argv[1] in ("plugin", "mcp"):
 if sys.argv[1:] == ["--help"]:
     print("Usage: claude [options] [command] [prompt]")
     print("  --mcp-config <configs...>   Load MCP servers from JSON files or strings")
+    print("  --include-partial-messages  Include partial message chunks as they arrive")
     if not OLD_CLI:
         print("  --strict-mcp-config         Only use MCP servers from --mcp-config")
     sys.exit(0)
@@ -175,6 +177,23 @@ for line in sys.stdin:
         continue
     text = msg["message"]["content"]
     out({"type": "assistant", "message": {"content": [{"type": "text", "text": "got: " + text[:400]}]}})
+    # Token-by-token output, as the real CLI writes it with --include-partial-messages (2.1.268):
+    # deltas, then the whole block as an assistant line, then the block's stop. Slow enough that a
+    # page watching the session sees it being written.
+    if "live-stream" in text and "--include-partial-messages" in sys.argv:
+        def ev(e):
+            out({"type": "stream_event", "event": e, "parent_tool_use_id": None})
+        ev({"type": "message_start", "message": {"id": "msg_live"}})
+        ev({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})
+        words = ["Streaming the answer as it is written, one piece after another, "] * 3 + ["done."]
+        for w in words:
+            time.sleep(0.4)
+            ev({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": w}})
+        out({"type": "assistant", "message": {"id": "msg_live", "content": [{"type": "text", "text": "".join(words)}]}})
+        ev({"type": "content_block_stop", "index": 0})
+        ev({"type": "message_stop"})
+        out({"type": "result", "subtype": "success", "duration_ms": 1600, "total_cost_usd": 0.0})
+        continue
     # The plan gate flow: every message plans, and nothing else. The plan says the owner is
     # needed only when the text says it is unclear, which a gate set to `auto` must respect.
     if "plan-gate" in text:
@@ -188,6 +207,10 @@ for line in sys.stdin:
     # A recurring job (the habits flow): present a plan and finish, nothing else. The plan says
     # the owner is needed only when the brief says the job is unclear, which is what lets the
     # test show that a habit never answers such a plan.
+    # The live session flow's task: it only waits to be written to.
+    if text.startswith("# Task") and "live-session" in text:
+        out({"type": "result", "subtype": "success", "total_cost_usd": 0.0})
+        continue
     if text.startswith("# Task") and "Review MR" in text and "[Message from" not in text:
         plan = "# Plan\n1. Read the diff\n2. Post the review"
         if "unclear" in text:

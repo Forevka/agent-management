@@ -47,6 +47,7 @@ pub fn router() -> Router<O> {
         .route("/api/tasks", get(tasks))
         .route("/api/tasks/{id}", get(task).post(task_act))
         .route("/api/tasks/{id}/events", get(task_events))
+        .route("/api/tasks/{id}/stream", get(task_stream))
         .route("/api/tasks/{id}/links", post(task_link))
         .route("/api/tasks/{id}/attachments", post(task_attach))
         .route("/api/attachments/{id}/file", get(attachment_file))
@@ -649,7 +650,14 @@ async fn task_act(
             })))
         }
         "send" => {
-            let d = crate::tasks::owner_send(&o, &id, &need(&a.body, "text")?).await?;
+            let text = need(&a.body, "text")?;
+            // The brain is the one standing session the owner talks to; the others refuse
+            // (`tasks::owner_task`).
+            let d = if id == crate::model::BRAIN_TASK {
+                crate::tasks::owner_send_brain(&o, &text).await?
+            } else {
+                crate::tasks::owner_send(&o, &id, &text).await?
+            };
             Ok(Json(json!({
                 "delivered": delivered_json(d),
                 "done": match d {
@@ -873,14 +881,194 @@ async fn task_events(
     .fetch_all(&o.db)
     .await?;
     Ok(Json(json!({
-        "events": rows.iter().rev().map(|(id, at, kind, data)| json!({
-            "id": id, "at": at, "kind": kind,
-            // Long lines are clipped: a transcript page must not become a megabyte because one
-            // tool read a file.
-            "data": crate::chat::clip(data, 20_000),
-        })).collect::<Vec<_>>(),
+        "events": rows.iter().rev().map(|(id, at, kind, data)| event_json(*id, at, kind, data)).collect::<Vec<_>>(),
         "more": rows.len() as i64 == limit,
     })))
+}
+
+/// One transcript line as the UI gets it. Long lines are clipped — a transcript page must not
+/// become a megabyte because one tool read a file — and an agent's output line is clipped inside
+/// its strings, so it stays the JSON the session page reads it as.
+fn event_json(id: i64, at: &chrono::DateTime<chrono::Utc>, kind: &str, data: &str) -> Value {
+    json!({"id": id, "at": at, "kind": kind, "data": clip_line(kind, data)})
+}
+
+/// The longest a line reaches the UI.
+const LINE_MAX: usize = 20_000;
+/// The longest any one string inside an output line reaches the UI.
+const LINE_STRING_MAX: usize = 4_000;
+
+fn clip_line(kind: &str, data: &str) -> String {
+    if data.len() <= LINE_MAX {
+        return data.to_owned();
+    }
+    if kind == "out"
+        && let Ok(mut v) = serde_json::from_str::<Value>(data)
+    {
+        clip_strings(&mut v);
+        let s = v.to_string();
+        if s.len() <= LINE_MAX * 2 {
+            return s;
+        }
+    }
+    crate::chat::clip(data, LINE_MAX)
+}
+
+fn clip_strings(v: &mut Value) {
+    match v {
+        Value::String(s) if s.len() > LINE_STRING_MAX => {
+            *s = crate::chat::clip(s, LINE_STRING_MAX);
+        }
+        Value::Array(a) => a.iter_mut().for_each(clip_strings),
+        Value::Object(m) => m.values_mut().for_each(clip_strings),
+        _ => {}
+    }
+}
+
+#[derive(Deserialize)]
+struct StreamQuery {
+    /// The newest line the page already has; without it, the stream starts from now.
+    after: Option<i64>,
+}
+
+/// A task's session, live, as server-sent events: every transcript line recorded after `after`
+/// (`line`, with its id, so a reconnecting browser resumes from `Last-Event-ID`), and what a run
+/// is writing before Claude finishes it (`partial`: the block so far, never stored). Woken by
+/// [`Orchestrator::events`] rather than polling, so a line shows the moment it is recorded.
+async fn task_stream(
+    State(o): State<O>,
+    h: HeaderMap,
+    Path(id): Path<String>,
+    Query(q): Query<StreamQuery>,
+) -> std::result::Result<Response, ApiError> {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    guard!(o, h);
+    o.task(&id).await?.context("no such task")?;
+    let resume = h
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<i64>().ok());
+    let after = match resume.or(q.after) {
+        Some(a) => a,
+        None => {
+            sqlx::query_scalar("select coalesce(max(id), 0) from task_events where task_id = $1")
+                .bind(&id)
+                .fetch_one(&o.db)
+                .await?
+        }
+    };
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(64);
+    tokio::spawn(follow(o, id, after, tx));
+    let stream = futures_util::stream::poll_fn(move |cx| {
+        rx.poll_recv(cx)
+            .map(|e| e.map(Ok::<_, std::convert::Infallible>))
+    });
+    let mut r = Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)))
+        .into_response();
+    // Not to be buffered or rewritten by a proxy on the way (nginx honours the first; Caddy
+    // flushes event streams on its own).
+    r.headers_mut().insert(
+        header::HeaderName::from_static("x-accel-buffering"),
+        header::HeaderValue::from_static("no"),
+    );
+    r.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-cache, no-transform"),
+    );
+    Ok(r)
+}
+
+/// Feeds one page's stream until the page goes away (the channel closes), watching the task for
+/// as long.
+async fn follow(
+    o: O,
+    id: String,
+    mut after: i64,
+    tx: tokio::sync::mpsc::Sender<axum::response::sse::Event>,
+) {
+    use axum::response::sse::Event;
+    use tokio::sync::broadcast::error::RecvError;
+    let _watch = crate::live::watch(&o, &id);
+    // Subscribed before the first read, so nothing recorded in between is missed.
+    let mut seen = o.events.subscribe();
+    let mut partials = o.live.partials.subscribe();
+    // Lines are recorded from several tasks at once (node events, the web, tool calls), so one
+    // can commit after a line with a higher id has been read: every read looks back this far
+    // and sends what it has not sent yet. The page drops what it already has.
+    const SLACK: i64 = 500;
+    let mut sent = std::collections::BTreeSet::new();
+    loop {
+        // Every line since the last one sent, in order, in pages.
+        let mut floor = after - SLACK;
+        loop {
+            let rows: Vec<(i64, chrono::DateTime<chrono::Utc>, String, String)> =
+                match sqlx::query_as(
+                    "select id, at, kind, data from task_events
+                     where task_id = $1 and id > $2 order by id limit 200",
+                )
+                .bind(&id)
+                .bind(floor)
+                .fetch_all(&o.db)
+                .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::warn!("following {id} failed: {e:#}");
+                        return;
+                    }
+                };
+            let n = rows.len();
+            for (row, at, kind, data) in rows {
+                floor = row;
+                if !sent.insert(row) {
+                    continue;
+                }
+                let ev = Event::default()
+                    .id(row.to_string())
+                    .event("line")
+                    .data(event_json(row, &at, &kind, &data).to_string());
+                if tx.send(ev).await.is_err() {
+                    return;
+                }
+                after = after.max(row);
+            }
+            if n < 200 {
+                break;
+            }
+        }
+        sent = sent.split_off(&(after - SLACK));
+        // The run whose partials belong on this page: the task's current one. A node sends
+        // partials only for runs it has, but the page shows one session, not a late straggler.
+        let run = match o.task(&id).await {
+            Ok(Some(t)) => t.run_id,
+            _ => None,
+        };
+        // Then wait: a new line anywhere (read again), or this task's run writing.
+        loop {
+            tokio::select! {
+                changed = seen.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    break;
+                }
+                p = partials.recv() => match p {
+                    Ok((line, p)) if p.task_id == id && run.as_deref() == Some(p.run_id.as_str()) => {
+                        // `after`: the newest line when it arrived. The page ignores a partial
+                        // older than a finished line it has, which it may receive first.
+                        let data = json!({"run_id": p.run_id, "kind": p.kind, "text": p.text, "after": line});
+                        if tx.send(Event::default().event("partial").data(data.to_string())).await.is_err() {
+                            return;
+                        }
+                    }
+                    Ok(_) | Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => return,
+                },
+                _ = tx.closed() => return,
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------- the human queue

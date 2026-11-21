@@ -1199,9 +1199,18 @@ impl Cli {
     }
 }
 
-/// Whether the node's `claude` knows `--strict-mcp-config` (added in 2.0; verified with
-/// 2.1.268), from its `--help`. `None` when the CLI cannot be asked at all.
-pub async fn probe_strict_mcp(command: &[String], paths: Option<&KitPaths>) -> Option<bool> {
+/// The flags of the node's `claude` whose absence would fail every run, from its `--help`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CliFlags {
+    /// `--strict-mcp-config` (added in 2.0; verified with 2.1.268).
+    pub strict_mcp: bool,
+    /// `--include-partial-messages` (verified with 2.1.268).
+    pub partial_messages: bool,
+}
+
+/// What the node's `claude` says it takes, from its `--help`. `None` when the CLI cannot be
+/// asked at all.
+pub async fn probe_cli_flags(command: &[String], paths: Option<&KitPaths>) -> Option<CliFlags> {
     let fallback;
     let paths = match paths {
         Some(p) => p,
@@ -1216,7 +1225,10 @@ pub async fn probe_strict_mcp(command: &[String], paths: Option<&KitPaths>) -> O
     };
     let cli = Cli::new(command, paths, Vec::new()).ok()?;
     let (ok, text) = cli.call(&["--help"], PROBE_TIMEOUT).await.ok()?;
-    (ok || text.contains("Usage")).then(|| text.contains(crate::runner::STRICT_MCP))
+    (ok || text.contains("Usage")).then(|| CliFlags {
+        strict_mcp: text.contains(crate::runner::STRICT_MCP),
+        partial_messages: text.contains(crate::runner::PARTIAL_MESSAGES),
+    })
 }
 
 async fn apply_plugins(

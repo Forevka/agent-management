@@ -9,6 +9,7 @@ import BoardPage from './pages/Board'
 import Tasks from './pages/Tasks'
 import TaskDetail from './pages/TaskDetail'
 import Sessions from './pages/Sessions'
+import Session from './pages/Session'
 import Projects from './pages/Projects'
 import ProjectDetail from './pages/ProjectDetail'
 import Secrets from './pages/Secrets'
@@ -37,6 +38,7 @@ createRoot(document.getElementById('root')!).render(
           <Route path="/" element={<BoardPage />} />
           <Route path="/tasks" element={<Tasks />} />
           <Route path="/tasks/:id" element={<TaskDetail />} />
+          <Route path="/tasks/:id/session" element={<Session />} />
           <Route path="/sessions" element={<Sessions />} />
           <Route path="/projects" element={<Projects />} />
           <Route path="/projects/:slug" element={<ProjectDetail />} />

@@ -55,7 +55,7 @@ pub mod redact;
 pub mod repo;
 
 pub use agent::{
-    AgentEvent, AgentEventKind, SecretFile, SpawnAgent, StopAgent, ToolCall, ToolResult,
+    AgentEvent, AgentEventKind, RunPartial, SecretFile, SpawnAgent, StopAgent, ToolCall, ToolResult,
 };
 pub use kit::{
     Kit, KitCapture, KitCaptureRequest, KitContent, KitFile, KitItemStatus, KitMcp, KitPlugin,
@@ -195,6 +195,16 @@ pub enum Body {
     Kit(Kit),
     /// Node -> orchestrator: how each item of the last complete [`Body::Kit`] fared here.
     KitStatus(Vec<KitItemStatus>),
+
+    // The live view of a session (the web UI's session page). Appended after release v0.2.13:
+    // the orchestrator sends `WatchTasks` only to a node that [`node_is_current`], and a node
+    // sends `RunPartial` only for a task named in the last `WatchTasks` of the current connection.
+    /// Orchestrator -> node: the tasks someone is watching live, whose runs' text is streamed as
+    /// it is written ([`Body::RunPartial`]). Replaces the previous set; an empty one stops it.
+    WatchTasks(Vec<String>),
+    /// Node -> orchestrator: what a watched run is writing right now, before Claude's finished
+    /// line for it arrives as an [`AgentEventKind::Output`]. Shown, never stored.
+    RunPartial(RunPartial),
 }
 
 /// Which release a node should move to, and where to fetch it.
@@ -293,6 +303,14 @@ pub fn parse_update_hint(reason: &str) -> Option<UpdateAvailable> {
 }
 
 impl Body {
+    /// Messages worth nothing to a different peer process than the one they were meant for: what
+    /// a run is writing this second, and which tasks are watched now. Dropped from the outbox when
+    /// the peer restarts (see `fleet_net`'s `adopt_peer`) — which is also what keeps them from
+    /// an older release a rollback puts in its place, which could not decode them.
+    pub fn is_ephemeral(&self) -> bool {
+        matches!(self, Body::RunPartial(_) | Body::WatchTasks(_))
+    }
+
     /// Control bodies are never queued for reliable delivery.
     pub fn is_control(&self) -> bool {
         matches!(
@@ -697,6 +715,21 @@ mod tests {
                 state: "conflict".into(),
                 detail: "the machine has its own".into(),
             }]),
+        });
+        roundtrip(Envelope {
+            seq: 17,
+            ack: 0,
+            body: Body::WatchTasks(vec!["bioins-3".into()]),
+        });
+        roundtrip(Envelope {
+            seq: 18,
+            ack: 0,
+            body: Body::RunPartial(RunPartial {
+                task_id: "bioins-3".into(),
+                run_id: "r1".into(),
+                kind: "text".into(),
+                text: "Looking at the".into(),
+            }),
         });
     }
 

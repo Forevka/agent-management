@@ -14,7 +14,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
@@ -36,6 +36,15 @@ const MAX_LINE: usize = 512 * 1024;
 const MCP_TOOL_TIMEOUT_MS: &str = "604800000";
 /// Claude loads only the servers of `--mcp-config` (see [`build_args`]).
 pub(crate) const STRICT_MCP: &str = "--strict-mcp-config";
+/// Claude writes each token as it comes (`stream_event` lines; checked against the real CLI,
+/// 2.1.268).
+pub(crate) const PARTIAL_MESSAGES: &str = "--include-partial-messages";
+/// How often a watched run's block in progress is sent on: often enough to read as typing,
+/// rarely enough that a long answer is not a frame per token.
+const PARTIAL_EVERY: Duration = Duration::from_millis(100);
+/// A block longer than this is not streamed further; its finished line follows anyway. Each
+/// partial carries the whole block (see `LiveBlock`), so this bounds what one costs.
+const PARTIAL_MAX: usize = 16 * 1024;
 /// After a graceful stop, how long Claude may take to finish its turn before it is killed.
 const GRACEFUL_STOP_LIMIT: Duration = Duration::from_secs(600);
 
@@ -136,6 +145,9 @@ pub fn build_args(
         "--output-format",
         "stream-json",
         "--verbose",
+        // Token-by-token output (`stream_event` lines), streamed only to someone watching the
+        // session live and otherwise dropped here; see `LiveBlock`.
+        PARTIAL_MESSAGES,
         "--permission-mode",
         &spawn.permission_mode,
         "--permission-prompt-tool",
@@ -275,6 +287,11 @@ pub fn start(
     {
         args.retain(|a| a != STRICT_MCP);
     }
+    // Nor for `--include-partial-messages`: such a CLI streams nothing, and its sessions show
+    // each block once it is finished.
+    if !node.partial_messages_supported(&settings.claude_command) {
+        args.retain(|a| a != PARTIAL_MESSAGES);
+    }
     let mut cmd = Command::new(&program);
     cmd.args(base_args)
         .args(args)
@@ -370,17 +387,37 @@ pub fn start(
     });
     let stdout = child.stdout.take().context("no stdout")?;
     let (ev_out, act, red) = (ev.clone(), activity.clone(), redact.clone());
+    let (live_node, live_task, live_run) = (node.clone(), task_id.clone(), run_id.clone());
     let out_task = tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
         let mut session_sent = false;
+        let mut live = LiveBlock::default();
         while let Ok(Some(mut line)) = lines.next_line().await {
             if !session_sent && let Some(id) = session_id(&line) {
                 session_sent = true;
                 ev_out(AgentEventKind::Session { session_id: id });
             }
             if is_noise(&line) {
+                // Claude's token-by-token output, which only someone watching the session
+                // live wants (see `LiveBlock`); nothing of it is kept.
+                if !live_node.watched(&live_task) {
+                    // A block missing a piece must never be streamed: redaction only sees a
+                    // secret whole, and one falling into the gap would go out in two halves. It
+                    // is forgotten; the next block starts clean.
+                    live.reset();
+                } else if let Some((kind, text)) = live.feed(&line, &red, Instant::now()) {
+                    live_node.partial(fleet_proto::RunPartial {
+                        task_id: live_task.clone(),
+                        run_id: live_run.clone(),
+                        kind,
+                        text,
+                    });
+                }
                 continue;
             }
+            // A finished line (the whole block, a tool result, the turn's end) supersedes
+            // whatever was being written.
+            live.reset();
             act.touch(is_turn_result(&line));
             redact_secrets(&mut line, &red);
             truncate(&mut line);
@@ -606,6 +643,110 @@ fn is_noise(line: &str) -> bool {
     }
 }
 
+/// The content block a run is writing, built from Claude's `stream_event` lines, for someone
+/// watching the session live.
+///
+/// What goes out is always the whole block so far, redacted, minus a tail as long as the longest
+/// secret: redaction only replaces a value it sees whole, so a secret still being written would
+/// otherwise show its beginning. Redacting first and cutting after is what makes that hold — a
+/// complete value anywhere is already `[secret]`, and an incomplete one can only be at the end.
+#[derive(Default)]
+struct LiveBlock {
+    /// `text`, `thinking` or `tool`; `None` between blocks (or for a block not worth showing).
+    kind: Option<String>,
+    text: String,
+    sent_at: Option<Instant>,
+    /// How much of the block went out last time, so an unchanged block is not sent again.
+    sent_len: usize,
+}
+
+impl LiveBlock {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Takes one `stream_event` line; returns what to send now, if anything.
+    fn feed(&mut self, line: &str, secrets: &[String], now: Instant) -> Option<(String, String)> {
+        let v: serde_json::Value = serde_json::from_str(line).ok()?;
+        // A subagent's own stream (Task tool) is not the session's voice.
+        if !v["parent_tool_use_id"].is_null() {
+            return None;
+        }
+        let ev = &v["event"];
+        match ev["type"].as_str()? {
+            "content_block_start" => {
+                self.reset();
+                let block = &ev["content_block"];
+                match block["type"].as_str()? {
+                    "text" => self.kind = Some("text".into()),
+                    // That it thinks, not what: the page shows a loader, and a long thought
+                    // would cost the most to stream.
+                    "thinking" => {
+                        self.kind = Some("thinking".into());
+                        return self.take(secrets, now, true);
+                    }
+                    // The tool's name, at once: what the agent is about to do is the most
+                    // useful thing to see while it writes the call's input.
+                    "tool_use" => {
+                        self.kind = Some("tool".into());
+                        self.text = block["name"].as_str().unwrap_or_default().to_owned();
+                        return self.take(secrets, now, true);
+                    }
+                    _ => {}
+                }
+                None
+            }
+            "content_block_delta" => {
+                let delta = &ev["delta"];
+                let piece = match (self.kind.as_deref(), delta["type"].as_str()?) {
+                    (Some("text"), "text_delta") => delta["text"].as_str()?,
+                    _ => return None,
+                };
+                if self.text.len() >= PARTIAL_MAX {
+                    return None;
+                }
+                self.text.push_str(piece);
+                self.take(secrets, now, false)
+            }
+            "content_block_stop" | "message_stop" => {
+                self.reset();
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn take(&mut self, secrets: &[String], now: Instant, always: bool) -> Option<(String, String)> {
+        let kind = self.kind.clone()?;
+        if !always
+            && self
+                .sent_at
+                .is_some_and(|t| now.duration_since(t) < PARTIAL_EVERY)
+        {
+            return None;
+        }
+        let mut text = self.text.clone();
+        redact_secrets(&mut text, secrets);
+        let hold = secrets
+            .iter()
+            .map(String::len)
+            .filter(|&l| l >= fleet_proto::redact::MIN_REDACT_LEN)
+            .max()
+            .unwrap_or(0);
+        let mut cut = text.len().saturating_sub(hold);
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text.truncate(cut);
+        if !always && text.len() <= self.sent_len {
+            return None;
+        }
+        self.sent_at = Some(now);
+        self.sent_len = text.len();
+        Some((kind, text))
+    }
+}
+
 fn truncate(line: &mut String) {
     if line.len() > MAX_LINE {
         let mut cut = MAX_LINE;
@@ -798,8 +939,118 @@ mod tests {
         assert!(!is_noise(r#"{"type":"system","subtype":"init"}"#));
         assert!(!is_noise(r#"{"type":"assistant","message":{}}"#));
         assert!(!is_noise("not json"));
+        assert!(is_noise(
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"one"}}}"#
+        ));
         assert!(is_turn_result(
             r#"{"type": "result", "subtype": "success"}"#
         ));
+    }
+
+    fn stream(event: serde_json::Value) -> String {
+        json!({"type": "stream_event", "event": event, "parent_tool_use_id": null}).to_string()
+    }
+
+    fn start(kind: &str) -> String {
+        stream(json!({"type": "content_block_start", "index": 0,
+                      "content_block": {"type": kind, "text": "", "name": "Bash"}}))
+    }
+
+    fn delta(text: &str) -> String {
+        stream(json!({"type": "content_block_delta", "index": 0,
+                      "delta": {"type": "text_delta", "text": text}}))
+    }
+
+    #[test]
+    fn a_live_block_streams_the_text_so_far_at_a_bounded_rate() {
+        let mut b = LiveBlock::default();
+        let t0 = Instant::now();
+        assert_eq!(b.feed(&start("text"), &[], t0), None);
+        assert_eq!(
+            b.feed(&delta("Looking"), &[], t0),
+            Some(("text".into(), "Looking".into()))
+        );
+        // Too soon after the last one: kept, and sent whole with the next.
+        assert_eq!(
+            b.feed(&delta(" at"), &[], t0 + Duration::from_millis(10)),
+            None
+        );
+        assert_eq!(
+            b.feed(&delta(" it"), &[], t0 + PARTIAL_EVERY * 2),
+            Some(("text".into(), "Looking at it".into()))
+        );
+        // The block ends; a delta without a block is not text of anything.
+        assert_eq!(
+            b.feed(
+                &stream(json!({"type": "content_block_stop", "index": 0})),
+                &[],
+                t0
+            ),
+            None
+        );
+        assert_eq!(b.feed(&delta("stray"), &[], t0 + PARTIAL_EVERY * 4), None);
+        // A tool call shows its name at once.
+        assert_eq!(
+            b.feed(&start("tool_use"), &[], t0 + PARTIAL_EVERY * 4),
+            Some(("tool".into(), "Bash".into()))
+        );
+        // Thinking shows that it happens, never what it says.
+        let mut b = LiveBlock::default();
+        assert_eq!(
+            b.feed(&start("thinking"), &[], t0),
+            Some(("thinking".into(), String::new()))
+        );
+        let thought = stream(json!({"type": "content_block_delta", "index": 0,
+                                    "delta": {"type": "thinking_delta", "thinking": "hmm"}}));
+        assert_eq!(b.feed(&thought, &[], t0 + PARTIAL_EVERY * 2), None);
+        // A block that missed a piece (the watch lapsed: the runner resets it) stays dropped
+        // until the next one starts, so no text from either side of the gap is ever joined.
+        let mut b = LiveBlock::default();
+        b.feed(&start("text"), &[], t0);
+        assert!(b.feed(&delta("before "), &[], t0).is_some());
+        b.reset();
+        assert_eq!(b.feed(&delta("after"), &[], t0 + PARTIAL_EVERY * 2), None);
+        assert_eq!(b.feed(&start("text"), &[], t0), None);
+        assert_eq!(
+            b.feed(&delta("fresh"), &[], t0 + PARTIAL_EVERY * 4),
+            Some(("text".into(), "fresh".into()))
+        );
+        // A subagent's stream is not the session's.
+        let mut b = LiveBlock::default();
+        let sub = json!({"type": "stream_event", "parent_tool_use_id": "toolu_1",
+                         "event": {"type": "content_block_start", "index": 0,
+                                   "content_block": {"type": "tool_use", "name": "Bash"}}});
+        assert_eq!(b.feed(&sub.to_string(), &[], t0), None);
+    }
+
+    #[test]
+    fn no_part_of_a_secret_leaves_in_a_live_block() {
+        let secret = "s3cr3t-value-xyz".to_owned();
+        let secrets = vec![secret.clone()];
+        let mut b = LiveBlock::default();
+        let mut now = Instant::now();
+        b.feed(&start("text"), &secrets, now);
+        let mut sent = Vec::new();
+        // The secret arrives a character at a time, between ordinary words, and every
+        // intermediate state is offered.
+        let text = format!("the key is {secret} and that is all of it, said plainly");
+        for c in text.chars() {
+            now += PARTIAL_EVERY;
+            if let Some((_, t)) = b.feed(&delta(&c.to_string()), &secrets, now) {
+                sent.push(t);
+            }
+        }
+        assert!(!sent.is_empty());
+        for t in &sent {
+            for n in 3..=secret.len() {
+                assert!(
+                    !t.contains(&secret[..n]),
+                    "{:?} leaks {:?}",
+                    t,
+                    &secret[..n]
+                );
+            }
+        }
+        assert!(sent.last().unwrap().contains("[secret]"), "{sent:?}");
     }
 }

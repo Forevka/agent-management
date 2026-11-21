@@ -76,6 +76,19 @@ pub struct StopAgent {
     pub run_id: String,
 }
 
+/// The content block a watched run is writing, so far (see [`crate::Body::RunPartial`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunPartial {
+    pub task_id: String,
+    pub run_id: String,
+    /// `text`, `thinking`, or `tool` (a tool call being written: `text` is the tool's name).
+    pub kind: String,
+    /// The block so far, secrets redacted. The whole block every time rather than the newest
+    /// piece: a secret split across two pieces would get past redaction, and a tail as long as
+    /// the longest secret is held back for the same reason, so no secret's beginning shows.
+    pub text: String,
+}
+
 /// Something that happened in an agent session on a node.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentEvent {

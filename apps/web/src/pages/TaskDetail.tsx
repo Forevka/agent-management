@@ -1,5 +1,5 @@
 import { useRef, useState } from 'react'
-import { Link, useParams, useSearchParams } from 'react-router-dom'
+import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader } from '@/components/ui/card'
@@ -347,6 +347,7 @@ type Tab = 'sessions' | 'checklist' | 'brief' | 'summary' | 'transcript'
 
 export default function TaskDetail() {
   const { id = '' } = useParams()
+  const navigate = useNavigate()
   const state = useApi<Detail>(`/api/tasks/${encodeURIComponent(id)}`, 10_000)
   const events = useApi<Events>(`/api/tasks/${encodeURIComponent(id)}/events?limit=200`)
   const [tab, setTab] = useState<Tab>('sessions')
@@ -386,8 +387,15 @@ export default function TaskDetail() {
               }
               meta={<StatusBadge status={d.task.status} running={d.task.running} />}
               action={
-                BUILTIN.includes(d.task.id) ? undefined : (
+                BUILTIN.includes(d.task.id) ? (
+                  <Link to={`/tasks/${encodeURIComponent(d.task.id)}/session`} className="fx-link">
+                    Open session
+                  </Link>
+                ) : (
                   <Row gap="2">
+                    <Button size="sm" onClick={() => navigate(`/tasks/${encodeURIComponent(d.task.id)}/session`)}>
+                      {d.task.running ? 'Watch live' : 'Open session'}
+                    </Button>
                     {!editing && (
                       <Button size="sm" variant="secondary" onClick={() => setEditing(true)}>
                         Edit

@@ -7,6 +7,31 @@ below is one release. How to add to this file is in `CLAUDE.md`
 
 ## Unreleased
 
+- **Watch any agent session live, and continue it, from the web.** A task's page has **Watch
+  live** / **Open session** (`/tasks/<id>/session`), and every row on **Sessions** opens one, as
+  do the fleet's own sessions (brain, secretary, retrospective) from the links on that page. The
+  session reads as a conversation: what was sent in, what the agent says (formatted), each tool
+  call as one line that unfolds to its input and result, thinking folded away, and where each
+  turn ended with its time and cost. It updates as things happen (server-sent events, resumed
+  after a dropped connection), and **the agent's words appear as they are written**. The box at
+  the bottom continues the session (Enter sends, Shift+Enter is a new line): a running session
+  gets the message at once, a finished one is resumed with it, as from its Telegram topic. The
+  brain can be written to here as from General; the secretary and the retrospective only be
+  watched. Open questions and plans waiting on the owner are linked under the conversation.
+- **What the fleet sends into a session is now part of its transcript** (`in` lines): the brief
+  and messages a run starts with, and every message after. Claude's own output never repeated
+  them, so the transcript used to show answers without their questions. Lines from before this
+  release have none.
+- **Nodes run Claude with `--include-partial-messages`** and stream a run's text while it is
+  written, but only for a session someone has open on the web, and never store it. Secrets are
+  redacted from it as from everything else, and a tail as long as the longest secret is held
+  back until the block is complete, so no secret's beginning can show; a block the node saw only
+  part of (the page was reopened mid-block) is not streamed at all. A node on an older release,
+  or whose `claude` does not list the flag in `--help`, shows each block once it is finished.
+  What a run is writing, and which sessions are watched, is never re-sent to a restarted peer.
+
+## v0.2.13 — 2026-11-21
+
 - **A task can be edited, stopped and written to from the web.** Its page has an **Edit** button
   (title, brief, model, effort; also `/tasks/<id>?edit=1`, linked from the board's list view),
   **Stop** (asks first) and a **message box**. A message is delivered exactly as one written in

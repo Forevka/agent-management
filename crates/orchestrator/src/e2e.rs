@@ -2920,13 +2920,14 @@ async fn task_edit_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeCha
     assert_eq!(r["changed"], json!(["model"]), "{r}");
     assert_eq!(o.task(&id).await.unwrap().unwrap().model, None);
 
-    // The fleet's own sessions are not edited, stopped or written to from here.
-    for body in [
-        json!({"op": "edit", "body": {"title": "x"}}),
-        json!({"op": "stop"}),
-        json!({"op": "send", "body": {"text": "x"}}),
+    // The fleet's own sessions are not edited or stopped from here, and only the brain is written
+    // to (see `live_session_flow`).
+    for (task, body) in [
+        ("brain", json!({"op": "edit", "body": {"title": "x"}})),
+        ("brain", json!({"op": "stop"})),
+        ("secretary", json!({"op": "send", "body": {"text": "x"}})),
     ] {
-        let (status, r) = api_post_status(o, "/api/tasks/brain", body.clone()).await;
+        let (status, r) = api_post_status(o, &format!("/api/tasks/{task}"), body.clone()).await;
         assert_eq!(status, 400, "{body}: {r}");
         assert!(
             r["error"]
@@ -3042,6 +3043,217 @@ async fn task_edit_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeCha
     api_post(o, uri2, json!({"op": "stop"})).await;
     wait_for("the second task stops", || async {
         o.task("demo-TE-2").await.unwrap().filter(|t| !t.running)
+    })
+    .await;
+}
+
+/// The session page: a task's conversation followed live over server-sent events — what was sent
+/// in (`in` lines), what the agent wrote, and its text while it is being written (partials, which
+/// the node streams only while someone watches) — and continued from the web, the brain's too.
+async fn live_session_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) {
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let task = tasks::create_task(
+        o,
+        CreateTask {
+            project: "demo".into(),
+            title: "Talk it through".into(),
+            // `live-session` is what the fake answers quietly, waiting to be written to.
+            brief: "live-session: wait for the owner.".into(),
+            ticket: None,
+            agent: Some("Alice".into()),
+            new_agent: None,
+            model: None,
+            effort: None,
+        },
+    )
+    .await
+    .unwrap();
+    let id = task.id.clone();
+    wait_for(&format!("{id} starts"), || async {
+        o.task(&id)
+            .await
+            .unwrap()
+            .filter(|t| t.session_id.is_some())
+    })
+    .await;
+    // The run's first message is in the transcript, whole: Claude's output never repeats it.
+    let first: String = sqlx::query_scalar(
+        "select data from task_events where task_id = $1 and kind = 'in' order by id limit 1",
+    )
+    .bind(&id)
+    .fetch_one(db)
+    .await
+    .unwrap();
+    assert!(
+        first.contains("live-session: wait for the owner."),
+        "the first message carries the brief: {first}"
+    );
+
+    // Open the stream, as the page's EventSource does, and collect what it says.
+    let session = crate::web::random_token();
+    sqlx::query(
+        "insert into web_sessions (token, expires_at) values ($1, now() + interval '1 day')",
+    )
+    .bind(&session)
+    .execute(db)
+    .await
+    .unwrap();
+    let newest: i64 = sqlx::query_scalar("select max(id) from task_events where task_id = $1")
+        .bind(&id)
+        .fetch_one(db)
+        .await
+        .unwrap();
+    let req = axum::http::Request::builder()
+        .uri(format!("/api/tasks/{id}/stream?after={newest}"))
+        .header(
+            axum::http::header::COOKIE,
+            format!("fleet_session={session}"),
+        )
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let res = crate::web::router(o.clone()).oneshot(req).await.unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(
+        res.headers()[axum::http::header::CONTENT_TYPE],
+        "text/event-stream"
+    );
+    let heard = Arc::new(std::sync::Mutex::new(String::new()));
+    let reader = {
+        let heard = heard.clone();
+        let mut body = res.into_body();
+        tokio::spawn(async move {
+            while let Some(Ok(frame)) = body.frame().await {
+                if let Some(data) = frame.data_ref() {
+                    heard
+                        .lock()
+                        .unwrap()
+                        .push_str(&String::from_utf8_lossy(data));
+                }
+            }
+        })
+    };
+    wait_for("the page watches the task", || async {
+        o.live.watched().contains(&id).then_some(())
+    })
+    .await;
+
+    // The owner writes from the page; the agent streams its answer.
+    let r = api_post(
+        o,
+        &format!("/api/tasks/{id}"),
+        json!({"op": "send", "body": {"text": "live-stream your answer"}}),
+    )
+    .await;
+    assert_eq!(r["delivered"], "to_run", "{r}");
+    let sse = || heard.lock().unwrap().clone();
+    wait_for("the owner's message shows as sent in", || async {
+        let s = sse();
+        (s.contains("event: line")
+            && s.contains(r#""kind":"in""#)
+            && s.contains("[Message from the human] live-stream your answer"))
+        .then_some(())
+    })
+    .await;
+    wait_for("the answer streams while it is written", || async {
+        let s = sse();
+        (s.contains("event: partial") && s.contains("Streaming the answer")).then_some(())
+    })
+    .await;
+    wait_for("then lands as a finished line", || async {
+        let s = sse();
+        // The turn's closing line, as the fake writes it (inside the line's JSON-quoted data).
+        s.contains("duration_ms").then_some(())
+    })
+    .await;
+    // Every line carries its id, so a reconnecting browser resumes where it was.
+    assert!(
+        sse().contains("\nid: ") || sse().starts_with("id: "),
+        "{}",
+        sse()
+    );
+    // Partials are shown, never kept.
+    let kept: i64 = sqlx::query_scalar(
+        "select count(*) from task_events where task_id = $1 and data like '%stream_event%'",
+    )
+    .bind(&id)
+    .fetch_one(db)
+    .await
+    .unwrap();
+    assert_eq!(kept, 0, "token-by-token output is not stored");
+
+    // The page goes away, and so does the watch.
+    reader.abort();
+    let _ = reader.await;
+    wait_for("the watch ends with the page", || async {
+        (!o.live.watched().contains(&id)).then_some(())
+    })
+    .await;
+
+    // The brain is written to from the web as from General: shown there, kept as the owner's
+    // request, and delivered framed as theirs.
+    let r = api_post(
+        o,
+        "/api/tasks/brain",
+        json!({"op": "send", "body": {"text": "what is the fleet doing?"}}),
+    )
+    .await;
+    assert!(r["delivered"].is_string(), "{r}");
+    wait_for("the brain hears the owner", || async {
+        (task_heard(
+            db,
+            "brain",
+            "[Message from the owner] what is the fleet doing?",
+        )
+        .await
+            > 0)
+        .then_some(())
+    })
+    .await;
+    assert!(
+        chat.sent().iter().any(|(_, t, h, _)| t.is_none()
+            && h.contains("on the web")
+            && h.contains("what is the fleet doing?")),
+        "General shows what the owner wrote"
+    );
+    let kept: i64 = sqlx::query_scalar(
+        "select count(*) from task_events where task_id = 'brain' and kind = 'owner' and data = 'what is the fleet doing?'",
+    )
+    .fetch_one(db)
+    .await
+    .unwrap();
+    assert_eq!(
+        kept, 1,
+        "kept as the owner's request, for habits and the retrospective"
+    );
+    // Gone again, so the habits flow later reflects on exactly the requests it made itself.
+    sqlx::query(
+        "delete from task_events where task_id = 'brain' and kind = 'owner' and data = 'what is the fleet doing?'",
+    )
+    .execute(db)
+    .await
+    .unwrap();
+
+    // A long output line still reaches the page as JSON, clipped inside its strings.
+    let big = json!({"type": "user", "message": {"content": [{"type": "tool_result",
+        "tool_use_id": "t1", "content": "x".repeat(100_000)}]}})
+    .to_string();
+    sqlx::query("insert into task_events (task_id, kind, data) values ($1, 'out', $2)")
+        .bind(&id)
+        .bind(&big)
+        .execute(db)
+        .await
+        .unwrap();
+    let page = api_get(o, &format!("/api/tasks/{id}/events?limit=1")).await;
+    let line = page["events"][0]["data"].as_str().unwrap();
+    let v: Value = serde_json::from_str(line).expect("still JSON");
+    assert_eq!(v["message"]["content"][0]["tool_use_id"], "t1");
+    assert!(line.len() < 10_000, "{}", line.len());
+
+    api_post(o, &format!("/api/tasks/{id}"), json!({"op": "stop"})).await;
+    wait_for("the run stops", || async {
+        o.task(&id).await.unwrap().filter(|t| !t.running)
     })
     .await;
 }
@@ -9940,6 +10152,7 @@ async fn lifecycle() {
 
     // 21a. The owner edits, stops, writes to and links a task from the web.
     Box::pin(task_edit_flow(&o, &db, &chat)).await;
+    Box::pin(live_session_flow(&o, &db, &chat)).await;
 
     // 21b. The kit: imported from a node, installed there without touching the owner's own
     //      items, the exact MCP allowlist of a worker's session, and the owner's alone. On node

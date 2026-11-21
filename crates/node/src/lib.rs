@@ -20,7 +20,7 @@ pub mod tools;
 pub mod update;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -139,7 +139,11 @@ pub struct Node {
     link_gen: AtomicU64,
     /// Whether the configured claude CLI knows `--strict-mcp-config`, for that command, from its
     /// `--help` (asked when the settings arrive). Unknown counts as yes.
-    strict_mcp: Mutex<Option<(Vec<String>, Option<bool>)>>,
+    strict_mcp: Mutex<Option<(Vec<String>, Option<kit::CliFlags>)>>,
+    /// The tasks someone watches live (`Body::WatchTasks`), whose runs' text is streamed as it is
+    /// written (`Body::RunPartial`). Cleared on every disconnect, like `disk_wanted`: only an
+    /// orchestrator that asked on the current connection reads a partial.
+    watching: Mutex<HashSet<String>>,
 }
 
 impl Node {
@@ -181,6 +185,7 @@ impl Node {
             kit_last: Mutex::new(None),
             link_gen: AtomicU64::new(0),
             strict_mcp: Mutex::new(None),
+            watching: Mutex::new(HashSet::new()),
         });
         // Replaces whatever a previous node process left, so the tray sees this pid at once.
         node.update_status(|_| {});
@@ -214,6 +219,16 @@ impl Node {
     }
 
     fn strict_mcp_known(&self, command: &[String]) -> Option<bool> {
+        self.cli_flags(command).map(|f| f.strict_mcp)
+    }
+
+    /// Whether `command` takes `--include-partial-messages`, on the same terms as
+    /// [`Self::strict_mcp_supported`]: without it a session only shows finished blocks.
+    pub(crate) fn partial_messages_supported(&self, command: &[String]) -> bool {
+        self.cli_flags(command).map(|f| f.partial_messages) != Some(false)
+    }
+
+    fn cli_flags(&self, command: &[String]) -> Option<kit::CliFlags> {
         match &*self.strict_mcp.lock().unwrap() {
             Some((c, known)) if c.as_slice() == command => *known,
             _ => None,
@@ -244,7 +259,7 @@ impl Node {
             }
             *known = Some((command.clone(), None));
         }
-        let known = kit::probe_strict_mcp(&command, self.kit_paths().as_ref()).await;
+        let known = kit::probe_cli_flags(&command, self.kit_paths().as_ref()).await;
         {
             let mut cached = self.strict_mcp.lock().unwrap();
             // The settings may have changed meanwhile; an answer for an old command is dropped.
@@ -252,7 +267,12 @@ impl Node {
                 *cached = Some((command, known));
             }
         }
-        if known == Some(false) {
+        if known.is_some_and(|f| !f.partial_messages) {
+            tracing::warn!(
+                "the claude CLI here has no --include-partial-messages: a session watched on the web shows each block once it is finished"
+            );
+        }
+        if known.is_some_and(|f| !f.strict_mcp) {
             tracing::warn!(
                 "the claude CLI here has no --strict-mcp-config: agent sessions run without the kit's MCP allowlist until it is updated"
             );
@@ -525,6 +545,7 @@ impl Node {
                     self.link_gen.fetch_add(1, Ordering::AcqRel);
                     self.disk_wanted.store(false, Ordering::Release);
                     self.assignments_heard.store(false, Ordering::Release);
+                    self.watching.lock().unwrap().clear();
                     self.update_status(|s| s.connected = false);
                 }
                 Inbound::Message { body, .. } => {
@@ -652,6 +673,9 @@ impl Node {
             }
             Body::KitCaptureRequest(r) => self.kit_capture(r.id),
             Body::Kit(k) => self.kit_received(k),
+            Body::WatchTasks(tasks) => {
+                *self.watching.lock().unwrap() = tasks.into_iter().collect();
+            }
             other => tracing::warn!("unexpected message for a node: {other:?}"),
         }
     }
@@ -813,6 +837,19 @@ impl Node {
             kind,
             run_id: run_id.into(),
         }));
+    }
+
+    /// Whether someone watches this task's session live.
+    pub(crate) fn watched(&self, task_id: &str) -> bool {
+        self.watching.lock().unwrap().contains(task_id)
+    }
+
+    /// Sends a watched run's block in progress — checked again here, so a watch ended (or a
+    /// link lost) since the caller looked sends nothing an orchestrator did not ask for.
+    pub(crate) fn partial(&self, p: fleet_proto::RunPartial) {
+        if self.watched(&p.task_id) {
+            self.client.send(Body::RunPartial(p));
+        }
     }
 
     fn resend_pending_permissions(&self) {

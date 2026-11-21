@@ -140,6 +140,9 @@ impl Session {
         if st.peer_incarnation.is_some() {
             tracing::info!(peer = %self.peer.fmt_short(), "peer restarted; resetting the message stream");
         }
+        // What was only meant for the process that went away is not sent to its successor: it
+        // is stale there, and the successor may be an older release that cannot decode it.
+        st.outbox.retain(|(_, body)| !body.is_ephemeral());
         st.last_received = 0;
         let mut seq = 1;
         for (s, _) in st.outbox.iter_mut() {
@@ -316,4 +319,37 @@ impl Session {
 pub(crate) fn new_incarnation() -> u64 {
     use rand::RngCore;
     rand::rng().next_u64() | 1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_restarted_peer_is_not_sent_what_was_meant_for_its_predecessor() {
+        let peer = iroh::SecretKey::from_bytes(&[7u8; 32]).public();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let s = Session::new(peer, tx);
+        s.adopt_peer(1);
+        s.send(Body::WatchTasks(vec!["t".into()]));
+        s.send(Body::SendToAgent {
+            agent_id: "a".into(),
+            task_id: "t".into(),
+            text: "kept".into(),
+        });
+        s.send(Body::RunPartial(fleet_proto::RunPartial {
+            task_id: "t".into(),
+            run_id: "r".into(),
+            kind: "text".into(),
+            text: "half a sent".into(),
+        }));
+        // The same process reconnecting gets everything.
+        s.adopt_peer(1);
+        assert_eq!(s.pending(), 3);
+        // A new one (a restart, or a rollback to an older release) only what lasts.
+        s.adopt_peer(2);
+        assert_eq!(s.pending(), 1);
+        let st = s.state.lock().unwrap();
+        assert!(matches!(st.outbox[0], (1, Body::SendToAgent { .. })));
+    }
 }

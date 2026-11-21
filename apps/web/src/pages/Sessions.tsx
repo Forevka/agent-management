@@ -2,7 +2,7 @@ import { useMemo } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 import { Badge } from '@/components/ui/badge'
 import { Select } from '@/components/ui/select'
-import { Page, PageHeader, Stack, Text } from '@/components/fx/layout'
+import { Page, PageHeader, Row, Stack, Text } from '@/components/fx/layout'
 import { Table } from '@/components/fx/table'
 import type { Overview, Session } from '../api'
 import { Duration, Loaded, When, useApi } from '../ui'
@@ -37,7 +37,7 @@ export default function Sessions() {
     <Page>
       <PageHeader
         title="Sessions"
-        description="One row per agent process the fleet has started."
+        description="One row per agent process the fleet has started. Open one to follow it live or continue it."
         meta={
           state.data && (
             <Text size="1" tone="muted">
@@ -61,6 +61,23 @@ export default function Sessions() {
         }
       />
 
+      {/* The fleet's standing sessions have no task page worth the name; their sessions are
+          what there is to see of them. */}
+      <Row gap="3">
+        <Text size="1" tone="muted">
+          The fleet’s own:
+        </Text>
+        {[
+          ['brain', 'Brain'],
+          ['secretary', 'Secretary'],
+          ['retro', 'Retrospective'],
+        ].map(([id, name]) => (
+          <Link key={id} to={`/tasks/${id}/session`} className="fx-link">
+            {name}
+          </Link>
+        ))}
+      </Row>
+
       <Loaded state={state}>
         {(d) => (
           <Table
@@ -76,7 +93,7 @@ export default function Sessions() {
                 width: '30%',
                 cell: (r) => (
                   <Stack gap="1">
-                    <Link to={`/tasks/${r.task}`} className="fx-link">
+                    <Link to={`/tasks/${encodeURIComponent(r.task ?? '')}/session`} className="fx-link">
                       {r.task}
                     </Link>
                     <Text size="1" tone="muted" breakAll>

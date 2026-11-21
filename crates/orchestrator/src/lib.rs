@@ -23,6 +23,7 @@ pub mod human;
 pub mod jira;
 pub mod kit;
 pub mod links;
+pub mod live;
 pub mod memory;
 pub mod model;
 pub mod node_projects;
