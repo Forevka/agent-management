@@ -1642,7 +1642,18 @@ pub async fn deliver_as(
 ) -> Result<Delivered> {
     let lock = o.task_lock(&task.id);
     let _held = lock.lock().await;
-    let mut task = o.task(&task.id).await?.context("task vanished")?;
+    let task = o.task(&task.id).await?.context("task vanished")?;
+    deliver_locked(o, task, text, origin).await
+}
+
+/// [`deliver_as`] for a caller that already holds the task's lock and has just read `task`
+/// under it — so what it decided from that copy still holds when the text goes out.
+async fn deliver_locked(
+    o: &Arc<Orchestrator>,
+    mut task: TaskRow,
+    text: String,
+    origin: Origin,
+) -> Result<Delivered> {
     let agent_id = task.agent_id.clone().context("task has no agent")?;
     let send = |task: &TaskRow, text: String| -> Result<bool> {
         let (true, Some(node), Some(run_id)) = (task.running, &task.node_id, &task.run_id) else {
@@ -1769,6 +1780,8 @@ pub struct Edited {
     /// Where the new brief went, when the agent had to be told (its session already read the
     /// old one); `None` when the next fresh session reads it anyway.
     pub brief_sent: Option<Delivered>,
+    /// Why the agent could not be told of the new brief, though the edit was saved.
+    pub brief_error: Option<String>,
 }
 
 /// The one task the owner names from the web: any of the fleet's work, never one of its own
@@ -1801,9 +1814,11 @@ pub async fn owner_edit(o: &Arc<Orchestrator>, id: &str, edit: TaskEdit) -> Resu
     let (model, effort) =
         crate::admin::agent_settings_values(edit.model.as_deref(), edit.effort.as_deref())?;
     let id = owner_task(o, id).await?.id;
-    let (before, task) = {
+    let (before, task, brief_sent, brief_error) = {
         // Under the task's lock and on a fresh copy, like every other change to a task: a run
-        // being claimed meanwhile must see either the old fields or the new, never half.
+        // being claimed meanwhile must see either the old fields or the new, never half. The new
+        // brief goes out under the same lock, so a task cannot finish between deciding to tell
+        // its agent and telling it — which would resume work that had just ended.
         let lock = o.task_lock(&id);
         let _held = lock.lock().await;
         let before = o.task(&id).await?.context("task vanished")?;
@@ -1815,12 +1830,8 @@ pub async fn owner_edit(o: &Arc<Orchestrator>, id: &str, edit: TaskEdit) -> Resu
             title.is_some() || brief.is_some() || model.is_some() || effort.is_some(),
             "nothing changed"
         );
-        let finished = matches!(
-            before.status.as_str(),
-            status::DONE | status::STOPPED | status::FAILED
-        );
         ensure!(
-            brief.is_none() || !finished || before.session_id.is_none(),
+            brief.is_none() || !is_finished(&before) || before.session_id.is_none(),
             "{} is {} and its agent has already read its brief; send it a message instead, \
              which resumes it",
             before.key(),
@@ -1842,7 +1853,37 @@ pub async fn owner_edit(o: &Arc<Orchestrator>, id: &str, edit: TaskEdit) -> Resu
         .bind(effort.clone().flatten())
         .execute(&o.db)
         .await?;
-        (before, o.task(&id).await?.context("task vanished")?)
+        let task = o.task(&id).await?.context("task vanished")?;
+        // A session that already began (or a first run already given the old brief) has to be
+        // told; one that has not starts from the new brief by itself. The edit is saved either
+        // way, so a delivery that fails is reported beside it rather than turning it into an
+        // error the owner would retry into "nothing changed".
+        let (mut sent, mut error) = (None, None);
+        if brief.is_some() && (task.session_id.is_some() || task.running) {
+            if is_finished(&task) && !task.running {
+                error = Some(format!(
+                    "{} ended meanwhile; send it a message to resume it with the new brief",
+                    task.key()
+                ));
+            } else {
+                let text = format!(
+                    "The owner updated this task's brief. Work to the new one from here on:\n\n{}",
+                    task.brief
+                );
+                match deliver_locked(
+                    o,
+                    task.clone(),
+                    format!("[Message from the human] {text}"),
+                    Origin::Owner(text),
+                )
+                .await
+                {
+                    Ok(d) => sent = Some(d),
+                    Err(e) => error = Some(format!("{e:#}")),
+                }
+            }
+        }
+        (before, task, sent, error)
     };
     let mut changed = Vec::new();
     if task.title != before.title {
@@ -1867,9 +1908,12 @@ pub async fn owner_edit(o: &Arc<Orchestrator>, id: &str, edit: TaskEdit) -> Resu
             "title": changed.contains(&"title").then_some(&task.title),
             "model": changed.contains(&"model").then_some(&task.model),
             "effort": changed.contains(&"effort").then_some(&task.effort),
+            "brief_sent": brief_sent.is_some(),
         }),
     )
     .await;
+    // Telegram last, outside the lock: it is rate-limited and can take seconds.
+    let task = o.task(&task.id).await?.unwrap_or(task);
     if let (true, Some(topic)) = (changed.contains(&"title"), task.topic_id)
         && let Err(e) = o
             .chat
@@ -1900,35 +1944,30 @@ pub async fn owner_edit(o: &Arc<Orchestrator>, id: &str, edit: TaskEdit) -> Resu
             .await
             .ok();
     }
-    // A session that already began (or a first run already given the old brief) has to be told;
-    // one that has not starts from the new brief by itself.
-    let brief_sent = if changed.contains(&"brief") && (task.session_id.is_some() || task.running) {
-        let text = format!(
-            "The owner updated this task's brief. Work to the new one from here on:\n\n{}",
-            task.brief
-        );
-        Some(
-            deliver_as(
-                o,
-                &task,
-                format!("[Message from the human] {text}"),
-                Origin::Owner(text),
-            )
-            .await?,
-        )
-    } else {
-        None
-    };
     Ok(Edited {
-        task: o.task(&task.id).await?.unwrap_or(task),
+        task,
         changed,
         brief_sent,
+        brief_error,
     })
 }
 
-/// The owner stops a task from the web, as `/stop` in its topic does.
-pub async fn owner_stop(o: &Orchestrator, id: &str) -> Result<TaskRow> {
+/// Over: done, stopped or failed. A message resumes such a task; nothing else should.
+fn is_finished(task: &TaskRow) -> bool {
+    matches!(
+        task.status.as_str(),
+        status::DONE | status::STOPPED | status::FAILED
+    )
+}
+
+/// The owner stops a task from the web, as `/stop` in its topic does. Returns the task and
+/// whether there was anything to stop: a finished task with no run is left alone (and not
+/// audited as stopped), and the owner is told so.
+pub async fn owner_stop(o: &Orchestrator, id: &str) -> Result<(TaskRow, bool)> {
     let task = owner_task(o, id).await?;
+    if is_finished(&task) && !task.running {
+        return Ok((task, false));
+    }
     stop(o, &task, false).await?;
     o.audit(
         crate::admin::Actor::Owner.audit_name(),
@@ -1936,26 +1975,17 @@ pub async fn owner_stop(o: &Orchestrator, id: &str) -> Result<TaskRow> {
         json!({"task": task.id}),
     )
     .await;
-    Ok(task)
+    Ok((task, true))
 }
 
 /// The owner writes to a task from the web: delivered exactly as their message in its Telegram
-/// topic is (see `tg::owner_message`), and shown in that topic, so the conversation there still
-/// reads whole when the agent answers it.
+/// topic is (see `tg::owner_message`), and shown in that topic first, so the agent's answer there
+/// lands below it.
 pub async fn owner_send(o: &Arc<Orchestrator>, id: &str, text: &str) -> Result<Delivered> {
     let text = text.trim();
     ensure!(!text.is_empty(), "write something to send");
     let task = owner_task(o, id).await?;
-    let delivered = deliver_as(
-        o,
-        &task,
-        format!("[Message from the human] {text}"),
-        Origin::Owner(text.to_owned()),
-    )
-    .await?;
-    // Read again: a follow-up to a task whose topic was pruned gave it a new one.
-    let topic = o.task(&task.id).await?.and_then(|t| t.topic_id);
-    if topic.is_some() {
+    let echo = |topic: Option<i64>| async move {
         o.chat
             .send(
                 From::Orchestrator,
@@ -1967,6 +1997,22 @@ pub async fn owner_send(o: &Arc<Orchestrator>, id: &str, text: &str) -> Result<D
             )
             .await
             .ok();
+    };
+    if task.topic_id.is_some() {
+        echo(task.topic_id).await;
+    }
+    let delivered = deliver_as(
+        o,
+        &task,
+        format!("[Message from the human] {text}"),
+        Origin::Owner(text.to_owned()),
+    )
+    .await?;
+    // A follow-up to a task whose topic was pruned gave it a new one, which only exists now.
+    if task.topic_id.is_none()
+        && let Some(topic) = o.task(&task.id).await?.and_then(|t| t.topic_id)
+    {
+        echo(Some(topic)).await;
     }
     Ok(delivered)
 }

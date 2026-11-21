@@ -2699,9 +2699,6 @@ async fn api_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool) {
     assert_ne!(state, "open", "the item is decided");
 }
 
-/// Waiting without a session (CLAUDE.md: new tool/flow needs e2e coverage): an agent asks the
-/// orchestrator to wake it, and is woken by the same delivery a follow-up uses. A condition in
-/// plain words goes to the brain, which writes the Rhai for it.
 /// How many times the task's agent has answered a message starting with `prefix` (the fake
 /// echoes each one).
 async fn task_heard(db: &sqlx::PgPool, task: &str, prefix: &str) -> usize {
@@ -2766,6 +2763,7 @@ async fn task_edit_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeCha
         (json!({"effort": "turbo"}), "is not one of"),
         (json!({"title": "Oil the hinges"}), "nothing changed"),
         (json!({"title": "   "}), "a task needs a title"),
+        (json!({"title": 5}), "title must be a string"),
     ] {
         let (status, r) = api_post_status(o, &uri, json!({"op": "edit", "body": body})).await;
         assert_eq!(status, 400, "{body} must be refused: {r}");
@@ -2906,6 +2904,21 @@ async fn task_edit_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeCha
         o.task(&id).await.unwrap().unwrap().brief,
         "Oil them twice, then wipe."
     );
+    // The audit says the brief changed, never what it says: it is the owner's prose.
+    let audit: Value = sqlx::query_scalar(
+        "select detail from audit_log where actor = 'owner' and action = 'task.edit'
+         and detail->>'task' = $1 order by id desc limit 1",
+    )
+    .bind(&id)
+    .fetch_one(db)
+    .await
+    .unwrap();
+    assert_eq!(audit["changed"], json!(["brief"]), "{audit}");
+    assert!(!audit.to_string().contains("Oil them twice"), "{audit}");
+    // An empty model goes back to the agent's own.
+    let r = api_post(o, &uri, json!({"op": "edit", "body": {"model": ""}})).await;
+    assert_eq!(r["changed"], json!(["model"]), "{r}");
+    assert_eq!(o.task(&id).await.unwrap().unwrap().model, None);
 
     // The fleet's own sessions are not edited, stopped or written to from here.
     for body in [
@@ -2969,8 +2982,73 @@ async fn task_edit_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeCha
         o.task(&id).await.unwrap().filter(|t| !t.running)
     })
     .await;
+    // Stopping it again has nothing to stop, says so, and is not recorded as a stop.
+    let stops = || async {
+        sqlx::query_scalar::<_, i64>(
+            "select count(*) from audit_log where action = 'task.stop' and detail->>'task' = $1",
+        )
+        .bind(&id)
+        .fetch_one(db)
+        .await
+        .unwrap()
+    };
+    let before = stops().await;
+    let r = api_post(o, &uri, json!({"op": "stop"})).await;
+    assert_eq!(r["stopped"], false, "{r}");
+    assert!(
+        r["done"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("nothing to stop"),
+        "{r}"
+    );
+    assert_eq!(stops().await, before);
+
+    // A task stopped before it ever ran (its agent never read a brief) takes a new one without
+    // anything being sent, and the session a message then starts reads the new brief.
+    let alice = tasks::find_agent(o, "Alice").await.unwrap().unwrap();
+    sqlx::query(
+        "insert into tasks (id, project, title, brief, agent_id, status)
+         values ('demo-TE-2', 'demo', 'Grease the latch', 'Grease it.', $1, 'stopped')",
+    )
+    .bind(&alice.id)
+    .execute(db)
+    .await
+    .unwrap();
+    let uri2 = "/api/tasks/demo-TE-2";
+    let r = api_post(
+        o,
+        uri2,
+        json!({"op": "edit", "body": {"brief": "Grease it, then test it."}}),
+    )
+    .await;
+    assert_eq!(r["changed"], json!(["brief"]), "{r}");
+    assert!(
+        r["brief_sent"].is_null() && r["brief_error"].is_null(),
+        "nothing to tell an agent that has not started: {r}"
+    );
+    api_post(o, uri2, json!({"op": "send", "body": {"text": "go ahead"}})).await;
+    wait_for("the fresh session reads the new brief", || async {
+        (task_heard(
+            db,
+            "demo-TE-2",
+            "# Task demo-TE-2: Grease the latch\n\nGrease it, then test it.",
+        )
+        .await
+            > 0)
+        .then_some(())
+    })
+    .await;
+    api_post(o, uri2, json!({"op": "stop"})).await;
+    wait_for("the second task stops", || async {
+        o.task("demo-TE-2").await.unwrap().filter(|t| !t.running)
+    })
+    .await;
 }
 
+/// Waiting without a session (CLAUDE.md: new tool/flow needs e2e coverage): an agent asks the
+/// orchestrator to wake it, and is woken by the same delivery a follow-up uses. A condition in
+/// plain words goes to the brain, which writes the Rhai for it.
 async fn wakeup_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool) {
     let worker = o.task("demo-BS-1").await.unwrap().unwrap();
     let agent = worker.agent_id.clone().unwrap();

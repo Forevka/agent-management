@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { Link, useParams, useSearchParams } from 'react-router-dom'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -35,14 +35,25 @@ const LINK_KINDS: Record<string, string> = { jira: 'ticket', mr: 'merge request'
 /// The owner's edit of a task. The brief only reaches a session that has not started yet, so a
 /// finished task whose agent already read it cannot take a new one: a message is the way to
 /// resume it, and the form says so instead of offering a field that would be refused.
-function EditTask({ task, onSaved, onCancel }: { task: Task; onSaved: (done: string) => void; onCancel: () => void }) {
+function EditTask({
+  task,
+  onSaved,
+  onCancel,
+}: {
+  task: Task
+  onSaved: (done: string, warning: boolean) => void
+  onCancel: () => void
+}) {
   // The same lists the agents page offers: any effort level, and the model as free text with the
   // fleet's suggestions (the owner is not held to the brain's allow-list).
   const agents = useApi<Agents>('/api/agents')
   const [effort, setEffort] = useState(task.effort ?? '')
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const briefLocked = FINISHED.includes(task.status) && task.session !== null
+  // Decided once, when the form opens: the page polls, and a task finishing while the owner
+  // writes must not take the field (and their draft) away. If it did finish, the server refuses
+  // the brief and the form keeps what they wrote.
+  const [briefLocked] = useState(() => FINISHED.includes(task.status) && task.session !== null)
 
   return (
     <Card>
@@ -58,13 +69,13 @@ function EditTask({ task, onSaved, onCancel }: { task: Task; onSaved: (done: str
             setSaving(true)
             setError(null)
             api
-              .act<{ done: string }>(`/api/tasks/${encodeURIComponent(task.id)}`, 'edit', {
+              .act<{ done: string; brief_error: string | null }>(`/api/tasks/${encodeURIComponent(task.id)}`, 'edit', {
                 title: f.get('title'),
                 ...(briefLocked ? {} : { brief: f.get('brief') }),
                 model: f.get('model'),
                 effort,
               })
-              .then((r) => onSaved(r.done))
+              .then((r) => onSaved(r.done, r.brief_error != null))
               .catch((err) => setError(message(err)))
               .finally(() => setSaving(false))
           }}
@@ -137,8 +148,12 @@ function MessageBox({ task, onSent }: { task: Task; onSent: () => void }) {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [done, setDone] = useState<string | null>(null)
+  // Ctrl+Enter and the button both send, and a state update lands only on the next render: the
+  // ref is what stops a second press from sending the message twice.
+  const inFlight = useRef(false)
   const send = () => {
-    if (!text.trim()) return
+    if (!text.trim() || busy || inFlight.current) return
+    inFlight.current = true
     setBusy(true)
     setError(null)
     setDone(null)
@@ -150,7 +165,10 @@ function MessageBox({ task, onSent }: { task: Task; onSent: () => void }) {
         onSent()
       })
       .catch((err) => setError(message(err)))
-      .finally(() => setBusy(false))
+      .finally(() => {
+        inFlight.current = false
+        setBusy(false)
+      })
   }
   return (
     <Stack gap="2">
@@ -343,6 +361,8 @@ export default function TaskDetail() {
     setParams(next, { replace: true })
   }
   const [saved, setSaved] = useState<string | null>(null)
+  // A saved edit whose new brief could not reach the agent: saved, but worth a second look.
+  const [savedWarning, setSavedWarning] = useState(false)
   const reload = () => {
     void state.reload()
     void events.reload()
@@ -382,6 +402,7 @@ export default function TaskDetail() {
                         confirm={`Stop ${d.task.key}? Its agent is stopped now; a message resumes the task later.`}
                         onDone={(r) => {
                           setSaved(typeof r.done === 'string' ? r.done : null)
+                          setSavedWarning(false)
                           reload()
                         }}
                       >
@@ -394,7 +415,7 @@ export default function TaskDetail() {
             />
 
             {saved && (
-              <Text size="1" tone="success" as="p">
+              <Text size="1" tone={savedWarning ? 'warning' : 'success'} as="p">
                 {saved}
               </Text>
             )}
@@ -405,8 +426,9 @@ export default function TaskDetail() {
                 // touches its task often enough to wipe a draft the owner is still writing.
                 task={d.task}
                 onCancel={() => setEditing(false)}
-                onSaved={(done) => {
+                onSaved={(done, warning) => {
                   setSaved(done)
+                  setSavedWarning(warning)
                   setEditing(false)
                   reload()
                 }}

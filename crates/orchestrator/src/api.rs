@@ -614,8 +614,17 @@ async fn task_act(
             task["model"] = json!(e.task.model);
             task["effort"] = json!(e.task.effort);
             let mut done = String::from("Saved.");
-            if e.brief_sent.is_some() {
-                done.push_str(" The agent was sent the new brief.");
+            match (e.brief_sent, &e.brief_error) {
+                (Some(crate::tasks::Delivered::ToRun), _) => {
+                    done.push_str(" The agent was sent the new brief.")
+                }
+                (Some(crate::tasks::Delivered::Queued), _) => done.push_str(
+                    " The new brief is kept for the agent: no node can take the task right now.",
+                ),
+                (None, Some(why)) => {
+                    done = format!("Saved, but the agent could not be told of the new brief: {why}")
+                }
+                (None, None) => {}
             }
             if e.changed.iter().any(|c| *c == "model" || *c == "effort") {
                 done.push_str(" The model and effort apply from the task's next run.");
@@ -624,12 +633,20 @@ async fn task_act(
                 "task": task,
                 "changed": e.changed,
                 "brief_sent": e.brief_sent.map(delivered_json),
+                "brief_error": e.brief_error,
                 "done": done,
             })))
         }
         "stop" => {
-            let t = crate::tasks::owner_stop(&o, &id).await?;
-            Ok(Json(json!({"done": format!("Stopping {}.", t.key())})))
+            let (t, stopping) = crate::tasks::owner_stop(&o, &id).await?;
+            Ok(Json(json!({
+                "stopped": stopping,
+                "done": if stopping {
+                    format!("Stopping {}.", t.key())
+                } else {
+                    format!("{} has nothing to stop: it is {}.", t.key(), t.status)
+                },
+            })))
         }
         "send" => {
             let d = crate::tasks::owner_send(&o, &id, &need(&a.body, "text")?).await?;

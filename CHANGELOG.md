@@ -39,7 +39,8 @@ below is one release. How to add to this file is in `CLAUDE.md`
   the task's Telegram topic, and shown in that topic. The model and effort apply from the task's
   next run. A new brief is sent to the agent as the owner's message when its session has already
   started; a finished task whose agent has read its brief is refused a new one (send it a message
-  instead, which resumes it). The topic is renamed with the title. The fleet's own sessions
+  instead, which resumes it); if the agent cannot be told, the edit is still saved and the page
+  says so. The topic is renamed with the title. The fleet's own sessions
   (brain, secretary, retrospective) cannot be changed here. Audited as `task.edit` (which fields,
   never the brief's text) and `task.stop`.
 - **A task's links are on its page**: tickets, merge requests and pages, opening in a new tab when
