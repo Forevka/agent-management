@@ -114,7 +114,15 @@ pub struct Node {
     kit_parts: Mutex<fleet_proto::kit::Parts>,
     /// The newest complete kit not yet applied, and whether an apply is under way: one at a
     /// time, and a kit that arrives meanwhile replaces any other still waiting.
-    kit_queue: Mutex<(Option<KitContent>, bool)>,
+    kit_queue: Mutex<(Option<(KitContent, u64)>, bool)>,
+    /// Counts connects and disconnects. A kit answer (a capture, a status) goes out only on the
+    /// connection it was asked on: after a reconnect the orchestrator may be an older release
+    /// that cannot decode it, and an undecodable frame drops the link. The orchestrator asks
+    /// again on every connect anyway.
+    link_gen: AtomicU64,
+    /// Whether the configured claude CLI knows `--strict-mcp-config`, for that command, from its
+    /// `--help` (asked when the settings arrive). Unknown counts as yes.
+    strict_mcp: Mutex<Option<(Vec<String>, Option<bool>)>>,
 }
 
 impl Node {
@@ -149,6 +157,8 @@ impl Node {
             claude_config: Mutex::new(None),
             kit_parts: Mutex::new(Default::default()),
             kit_queue: Mutex::new((None, false)),
+            link_gen: AtomicU64::new(0),
+            strict_mcp: Mutex::new(None),
         });
         // Replaces whatever a previous node process left, so the tray sees this pid at once.
         node.update_status(|_| {});
@@ -173,6 +183,48 @@ impl Node {
             .unwrap()
             .clone()
             .or_else(kit::KitPaths::from_env)
+    }
+
+    /// Whether `command` (the node's claude command) takes `--strict-mcp-config`. Yes until the
+    /// CLI was asked and said otherwise: a CLI that cannot even be asked fails its runs anyway.
+    pub(crate) fn strict_mcp_supported(&self, command: &[String]) -> bool {
+        self.strict_mcp_known(command) != Some(false)
+    }
+
+    fn strict_mcp_known(&self, command: &[String]) -> Option<bool> {
+        match &*self.strict_mcp.lock().unwrap() {
+            Some((c, known)) if c.as_slice() == command => *known,
+            _ => None,
+        }
+    }
+
+    /// Asks the configured claude CLI, once per command, whether it knows `--strict-mcp-config`.
+    async fn probe_cli(&self) {
+        let Some(command) = self
+            .config
+            .lock()
+            .unwrap()
+            .settings
+            .as_ref()
+            .map(|s| s.claude_command.clone())
+        else {
+            return;
+        };
+        if matches!(&*self.strict_mcp.lock().unwrap(), Some((c, Some(_))) if *c == command) {
+            return;
+        }
+        let known = kit::probe_strict_mcp(&command, self.kit_paths().as_ref()).await;
+        if known == Some(false) {
+            tracing::warn!(
+                "the claude CLI here has no --strict-mcp-config: agent sessions run without the kit's MCP allowlist until it is updated"
+            );
+        }
+        *self.strict_mcp.lock().unwrap() = Some((command, known));
+    }
+
+    /// Whether the connection `generation` an answer was asked on is still the live one.
+    fn same_link(&self, generation: u64) -> bool {
+        self.link_gen.load(Ordering::Acquire) == generation && self.client.is_connected()
     }
 
     /// The `CLAUDE_CONFIG_DIR` the agents must be given, when the node was pointed elsewhere.
@@ -406,16 +458,26 @@ impl Node {
         while let Some(ev) = events.recv().await {
             match ev {
                 Inbound::Connected { .. } => {
+                    self.link_gen.fetch_add(1, Ordering::AcqRel);
                     self.update_status(|s| s.connected = true);
                     self.send_info();
                     self.resend_pending_permissions();
                     // No disk report yet: the orchestrator asks for one if it can read it.
                 }
                 Inbound::Disconnected { .. } => {
+                    self.link_gen.fetch_add(1, Ordering::AcqRel);
                     self.disk_wanted.store(false, Ordering::Release);
                     self.update_status(|s| s.connected = false);
                 }
-                Inbound::Message { body, .. } => self.handle(body),
+                Inbound::Message { body, .. } => {
+                    let settings = matches!(body, Body::NodeSettings(_));
+                    self.handle(body);
+                    // Before anything after the settings (a spawn) is handled: whether this CLI
+                    // can hold a session to the kit's MCP servers decides its arguments.
+                    if settings {
+                        self.probe_cli().await;
+                    }
+                }
             }
         }
         Ok(())
@@ -721,6 +783,7 @@ impl Node {
     /// async runtime (it walks the skill directories), in parts that each fit a frame.
     fn kit_capture(self: &Arc<Self>, id: String) {
         let paths = self.kit_paths();
+        let generation = self.link_gen.load(Ordering::Acquire);
         let this = self.clone();
         tokio::spawn(async move {
             let (content, skipped) = match paths {
@@ -747,17 +810,32 @@ impl Node {
                         )
                     }),
             };
+            if !this.same_link(generation) {
+                tracing::info!("a kit capture was asked on a connection that is gone; not sent");
+                return;
+            }
             let parts = content.split(fleet_proto::kit::PART_BUDGET);
             let n = parts.len();
             let mut skipped = Some(skipped);
             for (i, part) in parts.into_iter().enumerate() {
-                this.client.send(Body::KitCapture(KitCapture {
+                let mut c = KitCapture {
                     id: id.clone(),
                     part: i as u32,
                     last: i + 1 == n,
                     content: part,
                     skipped: skipped.take().unwrap_or_default(),
-                }));
+                };
+                // A frame the link cannot send would block everything behind it. The caps make
+                // this unlikely; if it happens anyway, the part goes out empty, saying so.
+                if !fleet_proto::kit::fits(&Body::KitCapture(c.clone())) {
+                    c.content = KitContent::default();
+                    c.skipped = vec![KitSkipped {
+                        kind: "capture".into(),
+                        name: String::new(),
+                        reason: "part of what this machine has was too large to send".into(),
+                    }];
+                }
+                this.client.send(Body::KitCapture(c));
             }
         });
     }
@@ -773,9 +851,10 @@ impl Node {
         else {
             return;
         };
+        let generation = self.link_gen.load(Ordering::Acquire);
         let start = {
             let mut q = self.kit_queue.lock().unwrap();
-            q.0 = Some(whole);
+            q.0 = Some((whole, generation));
             !std::mem::replace(&mut q.1, true)
         };
         if start {
@@ -785,7 +864,7 @@ impl Node {
 
     async fn kit_apply_loop(self: Arc<Self>) {
         loop {
-            let kit = {
+            let (kit, generation) = {
                 let mut q = self.kit_queue.lock().unwrap();
                 match q.0.take() {
                     Some(k) => k,
@@ -805,7 +884,8 @@ impl Node {
                         .as_ref()
                         .map(|s| s.claude_command.clone())
                         .unwrap_or_else(|| vec!["claude".into()]);
-                    kit::apply(&paths, &self.data_dir, &command, &kit).await
+                    let strict = self.strict_mcp_known(&command);
+                    kit::apply(&paths, &self.data_dir, &command, strict, &kit).await
                 }
                 None => {
                     let failed = |kind: &str, name: String| KitItemStatus {
@@ -824,7 +904,20 @@ impl Node {
                         .collect()
                 }
             };
-            self.client.send(Body::KitStatus(statuses));
+            // The answer goes only to the connection that sent the kit; a new connection gets
+            // the kit again, and its own answer.
+            if !self.same_link(generation) {
+                continue;
+            }
+            let mut body = Body::KitStatus(statuses);
+            if !fleet_proto::kit::fits(&body)
+                && let Body::KitStatus(list) = &mut body
+            {
+                for s in list.iter_mut() {
+                    s.detail.clear();
+                }
+            }
+            self.client.send(body);
         }
     }
 

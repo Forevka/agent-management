@@ -2,7 +2,7 @@
 -- installed on every node. Enabled MCP servers are also the allowlist of agent sessions. See
 -- docs/plan.md ("The kit") and crates/orchestrator/src/kit.rs.
 --
--- Two new tables and nothing else: the previous release never reads them.
+-- Two new tables and one nullable column: the previous release never reads them.
 create table kit_items (
     id         bigserial primary key,
     kind       text not null check (kind in ('skill', 'plugin', 'mcp')),
@@ -31,3 +31,7 @@ create table node_kit (
     at      timestamptz not null default now(),
     primary key (node_id, item_id)
 );
+
+-- Why a node cannot hold its agent sessions to the kit's MCP servers (its claude CLI has no
+-- --strict-mcp-config), as the node last said; null when it can.
+alter table nodes add column kit_note text;

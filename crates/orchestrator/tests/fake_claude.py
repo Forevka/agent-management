@@ -59,6 +59,11 @@ def kit_cli(argv):
         if name in servers:
             print("MCP server %s already exists in user config" % name)
             return 1
+        # As the real CLI stores it: only the keys it knows, and a stdio server always has args.
+        known = ("type", "command", "args", "env", "url", "headers", "oauth")
+        config = {k: v for k, v in config.items() if k in known}
+        if config.get("type", "stdio") == "stdio":
+            config.setdefault("args", [])
         servers[name] = config
         save(claude_json, data)
         print("Added MCP server %s to user config" % name)
@@ -95,8 +100,23 @@ def kit_cli(argv):
     return 1
 
 
+# `fake_claude.py old-cli ...` (as a node's command) plays a CLI from before
+# `--strict-mcp-config`: it does not list the flag, and refuses a run that gives it.
+OLD_CLI = len(sys.argv) > 1 and sys.argv[1] == "old-cli"
+if OLD_CLI:
+    sys.argv.pop(1)
 if len(sys.argv) > 1 and sys.argv[1] in ("plugin", "mcp"):
     sys.exit(kit_cli(sys.argv[1:]))
+# The node asks once whether this CLI can hold a session to its MCP config.
+if sys.argv[1:] == ["--help"]:
+    print("Usage: claude [options] [command] [prompt]")
+    print("  --mcp-config <configs...>   Load MCP servers from JSON files or strings")
+    if not OLD_CLI:
+        print("  --strict-mcp-config         Only use MCP servers from --mcp-config")
+    sys.exit(0)
+if OLD_CLI and "--strict-mcp-config" in sys.argv:
+    sys.stderr.write("error: unknown option '--strict-mcp-config'\n")
+    sys.exit(1)
 
 # The same environment `fleet agent ...` reads in a real session.
 mcp = {"FLEET_IPC_ADDR": os.environ["FLEET_IPC_ADDR"], "FLEET_IPC_TOKEN": os.environ["FLEET_IPC_TOKEN"]}

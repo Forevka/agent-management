@@ -1,7 +1,7 @@
 //! The kit on a node: report what this machine's Claude Code has (the import), and install the
 //! orchestrator's kit for the owner's own Claude Code and the agents (both run as this user).
 //!
-//! Where things are, as Claude Code itself decides it (checked against the real CLI):
+//! Where things are, as Claude Code itself decides it (checked against the real CLI, 2.1.268):
 //!
 //! - the config dir is `CLAUDE_CONFIG_DIR` when set, else `~/.claude`; skills are its
 //!   `skills/<name>/` directories, and plugins are recorded in its `plugins/installed_plugins.json`
@@ -11,12 +11,14 @@
 //!   that file is read: it also holds the account's tokens.
 //!
 //! The node never touches what it did not install. A skill it writes carries a marker
-//! ([`SKILL_MARKER`]) with the content's hash; plugins and MCP servers it added are listed in
-//! `kit-state.json` in the node's data dir. An item of the same name the owner has on the
-//! machine is a `conflict` and is left alone (or `installed`, when it is identical), and only
-//! what the kit installed is ever removed. Plugins and MCP servers are changed with the `claude`
-//! CLI (`claude plugin install`, `claude mcp add-json --scope user`), which keeps its own files
-//! consistent; every call has a timeout, and a failure is a status, never a crash.
+//! ([`SKILL_MARKER`]) naming the skill and the files it wrote, with their hash; plugins and MCP
+//! servers it added are listed in `kit-state.json` in the node's data dir. An item of the same
+//! name the owner has on the machine is a `conflict` and is left alone (or `installed`, when it is
+//! identical); one the kit installed and the owner changed since is theirs from then on; and only
+//! what the kit installed, unchanged, is ever replaced or removed. Plugins and MCP servers are
+//! changed with the `claude` CLI (`claude plugin install`, `claude mcp add-json --scope user`),
+//! which keeps its own files consistent; every call has a timeout and takes its whole process
+//! tree down when it runs out, and a failure is a status, never a crash.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -29,20 +31,31 @@ use anyhow::{Context, Result};
 use fleet_proto::{
     KitContent, KitFile, KitItemStatus, KitMcp, KitPlugin, KitSkill, KitSkipped,
     kit::{
-        MAX_SKILL_BYTES, MAX_SKILL_FILE_BYTES, MAX_SKILL_FILES, SKILL_MARKER, safe_skill_path,
-        secret_file, valid_name,
+        MAX_SKILL_BYTES, MAX_SKILL_FILE_BYTES, MAX_SKILL_FILES, SKILL_MARKER, SpotAt,
+        has_credentials, safe_skill_path, secret_file, secret_spots, sensitive_name, valid_name,
     },
     redact::redact_secrets,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use tokio::io::AsyncReadExt;
 
 /// How long one `claude` CLI call may take. Adding a marketplace clones a repository, which the
 /// CLI itself gives two minutes.
 const CLI_TIMEOUT: Duration = Duration::from_secs(180);
+/// How long asking the CLI for its `--help` may take.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Directories inside a skill that are tooling, not the skill.
 const SKIP_DIRS: [&str; 3] = [".git", "node_modules", "__pycache__"];
+/// Files an OS or a tool leaves in any directory: never part of a skill, never the owner's work.
+const JUNK_FILES: [&str; 3] = [".DS_Store", "Thumbs.db", "desktop.ini"];
+/// At most this many things left out are reported per skill, and in all: a capture must fit its
+/// messages even for a skill directory with thousands of files the kit does not take.
+const MAX_SKIPPED_PER_SKILL: usize = 50;
+const MAX_SKIPPED: usize = 500;
+/// The longest MCP server config the kit takes (the orchestrator's limit too).
+const MAX_MCP_CONFIG_BYTES: usize = 64 * 1024;
 
 /// Where this user's Claude Code keeps its configuration.
 #[derive(Debug, Clone, PartialEq)]
@@ -97,6 +110,73 @@ impl KitPaths {
     }
 }
 
+// ---------------------------------------------------------------- reading what is there
+
+/// A JSON file the CLI keeps: `Ok(None)` when it does not exist yet, an error when it exists
+/// and cannot be read or parsed (it may be half written). An unreadable file is never taken for
+/// an empty one: that would make the kit forget, or redo, what it installed.
+fn read_json(path: &Path) -> std::result::Result<Option<Value>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str(&text)
+            .map(Some)
+            .map_err(|e| format!("{} cannot be read as JSON ({e})", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{} cannot be read ({e})", path.display())),
+    }
+}
+
+/// Plugin ids (`plugin@marketplace`) installed at user scope.
+fn user_plugins(plugins_dir: &Path) -> std::result::Result<BTreeSet<String>, String> {
+    let Some(v) = read_json(&plugins_dir.join("installed_plugins.json"))? else {
+        return Ok(BTreeSet::new());
+    };
+    Ok(v["plugins"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(_, installs)| {
+            installs
+                .as_array()
+                .is_some_and(|a| a.iter().any(|i| i["scope"] == "user"))
+        })
+        .map(|(id, _)| id.clone())
+        .collect())
+}
+
+/// Known marketplaces: name -> what `claude plugin marketplace add` takes to add it again.
+fn marketplaces(
+    plugins_dir: &Path,
+) -> std::result::Result<BTreeMap<String, Option<String>>, String> {
+    let Some(v) = read_json(&plugins_dir.join("known_marketplaces.json"))? else {
+        return Ok(BTreeMap::new());
+    };
+    Ok(v.as_object()
+        .into_iter()
+        .flatten()
+        .map(|(name, m)| {
+            let s = &m["source"];
+            let source = match s["source"].as_str() {
+                Some("github") => s["repo"].as_str(),
+                Some("git" | "url") => s["url"].as_str(),
+                Some("directory" | "file") => s["path"].as_str(),
+                _ => None,
+            };
+            (name.clone(), source.map(str::to_owned))
+        })
+        .collect())
+}
+
+/// User-scope MCP servers: `mcpServers` of `.claude.json`, and nothing else from that file.
+fn user_mcp(claude_json: &Path) -> std::result::Result<serde_json::Map<String, Value>, String> {
+    Ok(match read_json(claude_json)? {
+        Some(mut v) => match v.get_mut("mcpServers").map(Value::take) {
+            Some(Value::Object(m)) => m,
+            _ => serde_json::Map::new(),
+        },
+        None => serde_json::Map::new(),
+    })
+}
+
 // ---------------------------------------------------------------- capture
 
 /// What this machine has at user scope, and what was left out.
@@ -105,6 +185,16 @@ pub fn capture(paths: &KitPaths) -> (KitContent, Vec<KitSkipped>) {
     let skills = capture_skills(&paths.skills(), &mut skipped);
     let plugins = capture_plugins(&paths.plugins(), &mut skipped);
     let mcp = capture_mcp(&paths.claude_json, &mut skipped);
+    if skipped.len() > MAX_SKIPPED {
+        let more = skipped.len() - MAX_SKIPPED;
+        skipped.truncate(MAX_SKIPPED);
+        skip(
+            &mut skipped,
+            "capture",
+            "",
+            format!("…and {more} more left out"),
+        );
+    }
     (
         KitContent {
             skills,
@@ -116,10 +206,11 @@ pub fn capture(paths: &KitPaths) -> (KitContent, Vec<KitSkipped>) {
 }
 
 fn skip(out: &mut Vec<KitSkipped>, kind: &str, name: &str, reason: impl Into<String>) {
+    let clip = |s: &str| s.chars().take(300).collect::<String>();
     out.push(KitSkipped {
         kind: kind.into(),
-        name: name.into(),
-        reason: reason.into(),
+        name: clip(name),
+        reason: clip(&reason.into()),
     });
 }
 
@@ -148,17 +239,34 @@ fn capture_skills(dir: &Path, skipped: &mut Vec<KitSkipped>) -> Vec<KitSkill> {
             );
             continue;
         }
-        match read_skill(&path, &name, skipped) {
+        let mut own = Vec::new();
+        match read_skill(&path, &name, &mut own) {
             Ok(s) => out.push(s),
-            Err(reason) => skip(skipped, "skill", &name, reason),
+            Err(reason) => skip(&mut own, "skill", &name, reason),
         }
+        if own.len() > MAX_SKIPPED_PER_SKILL {
+            let more = own.len() - MAX_SKIPPED_PER_SKILL;
+            own.truncate(MAX_SKIPPED_PER_SKILL);
+            skip(
+                &mut own,
+                "skill",
+                &name,
+                format!("…and {more} more left out"),
+            );
+        }
+        skipped.extend(own);
     }
     out
 }
 
+/// A file that is never part of a skill and never the owner's work: an OS's or a tool's.
+fn junk(file_name: &str) -> bool {
+    JUNK_FILES.contains(&file_name) || file_name.ends_with(".pyc")
+}
+
 /// A skill directory's text files. Files the kit cannot carry (too large, binary, an unusable
-/// path) are reported in `skipped` and left out; a skill that is too large as a whole, or has no
-/// `SKILL.md`, is refused with the reason.
+/// path, a secret) are reported in `skipped` and left out; a skill that is too large as a whole,
+/// or has no `SKILL.md`, is refused with the reason.
 fn read_skill(
     dir: &Path,
     name: &str,
@@ -172,57 +280,38 @@ fn read_skill(
         for e in entries.flatten() {
             let file_name = e.file_name().to_string_lossy().into_owned();
             let rel = format!("{prefix}{file_name}");
+            let here = format!("{name}/{rel}");
             let Ok(meta) = std::fs::symlink_metadata(e.path()) else {
                 continue;
             };
             if meta.is_symlink() {
-                skip(
-                    skipped,
-                    "skill",
-                    &format!("{name}/{rel}"),
-                    "a link (not followed)",
-                );
+                skip(skipped, "skill", &here, "a link (not followed)");
                 continue;
             }
             if meta.is_dir() {
                 if SKIP_DIRS.contains(&file_name.as_str()) {
-                    skip(
-                        skipped,
-                        "skill",
-                        &format!("{name}/{rel}"),
-                        "tooling directory",
-                    );
+                    skip(skipped, "skill", &here, "tooling directory");
                 } else {
                     stack.push((e.path(), format!("{rel}/")));
                 }
                 continue;
             }
-            if rel == SKILL_MARKER {
+            if rel == SKILL_MARKER || junk(&file_name) {
                 continue;
             }
             if secret_file(&rel) {
-                skip(
-                    skipped,
-                    "skill",
-                    &format!("{name}/{rel}"),
-                    "looks like a secret file",
-                );
+                skip(skipped, "skill", &here, "looks like a secret file");
                 continue;
             }
             if !safe_skill_path(&rel) {
-                skip(
-                    skipped,
-                    "skill",
-                    &format!("{name}/{rel}"),
-                    "unusable file name",
-                );
+                skip(skipped, "skill", &here, "unusable file name");
                 continue;
             }
             if meta.len() as usize > MAX_SKILL_FILE_BYTES {
                 skip(
                     skipped,
                     "skill",
-                    &format!("{name}/{rel}"),
+                    &here,
                     format!("larger than {} KB", MAX_SKILL_FILE_BYTES / 1024),
                 );
                 continue;
@@ -231,7 +320,7 @@ fn read_skill(
             let text = match String::from_utf8(bytes) {
                 Ok(t) if !t.contains('\0') => t,
                 _ => {
-                    skip(skipped, "skill", &format!("{name}/{rel}"), "binary file");
+                    skip(skipped, "skill", &here, "binary file");
                     continue;
                 }
             };
@@ -258,53 +347,16 @@ fn read_skill(
     })
 }
 
-fn read_json(path: &Path) -> Option<Value> {
-    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
-}
-
-/// Plugin ids (`plugin@marketplace`) installed at user scope.
-fn user_plugins(plugins_dir: &Path) -> BTreeSet<String> {
-    let Some(v) = read_json(&plugins_dir.join("installed_plugins.json")) else {
-        return BTreeSet::new();
-    };
-    v["plugins"]
-        .as_object()
-        .into_iter()
-        .flatten()
-        .filter(|(_, installs)| {
-            installs
-                .as_array()
-                .is_some_and(|a| a.iter().any(|i| i["scope"] == "user"))
-        })
-        .map(|(id, _)| id.clone())
-        .collect()
-}
-
-/// Known marketplaces: name -> what `claude plugin marketplace add` takes to add it again.
-fn marketplaces(plugins_dir: &Path) -> BTreeMap<String, Option<String>> {
-    let Some(v) = read_json(&plugins_dir.join("known_marketplaces.json")) else {
-        return BTreeMap::new();
-    };
-    v.as_object()
-        .into_iter()
-        .flatten()
-        .map(|(name, m)| {
-            let s = &m["source"];
-            let source = match s["source"].as_str() {
-                Some("github") => s["repo"].as_str(),
-                Some("git" | "url") => s["url"].as_str(),
-                Some("directory" | "file") => s["path"].as_str(),
-                _ => None,
-            };
-            (name.clone(), source.map(str::to_owned))
-        })
-        .collect()
-}
-
 fn capture_plugins(dir: &Path, skipped: &mut Vec<KitSkipped>) -> Vec<KitPlugin> {
-    let known = marketplaces(dir);
+    let (installed, known) = match (user_plugins(dir), marketplaces(dir)) {
+        (Ok(i), Ok(k)) => (i, k),
+        (Err(e), _) | (_, Err(e)) => {
+            skip(skipped, "plugin", "", e);
+            return Vec::new();
+        }
+    };
     let mut out = Vec::new();
-    for id in user_plugins(dir) {
+    for id in installed {
         let Some((plugin, marketplace)) = id.rsplit_once('@') else {
             skip(skipped, "plugin", &id, "not a plugin@marketplace id");
             continue;
@@ -319,6 +371,13 @@ fn capture_plugins(dir: &Path, skipped: &mut Vec<KitSkipped>) -> Vec<KitPlugin> 
             continue;
         }
         match known.get(marketplace) {
+            // A password in the source would go into the database and to every machine.
+            Some(Some(source)) if has_credentials(source) => skip(
+                skipped,
+                "plugin",
+                &id,
+                "its marketplace's source carries a password",
+            ),
             Some(Some(source)) => out.push(KitPlugin {
                 plugin: plugin.into(),
                 marketplace: marketplace.into(),
@@ -341,19 +400,16 @@ fn capture_plugins(dir: &Path, skipped: &mut Vec<KitSkipped>) -> Vec<KitPlugin> 
     out
 }
 
-/// User-scope MCP servers: `mcpServers` of `.claude.json`, and nothing else from that file.
-fn user_mcp(claude_json: &Path) -> serde_json::Map<String, Value> {
-    read_json(claude_json)
-        .and_then(|mut v| match v.get_mut("mcpServers").map(Value::take) {
-            Some(Value::Object(m)) => Some(m),
-            _ => None,
-        })
-        .unwrap_or_default()
-}
-
 fn capture_mcp(claude_json: &Path, skipped: &mut Vec<KitSkipped>) -> Vec<KitMcp> {
+    let servers = match user_mcp(claude_json) {
+        Ok(s) => s,
+        Err(e) => {
+            skip(skipped, "mcp", "", e);
+            return Vec::new();
+        }
+    };
     let mut out = Vec::new();
-    for (name, config) in user_mcp(claude_json) {
+    for (name, config) in servers {
         if !valid_name(&name) {
             skip(
                 skipped,
@@ -367,15 +423,35 @@ fn capture_mcp(claude_json: &Path, skipped: &mut Vec<KitSkipped>) -> Vec<KitMcp>
             skip(skipped, "mcp", &name, "its config is not an object");
             continue;
         }
-        out.push(KitMcp {
-            name,
-            config: config.to_string(),
-        });
+        let config = config.to_string();
+        if config.len() > MAX_MCP_CONFIG_BYTES {
+            skip(
+                skipped,
+                "mcp",
+                &name,
+                format!(
+                    "its config is larger than {} KB",
+                    MAX_MCP_CONFIG_BYTES / 1024
+                ),
+            );
+            continue;
+        }
+        out.push(KitMcp { name, config });
     }
     out
 }
 
 // ---------------------------------------------------------------- install
+
+/// What the kit added of one MCP server.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct McpRecord {
+    /// Hash of the config the kit asked for: it changes only when the kit's does.
+    desired: String,
+    /// Hash of the config as the CLI stored it (it normalises: adds `args: []`, drops keys it
+    /// does not know). A different one on disk means the owner changed it since.
+    stored: String,
+}
 
 /// What the kit installed on this machine, so that only that is ever removed.
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -387,9 +463,8 @@ struct State {
     /// `plugin@marketplace` ids the kit installed.
     #[serde(default)]
     plugins: BTreeSet<String>,
-    /// MCP server name -> hash of the config the kit added.
     #[serde(default)]
-    mcp: BTreeMap<String, String>,
+    mcp: BTreeMap<String, McpRecord>,
 }
 
 impl State {
@@ -404,12 +479,19 @@ impl State {
             .unwrap_or_default()
     }
 
-    fn save(&self, data_dir: &Path) -> Result<()> {
-        let path = Self::path(data_dir);
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
-        std::fs::rename(&tmp, &path)?;
-        Ok(())
+    /// Written after every change the CLI made, so a crash in the middle of an apply never
+    /// leaves the kit not knowing what it installed.
+    fn save(&self, data_dir: &Path) {
+        let save = || -> Result<()> {
+            let path = Self::path(data_dir);
+            let tmp = path.with_extension("json.tmp");
+            std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
+            std::fs::rename(&tmp, &path)?;
+            Ok(())
+        };
+        if let Err(e) = save() {
+            tracing::warn!("could not save the kit state: {e:#}");
+        }
     }
 }
 
@@ -438,7 +520,7 @@ fn status(kind: &str, name: &str, state: &str, detail: impl Into<String>) -> Kit
         kind: kind.into(),
         name: name.into(),
         state: state.into(),
-        detail: detail.into(),
+        detail: detail.into().chars().take(500).collect(),
     }
 }
 
@@ -459,47 +541,80 @@ pub enum SkillPlan {
     Edited,
 }
 
+/// What the kit records in a skill directory it wrote: whose it is and exactly which files, so
+/// that what tools or the owner add beside them is never taken for a change, nor deleted.
+#[derive(Debug, Serialize, Deserialize)]
+struct Marker {
+    name: String,
+    hash: String,
+    files: Vec<String>,
+}
+
+fn marker_text(skill: &KitSkill, hash: &str) -> String {
+    serde_json::to_string(&Marker {
+        name: skill.name.clone(),
+        hash: hash.to_owned(),
+        files: skill.files.iter().map(|f| f.path.clone()).collect(),
+    })
+    .expect("a marker serialises")
+}
+
 /// Who a skill directory belongs to, as it stands on disk.
 #[derive(Debug, PartialEq)]
 enum Found {
     Absent,
-    /// The kit wrote it (the marker names this directory) and it is still exactly that.
+    /// The kit wrote it (the marker names this directory) and its files are still exactly that.
     Kit(String),
-    /// The kit wrote it, and it has been changed since.
+    /// The kit wrote it, and one of its files has changed or gone since.
     KitEdited,
     /// The owner's, with its content hash when the kit could read all of it.
     Own(Option<String>),
 }
 
-/// The marker's text: the skill's name and the content's hash. The name is in it so a copy of
-/// a kit skill under another name (`cp -r a b`) is never taken for the kit's own.
-fn marker_text(name: &str, hash: &str) -> String {
-    format!("{name} {hash}")
+fn read_marker(dir: &Path, name: &str) -> Option<Marker> {
+    let text = std::fs::read_to_string(dir.join(SKILL_MARKER)).ok()?;
+    serde_json::from_str::<Marker>(&text)
+        .ok()
+        .filter(|m| m.name == name)
 }
 
 fn inspect(dir: &Path, name: &str) -> Found {
     if !dir.exists() {
         return Found::Absent;
     }
+    if let Some(m) = read_marker(dir, name) {
+        // Only the files the kit wrote count: what was added beside them is someone else's.
+        let mut files = Vec::new();
+        for path in &m.files {
+            if !safe_skill_path(path) {
+                return Found::KitEdited;
+            }
+            match std::fs::read_to_string(dir.join(path)) {
+                Ok(text) => files.push(KitFile {
+                    path: path.clone(),
+                    text,
+                }),
+                Err(_) => return Found::KitEdited,
+            }
+        }
+        return if skill_hash(&files) == m.hash {
+            Found::Kit(m.hash)
+        } else {
+            Found::KitEdited
+        };
+    }
     // Only what the kit itself could have written counts: a file it would have left out (a
-    // binary, a secret, a link) means someone else put it there.
+    // binary, a secret, a link) means the directory is not the same as a kit skill.
     let mut skipped = Vec::new();
     let content = read_skill(dir, name, &mut skipped)
         .ok()
-        .filter(|_| skipped.is_empty())
+        .filter(|_| skipped.iter().all(|s| s.reason == "tooling directory"))
         .map(|s| skill_hash(&s.files));
-    let marker = std::fs::read_to_string(dir.join(SKILL_MARKER)).ok();
-    match marker.as_deref().and_then(|m| m.trim().split_once(' ')) {
-        Some((n, h)) if n == name => match content {
-            Some(c) if c == h => Found::Kit(c),
-            _ => Found::KitEdited,
-        },
-        _ => Found::Own(content),
-    }
+    Found::Own(content)
 }
 
-/// Decides for one skill: the marker says whether the directory is the kit's, and the files say
-/// whether it still is exactly what the kit wrote.
+/// Decides for one skill: the marker says whether the directory is the kit's, and its files
+/// whether they still are exactly what the kit wrote.
 pub fn plan_skill(dir: &Path, hash: &str, name: &str) -> SkillPlan {
     match inspect(dir, name) {
         Found::Absent => SkillPlan::Write,
@@ -511,33 +626,31 @@ pub fn plan_skill(dir: &Path, hash: &str, name: &str) -> SkillPlan {
     }
 }
 
-/// What to do with an MCP server of a name the machine may already have at user scope.
-#[derive(Debug, PartialEq)]
-pub enum McpPlan {
-    Add,
-    /// The kit's own, untouched since, with a different config: remove and add again.
-    Replace,
-    UpToDate,
-    OwnIdentical,
-    Conflict,
-    /// The kit's own, changed on this machine since: the owner's now, left alone.
-    Edited,
-}
-
-/// The hash a user-scope server's config is recorded by: of the JSON as Claude Code keeps it.
-fn config_hash(config: &Value) -> String {
-    hex_sha256(&[config.to_string().as_bytes()])
-}
-
-pub fn plan_mcp(current: Option<&Value>, managed_hash: Option<&str>, desired: &Value) -> McpPlan {
-    match (current, managed_hash) {
-        (None, _) => McpPlan::Add,
-        (Some(cur), Some(m)) if config_hash(cur) != m => McpPlan::Edited,
-        (Some(cur), Some(_)) if cur == desired => McpPlan::UpToDate,
-        (Some(_), Some(_)) => McpPlan::Replace,
-        (Some(cur), None) if cur == desired => McpPlan::OwnIdentical,
-        (Some(_), None) => McpPlan::Conflict,
+/// Files under `dir` that are neither the kit's (`listed`, the marker) nor junk: what the owner
+/// added to a kit skill. They are kept when the kit updates or removes it.
+fn extras(dir: &Path, listed: &BTreeSet<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack = vec![(dir.to_path_buf(), String::new())];
+    while let Some((at, prefix)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&at) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let file_name = e.file_name().to_string_lossy().into_owned();
+            let rel = format!("{prefix}{file_name}");
+            let Ok(meta) = std::fs::symlink_metadata(e.path()) else {
+                continue;
+            };
+            if meta.is_dir() && !meta.is_symlink() {
+                if !SKIP_DIRS.contains(&file_name.as_str()) {
+                    stack.push((e.path(), format!("{rel}/")));
+                }
+            } else if rel != SKILL_MARKER && !junk(&file_name) && !listed.contains(&rel) {
+                out.push(rel);
+            }
+        }
     }
+    out
 }
 
 /// Where the kit stages a skill's directory: beside `skills/`, on the same volume (so a rename
@@ -546,22 +659,50 @@ fn staging(paths: &KitPaths) -> PathBuf {
     paths.config_dir.join(".fleet-kit-staging")
 }
 
-/// Moves a skill directory out of `skills/` and deletes it there: a removal that fails half way
-/// (a file held open on Windows) then never leaves a broken skill where Claude Code loads it.
-fn take_away(paths: &KitPaths, dir: &Path, name: &str) -> Result<()> {
-    let old = staging(paths).join(format!("old-{name}"));
-    let _ = std::fs::remove_dir_all(&old);
-    std::fs::create_dir_all(staging(paths))?;
-    std::fs::rename(dir, &old).with_context(|| format!("moving {} aside", dir.display()))?;
-    if let Err(e) = std::fs::remove_dir_all(&old) {
-        tracing::warn!("could not delete {}: {e}", old.display());
+/// Moves `rel` from under `from` to under `to`.
+fn carry(from: &Path, to: &Path, rel: &str) -> std::io::Result<()> {
+    let dest = to.join(rel);
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
     }
+    std::fs::rename(from.join(rel), dest)
+}
+
+/// Takes the kit's skill off this machine. Without anything of the owner's in it, the directory
+/// is moved out of `skills/` and deleted there, so a removal that fails half way (a file held open
+/// on Windows) never leaves a broken skill where Claude Code loads it. With the owner's own files
+/// in it, only the kit's files and its marker go.
+fn take_away(paths: &KitPaths, dir: &Path, name: &str, marker: &Marker) -> Result<()> {
+    let listed: BTreeSet<String> = marker.files.iter().cloned().collect();
+    let own = extras(dir, &listed);
+    if own.is_empty() {
+        let old = staging(paths).join(format!("old-{name}"));
+        let _ = std::fs::remove_dir_all(&old);
+        std::fs::create_dir_all(staging(paths))?;
+        std::fs::rename(dir, &old).with_context(|| format!("moving {} aside", dir.display()))?;
+        if let Err(e) = std::fs::remove_dir_all(&old) {
+            tracing::warn!("could not delete {}: {e}", old.display());
+        }
+        return Ok(());
+    }
+    // SKILL.md first, so a half-finished removal leaves no skill behind.
+    let mut order: Vec<&String> = marker.files.iter().collect();
+    order.sort_by_key(|p| *p != "SKILL.md");
+    for path in order {
+        match std::fs::remove_file(dir.join(path)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(e).with_context(|| format!("removing {path}"));
+            }
+            _ => {}
+        }
+    }
+    std::fs::remove_file(dir.join(SKILL_MARKER))?;
     Ok(())
 }
 
 /// Writes a skill's directory: staged first, then swapped in, so a failure half way never
 /// leaves a broken skill where Claude Code would load it; an old copy goes back if the swap
-/// fails.
+/// fails. Files the owner added to the kit's older copy are carried over.
 fn write_skill(paths: &KitPaths, skill: &KitSkill, hash: &str) -> Result<()> {
     let tmp = staging(paths).join(format!("new-{}", skill.name));
     let _ = std::fs::remove_dir_all(&tmp);
@@ -573,11 +714,22 @@ fn write_skill(paths: &KitPaths, skill: &KitSkill, hash: &str) -> Result<()> {
         }
         std::fs::write(&path, &f.text).with_context(|| format!("writing {}", f.path))?;
     }
-    std::fs::write(tmp.join(SKILL_MARKER), marker_text(&skill.name, hash))?;
+    std::fs::write(tmp.join(SKILL_MARKER), marker_text(skill, hash))?;
     let dir = paths.skills().join(&skill.name);
     let old = staging(paths).join(format!("old-{}", skill.name));
     let _ = std::fs::remove_dir_all(&old);
     let had_old = dir.exists();
+    let keep = match read_marker(&dir, &skill.name) {
+        Some(m) if had_old => {
+            let new: BTreeSet<String> = skill.files.iter().map(|f| f.path.clone()).collect();
+            let listed: BTreeSet<String> = m.files.into_iter().collect();
+            extras(&dir, &listed)
+                .into_iter()
+                .filter(|p| !new.contains(p))
+                .collect()
+        }
+        _ => Vec::new(),
+    };
     if had_old {
         std::fs::rename(&dir, &old).with_context(|| format!("moving {} aside", dir.display()))?;
     }
@@ -586,6 +738,11 @@ fn write_skill(paths: &KitPaths, skill: &KitSkill, hash: &str) -> Result<()> {
             let _ = std::fs::rename(&old, &dir);
         }
         return Err(e).with_context(|| format!("putting {} in place", dir.display()));
+    }
+    for rel in &keep {
+        if let Err(e) = carry(&old, &dir, rel) {
+            tracing::warn!("could not keep {rel} in skill {}: {e}", skill.name);
+        }
     }
     if had_old && let Err(e) = std::fs::remove_dir_all(&old) {
         tracing::warn!("could not delete {}: {e}", old.display());
@@ -692,8 +849,8 @@ fn apply_skills(
     }
     for name in gone.into_iter().filter(|n| !wanted.contains(n.as_str())) {
         let target = dir.join(&name);
-        match inspect(&target, &name) {
-            Found::Kit(_) => match take_away(paths, &target, &name) {
+        match (inspect(&target, &name), read_marker(&target, &name)) {
+            (Found::Kit(_), Some(marker)) => match take_away(paths, &target, &name, &marker) {
                 Ok(()) => out.push(status("skill", &name, "removed", "")),
                 Err(e) => {
                     out.push(status(
@@ -705,14 +862,64 @@ fn apply_skills(
                     continue;
                 }
             },
-            Found::KitEdited => out.push(status("skill", &name, "conflict", EDITED)),
-            Found::Absent | Found::Own(_) => {}
+            (Found::KitEdited, _) => out.push(status("skill", &name, "conflict", EDITED)),
+            _ => {}
         }
         state.skills.remove(&name);
     }
 }
 
-/// Runs the `claude` CLI for kit changes.
+/// What to do with an MCP server of a name the machine may already have at user scope.
+#[derive(Debug, PartialEq)]
+pub enum McpPlan {
+    Add,
+    /// The kit's own, untouched since, and the kit's config for it changed: remove and add again.
+    Replace,
+    UpToDate,
+    OwnIdentical,
+    Conflict,
+    /// The kit's own, changed on this machine since: the owner's now, left alone.
+    Edited,
+}
+
+/// The hash a config is recorded by: of its JSON, keys in order.
+fn config_hash(config: &Value) -> String {
+    hex_sha256(&[config.to_string().as_bytes()])
+}
+
+/// A server's config as the CLI keeps it, for telling the owner's own copy from the kit's: only
+/// the keys Claude Code knows, with empty lists and maps (which the CLI adds or drops) and the
+/// default `stdio` type left out.
+fn normalized(config: &Value) -> Value {
+    const KNOWN: [&str; 7] = ["type", "command", "args", "env", "url", "headers", "oauth"];
+    let Value::Object(m) = config else {
+        return config.clone();
+    };
+    Value::Object(
+        m.iter()
+            .filter(|(k, _)| KNOWN.contains(&k.as_str()))
+            .filter(|(k, v)| {
+                !(matches!(v, Value::Array(a) if a.is_empty())
+                    || matches!(v, Value::Object(o) if o.is_empty())
+                    || (*k == "type" && *v == "stdio"))
+            })
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+    )
+}
+
+fn plan_mcp(current: Option<&Value>, record: Option<&McpRecord>, desired: &Value) -> McpPlan {
+    match (current, record) {
+        (None, _) => McpPlan::Add,
+        (Some(cur), Some(r)) if config_hash(cur) != r.stored => McpPlan::Edited,
+        (Some(_), Some(r)) if r.desired == config_hash(desired) => McpPlan::UpToDate,
+        (Some(_), Some(_)) => McpPlan::Replace,
+        (Some(cur), None) if normalized(cur) == normalized(desired) => McpPlan::OwnIdentical,
+        (Some(_), None) => McpPlan::Conflict,
+    }
+}
+
+/// The `claude` CLI, as the node's configured command runs it.
 struct Cli {
     program: PathBuf,
     /// The configured command's leading arguments up to its first long flag (a script for an
@@ -744,7 +951,14 @@ impl Cli {
         })
     }
 
-    async fn run(&self, args: &[&str]) -> std::result::Result<String, String> {
+    /// Runs one call: its output, or why it failed. The call runs in a process group (a job
+    /// object on Windows) that a timeout takes down whole, so nothing a `claude.cmd` shim started
+    /// is left running.
+    async fn call(
+        &self,
+        args: &[&str],
+        limit: Duration,
+    ) -> std::result::Result<(bool, String), String> {
         let mut cmd = tokio::process::Command::new(&self.program);
         cmd.args(&self.lead)
             .args(args)
@@ -755,53 +969,117 @@ impl Cli {
         if let Some(dir) = &self.env {
             cmd.env("CLAUDE_CONFIG_DIR", dir);
         }
+        #[cfg(unix)]
+        cmd.process_group(0);
         #[cfg(windows)]
         cmd.creation_flags(0x0800_0000);
         let what = args.iter().take(2).copied().collect::<Vec<_>>().join(" ");
-        let out = match tokio::time::timeout(CLI_TIMEOUT, cmd.output()).await {
-            Err(_) => {
-                return Err(format!(
-                    "`claude {what}` took over {}s",
-                    CLI_TIMEOUT.as_secs()
-                ));
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("could not run `claude {what}`: {e}"))?;
+        let tree = crate::runner::ProcessTree::adopt(&child);
+        let mut stdout = child.stdout.take();
+        let mut stderr = child.stderr.take();
+        let read = async {
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            if let Some(o) = stdout.as_mut() {
+                let _ = o.read_to_end(&mut a).await;
             }
-            Ok(Err(e)) => return Err(format!("could not run `claude {what}`: {e}")),
-            Ok(Ok(o)) => o,
+            if let Some(e) = stderr.as_mut() {
+                let _ = e.read_to_end(&mut b).await;
+            }
+            (a, b)
         };
-        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-        text.push_str(&String::from_utf8_lossy(&out.stderr));
+        let ran = tokio::time::timeout(limit, async {
+            let (out, status) = tokio::join!(read, child.wait());
+            (out, status)
+        })
+        .await;
+        let ((out, err), status) = match ran {
+            Ok(done) => done,
+            Err(_) => {
+                tree.kill(&mut child).await;
+                return Err(format!("`claude {what}` took over {}s", limit.as_secs()));
+            }
+        };
+        let mut text = String::from_utf8_lossy(&out).into_owned();
+        text.push_str(&String::from_utf8_lossy(&err));
         redact_secrets(&mut text, &self.secrets);
-        if out.status.success() {
-            Ok(text)
-        } else {
-            let tail: String = text
-                .trim()
-                .chars()
-                .rev()
-                .take(400)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect();
-            Err(format!("`claude {what}` failed: {tail}"))
-        }
+        let ok = status.map(|s| s.success()).unwrap_or(false);
+        Ok((ok, text))
     }
+
+    async fn run(&self, args: &[&str]) -> std::result::Result<String, String> {
+        let what = args.iter().take(2).copied().collect::<Vec<_>>().join(" ");
+        let (ok, text) = self.call(args, CLI_TIMEOUT).await?;
+        if ok {
+            return Ok(text);
+        }
+        let tail: String = text
+            .trim()
+            .chars()
+            .rev()
+            .take(400)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        Err(format!("`claude {what}` failed: {tail}"))
+    }
+}
+
+/// Whether the node's `claude` knows `--strict-mcp-config` (added in 2.0; verified with
+/// 2.1.268), from its `--help`. `None` when the CLI cannot be asked at all.
+pub async fn probe_strict_mcp(command: &[String], paths: Option<&KitPaths>) -> Option<bool> {
+    let fallback;
+    let paths = match paths {
+        Some(p) => p,
+        None => {
+            fallback = KitPaths {
+                config_dir: PathBuf::new(),
+                claude_json: PathBuf::new(),
+                set_env: false,
+            };
+            &fallback
+        }
+    };
+    let cli = Cli::new(command, paths, Vec::new()).ok()?;
+    let (ok, text) = cli.call(&["--help"], PROBE_TIMEOUT).await.ok()?;
+    (ok || text.contains("Usage")).then(|| text.contains(crate::runner::STRICT_MCP))
 }
 
 async fn apply_plugins(
     paths: &KitPaths,
+    data_dir: &Path,
     cli: &Cli,
     state: &mut State,
     plugins: &[KitPlugin],
     out: &mut Vec<KitItemStatus>,
 ) {
-    let installed = user_plugins(&paths.plugins());
-    let mut known = marketplaces(&paths.plugins());
+    let (installed, mut known) = match (
+        user_plugins(&paths.plugins()),
+        marketplaces(&paths.plugins()),
+    ) {
+        (Ok(i), Ok(k)) => (i, k),
+        (Err(e), _) | (_, Err(e)) => {
+            // Taken for empty, it would reinstall everything and forget what the kit did.
+            for p in plugins {
+                out.push(status(
+                    "plugin",
+                    &p.id(),
+                    "failed",
+                    format!("{e}; trying again next time"),
+                ));
+            }
+            return;
+        }
+    };
     for p in plugins {
         let id = p.id();
         if !valid_name(&p.plugin)
             || !valid_name(&p.marketplace)
             || p.marketplace_source.starts_with('-')
+            || has_credentials(&p.marketplace_source)
         {
             out.push(status(
                 "plugin",
@@ -838,6 +1116,7 @@ async fn apply_plugins(
         {
             Ok(_) => {
                 state.plugins.insert(id.clone());
+                state.save(data_dir);
                 out.push(status("plugin", &id, "installed", ""));
             }
             Err(e) => out.push(status("plugin", &id, "failed", e)),
@@ -857,6 +1136,7 @@ async fn apply_plugins(
         {
             Ok(_) => {
                 state.plugins.remove(&id);
+                state.save(data_dir);
                 out.push(status("plugin", &id, "removed", ""));
             }
             Err(e) => out.push(status("plugin", &id, "failed", e)),
@@ -866,12 +1146,34 @@ async fn apply_plugins(
 
 async fn apply_mcp(
     paths: &KitPaths,
+    data_dir: &Path,
     cli: &Cli,
     state: &mut State,
     servers: &[KitMcp],
     out: &mut Vec<KitItemStatus>,
 ) {
-    let current = user_mcp(&paths.claude_json);
+    let current = match user_mcp(&paths.claude_json) {
+        Ok(c) => c,
+        Err(e) => {
+            // Half written by a running Claude Code, perhaps: never taken for "no servers".
+            for m in servers {
+                out.push(status(
+                    "mcp",
+                    &m.name,
+                    "failed",
+                    format!("{e}; trying again next time"),
+                ));
+            }
+            return;
+        }
+    };
+    // What the CLI stored for `name` after a change, read back from its file.
+    let stored = |name: &str| -> Option<String> {
+        user_mcp(&paths.claude_json)
+            .ok()?
+            .get(name)
+            .map(config_hash)
+    };
     for m in servers {
         if !valid_name(&m.name) {
             out.push(status("mcp", &m.name, "failed", "the name is not usable"));
@@ -890,18 +1192,11 @@ async fn apply_mcp(
             }
         };
         let json = desired.to_string();
-        let plan = plan_mcp(
-            current.get(&m.name),
-            state.mcp.get(&m.name).map(String::as_str),
-            &desired,
-        );
-        // What the CLI stored, which is what an edit is later told apart from.
-        let stored = || {
-            user_mcp(&paths.claude_json)
-                .get(&m.name)
-                .map(config_hash)
-                .unwrap_or_else(|| config_hash(&desired))
+        let record = |stored: Option<String>| McpRecord {
+            desired: config_hash(&desired),
+            stored: stored.unwrap_or_else(|| config_hash(&desired)),
         };
+        let plan = plan_mcp(current.get(&m.name), state.mcp.get(&m.name), &desired);
         let add_args = [
             "mcp",
             "add-json",
@@ -914,28 +1209,35 @@ async fn apply_mcp(
             McpPlan::UpToDate => status("mcp", &m.name, "installed", ""),
             McpPlan::Edited => {
                 state.mcp.remove(&m.name);
+                state.save(data_dir);
                 status("mcp", &m.name, "conflict", EDITED)
             }
             McpPlan::Add => match cli.run(&add_args).await {
                 Ok(_) => {
-                    state.mcp.insert(m.name.clone(), stored());
+                    state.mcp.insert(m.name.clone(), record(stored(&m.name)));
+                    state.save(data_dir);
                     status("mcp", &m.name, "installed", "")
                 }
                 Err(e) => status("mcp", &m.name, "failed", e),
             },
             McpPlan::Replace => {
-                let replaced = match cli
+                let removed = cli
                     .run(&["mcp", "remove", "--scope", "user", &m.name])
-                    .await
-                {
-                    Ok(_) => cli.run(&add_args).await,
-                    Err(e) => Err(e),
-                };
-                match replaced {
-                    Ok(_) => {
-                        state.mcp.insert(m.name.clone(), stored());
-                        status("mcp", &m.name, "installed", "")
-                    }
+                    .await;
+                if removed.is_ok() {
+                    // Gone now: until it is added again the kit has nothing of it here.
+                    state.mcp.remove(&m.name);
+                    state.save(data_dir);
+                }
+                match removed {
+                    Ok(_) => match cli.run(&add_args).await {
+                        Ok(_) => {
+                            state.mcp.insert(m.name.clone(), record(stored(&m.name)));
+                            state.save(data_dir);
+                            status("mcp", &m.name, "installed", "")
+                        }
+                        Err(e) => status("mcp", &m.name, "failed", e),
+                    },
                     Err(e) => status("mcp", &m.name, "failed", e),
                 }
             }
@@ -969,7 +1271,7 @@ async fn apply_mcp(
             state.mcp.remove(&name);
             continue;
         };
-        if state.mcp.get(&name) != Some(&config_hash(cur)) {
+        if state.mcp.get(&name).map(|r| r.stored.as_str()) != Some(config_hash(cur).as_str()) {
             // Changed on this machine since the kit added it: the owner's now.
             state.mcp.remove(&name);
             out.push(status("mcp", &name, "conflict", EDITED));
@@ -978,6 +1280,7 @@ async fn apply_mcp(
         match cli.run(&["mcp", "remove", "--scope", "user", &name]).await {
             Ok(_) => {
                 state.mcp.remove(&name);
+                state.save(data_dir);
                 out.push(status("mcp", &name, "removed", ""));
             }
             Err(e) => out.push(status("mcp", &name, "failed", e)),
@@ -985,23 +1288,27 @@ async fn apply_mcp(
     }
 }
 
-/// The secrets of each server in a JSON object of MCP servers (env and header values, and
-/// secret-named URL parameters and flags: [`fleet_proto::kit::secret_spots`]): what a transcript
-/// or a CLI message must never show.
+/// The secrets of each server in a JSON object of MCP servers, which a transcript or a CLI
+/// message must never show: every header value, every secret found in a URL or the args, and an
+/// env value that is named like a secret or long enough to be one. Short, plainly named env
+/// values (`DEBUG=1`, `MODE=production`) are left readable.
 pub fn mcp_secret_values(servers: &serde_json::Map<String, Value>) -> Vec<String> {
     servers
         .values()
-        .flat_map(fleet_proto::kit::secret_spots)
+        .flat_map(secret_spots)
+        .filter(|s| s.at != SpotAt::Env || sensitive_name(&s.name) || s.value.len() >= 12)
         .map(|s| s.value)
         .collect()
 }
 
 /// Brings this machine to the kit: installs what is missing, updates what the kit installed
-/// before, removes what the kit installed and no longer has. One status per item it looked at.
+/// before, removes what the kit installed and no longer has. One status per item it looked at,
+/// and one for the node itself: whether its CLI holds agent sessions to the kit's MCP servers.
 pub async fn apply(
     paths: &KitPaths,
     data_dir: &Path,
     claude_command: &[String],
+    strict_mcp: Option<bool>,
     kit: &KitContent,
 ) -> Vec<KitItemStatus> {
     let skilled = tokio::task::spawn_blocking({
@@ -1010,6 +1317,7 @@ pub async fn apply(
             let mut state = State::load(&data_dir);
             let mut out = Vec::new();
             apply_skills(&paths, &mut state, &skills, &mut out);
+            state.save(&data_dir);
             (state, out)
         }
     })
@@ -1036,8 +1344,8 @@ pub async fn apply(
     };
     match Cli::new(claude_command, paths, secrets) {
         Ok(cli) => {
-            apply_plugins(paths, &cli, &mut state, &kit.plugins, &mut out).await;
-            apply_mcp(paths, &cli, &mut state, &kit.mcp, &mut out).await;
+            apply_plugins(paths, data_dir, &cli, &mut state, &kit.plugins, &mut out).await;
+            apply_mcp(paths, data_dir, &cli, &mut state, &kit.mcp, &mut out).await;
         }
         Err(e) => {
             let why = format!("{e:#}");
@@ -1049,9 +1357,16 @@ pub async fn apply(
             }
         }
     }
-    if let Err(e) = state.save(data_dir) {
-        tracing::warn!("could not save the kit state: {e:#}");
-    }
+    state.save(data_dir);
+    out.push(match strict_mcp {
+        Some(false) => status(
+            "node",
+            "allowlist",
+            "failed",
+            "allowlist not enforced: this node's claude CLI has no --strict-mcp-config, so agent sessions also load MCP servers configured outside the kit; update the claude CLI (2.1.268 is known to work)",
+        ),
+        _ => status("node", "allowlist", "installed", ""),
+    });
     out
 }
 
@@ -1097,6 +1412,7 @@ mod tests {
         std::fs::create_dir_all(skills.join("pdf/scripts")).unwrap();
         std::fs::write(skills.join("pdf/SKILL.md"), "---\nname: pdf\n---\nUse it.").unwrap();
         std::fs::write(skills.join("pdf/scripts/run.py"), "print(1)").unwrap();
+        std::fs::write(skills.join("pdf/.DS_Store"), "junk").unwrap();
         std::fs::write(
             skills.join("pdf/logo.png"),
             [0x89, b'P', b'N', b'G', 0, 1, 2],
@@ -1122,6 +1438,12 @@ mod tests {
             )
             .unwrap();
         }
+        // Thousands of files left out: the report says how many, not each.
+        std::fs::create_dir_all(skills.join("blobs")).unwrap();
+        std::fs::write(skills.join("blobs/SKILL.md"), "blobs").unwrap();
+        for i in 0..120 {
+            std::fs::write(skills.join(format!("blobs/b{i}.bin")), [0u8, 1, 2]).unwrap();
+        }
         // User-scope MCP servers, and only those, from .claude.json.
         std::fs::write(
             &paths.claude_json,
@@ -1131,19 +1453,19 @@ mod tests {
         std::fs::create_dir_all(paths.plugins()).unwrap();
         std::fs::write(
             paths.plugins().join("installed_plugins.json"),
-            r#"{"version":2,"plugins":{"mermaid@omm":[{"scope":"user"}],"local@omm":[{"scope":"project","projectPath":"C:/x"}],"lost@gone":[{"scope":"user"}]}}"#,
+            r#"{"version":2,"plugins":{"mermaid@omm":[{"scope":"user"}],"local@omm":[{"scope":"project","projectPath":"C:/x"}],"lost@gone":[{"scope":"user"}],"priv@corp":[{"scope":"user"}]}}"#,
         )
         .unwrap();
         std::fs::write(
             paths.plugins().join("known_marketplaces.json"),
-            r#"{"omm":{"source":{"source":"github","repo":"o/omm"}}}"#,
+            r#"{"omm":{"source":{"source":"github","repo":"o/omm"}},"corp":{"source":{"source":"git","url":"https://bot:ghp_secret@git.corp/m.git"}}}"#,
         )
         .unwrap();
 
         let (content, skipped) = capture(&paths);
-        assert_eq!(content.skills.len(), 1, "{skipped:?}");
-        let pdf = &content.skills[0];
-        assert_eq!(pdf.name, "pdf");
+        let names: Vec<&str> = content.skills.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["blobs", "pdf"], "{skipped:?}");
+        let pdf = &content.skills[1];
         let paths_of: Vec<&str> = pdf.files.iter().map(|f| f.path.as_str()).collect();
         assert_eq!(paths_of, ["SKILL.md", "scripts/run.py"]);
         let reason = |name: &str| {
@@ -1157,9 +1479,24 @@ mod tests {
         assert!(reason("pdf/huge.txt").starts_with("larger than"));
         assert_eq!(reason("pdf/node_modules"), "tooling directory");
         assert_eq!(reason("pdf/.env"), "looks like a secret file");
+        assert!(
+            !skipped.iter().any(|s| s.name.contains(".DS_Store")),
+            "junk is not news"
+        );
         assert_eq!(reason("notes"), "no SKILL.md");
         assert!(reason("big").starts_with("larger than"));
         assert!(reason("lost@gone").contains("marketplace"));
+        assert!(reason("priv@corp").contains("password"));
+        assert!(!format!("{content:?}{skipped:?}").contains("ghp_secret"));
+        let blobs = skipped
+            .iter()
+            .filter(|s| s.name.starts_with("blobs"))
+            .count();
+        assert_eq!(
+            blobs,
+            MAX_SKIPPED_PER_SKILL + 1,
+            "capped, with a count of the rest"
+        );
         assert_eq!(
             content.plugins,
             vec![KitPlugin {
@@ -1174,6 +1511,19 @@ mod tests {
             !content.mcp[0].config.contains("never"),
             "nothing else from .claude.json"
         );
+        // The capture fits its messages.
+        let parts = content.split(fleet_proto::kit::PART_BUDGET);
+        let n = parts.len();
+        for (i, p) in parts.into_iter().enumerate() {
+            let body = fleet_proto::Body::KitCapture(fleet_proto::KitCapture {
+                id: "c".into(),
+                part: i as u32,
+                last: i + 1 == n,
+                content: p,
+                skipped: if i == 0 { skipped.clone() } else { vec![] },
+            });
+            assert!(fleet_proto::kit::fits(&body));
+        }
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -1181,8 +1531,6 @@ mod tests {
     fn a_skill_is_written_only_where_the_kit_owns_the_directory() {
         let root = temp("skills");
         let paths = KitPaths::at(root.join("cfg"));
-        let data = root.join("data");
-        std::fs::create_dir_all(&data).unwrap();
         let mine = KitSkill {
             name: "mine".into(),
             files: vec![file("SKILL.md", "kit version")],
@@ -1219,10 +1567,9 @@ mod tests {
             "the owner's",
             "a conflict leaves the owner's directory alone"
         );
-        assert_eq!(
-            std::fs::read_to_string(paths.skills().join("mine").join(SKILL_MARKER)).unwrap(),
-            marker_text("mine", &skill_hash(&mine.files))
-        );
+        let marker = read_marker(&paths.skills().join("mine"), "mine").unwrap();
+        assert_eq!(marker.hash, skill_hash(&mine.files));
+        assert_eq!(marker.files, ["SKILL.md"]);
         assert!(
             !paths
                 .config_dir
@@ -1235,17 +1582,25 @@ mod tests {
             "not taken over"
         );
 
-        // An edit reaches the kit's own copy; nothing else changes.
+        // Tools leave things beside a kit skill (bytecode, an OS's index), and the owner may add
+        // a note of their own: none of it is a change to the skill.
+        let mine_dir = paths.skills().join("mine");
+        std::fs::create_dir_all(mine_dir.join("__pycache__")).unwrap();
+        std::fs::write(mine_dir.join("__pycache__/x.pyc"), [0u8, 1]).unwrap();
+        std::fs::write(mine_dir.join(".DS_Store"), "junk").unwrap();
+        std::fs::write(mine_dir.join("my-notes.md"), "the owner's note").unwrap();
+        assert_eq!(
+            plan_skill(&mine_dir, &skill_hash(&mine.files), "mine"),
+            SkillPlan::UpToDate
+        );
+
+        // An update reaches the kit's own copy, and keeps the owner's note.
         let mine2 = KitSkill {
             name: "mine".into(),
             files: vec![file("SKILL.md", "kit version 2")],
         };
         assert_eq!(
-            plan_skill(
-                &paths.skills().join("mine"),
-                &skill_hash(&mine2.files),
-                "mine"
-            ),
+            plan_skill(&mine_dir, &skill_hash(&mine2.files), "mine"),
             SkillPlan::Write
         );
         let mut out = Vec::new();
@@ -1256,15 +1611,19 @@ mod tests {
             &mut out,
         );
         assert_eq!(
-            std::fs::read_to_string(paths.skills().join("mine/SKILL.md")).unwrap(),
+            std::fs::read_to_string(mine_dir.join("SKILL.md")).unwrap(),
             "kit version 2"
+        );
+        assert_eq!(
+            std::fs::read_to_string(mine_dir.join("my-notes.md")).unwrap(),
+            "the owner's note"
         );
 
         // A copy of the kit's skill under another name is the owner's, not the kit's.
         let copy = paths.skills().join("copied");
         std::fs::create_dir_all(&copy).unwrap();
         for f in ["SKILL.md", SKILL_MARKER] {
-            std::fs::copy(paths.skills().join("mine").join(f), copy.join(f)).unwrap();
+            std::fs::copy(mine_dir.join(f), copy.join(f)).unwrap();
         }
         // A kit skill the owner then changed on this machine is theirs from then on.
         let edited = KitSkill {
@@ -1295,14 +1654,18 @@ mod tests {
             "an update never overwrites a local edit"
         );
 
-        // Dropped from the kit: the kit's copy goes; the owner's, the copy and the edited one
-        // stay.
+        // Dropped from the kit: the kit's files go; the owner's note, the owner's skills, the copy
+        // and the edited one stay.
         let mut out = Vec::new();
         apply_skills(&paths, &mut state, &[], &mut out);
         let s = by_item(&out);
         assert_eq!(s[&("skill".into(), "mine".into())].0, "removed");
         assert_eq!(s[&("skill".into(), "edited".into())].0, "conflict");
-        assert!(!paths.skills().join("mine").exists());
+        assert!(!mine_dir.join("SKILL.md").exists(), "no longer a skill");
+        assert!(
+            mine_dir.join("my-notes.md").exists(),
+            "the owner's note stays"
+        );
         assert!(paths.skills().join("theirs/SKILL.md").exists());
         assert!(paths.skills().join("same/SKILL.md").exists());
         assert!(paths.skills().join("copied/SKILL.md").exists());
@@ -1312,6 +1675,15 @@ mod tests {
             2,
             "only the kit's own skills are looked at: {out:?}"
         );
+
+        // A kit skill nobody added to goes whole.
+        let plain = KitSkill {
+            name: "plain".into(),
+            files: vec![file("SKILL.md", "plain")],
+        };
+        apply_skills(&paths, &mut state, &[plain], &mut Vec::new());
+        apply_skills(&paths, &mut state, &[], &mut Vec::new());
+        assert!(!paths.skills().join("plain").exists());
 
         // An unsafe path never reaches the disk.
         let evil = KitSkill {
@@ -1327,45 +1699,75 @@ mod tests {
     }
 
     #[test]
-    fn an_mcp_server_of_the_owners_is_never_replaced() {
-        let desired = serde_json::json!({"command": "npx", "env": {"T": "v"}});
-        let older = serde_json::json!({"command": "npx", "env": {"T": "old"}});
+    fn an_mcp_server_is_replaced_only_when_the_kit_changed_it() {
+        let desired = serde_json::json!({"type": "stdio", "command": "npx", "env": {"T": "v"}});
+        // What `claude mcp add-json` stores for it: `args: []` added.
+        let stored =
+            serde_json::json!({"type": "stdio", "command": "npx", "args": [], "env": {"T": "v"}});
         let edited = serde_json::json!({"command": "mine"});
-        let (h_desired, h_older) = (config_hash(&desired), config_hash(&older));
+        let rec = McpRecord {
+            desired: config_hash(&desired),
+            stored: config_hash(&stored),
+        };
         assert_eq!(plan_mcp(None, None, &desired), McpPlan::Add);
         assert_eq!(
-            plan_mcp(Some(&desired), Some(&h_desired), &desired),
-            McpPlan::UpToDate
+            plan_mcp(Some(&stored), Some(&rec), &desired),
+            McpPlan::UpToDate,
+            "what the CLI normalised is not a change"
         );
+        let newer = serde_json::json!({"type": "stdio", "command": "npx", "env": {"T": "w"}});
         assert_eq!(
-            plan_mcp(Some(&older), Some(&h_older), &desired),
+            plan_mcp(Some(&stored), Some(&rec), &newer),
             McpPlan::Replace,
-            "the kit's own older config is replaced"
+            "the kit's own config changed"
         );
         assert_eq!(
-            plan_mcp(Some(&edited), Some(&h_older), &desired),
+            plan_mcp(Some(&edited), Some(&rec), &desired),
             McpPlan::Edited,
             "a config changed on the machine since the kit added it is the owner's"
         );
         assert_eq!(
-            plan_mcp(Some(&desired), None, &desired),
-            McpPlan::OwnIdentical
+            plan_mcp(Some(&stored), None, &desired),
+            McpPlan::OwnIdentical,
+            "the owner's own copy, as the CLI keeps it, is identical"
         );
         assert_eq!(plan_mcp(Some(&edited), None, &desired), McpPlan::Conflict);
     }
 
     #[test]
-    fn mcp_secrets_are_found_for_redaction() {
+    fn only_secrets_are_scrubbed_from_transcripts() {
         let servers: serde_json::Map<String, Value> = serde_json::from_str(
-            r#"{"a":{"command":"x","env":{"K":"secret-1"}},"b":{"url":"u","headers":{"Authorization":"Bearer abcdef"}},"c":{"command":"y"}}"#,
+            r#"{"a":{"command":"x","env":{"API_KEY":"secret-1","MODE":"production","LONG":"abcdefghijkl"}},"b":{"url":"u","headers":{"Authorization":"Bearer abcdef"}},"c":{"command":"y","args":["--api-key","k-123456","postgres://u:pw-123@db/x"]}}"#,
         )
         .unwrap();
         let mut v = mcp_secret_values(&servers);
         v.sort();
-        assert_eq!(v, ["Bearer abcdef", "secret-1"]);
-        let flags: serde_json::Map<String, Value> =
-            serde_json::from_str(r#"{"a":{"command":"x","args":["--api-key","k-123456"]}}"#)
-                .unwrap();
-        assert_eq!(mcp_secret_values(&flags), ["k-123456"]);
+        assert_eq!(
+            v,
+            [
+                "Bearer abcdef",
+                "abcdefghijkl",
+                "k-123456",
+                "secret-1",
+                "u:pw-123"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unreadable_config_is_never_taken_for_an_empty_one() {
+        let root = temp("unreadable");
+        let paths = KitPaths::at(root.join("cfg"));
+        std::fs::create_dir_all(&paths.config_dir).unwrap();
+        assert!(
+            user_mcp(&paths.claude_json).unwrap().is_empty(),
+            "absent: empty"
+        );
+        std::fs::write(&paths.claude_json, r#"{"mcpServers": {"a": "#).unwrap();
+        assert!(
+            user_mcp(&paths.claude_json).is_err(),
+            "half written: an error"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

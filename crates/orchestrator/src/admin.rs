@@ -366,6 +366,22 @@ fn merge_claude_flags(
 }
 // ---------------------------------------------------------------- lookups
 
+/// The kit's secret folder holds the owner's MCP secrets for every machine, and the kit is the
+/// owner's alone (`kit.rs`): the brain may not propose binding it to a project (its values would
+/// reach that project's agents), unsetting a key in it or deleting it.
+async fn guard_kit_folder(o: &Orchestrator, id: i64) -> Result<()> {
+    let preset: Option<String> =
+        sqlx::query_scalar("select preset from secret_folders where id = $1")
+            .bind(id)
+            .fetch_optional(&o.db)
+            .await?;
+    ensure!(
+        preset.as_deref() != Some(crate::kit::KIT_PRESET),
+        "that is the kit's secret folder, which only the owner changes, on the web"
+    );
+    Ok(())
+}
+
 async fn folder(o: &Orchestrator, r: &Ref) -> Result<(i64, String)> {
     let row: Option<(i64, String)> = match r {
         Ref::Id(id) => {
@@ -1353,6 +1369,7 @@ pub async fn prepare(o: &Orchestrator, action: AdminAction) -> Result<(AdminActi
                 ids.dedup();
                 let mut names = Vec::new();
                 for id in &ids {
+                    guard_kit_folder(o, *id).await?;
                     let (_, name) = folder(o, &Ref::Id(*id)).await?;
                     names.push(format!("#{id} {}", q(&name)));
                 }
@@ -1406,6 +1423,7 @@ pub async fn prepare(o: &Orchestrator, action: AdminAction) -> Result<(AdminActi
             let p = tasks::project(o, &project).await?;
             guard_brain_secrets(o, Actor::Brain, &p.slug)?;
             let (id, name) = folder(o, &f).await?;
+            guard_kit_folder(o, id).await?;
             ensure!(
                 !folder_bound(o, &p.slug, id).await?,
                 "folder {name} is already bound to {}",
@@ -1941,6 +1959,7 @@ pub async fn prepare(o: &Orchestrator, action: AdminAction) -> Result<(AdminActi
         }
         A::FolderDelete { folder: f } => {
             let (id, name) = folder(o, &f).await?;
+            guard_kit_folder(o, id).await?;
             let keys = folder_keys(o, id).await?;
             let projects: Vec<String> = sqlx::query_scalar(
                 "select project from project_secrets where folder_id = $1 order by project",
@@ -1967,6 +1986,7 @@ pub async fn prepare(o: &Orchestrator, action: AdminAction) -> Result<(AdminActi
         }
         A::SecretUnset { folder: f, key } => {
             let (id, name) = folder(o, &f).await?;
+            guard_kit_folder(o, id).await?;
             let key = key.trim().to_owned();
             ensure!(
                 folder_keys(o, id).await?.contains(&key),

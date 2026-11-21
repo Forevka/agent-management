@@ -35,7 +35,7 @@ const MAX_LINE: usize = 512 * 1024;
 /// for hours, so the agent's MCP client must wait far longer (one week, in ms).
 const MCP_TOOL_TIMEOUT_MS: &str = "604800000";
 /// Claude loads only the servers of `--mcp-config` (see [`build_args`]).
-const STRICT_MCP: &str = "--strict-mcp-config";
+pub(crate) const STRICT_MCP: &str = "--strict-mcp-config";
 /// After a graceful stop, how long Claude may take to finish its turn before it is killed.
 const GRACEFUL_STOP_LIMIT: Duration = Duration::from_secs(600);
 
@@ -259,15 +259,25 @@ pub fn start(
     } else {
         project_dir.clone()
     };
+    let mut args = build_args(
+        &spawn,
+        base_args,
+        &mcp_path,
+        &plugin_dir,
+        system_path.as_deref(),
+    );
+    // A claude CLI too old for `--strict-mcp-config` would refuse every run with it. The node
+    // leaves out the flag it adds itself (a spawn that asks for it, the secretary's, keeps it:
+    // that session must not start wider than it is meant to), and the kit's status says the
+    // allowlist is not enforced on this node.
+    if !node.strict_mcp_supported(&settings.claude_command)
+        && !spawn.extra_args.iter().any(|a| a == STRICT_MCP)
+    {
+        args.retain(|a| a != STRICT_MCP);
+    }
     let mut cmd = Command::new(&program);
     cmd.args(base_args)
-        .args(build_args(
-            &spawn,
-            base_args,
-            &mcp_path,
-            &plugin_dir,
-            system_path.as_deref(),
-        ))
+        .args(args)
         .env("PATH", std::env::join_paths(path)?)
         .env("FLEET_IPC_ADDR", ipc_addr.to_string())
         .env("FLEET_IPC_TOKEN", &ipc_token)
@@ -457,7 +467,7 @@ pub fn start(
 }
 
 /// Everything an agent process started, so a stop can end all of it.
-struct ProcessTree {
+pub(crate) struct ProcessTree {
     #[cfg(unix)]
     pgid: Option<i32>,
     #[cfg(windows)]
@@ -465,7 +475,7 @@ struct ProcessTree {
 }
 
 impl ProcessTree {
-    fn adopt(child: &tokio::process::Child) -> Self {
+    pub(crate) fn adopt(child: &tokio::process::Child) -> Self {
         #[cfg(unix)]
         {
             Self {
@@ -491,7 +501,7 @@ impl ProcessTree {
         }
     }
 
-    async fn kill(&self, child: &mut tokio::process::Child) {
+    pub(crate) async fn kill(&self, child: &mut tokio::process::Child) {
         #[cfg(unix)]
         if let Some(pgid) = self.pgid {
             // SAFETY: killpg only sends a signal; the group was created for this child.

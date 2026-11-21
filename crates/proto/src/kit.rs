@@ -195,8 +195,10 @@ pub struct Parts {
 
 impl Parts {
     /// Takes one part. Returns the whole content once the `last` part of an unbroken sequence
-    /// is in. A part 0 starts a new sequence; a part out of order (a gap: the sender restarted
-    /// mid-way) drops what was collected, and the sender's next sequence replaces it.
+    /// is in. A part 0 starts a new sequence. A part of another id (a stale sequence the sender
+    /// gave up on) is ignored, and the sequence in progress goes on. A gap within the current
+    /// sequence (the sender restarted mid-way) drops what was collected; the sender's next
+    /// sequence replaces it.
     pub fn add(
         &mut self,
         id: &str,
@@ -208,9 +210,11 @@ impl Parts {
             self.id = Some(id.to_owned());
             self.next = 0;
             self.content = KitContent::default();
-        }
-        if self.id.as_deref() != Some(id) || part != self.next {
+        } else if self.id.as_deref() != Some(id) {
+            return None;
+        } else if part != self.next {
             self.id = None;
+            self.content = KitContent::default();
             return None;
         }
         self.content.extend(content);
@@ -223,13 +227,28 @@ impl Parts {
     }
 }
 
+/// Whether a message fits one frame. Kit messages are checked before they are queued: a frame
+/// the link cannot send would sit in the outbox for ever, and everything after it with it.
+pub fn fits(body: &crate::Body) -> bool {
+    crate::Envelope {
+        seq: u64::MAX,
+        ack: u64::MAX,
+        body: body.clone(),
+    }
+    .encode()
+    .is_ok()
+}
+
 /// Whether `name` can be a skill, plugin, marketplace or MCP server name in the kit: what the
 /// node turns into a directory name or passes to the CLI must not be able to point anywhere
-/// else. Letters, digits, `-`, `_`, `.` (not first), at most 100 characters.
+/// else. Letters, digits, `-`, `_`, `.` (not first or last), at most 100 characters, and not a
+/// name Windows opens as a device.
 pub fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 100
         && !name.starts_with('.')
+        && !name.ends_with('.')
+        && !windows_device(name)
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
@@ -271,25 +290,30 @@ fn windows_device(component: &str) -> bool {
             && stem.as_bytes()[3].is_ascii_digit())
 }
 
-/// Whether a skill's file is, by its name, where a secret lives (`.env`, a key, credentials).
-/// Such a file is never taken into the kit: its content would sit in the database and go to
-/// every machine, outside the vault.
+/// Whether a skill's file is, by its name, where a secret lives (`.env`, a key, credentials, a
+/// package registry's login). Such a file is never taken into the kit: its content would sit in
+/// the database and go to every machine, outside the vault.
 pub fn secret_file(path: &str) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
     name == ".env"
         || name.starts_with(".env.")
         || name.ends_with(".env")
+        || name.contains("secret")
+        || name.contains("token")
         || name.starts_with("credentials")
+        || name.starts_with("service-account")
         || name.starts_with("id_rsa")
         || name.starts_with("id_ed25519")
         || name.starts_with("id_ecdsa")
-        || [".pem", ".key", ".p12", ".pfx", ".keystore", ".jks"]
+        || matches!(name.as_str(), ".netrc" | "_netrc" | ".npmrc" | ".pypirc")
+        || [".pem", ".key", ".p12", ".pfx", ".ppk", ".keystore", ".jks"]
             .iter()
             .any(|ext| name.ends_with(ext))
 }
 
-/// Whether a flag or query parameter name says its value is a secret (`--api-key`, `token`).
-fn sensitive_name(name: &str) -> bool {
+/// Whether a variable, flag or parameter name says its value is a secret (`--api-key`, `token`,
+/// `DB_PASSWORD`).
+pub fn sensitive_name(name: &str) -> bool {
     let n = name.trim_start_matches('-').to_ascii_lowercase();
     [
         "token",
@@ -297,94 +321,168 @@ fn sensitive_name(name: &str) -> bool {
         "secret",
         "password",
         "passwd",
+        "pwd",
         "auth",
         "credential",
         "bearer",
+        "cookie",
+        "session",
+        "dsn",
     ]
     .iter()
     .any(|w| n.contains(w))
 }
 
-/// Where an MCP server's config holds a secret: every `env` and `headers` value, a URL query
-/// parameter or an `args` flag whose name says so (`?api_key=…`, `--token=…`, `--token …`).
+/// The `user:password` of a `scheme://user:password@host` in `s`, if it has one with a password.
+fn userinfo(s: &str) -> Option<&str> {
+    let start = s.find("://")? + 3;
+    let rest = &s[start..];
+    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+    let info = &authority[..authority.rfind('@')?];
+    (info.contains(':') && !info.contains("${secret:")).then_some(info)
+}
+
+/// Whether `s` carries a password in a `scheme://user:password@host`.
+pub fn has_credentials(s: &str) -> bool {
+    userinfo(s).is_some()
+}
+
+/// `NAME=value` where `NAME` reads as a variable name and says it is a secret.
+fn named_secret(s: &str) -> Option<(&str, &str)> {
+    let (name, value) = s.split_once('=')?;
+    let is_name = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
+    (is_name && sensitive_name(name) && !value.is_empty()).then_some((name, value))
+}
+
+/// Where an MCP server's config holds a secret:
+///
+/// - every `env` and `headers` value;
+/// - in `url`: a `user:password@`, and every query value;
+/// - in `args`: a `user:password@` in any argument (a database DSN), `NAME=value` with a secret
+///   name (also as docker's `-e NAME=value` or `--env=NAME=value`), and a flag named like a secret
+///   with its value (`--token=…`, `--api-key …`).
+///
 /// Both sides use it: the orchestrator to move each one into the vault, the node to scrub the
 /// resolved values from transcripts.
 pub fn secret_spots(config: &serde_json::Value) -> Vec<SecretSpot> {
     use serde_json::Value;
     let mut out = Vec::new();
-    for section in ["env", "headers"] {
+    let spot = |at: SpotAt, name: &str, prefix: &str, value: &str, suffix: &str| SecretSpot {
+        at,
+        name: name.to_owned(),
+        prefix: prefix.to_owned(),
+        value: value.to_owned(),
+        suffix: suffix.to_owned(),
+    };
+    for (section, kind) in [("env", SpotAt::Env), ("headers", SpotAt::Header)] {
         if let Some(Value::Object(m)) = config.get(section) {
             for (k, v) in m {
                 if let Value::String(s) = v {
-                    out.push(SecretSpot {
-                        at: SpotAt::Field(section, k.clone()),
-                        name: k.clone(),
-                        value: s.clone(),
-                    });
+                    out.push(spot(kind.clone(), k, "", s, ""));
                 }
             }
         }
     }
-    if let Some(Value::String(url)) = config.get("url")
-        && let Some((_, query)) = url.split_once('?')
-    {
-        for pair in query.split('&') {
-            if let Some((k, v)) = pair.split_once('=')
-                && sensitive_name(k)
-                && !v.is_empty()
-            {
-                out.push(SecretSpot {
-                    at: SpotAt::Url,
-                    name: k.to_owned(),
-                    value: v.split('#').next().unwrap_or(v).to_owned(),
-                });
+    if let Some(Value::String(url)) = config.get("url") {
+        if let Some(info) = userinfo(url) {
+            out.push(spot(SpotAt::Url, "url_userinfo", "//", info, "@"));
+        }
+        if let Some((_, query)) = url.split_once('?') {
+            let query = query.split('#').next().unwrap_or(query);
+            for pair in query.split('&') {
+                if let Some((k, v)) = pair.split_once('=')
+                    && !v.is_empty()
+                {
+                    out.push(spot(SpotAt::Url, k, &format!("{k}="), v, ""));
+                }
             }
         }
     }
     if let Some(Value::Array(args)) = config.get("args") {
+        let mut taken_next = false;
         for (i, a) in args.iter().enumerate() {
             let Some(a) = a.as_str() else { continue };
-            if !a.starts_with('-') {
+            if std::mem::take(&mut taken_next) {
                 continue;
             }
-            if let Some((flag, v)) = a.split_once('=') {
-                if sensitive_name(flag) && !v.is_empty() {
-                    out.push(SecretSpot {
-                        at: SpotAt::Arg(i),
-                        name: flag.trim_start_matches('-').to_owned(),
-                        value: v.to_owned(),
-                    });
+            let before = out.len();
+            if a.starts_with('-') {
+                let flag = a;
+                match flag.split_once('=') {
+                    Some((f, v)) if sensitive_name(f) && !v.is_empty() => {
+                        out.push(spot(
+                            SpotAt::Arg(i),
+                            f.trim_start_matches('-'),
+                            &format!("{f}="),
+                            v,
+                            "",
+                        ));
+                    }
+                    // `--env=NAME=value`
+                    Some((f, v)) => {
+                        if let Some((n, value)) = named_secret(v) {
+                            out.push(spot(SpotAt::Arg(i), n, &format!("{f}={n}="), value, ""));
+                        }
+                    }
+                    None if sensitive_name(flag) => {
+                        if let Some(Value::String(v)) = args.get(i + 1)
+                            && !v.starts_with('-')
+                            && !v.is_empty()
+                        {
+                            out.push(spot(
+                                SpotAt::Arg(i + 1),
+                                flag.trim_start_matches('-'),
+                                "",
+                                v,
+                                "",
+                            ));
+                            taken_next = true;
+                        }
+                    }
+                    None => {}
                 }
-            } else if sensitive_name(a)
-                && let Some(Value::String(v)) = args.get(i + 1)
-                && !v.starts_with('-')
-                && !v.is_empty()
+            } else if let Some((n, value)) = named_secret(a) {
+                out.push(spot(SpotAt::Arg(i), n, &format!("{n}="), value, ""));
+            }
+            // A DSN's password, where nothing above took the whole value already.
+            if out.len() == before
+                && let Some(info) = userinfo(a)
             {
-                out.push(SecretSpot {
-                    at: SpotAt::Arg(i + 1),
-                    name: a.trim_start_matches('-').to_owned(),
-                    value: v.clone(),
-                });
+                out.push(spot(
+                    SpotAt::Arg(i),
+                    &format!("arg{i}_userinfo"),
+                    "//",
+                    info,
+                    "@",
+                ));
             }
         }
     }
     out
 }
 
-/// One place [`secret_spots`] found a secret.
+/// One place [`secret_spots`] found a secret: `value` stands between `prefix` and `suffix` in
+/// the string at `at`, and a placeholder takes its place there.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SecretSpot {
     pub at: SpotAt,
     /// The env var, header, parameter or flag it belongs to.
     pub name: String,
-    /// The secret itself (within the string it is part of, for a URL or a `--flag=value`).
+    pub prefix: String,
+    /// The secret itself.
     pub value: String,
+    pub suffix: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SpotAt {
-    /// `config[section][key]`, the whole string.
-    Field(&'static str, String),
+    /// `config.env[name]`, the whole string.
+    Env,
+    /// `config.headers[name]`, the whole string.
+    Header,
     /// Inside `config.url`.
     Url,
     /// Inside `config.args[i]`.
@@ -470,18 +568,35 @@ mod tests {
             None,
             "a stale part is ignored"
         );
+        let mut both = c("b0");
+        both.extend(c("b1"));
         assert_eq!(
-            rx.add("b", 2, true, c("b2")),
+            rx.add("b", 1, true, c("b1")),
+            Some(both),
+            "and the sequence in progress goes on"
+        );
+        // A gap within the current sequence drops it; the next sequence starts afresh.
+        assert_eq!(rx.add("d", 0, false, c("d0")), None);
+        assert_eq!(
+            rx.add("d", 2, true, c("d2")),
             None,
             "a gap drops the sequence"
         );
-        assert_eq!(rx.add("c", 0, true, c("c0")), Some(c("c0")));
+        assert_eq!(
+            rx.add("d", 1, true, c("d1")),
+            None,
+            "nothing is left to finish"
+        );
+        assert_eq!(rx.add("e", 0, true, c("e0")), Some(c("e0")));
     }
 
     #[test]
     fn names_and_paths_cannot_point_outside_their_place() {
-        for ok in ["fleet", "my-skill", "a_b.c", "pdf"] {
+        for ok in ["fleet", "my-skill", "a_b.c", "pdf", "console", "com10"] {
             assert!(valid_name(ok), "{ok}");
+        }
+        for bad in ["NUL", "con", "aux.md", "COM1", "lpt9", "trailing."] {
+            assert!(!valid_name(bad), "{bad}");
         }
         for bad in [
             "",
@@ -526,6 +641,13 @@ mod tests {
             "ref/server.key",
             "credentials.json",
             "id_rsa",
+            "my-secrets.md",
+            "api_token.txt",
+            ".netrc",
+            ".npmrc",
+            ".pypirc",
+            "putty.ppk",
+            "service-account-prod.json",
         ] {
             assert!(secret_file(secret), "{secret}");
         }
@@ -537,14 +659,54 @@ mod tests {
     #[test]
     fn secrets_are_found_in_env_headers_urls_and_flags() {
         let config = serde_json::json!({
-            "command": "npx",
-            "args": ["-y", "server", "--api-key", "k-1", "--token=t-2", "--verbose", "--port", "80"],
-            "url": "https://h/mcp?team=a&access_token=q-3#x",
+            "command": "docker",
+            "args": [
+                "run", "-y", "server", "--api-key", "k-1", "--token=t-2", "--verbose", "--port", "80",
+                "postgresql://dbuser:p-6@db.local:5432/app",
+                "-e", "GITHUB_TOKEN=g-7",
+                "--env=SLACK_BOT_TOKEN=s-8",
+                "API_SECRET=a-9",
+                "MODE=fast",
+            ],
+            "url": "https://u:w-10@h/mcp?team=a&access_token=q-3#frag",
             "env": {"A": "e-4"},
             "headers": {"Authorization": "Bearer h-5"},
         });
-        let mut values: Vec<String> = secret_spots(&config).into_iter().map(|s| s.value).collect();
+        let spots = secret_spots(&config);
+        let mut values: Vec<&str> = spots.iter().map(|s| s.value.as_str()).collect();
         values.sort();
-        assert_eq!(values, ["Bearer h-5", "e-4", "k-1", "q-3", "t-2"]);
+        assert_eq!(
+            values,
+            [
+                "Bearer h-5",
+                "a",
+                "a-9",
+                "dbuser:p-6",
+                "e-4",
+                "g-7",
+                "k-1",
+                "q-3",
+                "s-8",
+                "t-2",
+                "u:w-10"
+            ],
+            "every query value counts, `team=a` included"
+        );
+        // Each sits exactly between its prefix and suffix in its string.
+        for s in &spots {
+            let text = match &s.at {
+                SpotAt::Env => config["env"][&s.name].as_str().unwrap().to_owned(),
+                SpotAt::Header => config["headers"][&s.name].as_str().unwrap().to_owned(),
+                SpotAt::Url => config["url"].as_str().unwrap().to_owned(),
+                SpotAt::Arg(i) => config["args"][*i].as_str().unwrap().to_owned(),
+            };
+            assert!(
+                text.contains(&format!("{}{}{}", s.prefix, s.value, s.suffix)),
+                "{s:?} in {text}"
+            );
+        }
+        // A username alone, or a host, is not a secret.
+        let plain = serde_json::json!({"args": ["ssh://git@github.com/o/r", "https://h/x"]});
+        assert!(secret_spots(&plain).is_empty());
     }
 }
