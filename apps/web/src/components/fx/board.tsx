@@ -200,6 +200,16 @@ const css = /* css */ `
    of the window, which is the loudest thing on a quiet page. */
 .fx-board::-webkit-scrollbar {
   height: 10px;
+  width: 10px;
+}
+
+/* On a page that fills the panel the board takes the room under the header and scrolls inside it,
+   both ways, so its horizontal scrollbar sits at the bottom of the window rather than under the
+   shortest column. (No backticks in here: this block is a JS template literal.) */
+.fx-page[data-fill] > .fx-board {
+  flex: 1 1 0;
+  min-height: 0;
+  overflow: auto;
 }
 
 .fx-board::-webkit-scrollbar-track {

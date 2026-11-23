@@ -182,13 +182,19 @@ export function Section({ title, description, action, children, className }: Sec
  * The page frame: one place decides the width and the rhythm, so every page agrees. A `div`: the
  * app shell's panel around it is the page's one `<main>`.
  */
-export function Page({ children, className }: { children?: ReactNode; className?: string }) {
+/**
+ * `fill`: the page is exactly as tall as the panel it sits in, so a last child that grows into the
+ * room left (the board) keeps its own scrollbars at the panel's bottom edge.
+ */
+export function Page({ children, className, fill }: { children?: ReactNode; className?: string; fill?: boolean }) {
   return (
     <>
       <style href="fx-layout" precedence="default">
         {css}
       </style>
-      <div className={join('fx-page', className)}>{children}</div>
+      <div className={join('fx-page', className)} data-fill={fill || undefined}>
+        {children}
+      </div>
     </>
   )
 }
@@ -324,6 +330,10 @@ const css = /* css */ `
   display: flex;
   flex-direction: column;
   gap: 28px;
+}
+.fx-page[data-fill] {
+  height: 100%;
+  padding-bottom: 12px;
 }
 @media (max-width: 640px) {
   .fx-page {

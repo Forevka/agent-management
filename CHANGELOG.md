@@ -7,6 +7,12 @@ below is one release. How to add to this file is in `CLAUDE.md`
 
 ## Unreleased
 
+- **The board's horizontal scrollbar is at the bottom of the window**, not under the shortest
+  column: the board fills the room under its header and scrolls inside it, so the bar is always
+  in reach, with or without a task open beside it.
+
+## v0.2.18 — 2026-11-23
+
 - **A task opens beside the page you are on.** Clicking a task anywhere (a board card, a list row,
   a project's folder in the sidebar, ⌘K, the inbox, the retro, a node) opens it in a panel on the
   right instead of leaving the page: where it stands, what it waits on you for, its checklist, what

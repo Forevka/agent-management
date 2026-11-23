@@ -94,7 +94,7 @@ export default function BoardPage() {
   const state = useApi<{ tasks: BoardTask[] }>('/api/board', 10_000)
   const peek = useTaskPeek()
   return (
-    <Page>
+    <Page fill={view === 'board'}>
       <PageHeader
         title="Board"
         description="Every task the fleet has in hand, in the state it is actually in."
