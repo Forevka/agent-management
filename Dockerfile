@@ -19,7 +19,11 @@ WORKDIR /web
 COPY apps/web/package.json apps/web/package-lock.json ./
 RUN npm ci --no-audit --no-fund
 COPY apps/web/ ./
-RUN npm run build
+# affectUI Pro is fetched here from its registry with the owner's access key, passed as the build
+# secret `affectui` (`docker build --secret id=affectui,src=<file>`), so the key is in no layer. It
+# is never committed: the repository is public (see apps/web/DESIGN.md). Its source is deleted in
+# the same step, so no layer (nor the build cache CI exports) holds it either; only dist/ is used.
+RUN --mount=type=secret,id=affectui npm run build && rm -rf /root/.cache/affectui node_modules/.affectui
 
 # ---- build ------------------------------------------------------------------
 # The builder and the runtime must be the same Debian release, so the binary

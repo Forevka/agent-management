@@ -79,8 +79,15 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: apps/web/package-lock.json
+      # affectUI Pro, fetched at build time with the owner's key (see apps/web/DESIGN.md).
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/affectui
+          key: affectui-${{ hashFiles('apps/web/affectui.lock.json') }}
       - name: Build the web UI
         working-directory: apps/web
+        env:
+          AFFECTUI_TOKEN: ${{ secrets.AFFECTUI_TOKEN }}
         run: npm ci && npm run build
       - name: Build
         run: cargo build --release --locked --package fleet --bin fleet
@@ -123,9 +130,16 @@ jobs:
           cache-dependency-path: |
             apps/web/package-lock.json
             apps/tray/package-lock.json
+      # affectUI Pro, fetched at build time with the owner's key (see apps/web/DESIGN.md).
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/affectui
+          key: affectui-${{ hashFiles('apps/web/affectui.lock.json') }}
       # Embedded into fleet.exe, so it comes before the cargo build.
       - name: Build the web UI
         working-directory: apps/web
+        env:
+          AFFECTUI_TOKEN: ${{ secrets.AFFECTUI_TOKEN }}
         run: npm ci && npm run build
       - name: Build
         run: cargo build --release --locked --package fleet --bin fleet --target x86_64-pc-windows-msvc
@@ -227,6 +241,9 @@ jobs:
           platforms: linux/amd64
           build-args: |
             FLEET_VERSION=${{ github.ref_name }}
+          # The web stage fetches affectUI Pro with it (a build secret: never in a layer).
+          secrets: |
+            affectui=${{ secrets.AFFECTUI_TOKEN }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

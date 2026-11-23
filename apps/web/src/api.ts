@@ -218,6 +218,8 @@ export type Overview = {
   projects: { slug: string; name: string; open: number; running: number; total: number }[]
   todos_open: number
   sessions_today: number
+  /** This orchestrator's release (`v0.2.17`; `0.1.0-dev` for a hand build). */
+  release?: string
 }
 
 /// A project as the detail endpoint describes it, where `jira` is the full mapping.

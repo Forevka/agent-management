@@ -71,9 +71,23 @@ jobs:
       - name: Install
         working-directory: apps/web
         run: npm ci
+      # affectUI Pro is fetched at build time and never committed (the repo is public; see
+      # apps/web/DESIGN.md). The cache keeps the registry's files per lock, so a build with an
+      # unchanged lock needs neither the network nor the key. Pushes only: a pull request's
+      # workflow could restore the cache (Pro source, no key needed) and print it.
+      - if: github.event_name == 'push'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/affectui
+          key: affectui-${{ hashFiles('apps/web/affectui.lock.json') }}
       - name: Typecheck and build
         working-directory: apps/web
+        env:
+          AFFECTUI_TOKEN: ${{ secrets.AFFECTUI_TOKEN }}
         run: npm run build
+      - name: No affectUI Pro source is committed
+        working-directory: apps/web
+        run: npm run aui:check
 
   test-linux:
     name: test (linux, postgres)

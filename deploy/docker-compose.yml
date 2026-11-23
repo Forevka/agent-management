@@ -95,6 +95,10 @@ services:
     build:
       context: ..
       dockerfile: Dockerfile
+      # The web UI fetches affectUI Pro with the owner's access key while it builds
+      # (deploy/README.md §8): a build secret, so it is in no image layer.
+      secrets:
+        - affectui
     # `docker compose up --build` tags the local build with this name. To run a
     # released image instead, set FLEET_IMAGE=ghcr.io/<owner>/fleet:<version>
     # and use `docker compose pull orchestrator && docker compose up -d`.
@@ -185,6 +189,11 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
+
+secrets:
+  # One line: the affectUI access key. Root-only (chmod 600), never committed.
+  affectui:
+    file: ./affectui.token
 
 volumes:
   postgres_data:

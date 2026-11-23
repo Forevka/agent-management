@@ -7,6 +7,29 @@ below is one release. How to add to this file is in `CLAUDE.md`
 
 ## Unreleased
 
+- **The web UI has a left sidebar instead of the top bar, and every project is a folder in it.**
+  The frame is affectUI's App Shell (the fleet now owns affectUI Pro): the pages on the left
+  (Board and Inbox with what waits on you, Tasks, Sessions, People, Retro), then **Projects**,
+  each a folder with its open-task count; opening a project lists its live tasks under it. The
+  fleet's administration (Agents, Nodes, Kit, Secrets, Habits) moved to **Settings**, a second face
+  of the sidebar with a way back. **⌘K** (or the search field) finds any page, project or open task.
+  Light, dark and system are under the account menu at the bottom (Appearance). Every URL is
+  unchanged. On a phone the sidebar is a drawer.
+- **Building the web UI now needs the affectUI access key**, because Pro source is fetched at build
+  time and never committed (the repository is public). **Before merging this, a person must:**
+  1. set the repository secret: `gh secret set AFFECTUI_TOKEN`;
+  2. put the key in `/opt/fleet/deploy/affectui.token` on the VPS (root-only, `deploy/README.md` §8);
+  3. **install this release's updater before it tries to deploy** — the installed one would build
+     without the key, fail and mark the release failed:
+     `git -C /opt/fleet fetch -q origin && git -C /opt/fleet show origin/<branch>:deploy/update/fleet-update.sh | install -m 0755 /dev/stdin /usr/local/sbin/fleet-update`.
+     The new updater hands the key to the image build, and while the file is missing it waits and
+     says so once, without marking the release failed.
+
+  A developer builds with `AFFECTUI_TOKEN` in the environment once (the files are then cached in
+  `~/.cache/affectui`); `fleet-src` agents get it from a secret folder.
+
+## v0.2.16 — 2026-11-21
+
 - **What an agent notes in Claude Code's own memory now reaches the fleet's memory.** Claude
   keeps notes for itself between sessions (the owner's rules, a project's gotchas), and the
   fleet's sessions were already writing them — the brain eight of the owner's rules — but they

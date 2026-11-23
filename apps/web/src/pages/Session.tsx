@@ -139,13 +139,17 @@ function SessionView({ id }: { id: string }) {
 
   const entries = useMemo(() => buildEntries(lines ?? []), [lines])
 
-  // Follow the bottom while the reader is there.
+  // Follow the bottom while the reader is there. The page scrolls inside the app shell's panel,
+  // not the window, and scroll events do not bubble: so listen in the capture phase and look at
+  // whichever scroller holds the transcript.
   useEffect(() => {
-    const onScroll = () => {
-      stick.current = window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - STICK_PX
+    const onScroll = (e: Event) => {
+      const el = e.target
+      if (!(el instanceof HTMLElement) || !bottom.current || !el.contains(bottom.current)) return
+      stick.current = el.scrollTop + el.clientHeight >= el.scrollHeight - STICK_PX
     }
-    window.addEventListener('scroll', onScroll, { passive: true })
-    return () => window.removeEventListener('scroll', onScroll)
+    document.addEventListener('scroll', onScroll, { capture: true, passive: true })
+    return () => document.removeEventListener('scroll', onScroll, { capture: true })
   }, [])
   useLayoutEffect(() => {
     if (stick.current) bottom.current?.scrollIntoView({ block: 'end' })
@@ -383,7 +387,8 @@ const pageCss = /* css */ `
   gap: 6px;
   margin: 0 -4px;
   padding: 12px 4px 16px;
-  background: var(--fx-page, #fafafa);
+  /* The page panel of the app shell is the surface colour, so the composer is too. */
+  background: var(--aui-surface, #fff);
   border-top: 1px solid var(--aui-border, #e5e5e5);
 }
 .fx-sessionpage__item {

@@ -277,6 +277,8 @@ async fn overview(State(o): State<O>, h: HeaderMap) -> Api {
         })).collect::<Vec<_>>(),
         "todos_open": todos,
         "sessions_today": sessions_today,
+        // What the web UI's sidebar says it runs: this orchestrator's release.
+        "release": fleet_proto::BUILD_VERSION,
     })))
 }
 

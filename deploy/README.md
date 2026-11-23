@@ -612,6 +612,22 @@ systemctl daemon-reload && systemctl enable --now fleet-update.timer
 systemctl start fleet-update        # one run now; then `journalctl -u fleet-update`
 ```
 
+**The affectUI access key.** The web UI is built on affectUI Pro, which is fetched from its
+registry while the image builds and never committed (the repository is public; see
+`apps/web/DESIGN.md`). The build reads the key from a root-only file next to `.env`, handed to
+Docker as a build secret, so it ends up in no image layer (and the Pro source is deleted in the
+same build step). While the file is missing the updater deploys nothing and says so once — the
+release is not marked failed, and goes out within five minutes of the file appearing — and
+`docker compose build` fails:
+
+```sh
+install -m 0600 /dev/null /opt/fleet/deploy/affectui.token
+printf '%s\n' 'aui_…' > /opt/fleet/deploy/affectui.token   # the key from affectui.com/account/downloads
+```
+
+CI and the release workflow read the same key from the repository secret `AFFECTUI_TOKEN`
+(`gh secret set AFFECTUI_TOKEN`), and a developer builds with it in the environment.
+
 ### By hand
 
 **The stack** — from `main`. Deploy only what CI called green, and prefer letting the

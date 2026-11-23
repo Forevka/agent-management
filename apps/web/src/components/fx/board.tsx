@@ -1,4 +1,3 @@
-import { useEffect } from 'react'
 import type { ReactNode } from 'react'
 import { Link } from 'react-router-dom'
 
@@ -17,19 +16,6 @@ import { Link } from 'react-router-dom'
 export type BoardTone = 'default' | 'info' | 'success' | 'warning' | 'danger'
 
 export function Board({ children }: { children: ReactNode }) {
-  // The board breaks out of the page's reading column to the width of the window, which in CSS
-  // means `100vw` — and `100vw` counts the scrollbar gutter that `html` keeps reserved, so using
-  // it raw would push the page sideways by that much. The gutter is the only thing CSS cannot
-  // tell us, so it is measured once and published as a variable.
-  useEffect(() => {
-    const measure = () => {
-      const sb = window.innerWidth - document.documentElement.clientWidth
-      document.documentElement.style.setProperty('--fx-sb', `${Math.max(0, sb)}px`)
-    }
-    measure()
-    window.addEventListener('resize', measure)
-    return () => window.removeEventListener('resize', measure)
-  }, [])
   return (
     <>
       <style href="fx-board" precedence="default">
@@ -191,13 +177,15 @@ const css = /* css */ `
   gap: 16px;
   align-items: flex-start;
   overflow-x: auto;
-  /* A board wants the window, not the page's reading column: seven states side by side do not
-     fit in 1200px, and a column half-hidden behind the fold is a column nobody reads. So it
-     breaks out to the full width and scrolls from there, keeping a gutter of its own.
+  /* A board wants the whole page panel, not the page's reading column: seven states side by side
+     do not fit in 1200px, and a column half-hidden behind the fold is a column nobody reads. So it
+     breaks out to the panel's full width and scrolls from there, keeping a gutter of its own. The
+     panel (the app shell's main area) is a size container, so cqw is its width, scrollbar
+     excluded; outside one, cqw falls back to the window, like vw.
      (No backticks in here: this block is a JS template literal.) */
-  width: calc(100vw - var(--fx-sb, 0px));
-  max-width: calc(100vw - var(--fx-sb, 0px));
-  margin-inline: calc(50% - 50vw + var(--fx-sb, 0px) / 2);
+  width: 100cqw;
+  max-width: 100cqw;
+  margin-inline: calc(50% - 50cqw);
   padding: 2px var(--fx-board-gutter) 14px;
   scrollbar-width: thin;
   scrollbar-color: var(--aui-border-strong, #d4d4d8) transparent;

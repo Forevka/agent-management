@@ -19,3 +19,7 @@ apps/web/dist/
 # A local code index (12 MB, rebuilt with `codegraph init`). Derived from the source, so it is
 # per-machine and goes stale the moment anyone commits.
 .codegraph/
+
+# The affectUI access key, for the image build (deploy/README.md §8). This repository is public.
+deploy/affectui.token
+*.token

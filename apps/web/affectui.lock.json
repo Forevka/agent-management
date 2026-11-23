@@ -1,0 +1,78 @@
+{
+  "roots": [
+    "app-shell"
+  ],
+  "items": {
+    "app-shell": {
+      "tier": "pro",
+      "files": {
+        "app-shell.tsx": "427ad6c412ff6d35f40959fd8a67e3f494f3209e167d675a7637a844f3e0bc70"
+      },
+      "dependencies": [
+        "@hugeicons/react",
+        "@hugeicons/core-free-icons"
+      ],
+      "html": "renders a \"doc\" artifact of the work area as HTML it builds itself, escaping title, paragraphs and bullets; only doc.html would go in raw, and the fleet never passes doc.html"
+    },
+    "command-menu-clean": {
+      "tier": "pro",
+      "files": {
+        "command-menu-clean.tsx": "963ebdb405ca2659d6f8bb0f9c90d856bf663e48dedcb279054ffd8fab94d1fa"
+      }
+    },
+    "dropdown-menu-clean": {
+      "tier": "free",
+      "files": {
+        "dropdown-menu-clean.tsx": "d6552544746bdde40febc8e0d461f6caf10f54d1661816afad4c09dd08398c04"
+      }
+    },
+    "empty-state-clean": {
+      "tier": "free",
+      "files": {
+        "empty-state-clean.tsx": "495f16a093feb816c8d1f26f9f4adeecfb95712fbf2ee55f9961432de9fe4d46"
+      }
+    },
+    "filter-menu-clean": {
+      "tier": "free",
+      "files": {
+        "filter-menu-clean.tsx": "fe0a4ce7152cd6c884f783b73fc77ae87eb5f3fc086a98a6fb58097ba5c1a618"
+      }
+    },
+    "icon-button-clean": {
+      "tier": "free",
+      "files": {
+        "icon-button-clean.tsx": "ce35654ae863e861f1e486f1f1df9d4bc21430629d429658905b08d414d727e0"
+      }
+    },
+    "popover-clean": {
+      "tier": "free",
+      "files": {
+        "popover-clean.tsx": "1115cc51917c9d69ec2da53af5ee5dd1e95e8482ddbe754d585e5775c717ad5d"
+      }
+    },
+    "setup-guide-clean": {
+      "tier": "pro",
+      "files": {
+        "setup-guide-clean.tsx": "4fbb24b69b082ecbd761c5c0dbba8af08376dfd262f5e55717abfcfd58d7a58d"
+      }
+    },
+    "skeleton-clean": {
+      "tier": "free",
+      "files": {
+        "skeleton-clean.tsx": "1664e4f6df2a4965b9f9cc483e69ba5f445bbde257c45b8c0f13b61784efb0e6"
+      }
+    },
+    "spinner-clean": {
+      "tier": "free",
+      "files": {
+        "spinner-clean.tsx": "e53e0798e1d6ad45afc1377b0bfcc1421edbafef83ae4d07562f883ab79896c4"
+      }
+    },
+    "text-field-clean": {
+      "tier": "free",
+      "files": {
+        "text-field-clean.tsx": "87a72ec504b23ff046d2b45944415c41f72f8ce99bcf9741918d96f5868717c4"
+      }
+    }
+  }
+}

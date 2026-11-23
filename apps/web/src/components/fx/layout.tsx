@@ -178,14 +178,17 @@ export function Section({ title, description, action, children, className }: Sec
   )
 }
 
-/** The page frame: one place decides the width and the rhythm, so every page agrees. */
+/**
+ * The page frame: one place decides the width and the rhythm, so every page agrees. A `div`: the
+ * app shell's panel around it is the page's one `<main>`.
+ */
 export function Page({ children, className }: { children?: ReactNode; className?: string }) {
   return (
     <>
       <style href="fx-layout" precedence="default">
         {css}
       </style>
-      <main className={join('fx-page', className)}>{children}</main>
+      <div className={join('fx-page', className)}>{children}</div>
     </>
   )
 }

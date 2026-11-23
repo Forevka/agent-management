@@ -158,6 +158,20 @@ Its migrations, if any, stayed applied (they are add-only)."
         exit 1
     }
 
+    # The web UI fetches affectUI Pro while the image builds, with the owner's access key, handed
+    # to the build as a secret (so it is in no layer) from a root-only file (deploy/README.md §8).
+    # Without it no release can build. That is a missing setting, not a bad release: so the
+    # release is not marked failed (it deploys once the file is there), and the owner is told once.
+    local aui=$DEPLOY/affectui.token
+    if [ ! -s "$aui" ]; then
+        log "waiting for $aui (the affectUI access key) to deploy $want"
+        if [ ! -e "$STATE/no-token-$want" ]; then
+            touch "$STATE/no-token-$want"
+            notify "⏸ $want is waiting: $aui is missing, and the web UI cannot build without the affectUI access key (deploy/README.md §8). Still running $was; it deploys within five minutes of the file appearing."
+        fi
+        return 0
+    fi
+
     log "deploying $want (running $was)"
     notify "🚀 Deploying $want (running $was)…" true
 
@@ -171,7 +185,7 @@ Its migrations, if any, stayed applied (they are add-only)."
     [ "$(git -C "$REPO" rev-parse HEAD)" = "$(git -C "$REPO" rev-parse "$want^{commit}")" ] ||
         refuse "/opt/fleet is ahead of $want (moved by hand?); the next release will catch up"
 
-    docker build -q --build-arg "FLEET_VERSION=$want" -t "fleet:$want" "$REPO" >/dev/null ||
+    docker build -q --secret "id=affectui,src=$aui" --build-arg "FLEET_VERSION=$want" -t "fleet:$want" "$REPO" >/dev/null ||
         refuse "the image did not build"
 
     # The URL the running orchestrator uses, handed over through the environment, not argv.
