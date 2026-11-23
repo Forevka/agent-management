@@ -4186,6 +4186,7 @@ async fn habit_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) {
         decision: Some("approve".into()),
         schedule: None,
         brief: None,
+        rules: vec![],
     };
     for (pattern, why) in [
         ("%a%e%i%o%", "a pattern of wildcards covers everything"),
@@ -4387,6 +4388,7 @@ async fn habit_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) {
         decision: None,
         schedule: Some("every:15m".into()),
         brief: Some("Pick two fresh MRs from #code-reviews and review them.".into()),
+        rules: vec![],
     };
     assert!(
         crate::admin::prepare(o, duty("no-such-project"))
@@ -4517,6 +4519,276 @@ async fn habit_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) {
         brain_heard(db, &standing).await,
         1,
         "and it asked nothing more"
+    );
+
+    // 8. A standing duty that acts in the owner's name follows an owner rule, cited, never a copy
+    //    of one written into its brief (retro P-8): a review habit that says "approve" without
+    //    citing one is refused when it is written.
+    let review_duty = |rules: Vec<i64>| crate::admin::AdminAction::HabitAdd {
+        kind: "do".into(),
+        why: "\"review two fresh MRs a day\"".into(),
+        project: Some("demo".into()),
+        title_like: None,
+        decision: None,
+        schedule: Some("every:30m".into()),
+        brief: Some(
+            "Review two fresh MRs: inline comments, approve if nothing is blocking.".into(),
+        ),
+        rules,
+    };
+    let refused = crate::admin::prepare(o, review_duty(vec![]))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refused.contains("approve/comment") && refused.contains("--rule OR-n"),
+        "{refused}"
+    );
+    assert!(
+        crate::admin::prepare(o, review_duty(vec![999]))
+            .await
+            .is_err(),
+        "a rule that does not exist cannot be cited"
+    );
+    //    A rule is written only by the owner's tap on a proposal.
+    let accept_last_change = || async {
+        let item: HumanItemRow = sqlx::query_as(
+            "select * from human_items where kind = 'admin_change' and state = 'open'
+              order by id desc limit 1",
+        )
+        .fetch_one(db)
+        .await
+        .unwrap();
+        let summary = item.payload.0["summary"].as_str().unwrap().to_owned();
+        human::answer(o, item.id, Answer::Accept).await.unwrap();
+        summary
+    };
+    crate::admin::propose(
+        o,
+        &json!({"action": "rule_add", "params": {
+            "text": "Approve an MR when the review finds nothing blocking",
+            "because": "approve if there are no blocking/High findings",
+        }}),
+    )
+    .await
+    .unwrap();
+    let rules_count = || async {
+        sqlx::query_scalar::<_, i64>("select count(*) from owner_rules")
+            .fetch_one(db)
+            .await
+            .unwrap()
+    };
+    assert_eq!(rules_count().await, 0, "a proposed rule is not a rule");
+    accept_last_change().await;
+    let first: i64 = sqlx::query_scalar("select id from owner_rules where active")
+        .fetch_one(db)
+        .await
+        .unwrap();
+    let (action, summary) = crate::admin::prepare(o, review_duty(vec![first]))
+        .await
+        .unwrap();
+    assert!(
+        summary.contains(&format!(
+            "It follows your rule OR-{first} \"Approve an MR when the review finds nothing blocking\""
+        )),
+        "the card quotes the rule it follows: {summary}"
+    );
+    crate::admin::execute(o, crate::admin::Actor::Owner, &action)
+        .await
+        .unwrap();
+    let cited: crate::model::HabitRow =
+        sqlx::query_as("select * from habits where $1 = any(rules)")
+            .bind(first)
+            .fetch_one(db)
+            .await
+            .unwrap();
+    assert!(crate::habits::describe(&cited).ends_with(&format!("(follows OR-{first})")));
+    //    Its request carries the rule from its record, as it stands now.
+    crate::habits::run_due(o).await.unwrap();
+    let request = format!(
+        "[Standing request from the owner (habit H-{}, project demo)]",
+        cited.id
+    );
+    wait_for("the cited rule travels with the request", || async {
+        events(db, "brain")
+            .await
+            .iter()
+            .any(|e| {
+                e["message"]["content"][0]["text"]
+                    .as_str()
+                    .is_some_and(|t| {
+                        t.starts_with(&format!("got: {request}"))
+                            && t.contains(&format!(
+                                "- OR-{first}: Approve an MR when the review finds nothing blocking"
+                            ))
+                    })
+            })
+            .then_some(())
+    })
+    .await;
+
+    //    The owner's rule changes: never approve. The card names the habit that cites the old
+    //    one, and approving it pauses that habit until the owner has read its brief again.
+    crate::admin::propose(
+        o,
+        &json!({"action": "rule_add", "params": {
+            "text": "Post review findings inline; never approve or merge",
+            "because": "post findings directly as inline comments, and never approve or merge",
+            "supersedes": first,
+        }}),
+    )
+    .await
+    .unwrap();
+    let summary = accept_last_change().await;
+    assert!(
+        summary.contains(&format!("It replaces OR-{first}"))
+            && summary.contains(&format!("H-{}", cited.id))
+            && summary.contains("paused until you check their briefs"),
+        "{summary}"
+    );
+    let second: i64 = sqlx::query_scalar("select id from owner_rules where active")
+        .fetch_one(db)
+        .await
+        .unwrap();
+    assert_ne!(second, first);
+    let after: crate::model::HabitRow = sqlx::query_as("select * from habits where id = $1")
+        .bind(cited.id)
+        .fetch_one(db)
+        .await
+        .unwrap();
+    assert!(
+        !after.active,
+        "a habit whose rule changed waits for the owner"
+    );
+    assert_eq!(
+        after.rules,
+        vec![second],
+        "it now cites the rule that holds"
+    );
+    assert!(
+        after
+            .paused_why
+            .as_deref()
+            .is_some_and(|w| w.contains(&format!("OR-{first}, was replaced by OR-{second}"))),
+        "{:?}",
+        after.paused_why
+    );
+    assert!(
+        chat.ops.lock().unwrap().iter().any(|op| matches!(
+            op,
+            Op::Send { html, .. } if html.contains(&format!("Owner rule OR-{second}"))
+        )),
+        "the new rule has its card in Rules"
+    );
+    //    A rule that no longer holds can be neither cited nor replaced again.
+    let stale = crate::admin::prepare(o, review_duty(vec![first]))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        stale.contains(&format!("replaced by OR-{second}")),
+        "{stale}"
+    );
+    assert!(
+        crate::admin::prepare(
+            o,
+            crate::admin::AdminAction::RuleAdd {
+                text: "Approve everything".into(),
+                because: "x".into(),
+                supersedes: Some(first),
+            }
+        )
+        .await
+        .is_err(),
+        "a replaced rule cannot be replaced again"
+    );
+    //    And the brain reads which version holds, and what the old one was.
+    let shown: Value =
+        serde_json::from_str(&crate::admin::read(o, "rules", None).await.unwrap()).unwrap();
+    assert_eq!(
+        shown["rules"][0]["id"],
+        json!(format!("OR-{second}")),
+        "{shown}"
+    );
+    assert_eq!(
+        shown["rules"][0]["cited_by"],
+        json!([format!("H-{} (paused)", cited.id)]),
+        "{shown}"
+    );
+    assert_eq!(
+        shown["ended"][0]["replaced_by"],
+        json!(format!("OR-{second}")),
+        "{shown}"
+    );
+
+    //    Removing a rule pauses what cites it too, in the same step, and the card says which.
+    sqlx::query("update habits set active = true, paused_why = null where id = $1")
+        .bind(cited.id)
+        .execute(db)
+        .await
+        .unwrap();
+    crate::admin::propose(
+        o,
+        &json!({"action": "rule_remove", "params": {"rule": second}}),
+    )
+    .await
+    .unwrap();
+    let summary = accept_last_change().await;
+    assert!(
+        summary.contains(&format!("H-{}", cited.id)) && summary.contains("will be paused"),
+        "{summary}"
+    );
+    let after: crate::model::HabitRow = sqlx::query_as("select * from habits where id = $1")
+        .bind(cited.id)
+        .fetch_one(db)
+        .await
+        .unwrap();
+    assert!(
+        !after.active,
+        "a habit whose rule was removed waits for the owner"
+    );
+    assert!(
+        after
+            .paused_why
+            .as_deref()
+            .is_some_and(|w| w.contains(&format!("OR-{second}, was removed"))),
+        "{:?}",
+        after.paused_why
+    );
+    let shown: Value =
+        serde_json::from_str(&crate::admin::read(o, "rules", None).await.unwrap()).unwrap();
+    assert_eq!(shown["rules"], json!([]), "{shown}");
+
+    //    A habit from before rules were records, whose brief approves on the owner's behalf with
+    //    no rule cited (H-1's case), stands aside when it is due instead of acting on its copy.
+    let legacy: i64 = sqlx::query_scalar(
+        "insert into habits (kind, schedule, brief, why)
+         values ('do', 'every:45m', 'Review fresh MRs: inline comments, approve if nothing is blocking', 'legacy')
+         returning id",
+    )
+    .fetch_one(db)
+    .await
+    .unwrap();
+    crate::habits::run_due(o).await.unwrap();
+    let skipped: String =
+        sqlx::query_scalar("select what from habit_log where habit_id = $1 and kind = 'skipped'")
+            .bind(legacy)
+            .fetch_one(db)
+            .await
+            .unwrap();
+    assert!(
+        skipped.contains("approve/comment as you without citing an owner rule"),
+        "{skipped}"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        brain_heard(
+            db,
+            &format!("[Standing request from the owner (habit H-{legacy})]")
+        )
+        .await,
+        0,
+        "it asked nothing"
     );
 }
 

@@ -360,6 +360,25 @@ pub struct HabitRow {
     pub tg_msg: Option<i64>,
     /// When the orchestrator last evaluated it (what it decided is in `habit_log`).
     pub last_checked_at: Option<DateTime<Utc>>,
+    /// The owner rules it follows (`owner_rules` ids), cited when it was proposed.
+    pub rules: Vec<i64>,
+}
+
+/// One of the owner's operating rules: how the fleet acts in their name (see `admin.rs`,
+/// `RuleAdd`). Written only by an approved `admin_change`; replaced, never edited.
+#[derive(Debug, Clone, FromRow)]
+pub struct OwnerRuleRow {
+    pub id: i64,
+    pub text: String,
+    /// The owner's words it was written from.
+    pub because: String,
+    /// The rule it replaced.
+    pub supersedes: Option<i64>,
+    pub active: bool,
+    pub created_at: DateTime<Utc>,
+    /// When it was replaced or removed.
+    pub ended_at: Option<DateTime<Utc>>,
+    pub tg_msg: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

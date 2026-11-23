@@ -96,6 +96,14 @@ export default function Habits() {
                       <Text size="2" breakAll>
                         {h.status}
                       </Text>
+                      {h.rules.map((r) => (
+                        <Row key={r.id} gap="2" align="start">
+                          <Badge tone={r.active ? 'info' : 'warning'}>OR-{r.id}</Badge>
+                          <Text size="1" tone="muted" breakAll>
+                            {r.active ? r.text : `${r.text} (no longer holds)`}
+                          </Text>
+                        </Row>
+                      ))}
                       {h.log.length > 0 && (
                         <Stack gap="1">
                           <Text size="1" tone="muted" weight="medium">
@@ -165,6 +173,12 @@ export default function Habits() {
                 habit keeps a log: when it was last checked, when it last acted, what it stood aside
                 from and why, and the orchestrator’s report of what it did with each request and
                 what it passed over. So “did something go wrong?” is answered here.
+              </Text>
+              <Text as="p" size="2" tone="muted">
+                A habit that acts in your name — approving or merging, posting or commenting,
+                moving a ticket, replying as you — cites the rule of yours it follows (OR-n), and
+                each request carries that rule as it stands now. When you replace or remove a rule,
+                the habits that cite it are paused until you have checked their briefs.
               </Text>
             </Stack>
           </CardContent>

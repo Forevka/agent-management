@@ -251,7 +251,8 @@ pub struct AdminArgs {
 #[derive(Debug, Subcommand)]
 pub enum AdminCmd {
     /// Read the fleet's setup: projects, project <slug>, agents [project], bots, nodes,
-    /// node <id|name>, secrets, secret <folder>, status, items. Never shows secret values.
+    /// node <id|name>, secrets, secret <folder>, status, items, habits, rules (the owner's
+    /// operating rules). Never shows secret values.
     Show {
         what: String,
         target: Option<String>,
@@ -360,11 +361,31 @@ pub enum AdminCmd {
         /// do: what to ask for, in the owner's words ("-" reads it from stdin).
         #[arg(long)]
         brief: Option<String>,
+        /// An owner rule it follows (OR-3), repeatable. Required when the brief says what to do
+        /// on an outward action (approve, merge, post, comment, transition, reply as the owner).
+        #[arg(long = "rule")]
+        rules: Vec<String>,
     },
     /// Propose pausing a habit (`fleet agent admin show habits` lists them).
     HabitPause { habit: i64 },
     /// Propose deleting a habit.
     HabitRemove { habit: i64 },
+    /// Propose one of the owner's operating rules: how the fleet acts in their name (approve,
+    /// merge, post, transition, reply). Only from the owner's own words; habits and briefs cite
+    /// it as OR-n. `admin show rules` lists them.
+    RuleAdd {
+        /// The rule, in one line.
+        #[arg(long)]
+        text: String,
+        /// The owner's words it is written from. They read it.
+        #[arg(long)]
+        because: String,
+        /// The rule it replaces (OR-n); the habits citing that one are paused for the owner.
+        #[arg(long)]
+        supersedes: Option<String>,
+    },
+    /// Propose removing an owner rule (OR-n); the habits citing it are paused.
+    RuleRemove { rule: String },
     /// Send the owner a login link to any page of the fleet's UI, so they land on the exact
     /// thing you are talking about: /tasks/<id> (and /tasks/<id>/session, its live session),
     /// /sessions, /inbox, /projects/<slug> (and its /tasks, /sessions, /agents or /settings),
@@ -1147,6 +1168,7 @@ fn admin_call(a: AdminArgs) -> Result<(&'static str, Value)> {
             decision,
             schedule,
             brief,
+            rules,
         } => propose(
             "habit_add",
             json!({
@@ -1157,11 +1179,37 @@ fn admin_call(a: AdminArgs) -> Result<(&'static str, Value)> {
                 "decision": decision,
                 "schedule": schedule,
                 "brief": brief.map(stdin_if_dash).transpose()?,
+                "rules": rules.iter().map(|r| rule_id(r)).collect::<Result<Vec<_>>>()?,
             }),
         ),
         AdminCmd::HabitPause { habit } => propose("habit_pause", json!({"habit": habit})),
         AdminCmd::HabitRemove { habit } => propose("habit_remove", json!({"habit": habit})),
+        AdminCmd::RuleAdd {
+            text,
+            because,
+            supersedes,
+        } => propose(
+            "rule_add",
+            json!({
+                "text": text,
+                "because": because,
+                "supersedes": supersedes.as_deref().map(rule_id).transpose()?,
+            }),
+        ),
+        AdminCmd::RuleRemove { rule } => propose("rule_remove", json!({"rule": rule_id(&rule)?})),
     }
+}
+
+/// An owner rule's id as the orchestrator takes it: `OR-3`, `or-3` or `3`.
+fn rule_id(s: &str) -> Result<i64> {
+    let t = s.trim();
+    let digits = t
+        .strip_prefix("OR-")
+        .or_else(|| t.strip_prefix("or-"))
+        .unwrap_or(t);
+    digits
+        .parse()
+        .map_err(|_| anyhow::anyhow!("{s:?} is not an owner rule id; they look like OR-3"))
 }
 
 /// `fleet agent retro person ...` as the orchestrator's `retro_person` expects it: lists only when

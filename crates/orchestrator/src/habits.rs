@@ -31,8 +31,8 @@ use crate::{
     chat::{Button, From, Keyboard, Notify, clip, esc},
     core::Orchestrator,
     human::{self, Answer},
-    model::{HabitRow, HumanItemRow, TaskRow},
-    tasks, topics, workflows,
+    model::{HabitRow, HumanItemRow, OwnerRuleRow, TaskRow},
+    owner_rules, tasks, topics, workflows,
 };
 
 /// At most this many habits, so the mechanism stays something the owner can read in one screen.
@@ -510,15 +510,34 @@ async fn told_the_owner(o: &Arc<Orchestrator>, habit: &HabitRow, task: &TaskRow,
 // ---------------------------------------------------------------- doing
 
 /// What the brain is handed when a `do` habit is due: the owner's standing words, the project
-/// they belong to, and the one thing that makes a miss visible afterwards — the report.
-fn standing_request(habit: &HabitRow, brief: &str) -> String {
+/// they belong to, the owner rules it cites as they stand now, and the one thing that makes a
+/// miss visible afterwards — the report. The rules come from their records, not from the brief:
+/// a rule is kept in one place, and the brief only refers to it.
+fn standing_request(habit: &HabitRow, brief: &str, rules: &[OwnerRuleRow]) -> String {
     let project = habit
         .project
         .as_deref()
         .map(|p| format!(", project {p}"))
         .unwrap_or_default();
+    let mut cited = String::new();
+    if !rules.is_empty() {
+        cited.push_str(
+            "\nOwner rules this follows, as they stand now (they win over anything the brief \
+             says):",
+        );
+        for r in rules {
+            if r.active {
+                cited.push_str(&format!("\n- OR-{}: {}", r.id, r.text));
+            } else {
+                cited.push_str(&format!(
+                    "\n- OR-{} no longer holds: do nothing it covered, and ask the owner",
+                    r.id
+                ));
+            }
+        }
+    }
     format!(
-        "[Standing request from the owner (habit H-{id}{project})] {brief}\n\
+        "[Standing request from the owner (habit H-{id}{project})] {brief}{cited}\n\
          (They asked for this to happen on its own, so answer as if they had just asked. When you \
          have handled it — also when there was nothing to do — say what you did and, for each \
          candidate you passed over, why: `fleet agent habit report {id} --did \"...\" --skipped \
@@ -570,6 +589,30 @@ pub async fn run_due(o: &Arc<Orchestrator>) -> Result<()> {
             say(o, habit.id, "skipped", &what).await;
             continue;
         }
+        // A brief that says what to do on an outward action, citing no owner rule, holds its own
+        // copy of a policy nobody can tell is current (retro P-8: "approve if nothing is
+        // blocking", after the owner had said "never approve"). Such a habit predates rules as
+        // records; it stands aside until it is proposed again citing the rule that holds.
+        let outward = owner_rules::outward_actions(brief);
+        if habit.rules.is_empty() && !outward.is_empty() {
+            let what = format!(
+                "due, but its brief says what to do on {} as you without citing an owner rule; \
+                 it waits until it is proposed again citing the rule that holds",
+                outward.join("/")
+            );
+            say(o, habit.id, "skipped", &what).await;
+            continue;
+        }
+        // The rules it cites, read now: what the owner holds today is what the request carries.
+        let rules = match owner_rules::cited(o, &habit.rules).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("reading habit {}'s owner rules failed: {e:#}", habit.id);
+                let what = format!("due, but the owner rules it follows could not be read: {e:#}");
+                say(o, habit.id, "failed", &what).await;
+                continue;
+            }
+        };
         // Due time advances first: a failure to deliver must not turn into the same request
         // every five minutes, and one habit's trouble must not stop the others' (hence the
         // `continue`s rather than `?`).
@@ -604,8 +647,12 @@ pub async fn run_due(o: &Arc<Orchestrator>) -> Result<()> {
         };
         // The owner's own words, standing: trusted exactly as far as they were when the owner
         // approved this habit, and no further. Nothing a feed message said can reach here.
-        if let Err(e) =
-            tasks::to_brain_as(o, standing_request(&habit, brief), tasks::Origin::Other).await
+        if let Err(e) = tasks::to_brain_as(
+            o,
+            standing_request(&habit, brief, &rules),
+            tasks::Origin::Other,
+        )
+        .await
         {
             tracing::warn!("making habit {}'s request failed: {e:#}", habit.id);
             // It did not go out, so it did not fire: give the cap back, and say what happened.
@@ -785,6 +832,23 @@ pub fn describe(h: &HabitRow) -> String {
             clip(h.brief.as_deref().unwrap_or("?"), 120)
         ),
     };
+    // What it acts in the owner's name by: the rules it cites, or a warning when its brief says
+    // what to do on an outward action and cites none (a habit from before rules were records),
+    // so the owner reads that before they resume it.
+    let what = if !h.rules.is_empty() {
+        let ids: Vec<String> = h.rules.iter().map(|r| format!("OR-{r}")).collect();
+        format!("{what} (follows {})", ids.join(", "))
+    } else {
+        let outward = owner_rules::outward_actions(h.brief.as_deref().unwrap_or_default());
+        if h.kind == "do" && !outward.is_empty() {
+            format!(
+                "{what} ⚠ says what to do on {} without citing an owner rule",
+                outward.join("/")
+            )
+        } else {
+            what
+        }
+    };
     match (h.active, h.paused_why.as_deref()) {
         (true, _) => what,
         (false, Some(why)) => format!("{what} (paused: {why})"),
@@ -805,14 +869,21 @@ pub async fn pause(o: &Arc<Orchestrator>, id: i64, why: &str) -> Result<HabitRow
     .fetch_optional(&o.db)
     .await?;
     let row = row.with_context(|| format!("no habit H-{id}"))?;
+    paused(o, &row, why).await;
+    Ok(row)
+}
+
+/// What follows a habit being paused, wherever the pause was written (here, or in the same
+/// transaction as a change to an owner rule it cites): the audit, its card, and the brain.
+pub(crate) async fn paused(o: &Arc<Orchestrator>, row: &HabitRow, why: &str) {
+    let id = row.id;
     o.audit("owner", "habit.pause", json!({"habit": id, "why": why}))
         .await;
-    show(o, &row).await;
+    show(o, row).await;
     // The brain hears it, so it does not propose the same thing again tomorrow.
     o.tell_brain(format!(
         "[Habit H-{id} paused] {why}. Do not propose it again unless the owner asks."
     ));
-    Ok(row)
 }
 
 /// Writes or rewrites a habit's card in the Rules topic, where the fleet's standing instructions
@@ -1150,6 +1221,11 @@ pub async fn json(o: &Orchestrator, for_agents: bool) -> Result<Value> {
     let mut out = vec![];
     for h in rows {
         let r = record(o, h.id).await?;
+        let rules: Vec<Value> = owner_rules::cited(o, &h.rules)
+            .await?
+            .into_iter()
+            .map(|r| json!({"id": r.id, "text": r.text, "active": r.active}))
+            .collect();
         let log: Vec<(
             DateTime<Utc>,
             String,
@@ -1183,6 +1259,7 @@ pub async fn json(o: &Orchestrator, for_agents: bool) -> Result<Value> {
             "project": h.project,
             "schedule": h.schedule,
             "brief": h.brief,
+            "rules": rules,
             "why": h.why,
             "active": h.active,
             "paused_why": h.paused_why,
@@ -1462,6 +1539,7 @@ mod tests {
             last_used_at: None,
             tg_msg: None,
             last_checked_at: None,
+            rules: vec![],
         }
     }
 
@@ -1598,8 +1676,62 @@ mod tests {
     /// visible.
     #[test]
     fn a_standing_request_asks_to_be_reported_on() {
-        let text = standing_request(&habit("do"), "Review two fresh MRs");
+        let text = standing_request(&habit("do"), "Review two fresh MRs", &[]);
         assert!(text.starts_with("[Standing request from the owner (habit H-3, project demo)]"));
         assert!(text.contains("fleet agent habit report 3"), "{text}");
+        assert!(!text.contains("Owner rules"), "{text}");
+    }
+
+    /// The rules a habit cites travel with its request as they stand now, and win over the
+    /// brief; one that no longer holds says so instead of its old text.
+    #[test]
+    fn a_standing_request_carries_the_rules_it_follows() {
+        let rule = |id: i64, text: &str, active: bool| OwnerRuleRow {
+            id,
+            text: text.into(),
+            because: "you said so".into(),
+            supersedes: None,
+            active,
+            created_at: Utc::now(),
+            ended_at: None,
+            tg_msg: None,
+        };
+        let text = standing_request(
+            &habit("do"),
+            "Review two fresh MRs",
+            &[
+                rule(
+                    4,
+                    "Post review findings inline; never approve or merge",
+                    true,
+                ),
+                rule(2, "Approve when nothing is blocking", false),
+            ],
+        );
+        assert!(
+            text.contains("they win over anything the brief says"),
+            "{text}"
+        );
+        assert!(
+            text.contains("- OR-4: Post review findings inline; never approve or merge"),
+            "{text}"
+        );
+        assert!(text.contains("- OR-2 no longer holds"), "{text}");
+        assert!(!text.contains("Approve when nothing is blocking"), "{text}");
+    }
+
+    /// A habit that acts in the owner's name without citing a rule says so wherever it is shown.
+    #[test]
+    fn an_uncited_outward_habit_is_flagged() {
+        let mut h = habit("do");
+        h.brief = Some("review: inline comments, approve if nothing is blocking".into());
+        assert!(
+            describe(&h).contains("⚠ says what to do on approve/comment without citing"),
+            "{}",
+            describe(&h)
+        );
+        h.rules = vec![4];
+        assert!(describe(&h).ends_with("(follows OR-4)"), "{}", describe(&h));
+        assert!(!describe(&habit("do")).contains('⚠'));
     }
 }

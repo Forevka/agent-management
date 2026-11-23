@@ -305,6 +305,9 @@ export type Habits = {
     project: string | null
     schedule: string | null
     brief: string | null
+    /// The owner rules (OR-n) it follows, as they stand now: their text is what each of its
+    /// requests carries, over anything its brief says.
+    rules: { id: number; text: string; active: boolean }[]
     why: string
     active: boolean
     paused_why: string | null

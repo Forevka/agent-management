@@ -213,12 +213,29 @@ pub enum AdminAction {
         schedule: Option<String>,
         #[serde(default)]
         brief: Option<String>,
+        /// The owner rules (`OR-n` ids) it follows. Required for a `do` habit whose brief says
+        /// what to do on an outward action (`owner_rules::outward_actions`).
+        #[serde(default)]
+        rules: Vec<i64>,
     },
     HabitPause {
         habit: i64,
     },
     HabitRemove {
         habit: i64,
+    },
+    /// One of the owner's operating rules (see `owner_rules.rs`): how the fleet acts in their
+    /// name. `because` is their words it was written from; `supersedes` the rule it replaces,
+    /// whose citing habits are paused for the owner to check.
+    RuleAdd {
+        text: String,
+        because: String,
+        #[serde(default)]
+        supersedes: Option<i64>,
+    },
+    /// Ends a rule without a replacement; the habits citing it are paused.
+    RuleRemove {
+        rule: i64,
     },
 }
 
@@ -1004,10 +1021,24 @@ pub async fn execute(o: &Arc<Orchestrator>, actor: Actor, action: &AdminAction) 
             decision,
             schedule,
             brief,
+            rules,
         } => {
-            let id: i64 = sqlx::query_scalar(
-                "insert into habits (kind, why, project, item_kind, title_like, decision, schedule, brief)
-                 values ($1, $2, $3, case when $1 = 'decide' then 'plan' end, $4, $5, $6, $7)
+            // Checked again at the owner's tap: a proposal made before this check existed must
+            // not slip a brief that acts in their name past it.
+            let outward = crate::owner_rules::outward_actions(brief.as_deref().unwrap_or_default());
+            ensure!(
+                kind != "do" || outward.is_empty() || !rules.is_empty(),
+                "its brief says what to do on {} as you without citing an owner rule; ask me to \
+                 propose it again citing the rule that holds",
+                outward.join("/")
+            );
+            // Inserted only while every rule it cites still holds, in the same statement, so a
+            // rule replaced or removed since the proposal cannot be cited by a habit that its
+            // replacement never paused.
+            let id: Option<i64> = sqlx::query_scalar(
+                "insert into habits (kind, why, project, item_kind, title_like, decision, schedule, brief, rules)
+                 select $1, $2, $3, case when $1 = 'decide' then 'plan' end, $4, $5, $6, $7, $8
+                  where not exists (select 1 from owner_rules where id = any($8) and not active)
                  returning id",
             )
             .bind(kind)
@@ -1017,13 +1048,15 @@ pub async fn execute(o: &Arc<Orchestrator>, actor: Actor, action: &AdminAction) 
             .bind(decision)
             .bind(schedule)
             .bind(brief)
-            .fetch_one(&o.db)
+            .bind(rules)
+            .fetch_optional(&o.db)
             .await?;
+            let id = id.context("an owner rule it cites no longer holds; propose it again")?;
             o.audit(
                 actor.audit_name(),
                 "habit.add",
                 json!({"habit": id, "kind": kind, "project": project, "title_like": title_like,
-                       "decision": decision, "schedule": schedule}),
+                       "decision": decision, "schedule": schedule, "rules": rules}),
             )
             .await;
             // Its card goes where the fleet's standing instructions live, with Pause and Delete.
@@ -1052,6 +1085,14 @@ pub async fn execute(o: &Arc<Orchestrator>, actor: Actor, action: &AdminAction) 
                 .await;
             Ok(format!("habit H-{habit} deleted"))
         }
+        // `prepare` has checked the text and that the rule it replaces still holds; `add`
+        // checks that again under its own transaction, since a rival replacement may have landed.
+        A::RuleAdd {
+            text,
+            because,
+            supersedes,
+        } => crate::owner_rules::add(o, actor.audit_name(), text, because, *supersedes).await,
+        A::RuleRemove { rule } => crate::owner_rules::remove(o, actor.audit_name(), *rule).await,
     }
 }
 
@@ -2216,6 +2257,7 @@ pub async fn prepare(o: &Orchestrator, action: AdminAction) -> Result<(AdminActi
             decision,
             schedule,
             brief,
+            rules,
         } => {
             let living: i64 = sqlx::query_scalar("select count(*) from habits where active")
                 .fetch_one(&o.db)
@@ -2230,6 +2272,31 @@ pub async fn prepare(o: &Orchestrator, action: AdminAction) -> Result<(AdminActi
                 "why is required: say what of the owner's own doing this was learned from"
             );
             check_len("why", &why, MAX_PROPOSED_DESCRIPTION)?;
+            // The owner rules it cites: each one must still hold, and the card quotes them, so
+            // the owner approves the habit together with what it acts in their name by.
+            let mut rules = rules;
+            rules.sort_unstable();
+            rules.dedup();
+            ensure!(
+                rules.len() <= crate::owner_rules::MAX_CITED,
+                "a habit cites at most {} owner rules",
+                crate::owner_rules::MAX_CITED
+            );
+            let mut follows = vec![];
+            for id in &rules {
+                let r = crate::owner_rules::live(o, *id).await?;
+                follows.push(format!("OR-{id} {}", q(&r.text)));
+            }
+            let follows = if follows.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " It follows your rule{} {}, read from the rule itself each time, so a later \
+                     change to the rule pauses this habit for you to check.",
+                    if follows.len() == 1 { "" } else { "s" },
+                    follows.join("; ")
+                )
+            };
             match kind.as_str() {
                 "decide" => {
                     let project = project.context("project required for a decide habit")?;
@@ -2319,7 +2386,7 @@ pub async fn prepare(o: &Orchestrator, action: AdminAction) -> Result<(AdminActi
                          button that stops the task and pauses this. Note that it covers tasks \
                          I create, including ones I create after reading a ticket or a Slack \
                          message — their briefs are not part of what you are approving here. \
-                         Learned from: {}.",
+                         Learned from: {}.{follows}",
                         q(&pattern),
                         crate::habits::WINDOW_DAYS,
                         if unseen > 0 {
@@ -2341,6 +2408,7 @@ pub async fn prepare(o: &Orchestrator, action: AdminAction) -> Result<(AdminActi
                             decision: Some("approve".into()),
                             schedule: None,
                             brief: None,
+                            rules,
                         },
                         summary,
                     )
@@ -2354,6 +2422,18 @@ pub async fn prepare(o: &Orchestrator, action: AdminAction) -> Result<(AdminActi
                         .to_owned();
                     ensure!(!brief.is_empty(), "brief required");
                     check_len("brief", &brief, MAX_PROPOSED_DESCRIPTION)?;
+                    // A brief that says what to do on an outward action (approve, merge, post,
+                    // reply as the owner...) is policy, and policy has one source: the owner rule
+                    // it comes from, cited, never a copy of it written into the brief (retro P-8).
+                    let outward = crate::owner_rules::outward_actions(&brief);
+                    ensure!(
+                        outward.is_empty() || !rules.is_empty(),
+                        "this brief says what to do on {} as the owner; cite the owner rule it \
+                         follows with --rule OR-n (`fleet agent admin show rules`). If no rule \
+                         holds it, or your memory holds versions that disagree, ask the owner which \
+                         holds, propose it with `admin rule-add`, and cite it once approved",
+                        outward.join("/")
+                    );
                     // The project a standing duty belongs to, when it has one: a label the
                     // request carries and the owner reads, so it must name a real project.
                     let project = match project {
@@ -2392,7 +2472,7 @@ pub async fn prepare(o: &Orchestrator, action: AdminAction) -> Result<(AdminActi
                         "From now on, {schedule} ({}), do this without being asked{}: {}. It \
                          reaches me as if you had just asked for it, at most 10 times a day; I \
                          report what I did and what I passed over, which /habits shows, and \
-                         /habits pauses it. Learned from: {}.",
+                         /habits pauses it. Learned from: {}.{follows}",
                         crate::habits::how_often(&schedule),
                         project
                             .as_deref()
@@ -2410,6 +2490,7 @@ pub async fn prepare(o: &Orchestrator, action: AdminAction) -> Result<(AdminActi
                             decision: None,
                             schedule: Some(schedule),
                             brief: Some(brief),
+                            rules,
                         },
                         summary,
                     )
@@ -2433,6 +2514,93 @@ pub async fn prepare(o: &Orchestrator, action: AdminAction) -> Result<(AdminActi
                 q(&crate::habits::describe(&row))
             );
             (A::HabitRemove { habit }, summary)
+        }
+        // A rule acts through every habit that cites it, so its card says exactly what it
+        // replaces and which habits stop until the owner has looked at them.
+        A::RuleAdd {
+            text,
+            because,
+            supersedes,
+        } => {
+            let text = crate::owner_rules::check_text(&text)?;
+            let because = because.trim().to_owned();
+            ensure!(
+                !because.is_empty(),
+                "because is required: the owner's own words this rule is written from"
+            );
+            check_len("because", &because, MAX_PROPOSED_DESCRIPTION)?;
+            // The same rule twice would be two records of one policy, the thing this exists to
+            // prevent; a replacement that changes nothing is the same.
+            let same: Option<i64> = sqlx::query_scalar(
+                "select id from owner_rules where active and lower(text) = lower($1)",
+            )
+            .bind(&text)
+            .fetch_optional(&o.db)
+            .await?;
+            if let Some(id) = same {
+                bail!("OR-{id} already says that");
+            }
+            let mut summary = format!("Record an owner rule: {}.", q(&text));
+            match supersedes {
+                Some(old) => {
+                    let old_row = crate::owner_rules::live(o, old).await?;
+                    summary.push_str(&format!(" It replaces OR-{old}: {}.", q(&old_row.text)));
+                    let citing = crate::owner_rules::citing(o, old).await?;
+                    if citing.is_empty() {
+                        summary.push_str(&format!(" No habit cites OR-{old}."));
+                    } else {
+                        let list = citing
+                            .iter()
+                            .map(|(id, _, what)| format!("H-{id} ({})", q(&clip(what, 150))))
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        summary.push_str(&format!(
+                            " These habits cite OR-{old} and will cite the new rule, paused until \
+                             you check their briefs: {list}."
+                        ));
+                    }
+                }
+                None => {
+                    let holding: i64 =
+                        sqlx::query_scalar("select count(*) from owner_rules where active")
+                            .fetch_one(&o.db)
+                            .await?;
+                    ensure!(
+                        holding < crate::owner_rules::MAX_RULES,
+                        "there are already {holding} owner rules; replace one instead \
+                         (--supersedes OR-n)"
+                    );
+                }
+            }
+            summary.push_str(&format!(
+                " Habits and briefs that act in your name cite it by its number, and it wins \
+                 over any copy of it in my memory. From your words: {}.",
+                q(&because)
+            ));
+            (
+                A::RuleAdd {
+                    text,
+                    because,
+                    supersedes,
+                },
+                summary,
+            )
+        }
+        A::RuleRemove { rule } => {
+            let row = crate::owner_rules::live(o, rule).await?;
+            let citing = crate::owner_rules::citing(o, rule).await?;
+            let mut summary = format!("Remove owner rule OR-{rule}: {}.", q(&row.text));
+            if !citing.is_empty() {
+                let list = citing
+                    .iter()
+                    .map(|(id, _, what)| format!("H-{id} ({})", q(&clip(what, 150))))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                summary.push_str(&format!(
+                    " These habits cite it and will be paused until you check them: {list}."
+                ));
+            }
+            (A::RuleRemove { rule }, summary)
         }
     })
 }
@@ -2617,7 +2785,7 @@ async fn snapshot(o: &Orchestrator, action: &AdminAction) -> Result<Value> {
         // any habit appears, is paused or is removed in the meantime — a `do` proposal too,
         // which is why this does not filter by kind, project or active. For pause and remove,
         // what that habit is now.
-        A::HabitAdd { .. } => {
+        A::HabitAdd { rules, .. } => {
             let rows: Vec<(
                 i64,
                 String,
@@ -2631,7 +2799,19 @@ async fn snapshot(o: &Orchestrator, action: &AdminAction) -> Result<Value> {
             )
             .fetch_all(&o.db)
             .await?;
-            json!(rows)
+            // The rules it cites, as the card quoted them: one replaced in the meantime means
+            // the owner would be approving a habit that follows a rule that no longer holds.
+            if rules.is_empty() {
+                json!(rows)
+            } else {
+                let cited: Vec<(i64, bool)> = sqlx::query_as(
+                    "select id, active from owner_rules where id = any($1) order by id",
+                )
+                .bind(rules)
+                .fetch_all(&o.db)
+                .await?;
+                json!({"habits": rows, "rules": cited})
+            }
         }
         A::HabitPause { habit } | A::HabitRemove { habit } => {
             let row: Option<(bool, String)> =
@@ -2640,6 +2820,27 @@ async fn snapshot(o: &Orchestrator, action: &AdminAction) -> Result<Value> {
                     .fetch_optional(&o.db)
                     .await?;
             json!(row)
+        }
+        // What the card showed: the rule it replaces (or removes) still holding, and the habits
+        // it named as citing it, with whether each is on.
+        A::RuleAdd { supersedes, .. } => {
+            let holding: Vec<(i64, String)> =
+                sqlx::query_as("select id, text from owner_rules where active order by id")
+                    .fetch_all(&o.db)
+                    .await?;
+            let citing = match supersedes {
+                Some(old) => crate::owner_rules::citing(o, *old).await?,
+                None => vec![],
+            };
+            json!({"holding": holding, "citing": citing})
+        }
+        A::RuleRemove { rule } => {
+            let active: Option<bool> =
+                sqlx::query_scalar("select active from owner_rules where id = $1")
+                    .bind(rule)
+                    .fetch_optional(&o.db)
+                    .await?;
+            json!({"active": active, "citing": crate::owner_rules::citing(o, *rule).await?})
         }
     })
 }
@@ -2929,8 +3130,9 @@ pub async fn read(o: &Orchestrator, what: &str, target: Option<&str>) -> Result<
             )
         }
         "habits" => crate::habits::json(o, true).await?,
+        "rules" => crate::owner_rules::json(o).await?,
         other => bail!(
-            "unknown read {other:?}; use projects, project <slug>, agents [project], bots, nodes, node <id|name>, secrets, secret <folder>, status, items or habits"
+            "unknown read {other:?}; use projects, project <slug>, agents [project], bots, nodes, node <id|name>, secrets, secret <folder>, status, items, habits or rules"
         ),
     };
     Ok(serde_json::to_string_pretty(&v)?)
