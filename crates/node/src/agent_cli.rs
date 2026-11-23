@@ -366,9 +366,11 @@ pub enum AdminCmd {
     /// Propose deleting a habit.
     HabitRemove { habit: i64 },
     /// Send the owner a login link to any page of the fleet's UI, so they land on the exact
-    /// thing you are talking about: /tasks/<id>, /sessions, /inbox, /projects/<slug>, /agents,
-    /// /nodes/<id>, /secrets/<id> (to enter a token), /items/<id>, /people/<id>, and filtered views such as
-    /// `/tasks?project=bioins&status=failed`. You never see the link yourself.
+    /// thing you are talking about: /tasks/<id> (and /tasks/<id>/session, its live session),
+    /// /sessions, /inbox, /projects/<slug> (and its /tasks, /sessions, /agents or /settings),
+    /// /agents, /nodes/<id>, /secrets/<id> (to enter a token), /kit[/<item-id>], /items/<id>,
+    /// /people/<id>, and
+    /// filtered views such as `/tasks?project=bioins&status=failed`. You never see the link yourself.
     Link {
         page: String,
         /// One line telling the owner what to do there.

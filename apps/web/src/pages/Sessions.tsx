@@ -11,54 +11,11 @@ import { Duration, Loaded, When, useApi } from '../ui'
 /// filterable by project. This is the view that did not exist before: a run used to leave only
 /// a transcript, so there was no way to ask "what has this project been doing".
 export default function Sessions() {
-  const [params, setParams] = useSearchParams()
-  const project = params.get('project') ?? ''
-  const agent = params.get('agent') ?? ''
-
-  const path = useMemo(() => {
-    const u = new URLSearchParams()
-    if (project) u.set('project', project)
-    if (agent) u.set('agent', agent)
-    u.set('limit', '200')
-    return `/api/runs?${u}`
-  }, [project, agent])
-
-  const state = useApi<{ runs: Session[]; total: number }>(path, 15_000)
-  const overview = useApi<Overview>('/api/overview')
-
-  const set = (key: string, value: string) => {
-    const next = new URLSearchParams(params)
-    if (value) next.set(key, value)
-    else next.delete(key)
-    setParams(next, { replace: true })
-  }
-
   return (
     <Page>
       <PageHeader
         title="Sessions"
         description="One row per agent process the fleet has started. Open one to follow it live or continue it."
-        meta={
-          state.data && (
-            <Text size="1" tone="muted">
-              {state.data.runs.length} of {state.data.total}
-            </Text>
-          )
-        }
-        action={
-          <div style={{ minWidth: '12rem' }}>
-            <Select
-              size="sm"
-              aria-label="Project"
-              value={project || 'all'}
-              onChange={(v) => set('project', v === 'all' ? '' : v)}
-              options={[
-                { value: 'all', label: 'Every project' },
-                ...(overview.data?.projects ?? []).map((p) => ({ value: p.slug, label: p.name || p.slug })),
-              ]}
-            />
-          </div>
-        }
       />
 
       {/* The fleet's standing sessions have no task page worth the name; their sessions are
@@ -76,6 +33,62 @@ export default function Sessions() {
             {name}
           </Link>
         ))}
+      </Row>
+
+      <SessionList />
+    </Page>
+  )
+}
+
+/// The filter and the list, shared by this page and a project's own Sessions
+/// (`/projects/<slug>/sessions`), where `project` is fixed by the page rather than chosen.
+export function SessionList({ project: fixed }: { project?: string }) {
+  const [params, setParams] = useSearchParams()
+  const project = fixed ?? params.get('project') ?? ''
+  const agent = params.get('agent') ?? ''
+
+  const path = useMemo(() => {
+    const u = new URLSearchParams()
+    if (project) u.set('project', project)
+    if (agent) u.set('agent', agent)
+    u.set('limit', '200')
+    return `/api/runs?${u}`
+  }, [project, agent])
+
+  const state = useApi<{ runs: Session[]; total: number }>(path, 15_000, { keepPrevious: true })
+  const overview = useApi<Overview>(fixed === undefined ? '/api/overview' : null)
+
+  const set = (key: string, value: string) => {
+    const next = new URLSearchParams(params)
+    if (value) next.set(key, value)
+    else next.delete(key)
+    setParams(next, { replace: true })
+  }
+
+  return (
+    <Stack gap="4">
+      <Row gap="2" align="end" justify="between">
+        {state.data ? (
+          <Text size="1" tone="muted">
+            {state.data.runs.length} of {state.data.total}
+          </Text>
+        ) : (
+          <span />
+        )}
+        {fixed === undefined && (
+          <div style={{ minWidth: '12rem' }}>
+            <Select
+              size="sm"
+              aria-label="Project"
+              value={project || 'all'}
+              onChange={(v) => set('project', v === 'all' ? '' : v)}
+              options={[
+                { value: 'all', label: 'Every project' },
+                ...(overview.data?.projects ?? []).map((p) => ({ value: p.slug, label: p.name || p.slug })),
+              ]}
+            />
+          </div>
+        )}
       </Row>
 
       <Loaded state={state}>
@@ -108,9 +121,11 @@ export default function Sessions() {
                 cell: (r) => (
                   <Stack gap="1">
                     <Text size="1">{r.agent ?? '—'}</Text>
-                    <Text size="1" tone="muted">
-                      {r.project}
-                    </Text>
+                    {fixed === undefined && (
+                      <Text size="1" tone="muted">
+                        {r.project}
+                      </Text>
+                    )}
                   </Stack>
                 ),
               },
@@ -157,6 +172,6 @@ export default function Sessions() {
           />
         )}
       </Loaded>
-    </Page>
+    </Stack>
   )
 }

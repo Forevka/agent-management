@@ -11,7 +11,14 @@ import TaskDetail from './pages/TaskDetail'
 import Sessions from './pages/Sessions'
 import Session from './pages/Session'
 import Projects from './pages/Projects'
-import ProjectDetail from './pages/ProjectDetail'
+import {
+  ProjectAgents,
+  ProjectLayout,
+  ProjectOverview,
+  ProjectSessions,
+  ProjectSettings,
+  ProjectTasks,
+} from './pages/Project'
 import Secrets from './pages/Secrets'
 import SecretFolder from './pages/SecretFolder'
 import Nodes from './pages/Nodes'
@@ -41,7 +48,14 @@ createRoot(document.getElementById('root')!).render(
           <Route path="/tasks/:id/session" element={<Session />} />
           <Route path="/sessions" element={<Sessions />} />
           <Route path="/projects" element={<Projects />} />
-          <Route path="/projects/:slug" element={<ProjectDetail />} />
+          {/* A project is a directory: each section its own URL, under one header and its tabs. */}
+          <Route path="/projects/:slug" element={<ProjectLayout />}>
+            <Route index element={<ProjectOverview />} />
+            <Route path="tasks" element={<ProjectTasks />} />
+            <Route path="sessions" element={<ProjectSessions />} />
+            <Route path="agents" element={<ProjectAgents />} />
+            <Route path="settings" element={<ProjectSettings />} />
+          </Route>
           <Route path="/secrets" element={<Secrets />} />
           <Route path="/secrets/:id" element={<SecretFolder />} />
           <Route path="/nodes" element={<Nodes />} />

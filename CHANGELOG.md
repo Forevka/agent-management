@@ -15,6 +15,12 @@ below is one release. How to add to this file is in `CLAUDE.md`
   of the sidebar with a way back. **⌘K** (or the search field) finds any page, project or open task.
   Light, dark and system are under the account menu at the bottom (Appearance). Every URL is
   unchanged. On a phone the sidebar is a drawer.
+- **A project is a directory.** `/projects/<slug>` has tabs, each its own page: Overview (counts,
+  open tasks, where its code is checked out), Tasks and Sessions (the project's own, with the same
+  filters as the fleet-wide lists), Agents (the ones bound to it) and Settings (name, secret
+  folders, repository, plan approval, Jira, channels). The projects page shows them as folder cards.
+  The orchestrator may now link to these sections, to a task's live session (`/tasks/<id>/session`)
+  and to the kit (`/kit`, `/kit/<item>`).
 - **Building the web UI now needs the affectUI access key**, because Pro source is fetched at build
   time and never committed (the repository is public). **Before merging this, a person must:**
   1. set the repository secret: `gh secret set AFFECTUI_TOKEN`;

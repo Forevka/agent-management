@@ -254,6 +254,8 @@ export type ProjectDetail = {
   /** The nodes it is assigned to (cloned there on demand), and how it stands on each. */
   assigned?: NodeAssignment[]
   tasks: Task[]
+  /** Every open task (not done, stopped or failed), however old; `tasks` is only the latest. */
+  open?: Task[]
   sessions: number
   open_tasks: number
 }

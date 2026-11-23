@@ -88,6 +88,84 @@ function RunsWith({
   )
 }
 
+/// The agents and what each runs with, shared by this page and a project's own Agents
+/// (`/projects/<slug>/agents`), which passes `project` to show only the ones bound to it.
+export function AgentTable({
+  data: d,
+  loading,
+  onSaved,
+  project,
+}: {
+  data: AgentsT
+  loading?: boolean
+  onSaved: () => void
+  project?: string
+}) {
+  const rows = project === undefined ? d.agents : d.agents.filter((a) => a.project === project)
+  return (
+    <Table
+      rows={rows}
+      rowKey={(a) => a.id}
+      loading={loading}
+      empty={project === undefined ? 'No agent yet' : 'No agent works on this project yet'}
+      columns={[
+        {
+          key: 'agent',
+          header: 'Agent',
+          cell: (a) => (
+            <Stack gap="1">
+              <Row gap="2" align="center">
+                <Text weight="medium">{a.name}</Text>
+                {/* An agent without a bot works; it just has no face of its own, which
+                    is worth seeing here because the pool is where that is fixed. */}
+                {a.bot === null && <Badge>speaks as the fleet</Badge>}
+              </Row>
+              <Text size="1" tone="muted" mono>
+                {a.id}
+              </Text>
+            </Stack>
+          ),
+        },
+        { key: 'role', header: 'Role', cell: (a) => <Badge>{a.role}</Badge> },
+        // In a project's own list every row is that project.
+        ...(project === undefined
+          ? [
+              {
+                key: 'project',
+                header: 'Project',
+                secondary: true,
+                cell: (a: AgentsT['agents'][number]) =>
+                  a.project ? (
+                    <Link to={`/projects/${a.project}`} className="fx-link">
+                      {a.project}
+                    </Link>
+                  ) : (
+                    <Text size="1" tone="muted">
+                      any
+                    </Text>
+                  ),
+              },
+            ]
+          : []),
+        {
+          key: 'runs',
+          header: 'Runs with',
+          width: '28rem',
+          cell: (a) => (
+            <RunsWith
+              agent={a}
+              efforts={d.efforts}
+              defaultModel={d.default_model}
+              suggested={d.suggested_models}
+              onSaved={onSaved}
+            />
+          ),
+        },
+      ]}
+    />
+  )
+}
+
 export default function Agents() {
   const state = useApi<AgentsT>('/api/agents')
   const [busy, setBusy] = useState(false)
@@ -115,61 +193,7 @@ export default function Agents() {
       <Loaded state={state}>
         {(d) => (
           <>
-            <Table
-              rows={d.agents}
-              rowKey={(a) => a.id}
-              loading={state.loading}
-              empty="No agent yet"
-              columns={[
-                {
-                  key: 'agent',
-                  header: 'Agent',
-                  cell: (a) => (
-                    <Stack gap="1">
-                      <Row gap="2" align="center">
-                        <Text weight="medium">{a.name}</Text>
-                        {/* An agent without a bot works; it just has no face of its own, which
-                            is worth seeing here because the pool is where that is fixed. */}
-                        {a.bot === null && <Badge>speaks as the fleet</Badge>}
-                      </Row>
-                      <Text size="1" tone="muted" mono>
-                        {a.id}
-                      </Text>
-                    </Stack>
-                  ),
-                },
-                { key: 'role', header: 'Role', cell: (a) => <Badge>{a.role}</Badge> },
-                {
-                  key: 'project',
-                  header: 'Project',
-                  secondary: true,
-                  cell: (a) =>
-                    a.project ? (
-                      <Link to={`/projects/${a.project}`} className="fx-link">
-                        {a.project}
-                      </Link>
-                    ) : (
-                      <Text size="1" tone="muted">
-                        any
-                      </Text>
-                    ),
-                },
-                {
-                  key: 'runs',
-                  header: 'Runs with',
-                  width: '28rem',
-                  cell: (a) => (
-                    <RunsWith
-                      agent={a}
-                      efforts={d.efforts}
-                      defaultModel={d.default_model}
-                      suggested={d.suggested_models}
-                      onSaved={() => void state.reload()}
-                    />
-                  ),
-                },
-              ]}
-            />
+            <AgentTable data={d} loading={state.loading} onSaved={() => void state.reload()} />
 
             <Section
               title="Telegram bots"

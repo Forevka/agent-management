@@ -90,6 +90,14 @@ a rounded panel on the gray page, the sidebar on its left, and the page scrolls 
   the panel's top left corner, so a page starts 52px down there.
 - **Dark mode** is still `fx/theme.tsx`: the account menu's Appearance sets it, and App Shell's
   dark rules key on the same `data-theme`.
+- **A project is a directory** (`pages/Project.tsx`): `ProjectLayout` loads it once and puts the
+  header and App Shell's `Tabs` over its sections (the overview at `/projects/<slug>`, then
+  `/projects/<slug>/tasks`, `…/sessions`, `…/agents` and `…/settings`), which read it through the
+  outlet's context, keyed by the project so no form outlives it. A section that is also a
+  fleet-wide page reuses that page's body with the project fixed (`TaskList`, `SessionList`,
+  `AgentTable`), so the two never drift. A new section is a route in `main.tsx`, an entry in
+  `SECTIONS`, and a case in `link_allowed` (`crates/orchestrator/src/admin.rs`) if the orchestrator
+  should be able to link to it.
 
 ## The contract every component here follows
 

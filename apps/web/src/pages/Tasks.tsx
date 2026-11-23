@@ -14,8 +14,22 @@ const STATUSES = ['queued', 'planning', 'running', 'waiting', 'done', 'stopped',
 /// Every task the fleet has ever had, filtered. The filters live in the URL, so a view can be
 /// bookmarked and the back button behaves.
 export default function Tasks() {
+  return (
+    <Page>
+      <PageHeader
+        title="Tasks"
+        description="Everything the fleet has worked on. Every word you search for must match somewhere; archived tasks are searched too. The filters are in the URL, so a view can be shared."
+      />
+      <TaskList />
+    </Page>
+  )
+}
+
+/// The filters and the list, shared by this page and a project's own Tasks (`/projects/<slug>/tasks`),
+/// where `project` is fixed by the page rather than chosen.
+export function TaskList({ project: fixed }: { project?: string }) {
   const [params, setParams] = useSearchParams()
-  const project = params.get('project') ?? ''
+  const project = fixed ?? params.get('project') ?? ''
   const status = params.get('status') ?? ''
   const q = params.get('q') ?? ''
   const builtin = params.get('builtin') === 'true'
@@ -34,9 +48,9 @@ export default function Tasks() {
     return `/api/tasks?${u}`
   }, [project, status, q, builtin, archived])
 
-  const state = useApi<{ tasks: Task[]; total: number }>(path)
+  const state = useApi<{ tasks: Task[]; total: number }>(path, undefined, { keepPrevious: true })
   // Only for the project dropdown; the task list itself comes from the server filtered.
-  const overview = useApi<Overview>('/api/overview')
+  const overview = useApi<Overview>(fixed === undefined ? '/api/overview' : null)
 
   const set = (key: string, value: string) => {
     const next = new URLSearchParams(params)
@@ -46,19 +60,7 @@ export default function Tasks() {
   }
 
   return (
-    <Page>
-      <PageHeader
-        title="Tasks"
-        description="Everything the fleet has worked on. Every word you search for must match somewhere; archived tasks are searched too. The filters are in the URL, so a view can be shared."
-        meta={
-          state.data && (
-            <Text size="1" tone="muted">
-              {state.data.tasks.length} of {state.data.total}
-            </Text>
-          )
-        }
-      />
-
+    <Stack gap="4">
       <Row gap="2" align="end">
         <div style={{ minWidth: '15rem', flexGrow: 1 }}>
           <TextField
@@ -72,18 +74,20 @@ export default function Tasks() {
             aria-label="Search tasks"
           />
         </div>
-        <div style={{ minWidth: '11rem' }}>
-          <Select
-            size="sm"
-            aria-label="Project"
-            value={project || 'all'}
-            onChange={(v) => set('project', v === 'all' ? '' : v)}
-            options={[
-              { value: 'all', label: 'Every project' },
-              ...(overview.data?.projects ?? []).map((p) => ({ value: p.slug, label: p.name || p.slug })),
-            ]}
-          />
-        </div>
+        {fixed === undefined && (
+          <div style={{ minWidth: '11rem' }}>
+            <Select
+              size="sm"
+              aria-label="Project"
+              value={project || 'all'}
+              onChange={(v) => set('project', v === 'all' ? '' : v)}
+              options={[
+                { value: 'all', label: 'Every project' },
+                ...(overview.data?.projects ?? []).map((p) => ({ value: p.slug, label: p.name || p.slug })),
+              ]}
+            />
+          </div>
+        )}
         <div style={{ minWidth: '10rem' }}>
           <Select
             size="sm"
@@ -118,6 +122,11 @@ export default function Tasks() {
             ]}
           />
         </div>
+        {state.data && (
+          <Text size="1" tone="muted">
+            {state.data.tasks.length} of {state.data.total}
+          </Text>
+        )}
       </Row>
 
       <Loaded state={state}>
@@ -127,7 +136,7 @@ export default function Tasks() {
             rows={d.tasks}
             rowKey={(t) => t.id}
             loading={state.loading}
-            empty={q || status || project ? 'No task matches those filters' : 'No task yet'}
+            empty={q || status || (fixed === undefined && project) ? 'No task matches those filters' : 'No task yet'}
             columns={[
               {
                 key: 'task',
@@ -144,16 +153,21 @@ export default function Tasks() {
                   </Stack>
                 ),
               },
-              {
-                key: 'project',
-                header: 'Project',
-                secondary: true,
-                cell: (t) => (
-                  <Link to={`/projects/${t.project}`} className="fx-link" data-muted="">
-                    {t.project}
-                  </Link>
-                ),
-              },
+              // In a project's own list every row is that project.
+              ...(fixed === undefined
+                ? [
+                    {
+                      key: 'project',
+                      header: 'Project',
+                      secondary: true,
+                      cell: (t: Task) => (
+                        <Link to={`/projects/${t.project}`} className="fx-link" data-muted="">
+                          {t.project}
+                        </Link>
+                      ),
+                    },
+                  ]
+                : []),
               {
                 key: 'status',
                 header: 'Status',
@@ -187,6 +201,6 @@ export default function Tasks() {
           />
         )}
       </Loaded>
-    </Page>
+    </Stack>
   )
 }

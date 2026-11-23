@@ -16,13 +16,20 @@ import * as api from './api'
 
 /// Loading, with three outcomes the pages treat differently: data, an error worth showing, and
 /// "the session is gone", which the shell turns into a sign-in screen rather than an error.
-export function useApi<T>(path: string | null, intervalMs?: number) {
-  const [data, setData] = useState<T | null>(null)
+export function useApi<T>(path: string | null, intervalMs?: number, opts?: { keepPrevious?: boolean }) {
+  // The data is kept with the path it answers. One page instance serves many URLs (a project's
+  // layout across projects, a task page across tasks), and handing out the last project's data
+  // under the next project's URL is how a form came to show one project and save into another:
+  // until the new path has answered, there is no data. A filtered list, whose path changes with
+  // every keystroke in its search, may keep showing the previous rows instead (`keepPrevious`);
+  // `loading` says they are on their way out.
+  const [held, setHeld] = useState<{ path: string; data: T } | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [expired, setExpired] = useState(false)
   const [loading, setLoading] = useState(path !== null)
   // Kept in a ref so the polling effect does not restart on every render.
   const seq = useRef(0)
+  const data = held !== null && (held.path === path || opts?.keepPrevious) ? held.data : null
 
   const reload = useCallback(async () => {
     if (path === null) return
@@ -31,7 +38,7 @@ export function useApi<T>(path: string | null, intervalMs?: number) {
       const next = await api.get<T>(path)
       // A slow earlier request must not overwrite a newer answer.
       if (mine === seq.current) {
-        setData(next)
+        setHeld({ path, data: next })
         setError(null)
       }
     } catch (e) {
@@ -43,11 +50,14 @@ export function useApi<T>(path: string | null, intervalMs?: number) {
   }, [path])
 
   useEffect(() => {
+    // A new path is a new load, which is what `loading` is for; a poll of the same one is not.
+    if (path !== null) setLoading(true)
     void reload()
     if (!intervalMs) return
     const t = setInterval(() => void reload(), intervalMs)
     return () => clearInterval(t)
-  }, [reload, intervalMs])
+    // `reload` changes exactly when `path` does.
+  }, [reload, intervalMs, path])
 
   return { data, error, loading, expired, reload }
 }

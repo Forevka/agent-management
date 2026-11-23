@@ -2795,20 +2795,31 @@ fn link_allowed(page: &str) -> bool {
     let mut parts = rest.split('/');
     let first = parts.next().unwrap_or_default();
     let second = parts.next();
+    let third = parts.next();
     if parts.next().is_some() {
         return false;
     }
-    match (first, second) {
+    let id = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    };
+    match (first, second, third) {
         (
             "" | "projects" | "secrets" | "nodes" | "agents" | "tasks" | "sessions" | "inbox"
-            | "habits" | "retro" | "people",
+            | "habits" | "retro" | "people" | "kit",
+            None,
             None,
         ) => true,
-        ("projects" | "secrets" | "nodes" | "items" | "tasks" | "people", Some(s)) => {
-            !s.is_empty()
-                && s.chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        }
+        (
+            "projects" | "secrets" | "nodes" | "items" | "tasks" | "people" | "kit",
+            Some(s),
+            None,
+        ) => id(s),
+        // A project is a directory in the UI: its own tasks, sessions, agents and settings.
+        ("projects", Some(s), Some("tasks" | "sessions" | "agents" | "settings")) => id(s),
+        // A task's live session.
+        ("tasks", Some(s), Some("session")) => id(s),
         _ => false,
     }
 }
@@ -2819,7 +2830,7 @@ pub async fn send_link(o: &Orchestrator, page: &str, text: Option<&str>) -> Resu
     let page = page.trim();
     ensure!(
         link_allowed(page),
-        "page must be one of /, /tasks[/<id>], /sessions, /projects[/<slug>], /inbox, /agents, /nodes[/<node-id>], /secrets[/<folder-id>], /items/<id>, optionally with a filter query such as /tasks?project=bioins&status=failed"
+        "page must be one of /, /tasks[/<id>[/session]], /sessions, /projects[/<slug>[/tasks|/sessions|/agents|/settings]], /inbox, /agents, /nodes[/<node-id>], /secrets[/<folder-id>], /kit[/<item-id>], /habits, /retro, /people[/<id>], /items/<id>, optionally with a filter query such as /tasks?project=bioins&status=failed"
     );
     let text = clip(
         text.map(str::trim)
@@ -3216,6 +3227,14 @@ mod tests {
             "/people",
             "/people/4",
             "/people?tag=night-owl&language=uk",
+            "/projects/bioins/tasks",
+            "/projects/bioins/tasks?status=failed",
+            "/projects/fleet-src/sessions",
+            "/projects/dap/agents",
+            "/projects/dap/settings",
+            "/tasks/bioins-7/session",
+            "/kit",
+            "/kit/3",
         ] {
             assert!(link_allowed(ok), "{ok}");
         }
@@ -3231,6 +3250,13 @@ mod tests {
             "/items/",
             "/people/4/edit",
             "/people/../login",
+            "/projects/bioins/secrets",
+            "/projects/bioins/tasks/x",
+            "/projects//tasks",
+            "/tasks/bioins-7/edit",
+            "/nodes/x/session",
+            "/kit/",
+            "/kit/3/x",
             // A query is for the UI's filters, not a place to hide a payload.
             "/tasks?",
             "/tasks?q=<script>",

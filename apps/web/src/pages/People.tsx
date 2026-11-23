@@ -31,7 +31,7 @@ export default function People() {
     if (language) u.set('language', language)
     return `/api/people?${u}`
   }, [q, tag, project, language])
-  const state = useApi<PeopleT>(path)
+  const state = useApi<PeopleT>(path, undefined, { keepPrevious: true })
 
   const set = (key: string, value: string) => {
     const next = new URLSearchParams(params)

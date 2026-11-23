@@ -1,11 +1,13 @@
 import { useState } from 'react'
 import { Link } from 'react-router-dom'
+import { Folder01Icon } from '@hugeicons/core-free-icons'
+import { Icon } from '@/components/ui/app-shell'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader } from '@/components/ui/card'
+import { EmptyState } from '@/components/ui/empty-state'
 import { TextField } from '@/components/ui/text-field'
-import { Page, PageHeader, Row, Section, Stack, Text } from '@/components/fx/layout'
-import { Table } from '@/components/fx/table'
+import { Grid, Page, PageHeader, Row, Section, Stack, Text } from '@/components/fx/layout'
 import * as api from '../api'
 import type { Overview, ProjectRow } from '../api'
 import { ErrorNote, Loaded, useApi } from '../ui'
@@ -36,74 +38,63 @@ export default function Projects() {
 
   return (
     <Page>
+      <style href="fx-projects" precedence="default">
+        {css}
+      </style>
       <PageHeader title="Projects" description="What the fleet works on, and where its work stands." />
       {error && <ErrorNote>{error}</ErrorNote>}
 
       <Loaded state={state}>
-        {(d) => (
-          <Table
-            rows={d.projects}
-            rowKey={(p) => p.slug}
-            loading={state.loading}
-            empty="No projects yet"
-            columns={[
-              {
-                key: 'project',
-                header: 'Project',
-                width: '40%',
-                cell: (p) => (
-                  <Stack gap="1">
-                    <Link to={`/projects/${p.slug}`} className="fx-link">
-                      {p.name || p.slug}
-                    </Link>
-                    <Text size="1" tone="muted" mono>
-                      {p.slug}
-                    </Text>
-                  </Stack>
-                ),
-              },
-              {
-                key: 'jira',
-                header: 'Jira',
-                secondary: true,
-                cell: (p) =>
-                  p.jira ? (
-                    <Badge>{p.jira}</Badge>
-                  ) : (
-                    <Text size="1" tone="muted">
-                      —
-                    </Text>
-                  ),
-              },
-              {
-                key: 'tasks',
-                header: 'Tasks',
-                align: 'end',
-                cell: (p) => {
-                  const counts = overview.data?.projects.find((x) => x.slug === p.slug)
-                  if (!counts)
-                    return (
-                      <Text size="1" tone="muted">
-                        —
-                      </Text>
-                    )
-                  return (
-                    <Row gap="2" justify="end">
-                      {counts.running > 0 && (
-                        <Badge tone="success" live>
-                          {counts.running} live
-                        </Badge>
+        {(d) =>
+          d.projects.length === 0 ? (
+            <EmptyState title="No projects yet" text="Add one below; it becomes a folder in the sidebar." />
+          ) : (
+            // Each project is a folder, as in the sidebar: a card that opens its directory.
+            <Grid min={260} gap="3">
+              {d.projects.map((p) => {
+                const counts = overview.data?.projects.find((x) => x.slug === p.slug)
+                return (
+                  <Card key={p.slug} interactive>
+                    <Link to={`/projects/${encodeURIComponent(p.slug)}`} className="fx-item">
+                      <Row gap="2" wrap={false}>
+                        <span className="fx-projects__folder" aria-hidden="true">
+                          <Icon icon={Folder01Icon} size={18} />
+                        </span>
+                        <Stack gap="0">
+                          <Text weight="medium">{p.name || p.slug}</Text>
+                          <Text size="1" tone="muted" mono>
+                            {p.slug}
+                          </Text>
+                        </Stack>
+                      </Row>
+                      {p.description && (
+                        <Text size="1" tone="muted" className="fx-projects__desc">
+                          {p.description}
+                        </Text>
                       )}
-                      <Text size="1">
-                        {counts.open} open of {counts.total}
-                      </Text>
-                    </Row>
-                  )
-                },
-              },
-            ]}
-          />
-        )}
+                      <Row gap="2">
+                        {counts && counts.running > 0 && (
+                          <Badge tone="success" live>
+                            {counts.running} live
+                          </Badge>
+                        )}
+                        {/* Only the overview's counts: the list's own `open_tasks` counts stopped
+                            and failed work too, and a number that changes as the page loads is
+                            worse than none. */}
+                        {counts && (
+                          <Text size="1">
+                            {counts.open} open of {counts.total}
+                          </Text>
+                        )}
+                        {p.jira && <Badge>{p.jira}</Badge>}
+                      </Row>
+                    </Link>
+                  </Card>
+                )
+              })}
+            </Grid>
+          )
+        }
       </Loaded>
 
       <Section title="New project">
@@ -140,3 +131,22 @@ export default function Projects() {
     </Page>
   )
 }
+
+const css = /* css */ `
+.fx-projects__folder {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 34px;
+  height: 34px;
+  border-radius: var(--aui-radius-sm, 7px);
+  background: var(--aui-subtle, #f0f0f0);
+  color: var(--aui-muted, #737373);
+}
+.fx-projects__desc {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+`

@@ -1249,6 +1249,16 @@ async fn project(State(o): State<O>, h: HeaderMap, Path(slug): Path<String>) -> 
     .bind(&slug)
     .fetch_all(&o.db)
     .await?;
+    // Everything still open, however long ago it was touched: `tasks` is the latest 100, which a
+    // busy project can fill while an old task still waits, and the overview's list of open work
+    // must agree with its count. Bounded all the same, as every list here is.
+    let open_rows: Vec<TaskRow> = sqlx::query_as(
+        "select * from tasks where project = $1 and status not in ('done','stopped','failed')
+           and id not in ('brain','secretary','retro') order by updated_at desc limit 200",
+    )
+    .bind(&slug)
+    .fetch_all(&o.db)
+    .await?;
     let (sessions, open): (i64, i64) = sqlx::query_as(
         "select (select count(*) from runs where project = $1),
                 (select count(*) from tasks where project = $1 and status not in ('done','stopped','failed') and id not in ('brain','secretary','retro'))",
@@ -1269,6 +1279,7 @@ async fn project(State(o): State<O>, h: HeaderMap, Path(slug): Path<String>) -> 
         // The nodes it is assigned to (cloned there on demand), and how it stands on each.
         "assigned": crate::node_projects::project_json(&o, &slug).await?,
         "tasks": tasks.iter().map(task_json).collect::<Vec<_>>(),
+        "open": open_rows.iter().map(task_json).collect::<Vec<_>>(),
         "sessions": sessions,
         "open_tasks": open,
     })))

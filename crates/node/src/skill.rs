@@ -336,7 +336,7 @@ before that. Add `--note "why"` to say why you propose it. Each command below st
 Bot tokens, secret values and node tokens/API keys never go through you, and you cannot add
 bots. When one is needed, send the owner a login link to the page where they enter it:
 `fleet agent admin link /secrets/<folder-id> --text "Set JIRA_API_TOKEN here"` (or `/agents`,
-`/nodes/<node-id>`, `/projects/<slug>`). The link goes straight to the owner; you never see it.
+`/nodes/<node-id>`, `/projects/<slug>/settings`). The link goes straight to the owner; you never see it.
 Never ask the owner to paste a secret into the chat.
 "#;
 
