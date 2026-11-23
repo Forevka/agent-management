@@ -1,5 +1,4 @@
 import { useState } from 'react'
-import { Link } from 'react-router-dom'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardFooter, CardHeader } from '@/components/ui/card'
@@ -11,6 +10,7 @@ import { Stat } from '@/components/fx/stat'
 import * as api from '../api'
 import type { Inbox as InboxT } from '../api'
 import { ActionButton, ErrorNote, Loaded, When, useApi } from '../ui'
+import { TaskLink } from '../peek'
 
 /// The three todo actions are the same ones the Inbox buttons in Telegram send, by the same code
 /// path on the server: done, dropped, and mine (make it a task).
@@ -51,13 +51,13 @@ export default function Inbox() {
         {(d) => (
           <>
             <Grid min={200} gap="3">
-              <Stat label="messages in 24h" value={d.stats.messages_today} />
+              <Stat label="Messages in 24h" value={d.stats.messages_today} />
               <Stat
-                label="not yet handled"
+                label="Not yet handled"
                 value={d.stats.pending}
-                tone={d.stats.pending > 0 ? 'warning' : 'default'}
+                hint={d.stats.pending > 0 ? 'Waiting for the secretary' : undefined}
               />
-              <Stat label="secretary runs in 24h" value={d.stats.batches_today} />
+              <Stat label="Secretary runs in 24h" value={d.stats.batches_today} />
             </Grid>
 
             <Stack gap="3">
@@ -98,9 +98,7 @@ export default function Inbox() {
                           <CardContent>
                             <Text size="1">
                               Linked to workflow{' '}
-                              <Link to={`/tasks/${t.workflow}`} className="fx-link">
-                                {t.workflow}
-                              </Link>
+                              <TaskLink id={t.workflow}>{t.workflow}</TaskLink>
                             </Text>
                           </CardContent>
                         )}

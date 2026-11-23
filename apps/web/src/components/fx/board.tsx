@@ -1,5 +1,5 @@
-import type { ReactNode } from 'react'
-import { Link } from 'react-router-dom'
+import type { MouseEvent, ReactNode } from 'react'
+import { Link, type To } from 'react-router-dom'
 
 /*
  * Board – the fleet's work as columns of cards.
@@ -89,7 +89,9 @@ export function BoardColumn({
 }
 
 export type BoardCardProps = {
-  to: string
+  to: To
+  /** Runs before the link navigates; it may prevent it. */
+  onClick?: (e: MouseEvent<HTMLAnchorElement>) => void
   title: ReactNode
   /** The handle this card is named by, set across from the title. */
   badge?: ReactNode
@@ -119,11 +121,12 @@ export function BoardCard({
   tone = 'default',
   facts,
   links,
+  onClick,
 }: BoardCardProps) {
   const chips = links?.slice(0, CHIPS) ?? []
   const more = (links?.length ?? 0) - chips.length
   return (
-    <Link className="fx-card" data-tone={tone} to={to}>
+    <Link className="fx-card" data-tone={tone} to={to} onClick={onClick}>
       <span className="fx-card__head">
         <span className="fx-card__title">
           {mark && <span className="fx-card__mark">{mark}</span>}

@@ -19,10 +19,10 @@ import { ActionButton, Duration, ErrorNote, Loaded, Pre, StatusBadge, When, useA
 
 /// The fleet's own standing sessions. They are not work the owner edits, stops or writes to from
 /// here (the server refuses it too); they have their own resets in Telegram.
-const BUILTIN = ['brain', 'secretary', 'retro']
+export const BUILTIN = ['brain', 'secretary', 'retro']
 
 /// Over, as far as the fleet is concerned: a message resumes it, an edit does not.
-const FINISHED = ['done', 'stopped', 'failed']
+export const FINISHED = ['done', 'stopped', 'failed']
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e))
 
@@ -143,7 +143,7 @@ function EditTask({
 }
 
 /// Writing to the task's agent, as a message in its Telegram topic does (it is shown there too).
-function MessageBox({ task, onSent }: { task: Task; onSent: () => void }) {
+export function MessageBox({ task, onSent }: { task: Task; onSent: () => void }) {
   const [text, setText] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -296,12 +296,12 @@ function Links({ task, onChanged }: { task: Task; onChanged: () => void }) {
 /// Whether an item is still waiting for the owner. An item from an older build of the API may
 /// carry no state at all; it is then treated as settled rather than as a false alarm, because
 /// the fleet asks again when it still needs something.
-function isOpen(i: Item): boolean {
+export function isOpen(i: Item): boolean {
   return i.state === 'open'
 }
 
 /// One item of a task, linking to its own page, where the question and the answer are.
-function ItemCard({ item, answered }: { item: Item; answered?: boolean }) {
+export function ItemCard({ item, answered }: { item: Item; answered?: boolean }) {
   return (
     <Card as="div" interactive>
       <Link to={`/items/${item.id}`} className="fx-item">

@@ -50,8 +50,9 @@ file would publish what the licence sells.
   - `npm run aui:check` (in CI) fails if any tracked file is a Pro file, by name or by content.
 - **Patches** (`scripts/affectui.patches.mjs`) are exact replacements the script applies to a Pro
   file on every build, each required to match exactly once. They exist only to give a component a
-  prop it lacks where it hard-codes showcase content: App Shell, for instance, ships sample
-  workspace, account and ⌘K menus ("Billing", "Log out"), and the patches let us pass our own.
+  prop it lacks: where it hard-codes showcase content (App Shell ships sample workspace, account
+  and ⌘K menus, "Billing", "Log out", and the patches let us pass our own), or where a control has
+  no accessible name of its own (App Shell's `MenuButton` takes a `label`, "Status: failed").
   They never change what a component does with its data, and never copy a block of it (that file is
   public).
 
@@ -65,8 +66,9 @@ Inbox, Settings…) renders its own App Shell with its own hard-coded sidebar, s
 inside our navigation. We use **App Shell** itself (`shell.tsx`) and Pro *components* (data-driven:
 they take our data as props), and build each page in the layout of the matching screen.
 
-Ours, in `components/fx/`, written to the same contract: `fx/table.tsx` and `fx/stat.tsx` (until
-Pro's Data Table and Stat Card replace them), `fx/board.tsx` (the landing page's columns and cards —
+Ours, in `components/fx/`, written to the same contract: `fx/table.tsx` (Pro's Data Table is a
+spreadsheet, editable cell by cell, which is not what a list of tasks is), `fx/stat.tsx` (Pro's Stat
+Card, made a router link), `fx/board.tsx` (the landing page's columns and cards —
 a *reading* board, not a planning one: the cards do not drag, because a column is the task's real
 state in the fleet and moving one by hand would be a lie), `fx/layout.tsx` (`Page`, `PageHeader`,
 `Section`, `Stack`, `Row`, `Grid`, `Text`, `Heading`), `fx/note.tsx` (a callout), `fx/radio.tsx`,
@@ -90,6 +92,15 @@ a rounded panel on the gray page, the sidebar on its left, and the page scrolls 
   the panel's top left corner, so a page starts 52px down there.
 - **Dark mode** is still `fx/theme.tsx`: the account menu's Appearance sets it, and App Shell's
   dark rules key on the same `data-theme`.
+- **The work area is the open task** (`peek.tsx`, `pages/TaskPeek.tsx`). A task link anywhere is
+  `TaskLink` (or `useTaskPeek().to(id)`): it keeps the page and adds `?task=<id>`, and `shell.tsx`
+  hands App Shell a work area with one tab for it, only while one is open (so a page with none has
+  no empty panel). The tab's × removes it from the URL; the panel's own fold button only folds it, and a click on the
+  open task brings it forward again (`RevealTask`).
+  The full page `/tasks/<id>` stays, for editing, links, the session list and the transcript.
+- **Lists use App Shell's toolbar**, as the Agent / Tasks screen does: `SectionHead` with the count,
+  then `SearchField`, `MenuButton` for a single choice and `FilterButton` for on/off options, all
+  still writing to the URL.
 - **A project is a directory** (`pages/Project.tsx`): `ProjectLayout` loads it once and puts the
   header and App Shell's `Tabs` over its sections (the overview at `/projects/<slug>`, then
   `/projects/<slug>/tasks`, `…/sessions`, `…/agents` and `…/settings`), which read it through the

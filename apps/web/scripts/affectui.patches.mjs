@@ -42,5 +42,17 @@ export const PATCHES = {
       '            onRun={(id) => {\n              closeSearch();\n              if (id.startsWith("go:")) go(id.split(":").slice(2).join(":"));',
       '            onRun={(id, query) => {\n              closeSearch();\n              if (id.startsWith("go:")) go(id.split(":").slice(2).join(":"));\n              else onCommand?.(id, query);',
     ],
+    // MenuButton's button is named by its current choice alone ("failed", "bioins"), which tells a
+    // screen reader nothing about which filter it is. `label` names it: "Status: failed".
+    [
+      '  className,\n}: {\n  value: T;\n  options: { value: T; label: string }[];',
+      '  className,\n  label,\n}: {\n' +
+        '  /** (fleet patch) What the menu chooses, e.g. "Status": with the choice, its accessible name */\n' +
+        '  label?: string;\n  value: T;\n  options: { value: T; label: string }[];',
+    ],
+    [
+      'aria-expanded={open} onClick={() => toggle()}>',
+      'aria-expanded={open} aria-label={label ? `${label}: ${current?.label ?? ""}` : undefined} onClick={() => toggle()}>',
+    ],
   ],
 }

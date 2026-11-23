@@ -1,7 +1,7 @@
 import { useMemo } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
+import { MenuButton, SectionHead } from '@/components/ui/app-shell'
 import { Badge } from '@/components/ui/badge'
-import { Select } from '@/components/ui/select'
 import { Page, PageHeader, Row, Stack, Text } from '@/components/fx/layout'
 import { Table } from '@/components/fx/table'
 import type { Overview, Session } from '../api'
@@ -66,31 +66,34 @@ export function SessionList({ project: fixed }: { project?: string }) {
   }
 
   return (
-    <Stack gap="4">
-      <Row gap="2" align="end" justify="between">
-        {state.data ? (
-          <Text size="1" tone="muted">
-            {state.data.runs.length} of {state.data.total}
-          </Text>
-        ) : (
-          <span />
-        )}
-        {fixed === undefined && (
-          <div style={{ minWidth: '12rem' }}>
-            <Select
-              size="sm"
-              aria-label="Project"
+    <Stack gap="3">
+      <SectionHead
+        title={fixed === undefined ? 'All sessions' : 'Sessions'}
+        count={state.data?.total}
+        right={
+          fixed === undefined && (
+            <MenuButton
+              label="Project"
               value={project || 'all'}
               onChange={(v) => set('project', v === 'all' ? '' : v)}
               options={[
                 { value: 'all', label: 'Every project' },
                 ...(overview.data?.projects ?? []).map((p) => ({ value: p.slug, label: p.name || p.slug })),
+                ...(project && !overview.data?.projects.some((p) => p.slug === project)
+                  ? [{ value: project, label: project }]
+                  : []),
               ]}
             />
-          </div>
-        )}
-      </Row>
+          )
+        }
+      />
 
+      {/* The list is fetched 200 at a time; the count above is everything that matches. */}
+      {state.data && state.data.runs.length < state.data.total && (
+        <Text size="1" tone="muted">
+          Showing the first {state.data.runs.length} of {state.data.total}; narrow the filters to see the rest.
+        </Text>
+      )}
       <Loaded state={state}>
         {(d) => (
           <Table

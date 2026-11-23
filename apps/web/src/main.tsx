@@ -39,7 +39,9 @@ startTheme()
 
 createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
-    <BrowserRouter>
+    {/* Without transitions: a search field here is driven by the URL, and a controlled input
+        whose value arrives in a transition loses keystrokes and its cursor. */}
+    <BrowserRouter useTransitions={false}>
       <Routes>
         <Route element={<Shell />}>
           <Route path="/" element={<BoardPage />} />

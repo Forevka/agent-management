@@ -1,13 +1,12 @@
 import { useMemo } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
+import { FilterButton, MenuButton, SearchField, SectionHead } from '@/components/ui/app-shell'
 import { Badge } from '@/components/ui/badge'
-import { Select } from '@/components/ui/select'
-import { TextField } from '@/components/ui/text-field'
-import { Page, PageHeader, Row, Stack, Text } from '@/components/fx/layout'
+import { Page, PageHeader, Stack, Text } from '@/components/fx/layout'
 import { Table } from '@/components/fx/table'
-import { SearchIcon } from '@/components/fx/icons'
 import type { Overview, Task } from '../api'
 import { Loaded, StatusBadge, When, useApi } from '../ui'
+import { TaskLink } from '../peek'
 
 const STATUSES = ['queued', 'planning', 'running', 'waiting', 'done', 'stopped', 'failed', 'archived']
 
@@ -60,75 +59,78 @@ export function TaskList({ project: fixed }: { project?: string }) {
   }
 
   return (
-    <Stack gap="4">
-      <Row gap="2" align="end">
-        <div style={{ minWidth: '15rem', flexGrow: 1 }}>
-          <TextField
-            placeholder="Search title, brief, F-key, agent, links, attachments"
-            defaultValue={q}
-            onChange={(e) => set('q', e.currentTarget.value)}
-            prefix={<SearchIcon />}
-            clearable
-            onClear={() => set('q', '')}
-            size="sm"
-            aria-label="Search tasks"
-          />
-        </div>
-        {fixed === undefined && (
-          <div style={{ minWidth: '11rem' }}>
-            <Select
-              size="sm"
-              aria-label="Project"
-              value={project || 'all'}
-              onChange={(v) => set('project', v === 'all' ? '' : v)}
+    <Stack gap="3">
+      {/* The Agent / Tasks screen's bar: a count, the search and the filters on one line. */}
+      <SectionHead
+        title={fixed === undefined ? 'All tasks' : 'Tasks'}
+        count={state.data?.total}
+        right={
+          <>
+            <SearchField
+              placeholder="Search tasks, F-keys, links…"
+              width={240}
+              value={q}
+              onChange={(v) => set('q', v)}
+            />
+            {fixed === undefined && (
+              <MenuButton
+                label="Project"
+                value={project || 'all'}
+                onChange={(v) => set('project', v === 'all' ? '' : v)}
+                options={[
+                  { value: 'all', label: 'Every project' },
+                  ...(overview.data?.projects ?? []).map((p) => ({ value: p.slug, label: p.name || p.slug })),
+                  // A project in the URL that the overview does not list (yet) still names itself.
+                  ...(project && !overview.data?.projects.some((p) => p.slug === project)
+                    ? [{ value: project, label: project }]
+                    : []),
+                ]}
+              />
+            )}
+            <MenuButton
+              label="Status"
+              value={status || 'all'}
+              onChange={(v) => set('status', v === 'all' ? '' : v)}
               options={[
-                { value: 'all', label: 'Every project' },
-                ...(overview.data?.projects ?? []).map((p) => ({ value: p.slug, label: p.name || p.slug })),
+                { value: 'all', label: 'Any status' },
+                ...STATUSES.map((s) => ({ value: s, label: s })),
+                ...(status && !STATUSES.includes(status) ? [{ value: status, label: status }] : []),
               ]}
             />
-          </div>
-        )}
-        <div style={{ minWidth: '10rem' }}>
-          <Select
-            size="sm"
-            aria-label="Status"
-            value={status || 'all'}
-            onChange={(v) => set('status', v === 'all' ? '' : v)}
-            options={[{ value: 'all', label: 'Any status' }, ...STATUSES.map((s) => ({ value: s, label: s }))]}
-          />
-        </div>
-        <div style={{ minWidth: '13rem' }}>
-          {/* The brain, the secretary and the retrospective are standing sessions, not work. */}
-          <Select
-            size="sm"
-            aria-label="Include the fleet's own sessions"
-            value={builtin ? 'true' : 'false'}
-            onChange={(v) => set('builtin', v === 'true' ? 'true' : '')}
-            options={[
-              { value: 'false', label: 'Work only' },
-              { value: 'true', label: "The fleet's own sessions too" },
-            ]}
-          />
-        </div>
-        <div style={{ minWidth: '11rem' }}>
-          <Select
-            size="sm"
-            aria-label="Include archived tasks"
-            value={archived ? 'true' : 'false'}
-            onChange={(v) => set('archived', v === 'true' ? 'true' : '')}
-            options={[
-              { value: 'false', label: 'Hide archived' },
-              { value: 'true', label: 'Archived too' },
-            ]}
-          />
-        </div>
-        {state.data && (
-          <Text size="1" tone="muted">
-            {state.data.tasks.length} of {state.data.total}
-          </Text>
-        )}
-      </Row>
-
+            {/* The brain, the secretary and the retrospective are standing sessions, not work;
+                archived tasks are left out until asked for (or searched for). */}
+            <FilterButton
+              label="Include"
+              groups={[
+                {
+                  id: 'include',
+                  label: 'Include',
+                  options: [
+                    { id: 'builtin', label: "The fleet's own sessions" },
+                    { id: 'archived', label: 'Archived tasks' },
+                  ],
+                },
+              ]}
+              value={{ include: [...(builtin ? ['builtin'] : []), ...(archived ? ['archived'] : [])] }}
+              onChange={(v) => {
+                const on = v.include ?? []
+                const next = new URLSearchParams(params)
+                for (const k of ['builtin', 'archived']) {
+                  if (on.includes(k)) next.set(k, 'true')
+                  else next.delete(k)
+                }
+                setParams(next, { replace: true })
+              }}
+            />
+          </>
+        }
+      />
+      {/* The list is fetched 200 at a time; the count above is everything that matches. */}
+      {state.data && state.data.tasks.length < state.data.total && (
+        <Text size="1" tone="muted">
+          Showing the first {state.data.tasks.length} of {state.data.total}; narrow the filters to see the rest.
+        </Text>
+      )}
       <Loaded state={state}>
         {(d) => (
           <Table
@@ -144,9 +146,7 @@ export function TaskList({ project: fixed }: { project?: string }) {
                 width: '34%',
                 cell: (t) => (
                   <Stack gap="1">
-                    <Link to={`/tasks/${t.id}`} className="fx-link">
-                      {t.key && t.key !== t.id ? `${t.key} · ${t.id}` : t.id}
-                    </Link>
+                    <TaskLink id={t.id}>{t.key && t.key !== t.id ? `${t.key} · ${t.id}` : t.id}</TaskLink>
                     <Text size="1" tone="muted" breakAll>
                       {t.title}
                     </Text>

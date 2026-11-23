@@ -15,6 +15,7 @@ import * as api from '../api'
 import type { Node, NodeAssignment, NodeDisk } from '../api'
 import { DiskBadge } from '../disk'
 import { ActionButton, ErrorNote, Loaded, When, useApi } from '../ui'
+import { TaskLink } from '../peek'
 
 const AUTH_MODES = ['default', 'oauth_token', 'api_key']
 
@@ -500,9 +501,7 @@ export default function NodeDetail() {
                     key: 'task',
                     header: 'Task',
                     cell: (r) => (
-                      <Link to={`/tasks/${r.task}`} className="fx-link">
-                        {r.task}
-                      </Link>
+                      <TaskLink id={r.task}>{r.task}</TaskLink>
                     ),
                   },
                   { key: 'started', header: 'Started', cell: (r) => <When at={r.started_at} /> },

@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { Outlet, matchPath, useLocation, useNavigate, useNavigationType } from 'react-router-dom'
 import type { IconSvgElement } from '@hugeicons/react'
 import {
@@ -23,11 +23,13 @@ import {
   UserGroupIcon,
   HardDriveIcon,
 } from '@hugeicons/core-free-icons'
-import { AppShell, Icon, type MenuItem, type ShellGroup, type ShellNavItem } from '@/components/ui/app-shell'
+import { AppShell, Icon, useWorkArea, type MenuItem, type ShellGroup, type ShellNavItem } from '@/components/ui/app-shell'
 import type { CommandGroup } from '@/components/ui/command-menu-clean'
 import { useTheme, type Mode } from '@/components/fx/theme'
 import type { Overview } from './api'
 import { useApi } from './ui'
+import { RevealTask, useTaskPeek } from './peek'
+import { TaskPeek } from './pages/TaskPeek'
 
 /*
  * The frame: affectUI's App Shell (Pro, fetched at build time; see apps/web/DESIGN.md), with the
@@ -41,7 +43,13 @@ import { useApi } from './ui'
  * The sidebar has two faces. The app: the pages the owner works in, then every project as a folder,
  * and the open project's live tasks under it. Settings: the fleet's administration (agents, nodes,
  * the kit, secrets, habits), with a way back.
+ *
+ * On the right, the work area: a task opened from anywhere (a board card, a list row, the folder, ⌘K)
+ * opens there beside the page, as `?task=<id>` in the URL (`peek.tsx`).
  */
+
+/** What a sidebar row or a ⌘K command that opens a task beside the page hands back. */
+const TASK = 'task:'
 
 type Page = { label: string; path: string; icon: IconSvgElement; /** other paths that are this page */ match?: string[] }
 
@@ -111,6 +119,7 @@ function usePanelScroll() {
 export function Shell() {
   const { pathname } = useLocation()
   const navigate = useNavigate()
+  const peek = useTaskPeek()
   usePanelScroll()
   const { mode, setMode } = useTheme()
   // The sidebar's counts and folders. The overview is the landing data the board predates; one
@@ -119,10 +128,10 @@ export function Shell() {
   const data = overview.data
 
   const inSettings = SETTINGS.some((p) => isAt(p, pathname))
-  // The open folder: the project whose page this is, or the project of the task whose page this is
-  // (so clicking a task in the folder keeps the folder open, with that task marked).
-  const taskId =
-    matchPath({ path: '/tasks/:id/*' }, pathname)?.params.id ?? null
+  // The task in view: the one open beside the page, or the one whose page this is.
+  const taskId = peek.id ?? matchPath({ path: '/tasks/:id/*' }, pathname)?.params.id ?? null
+  // The open folder: the project whose page this is, or the project of that task (so clicking a
+  // task in the folder keeps the folder open, with that task marked).
   const projectSlug =
     matchPath({ path: '/projects/:slug/*' }, pathname)?.params.slug ??
     (taskId ? (data?.tasks.find((t) => t.id === taskId)?.project ?? null) : null)
@@ -170,7 +179,7 @@ export function Shell() {
         groups.push({
           label: open.name,
           items: tasks.map((t) => {
-            const label = take(`${t.key} ${t.title}`, `/tasks/${encodeURIComponent(t.id)}`)
+            const label = take(`${t.key} ${t.title}`, `${TASK}${t.id}`)
             if (t.id === taskId) activeTask = label
             return { label, icon: t.running ? Loading03Icon : Task01Icon }
           }),
@@ -181,9 +190,10 @@ export function Shell() {
 
     const page = pages.find((p) => isAt(p, pathname))
     // A task in the open folder is marked there; its project only on the project's own pages.
+    const onTaskPage = matchPath({ path: '/tasks/:id/*' }, pathname) !== null
     const active =
       activeTask ??
-      (taskId ? undefined : activeProject) ??
+      (onTaskPage ? undefined : activeProject) ??
       (page ? page.label : matchPath({ path: '/projects', end: true }, pathname) ? ALL_PROJECTS : undefined)
 
     // ⌘K: every page, and the open tasks by their key and title. Projects are in its "Go to" group.
@@ -201,7 +211,7 @@ export function Shell() {
         id: 'tasks',
         label: 'Open tasks',
         commands: (data?.tasks ?? []).map((t) => ({
-          id: `path:/tasks/${encodeURIComponent(t.id)}`,
+          id: `${TASK}${t.id}`,
           label: `${t.key} · ${t.title}`,
           hint: t.project,
           keywords: `${t.id} ${t.project} ${t.status}`,
@@ -212,10 +222,55 @@ export function Shell() {
     return { routes, nav, groups, active, commands }
   }, [data, overview.loading, inSettings, projectSlug, taskId, pathname])
 
+  // A task from the folder or ⌘K: opened beside the page, or, already open, brought forward.
+  const openTask = (id: string) => (id === peek.id ? ws.show('task') : peek.open(id))
   const go = (label: string) => {
     const to = model.routes.get(label)
-    if (to && to !== pathname) navigate(to)
+    if (to?.startsWith(TASK)) openTask(to.slice(TASK.length))
+    // The page already open: the click closes the task beside it, and keeps the page's filters.
+    else if (to === pathname && peek.id) peek.close()
+    else if (to && to !== pathname) navigate(to)
   }
+
+  // The work area holds one tab, the open task. It is there only while a task is open, so a page
+  // with none has no empty panel and no button for one.
+  // The tab is named by the task's F-key: from the sidebar's data for an open task, or from the
+  // panel itself once it has loaded one that is finished.
+  const [loadedKey, setLoadedKey] = useState<{ id: string; key: string } | null>(null)
+  const peekKey =
+    data?.tasks.find((t) => t.id === peek.id)?.key ?? (loadedKey?.id === peek.id ? loadedKey.key : undefined)
+  const ws = useWorkArea({
+    tabs: peek.id
+      ? [{ id: 'task', title: peekKey ?? peek.id, icon: Task01Icon, content: <TaskPeek key={peek.id} id={peek.id} onKey={(key) => setLoadedKey({ id: peek.id!, key })} /> }]
+      : [],
+    newTab: false,
+  })
+  // A task opened (or another one in its place) brings the panel forward, unfolding it if the
+  // owner had folded it away.
+  useEffect(() => {
+    if (peek.id) ws.show('task')
+    // `ws` is a new object every render; only the task changing should reveal it.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [peek.id])
+  // The tab's × closes the task: it leaves the URL too. (The panel's own fold button only folds it;
+  // the task stays open behind the button that brings it back.)
+  const tabs = ws.state.tabs.length
+  const hadTab = useRef(false)
+  useEffect(() => {
+    if (hadTab.current && tabs === 0 && peek.id) {
+      peek.close()
+      // The shell would focus the button that brings the panel back, but with the task gone the
+      // panel goes too; the page takes the focus rather than leave it nowhere.
+      requestAnimationFrame(() => {
+        const main = document.querySelector<HTMLElement>('.fx-shell .ui-as-main')
+        if (!main) return
+        if (!main.hasAttribute('tabindex')) main.setAttribute('tabindex', '-1')
+        main.focus({ preventScroll: true })
+      })
+    }
+    hadTab.current = tabs > 0
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tabs])
 
   const appearance: [Mode, string, IconSvgElement][] = [
     ['system', 'System', ComputerIcon],
@@ -237,6 +292,7 @@ export function Shell() {
   ]
 
   return (
+    <RevealTask.Provider value={() => ws.show('task')}>
     <div className="fx-shell">
       <style href="fx-shell" precedence="default">
         {css}
@@ -258,11 +314,15 @@ export function Shell() {
         commands={model.commands}
         onCommand={(id) => {
           if (id.startsWith('path:')) navigate(id.slice('path:'.length))
+          else if (id.startsWith(TASK)) openTask(id.slice(TASK.length))
         }}
+        workArea={peek.id ? ws : undefined}
+        panelTitle="Task panel"
       >
         <Outlet />
       </AppShell>
     </div>
+    </RevealTask.Provider>
   )
 }
 

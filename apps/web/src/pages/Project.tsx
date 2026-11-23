@@ -15,6 +15,7 @@ import { ArrowLeftIcon } from '@/components/fx/icons'
 import * as api from '../api'
 import type { Agents as AgentsT, ProjectDetail as Detail } from '../api'
 import { ActionButton, ErrorNote, Loaded, StatusBadge, When, useApi } from '../ui'
+import { TaskLink } from '../peek'
 import { TaskList } from './Tasks'
 import { SessionList } from './Sessions'
 import { AgentTable } from './Agents'
@@ -113,10 +114,10 @@ export function ProjectOverview() {
   return (
     <>
       <Grid min={200} gap="3">
-        <Stat label="open tasks" value={d.open_tasks} to={`${base}/tasks`} />
-        <Stat label="sessions, all time" value={d.sessions} to={`${base}/sessions`} />
-        <Stat label="mapped channels" value={d.channels.length} to={`${base}/settings`} />
-        <Stat label="nodes with a checkout" value={d.nodes.length} />
+        <Stat label="Open tasks" value={d.open_tasks} to={`${base}/tasks`} />
+        <Stat label="Sessions, all time" value={d.sessions} to={`${base}/sessions`} />
+        <Stat label="Mapped channels" value={d.channels.length} to={`${base}/settings`} />
+        <Stat label="Nodes with a checkout" value={d.nodes.length} />
       </Grid>
 
       <Section
@@ -138,9 +139,7 @@ export function ProjectOverview() {
               width: '45%',
               cell: (t) => (
                 <Stack gap="1">
-                  <Link to={`/tasks/${encodeURIComponent(t.id)}`} className="fx-link">
-                    {t.key && t.key !== t.id ? `${t.key} · ${t.id}` : t.id}
-                  </Link>
+                  <TaskLink id={t.id}>{t.key && t.key !== t.id ? `${t.key} · ${t.id}` : t.id}</TaskLink>
                   <Text size="1" tone="muted" breakAll>
                     {t.title}
                   </Text>

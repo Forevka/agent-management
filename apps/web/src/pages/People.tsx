@@ -1,12 +1,11 @@
 import { useMemo, useState } from 'react'
 import { Link, useNavigate, useSearchParams } from 'react-router-dom'
+import { MenuButton, SearchField, SectionHead } from '@/components/ui/app-shell'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { Select } from '@/components/ui/select'
 import { TextField } from '@/components/ui/text-field'
 import { Page, PageHeader, Row, Stack, Text } from '@/components/fx/layout'
 import { Table } from '@/components/fx/table'
-import { SearchIcon } from '@/components/fx/icons'
 import * as api from '../api'
 import type { People as PeopleT } from '../api'
 import { ErrorNote, Loaded, When, useApi } from '../ui'
@@ -45,68 +44,49 @@ export default function People() {
       <PageHeader
         title="People"
         description="Your colleagues the agents come into contact with. The retrospective keeps these records every day from the day’s messages and its memories, without pinging you; the orchestrator and the secretary read a person’s card before writing to them, and use it only for how they write (language, tone, form of address), never for what the fleet does. Correct anything here: a field you set stays yours, the retrospective can only add to it, and what you remove stays removed."
-        meta={
-          state.data && (
-            <Text size="1" tone="muted">
-              {state.data.people.length} of {state.data.total}
-            </Text>
-          )
-        }
       />
 
-      <Row gap="2" align="end">
-        <div style={{ minWidth: '15rem', flexGrow: 1 }}>
-          <TextField
-            placeholder="Search a name, handle, tag or project"
-            defaultValue={q}
-            onChange={(e) => set('q', e.currentTarget.value)}
-            prefix={<SearchIcon />}
-            clearable
-            onClear={() => set('q', '')}
-            size="sm"
-            aria-label="Search people"
-          />
-        </div>
-        <div style={{ minWidth: '10rem' }}>
-          <Select
-            size="sm"
-            aria-label="Tag"
-            value={tag || 'all'}
-            onChange={(v) => set('tag', v === 'all' ? '' : v)}
-            options={[
-              { value: 'all', label: 'Any tag' },
-              ...(state.data?.tags ?? []).map((t) => ({ value: t.tag, label: `${t.tag} (${t.count})` })),
-            ]}
-          />
-        </div>
-        <div style={{ minWidth: '10rem' }}>
-          <Select
-            size="sm"
-            aria-label="Project"
-            value={project || 'all'}
-            onChange={(v) => set('project', v === 'all' ? '' : v)}
-            options={[
-              { value: 'all', label: 'Any project' },
-              ...(state.data?.projects ?? []).map((p) => ({
-                value: p.project,
-                label: `${p.project} (${p.count})`,
-              })),
-            ]}
-          />
-        </div>
-        <div style={{ minWidth: '9rem' }}>
-          <Select
-            size="sm"
-            aria-label="Language"
-            value={language || 'all'}
-            onChange={(v) => set('language', v === 'all' ? '' : v)}
-            options={[
-              { value: 'all', label: 'Any language' },
-              ...Object.entries(LANGUAGES).map(([value, label]) => ({ value, label })),
-            ]}
-          />
-        </div>
-      </Row>
+      <SectionHead
+        title="Everyone"
+        count={state.data?.total}
+        right={
+          <>
+            <SearchField placeholder="Search people" width={220} value={q} onChange={(v) => set('q', v)} />
+            <MenuButton
+              label="Tag"
+              value={tag || 'all'}
+              onChange={(v) => set('tag', v === 'all' ? '' : v)}
+              options={[
+                { value: 'all', label: 'Any tag' },
+                ...(state.data?.tags ?? []).map((t) => ({ value: t.tag, label: `${t.tag} (${t.count})` })),
+                ...(tag && !state.data?.tags.some((t) => t.tag === tag) ? [{ value: tag, label: tag }] : []),
+              ]}
+            />
+            <MenuButton
+              label="Project"
+              value={project || 'all'}
+              onChange={(v) => set('project', v === 'all' ? '' : v)}
+              options={[
+                { value: 'all', label: 'Any project' },
+                ...(state.data?.projects ?? []).map((p) => ({ value: p.project, label: `${p.project} (${p.count})` })),
+                ...(project && !state.data?.projects.some((p) => p.project === project)
+                  ? [{ value: project, label: project }]
+                  : []),
+              ]}
+            />
+            <MenuButton
+              label="Language"
+              value={language || 'all'}
+              onChange={(v) => set('language', v === 'all' ? '' : v)}
+              options={[
+                { value: 'all', label: 'Any language' },
+                ...Object.entries(LANGUAGES).map(([value, label]) => ({ value, label })),
+                ...(language && !(language in LANGUAGES) ? [{ value: language, label: language }] : []),
+              ]}
+            />
+          </>
+        }
+      />
 
       <Loaded state={state}>
         {(d) => (

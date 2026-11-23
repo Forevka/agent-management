@@ -7,6 +7,20 @@ below is one release. How to add to this file is in `CLAUDE.md`
 
 ## Unreleased
 
+- **A task opens beside the page you are on.** Clicking a task anywhere (a board card, a list row,
+  a project's folder in the sidebar, ⌘K, the inbox, the retro, a node) opens it in a panel on the
+  right instead of leaving the page: where it stands, what it waits on you for, its checklist, what
+  it produced, its summary or brief, a box to write to its agent, and Stop. Its full page and its
+  session are one click away. The open task is part of the URL (`?task=<id>` on any page), so a
+  link can carry it; the tab's × closes it. On a phone the panel slides over the page.
+- **Pages look more like affectUI's own screens.** The counts on a project's overview and on the
+  inbox are affectUI's Stat Card; Tasks, Sessions and People have the Agent / Tasks screen's bar (a
+  count, a search field and compact filter menus, with "the fleet's own sessions" and "archived
+  tasks" under one *Include* filter); the board's Board / List switch is the Kanban screen's
+  toggle. Every URL and filter is unchanged.
+
+## v0.2.17 — 2026-11-23
+
 - **The web UI has a left sidebar instead of the top bar, and every project is a folder in it.**
   The frame is affectUI's App Shell (the fleet now owns affectUI Pro): the pages on the left
   (Board and Inbox with what waits on you, Tasks, Sessions, People, Retro), then **Projects**,

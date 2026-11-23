@@ -1,6 +1,7 @@
 {
   "roots": [
-    "app-shell"
+    "app-shell",
+    "stat-card"
   ],
   "items": {
     "app-shell": {
@@ -12,7 +13,7 @@
         "@hugeicons/react",
         "@hugeicons/core-free-icons"
       ],
-      "html": "renders a \"doc\" artifact of the work area as HTML it builds itself, escaping title, paragraphs and bullets; only doc.html would go in raw, and the fleet never passes doc.html"
+      "html": "renders a \"doc\" artifact of the work area as HTML it builds itself, escaping title, paragraphs and bullets; only doc.html goes in raw, and the fleet never passes doc.html"
     },
     "command-menu-clean": {
       "tier": "pro",
@@ -66,6 +67,12 @@
       "tier": "free",
       "files": {
         "spinner-clean.tsx": "e53e0798e1d6ad45afc1377b0bfcc1421edbafef83ae4d07562f883ab79896c4"
+      }
+    },
+    "stat-card": {
+      "tier": "pro",
+      "files": {
+        "stat-card.tsx": "860460ac3d92523a1b8335870fe2129d62e6eb5bfd7de81c8db12369f12f4be7"
       }
     },
     "text-field-clean": {

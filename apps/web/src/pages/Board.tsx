@@ -1,13 +1,11 @@
 import { useEffect, useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
-import { SegmentedControl } from '@/components/ui/segmented-control'
+import { ViewToggle } from '@/components/ui/app-shell'
 import { Board, BoardCard, BoardColumn, BoardDot } from '@/components/fx/board'
 import type { BoardTone } from '@/components/fx/board'
 import { Page, PageHeader, Row, Stack, Text } from '@/components/fx/layout'
 import { Table } from '@/components/fx/table'
 import {
-  BoardIcon,
-  ListIcon,
   MilestoneIcon,
   PaperclipIcon,
   SessionsIcon,
@@ -16,6 +14,7 @@ import {
 } from '@/components/fx/icons'
 import type { BoardTask } from '../api'
 import { Loaded, StatusBadge, When, useApi } from '../ui'
+import { TaskLink, useTaskPeek } from '../peek'
 
 /*
  * The fleet's work, as a board.
@@ -93,28 +92,23 @@ export default function BoardPage() {
   const view = params.get('view') === 'list' ? 'list' : 'board'
   // The fleet moves while the page is open; the durations below tick on their own.
   const state = useApi<{ tasks: BoardTask[] }>('/api/board', 10_000)
+  const peek = useTaskPeek()
   return (
     <Page>
       <PageHeader
         title="Board"
         description="Every task the fleet has in hand, in the state it is actually in."
         action={
-          <SegmentedControl
-            size="sm"
-            aria-label="How to show the work"
-            value={view}
+          // The Kanban screen's grid/list toggle. The view is part of the URL, like every other
+          // filter in this app, so a link to the board is a link to what the sender was looking at.
+          <ViewToggle
+            value={view === 'list' ? 'list' : 'grid'}
             onChange={(v) => {
-              // The view is part of the URL, like every other filter in this app, so a link to
-              // the board is a link to what the sender was looking at.
               const next = new URLSearchParams(params)
-              if (v === 'board') next.delete('view')
-              else next.set('view', v)
+              if (v === 'list') next.set('view', 'list')
+              else next.delete('view')
               setParams(next, { replace: true })
             }}
-            options={[
-              { value: 'board', label: 'Board', icon: <BoardIcon /> },
-              { value: 'list', label: 'List', icon: <ListIcon /> },
-            ]}
           />
         }
       />
@@ -143,7 +137,8 @@ export default function BoardPage() {
                   {c.tasks.map((t) => (
                     <BoardCard
                       key={t.id}
-                      to={`/tasks/${t.id}`}
+                      to={peek.to(t.id)}
+                      onClick={peek.onClick(t.id)}
                       title={t.title || t.id}
                       badge={t.key}
                       mark={<SparkIcon />}
@@ -267,9 +262,7 @@ function BoardList({ tasks }: { tasks: BoardTask[] }) {
           width: '42%',
           cell: (t) => (
             <Stack gap="1">
-              <Link to={`/tasks/${t.id}`} className="fx-link">
-                {t.title || t.id}
-              </Link>
+              <TaskLink id={t.id}>{t.title || t.id}</TaskLink>
               <Row gap="2">
                 <Text size="1" tone="muted" mono>
                   {t.key} · {t.id}

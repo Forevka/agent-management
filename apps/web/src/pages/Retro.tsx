@@ -1,10 +1,10 @@
-import { Link } from 'react-router-dom'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent, CardFooter, CardHeader } from '@/components/ui/card'
 import { EmptyState } from '@/components/ui/empty-state'
 import { Page, PageHeader, Row, Section, Stack, Text } from '@/components/fx/layout'
 import type { Retro as RetroT } from '../api'
 import { ActionButton, Loaded, Pre, useApi } from '../ui'
+import { TaskLink } from '../peek'
 
 const STATE: Record<string, { label: string; tone: 'success' | 'neutral' | 'warning' }> = {
   open: { label: 'open', tone: 'warning' },
@@ -55,9 +55,7 @@ export default function Retro() {
                             P-{p.id}
                           </Text>
                           {p.task && (
-                            <Link to={`/tasks/${p.task}`} className="fx-link">
-                              {p.task}
-                            </Link>
+                            <TaskLink id={p.task}>{p.task}</TaskLink>
                           )}
                         </Row>
                         {/* Written by a session that read the day: shown as text, never markup. */}
