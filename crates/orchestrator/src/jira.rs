@@ -130,12 +130,13 @@ pub fn scoped_jql(project_key: &str, jql: &str) -> String {
     out
 }
 
-/// What "my sprint" means: one board's active sprint when there is one, else every open sprint
-/// of the project.
+/// What "my sprint" means: one board's active sprint when there is one, else every active sprint
+/// of the project. Jira's `openSprints()` also holds the sprints not started yet, so those are
+/// taken out: a ticket of next sprint is not this sprint's work (and the roadmap would start it).
 pub fn sprint_jql(sprint: Option<i64>) -> String {
     let which = match sprint {
         Some(id) => format!("sprint = {id}"),
-        None => "sprint in openSprints()".into(),
+        None => "sprint in openSprints() AND sprint not in futureSprints()".into(),
     };
     format!("{which} AND assignee = currentUser() ORDER BY status, priority DESC")
 }
@@ -865,9 +866,9 @@ mod tests {
     #[test]
     fn my_sprint_follows_the_board_when_there_is_one() {
         assert!(sprint_jql(Some(42)).starts_with("sprint = 42 AND assignee = currentUser()"));
-        assert!(
-            sprint_jql(None).starts_with("sprint in openSprints() AND assignee = currentUser()")
-        );
+        assert!(sprint_jql(None).starts_with(
+            "sprint in openSprints() AND sprint not in futureSprints() AND assignee = currentUser()"
+        ));
         // Whichever it is, the project scope is added around the predicate only.
         assert_eq!(
             scoped_jql("DAP", &sprint_jql(Some(42))),

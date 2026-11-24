@@ -7,6 +7,13 @@ below is one release. How to add to this file is in `CLAUDE.md`
 
 ## Unreleased
 
+- **Next sprint's tickets are no longer taken as this sprint's.** For a project with no Jira
+  board set, "my sprint" meant every sprint that is not closed, which in Jira includes the ones
+  not started yet; so the roadmap could pick up, and once approved start, next sprint's tickets
+  early. It now means the active sprints only (`jira sprint` for agents too).
+
+## v0.2.22 — 2026-11-24
+
 - **The roadmap: your Jira sprints, worked through by the fleet.** Every project with a Jira
   key has its sprint read every 15 minutes (the tickets assigned to you, as `jira sprint`
   means) into the fleet's own two-week sprint, `S-1`, `S-2`, … Each day has Claude usage
