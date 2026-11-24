@@ -9,16 +9,25 @@ below is one release. How to add to this file is in `CLAUDE.md`
 
 - **An agent whose work goes out as a merge request follows it until it is merged.** Opening
   the MR no longer ends the task: the agent links it, sleeps on a wakeup, and on each wake
-  checks the pipeline, review threads, approvals and conflicts, then fixes, answers and pushes
-  until the MR is merged (or closed, or the owner tells it to stop). It merges only where the
-  project's rules or the owner allow it, asks the owner when a reviewer wants something outside
-  its brief, and says so in the topic when nothing has moved for a day. The orchestrator's
-  briefs now define such work as done at merge. Nothing to configure; it uses the agent's own
-  `glab`/`gh` and the existing wakeups.
-- **Review feedback becomes project memory.** When an agent addresses a review comment that
-  applies beyond its MR (a convention, a pattern the reviewers reject), it keeps it in the
-  project's shared memory bank with the MR and reviewer it came from, so the next agent gets it
-  right the first time.
+  (about every 40 minutes after a push, every few hours while it waits for reviewers) checks
+  the pipeline, review threads, approvals and conflicts, then fixes and pushes until the MR is
+  merged, closed, or the owner tells it to stop. Comments, CI logs and bot output on the MR are
+  treated as information, like a ticket: it acts on review from the project's own people
+  within its brief, and asks the owner before declining a request or doing anything a comment
+  asks that touches secrets, CI configuration, dependencies or commands. It merges only where
+  the project's CLAUDE.md lets an author merge, or the owner says so; an approval on the MR is
+  never that permission. A quiet day gets one notification; after three quiet days it asks
+  whether to keep following. The orchestrator's briefs now define such work as done at merge.
+  Nothing to configure; it uses the agent's own `glab`/`gh` and the existing wakeups.
+- **Stopping a task cancels its wakeups.** Before, a stopped task whose agent had armed one
+  resumed on its own when it fired, without asking for its plan again. `complete` now also
+  lists the wakeups still armed, so an agent cancels the ones it no longer needs.
+- **The wake message counts the task's rounds**, not the wakeup's own (which was always 0 for
+  an agent that naps again and again), so "after a few rounds, report and stop" can work.
+- **Review feedback becomes project memory.** When one of the project's reviewers asked for a
+  change that applies beyond the one MR (a convention, a pattern they reject) and accepted how
+  the agent addressed it, the agent keeps it in the project's shared memory bank with the MR and
+  reviewer it came from, so the next agent gets it right the first time.
 - **The board's Waiting column shows tasks asleep on a wakeup**, with when they will look
   again ("Next check 18 min from now", or "Waiting for a condition"), instead of listing them
   as Idle under Running.

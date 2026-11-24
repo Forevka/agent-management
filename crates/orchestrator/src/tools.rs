@@ -391,7 +391,24 @@ pub async fn handle(
             if let Err(e) = tasks::stop(o, &task, true).await {
                 tracing::warn!("ending {}'s session failed: {e:#}", task.id);
             }
-            ok("Task closed. The session stays resumable for follow-ups.".into())
+            // A wakeup still armed reopens the finished task when it fires, which is right for
+            // one armed on purpose ("check the deploy tomorrow") and a surprise plan card for one
+            // left over from following a merge request. The agent knows which; say what is left.
+            let armed: Vec<i64> = sqlx::query_scalar(
+                "select id from wakeups where task_id = $1 and state in ('armed', 'drafting') order by id",
+            )
+            .bind(&task.id)
+            .fetch_all(&o.db)
+            .await?;
+            let mut msg = String::from("Task closed. The session stays resumable for follow-ups.");
+            if !armed.is_empty() {
+                let ids: Vec<String> = armed.iter().map(|id| format!("W-{id}")).collect();
+                msg.push_str(&format!(
+                    " Still armed: {}. Each reopens this task when it fires; cancel the ones you no longer need (`fleet agent wake cancel W-n`).",
+                    ids.join(", ")
+                ));
+            }
+            ok(msg)
         }
         // Like `complete`, but the topic stays open (no `close_topic`) and the owner gets a
         // control card instead: this task can now be triggered again, on a schedule or by

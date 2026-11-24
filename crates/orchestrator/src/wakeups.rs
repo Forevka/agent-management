@@ -628,10 +628,20 @@ async fn fire(
         .task(&w.task_id)
         .await?
         .with_context(|| format!("task {} is gone", w.task_id))?;
+    // Rounds are counted for the task, not for this one wakeup: an agent that keeps waiting arms
+    // a new one-shot nap each time, so the wakeup's own count would always say 0, and the advice
+    // below to stop after a few rounds would never have a number to go by. This firing is
+    // already counted (`fire_and_rearm`), so it is taken off.
+    let total: i64 = sqlx::query_scalar(
+        "select coalesce(sum(fires), 0)::bigint from wakeups where task_id = $1",
+    )
+    .bind(&w.task_id)
+    .fetch_one(&o.db)
+    .await?;
     let mut text = format!(
-        "[Wakeup W-{}, woken {} time(s) before] You asked to be woken, in your own words: {}.",
+        "[Wakeup W-{}; this task was woken {} time(s) before] You asked to be woken, in your own words: {}.",
         w.id,
-        w.fires,
+        (total - 1).max(0),
         tasks::untrusted(&w.note, 1000)
     );
     if let Some(why) = why {
@@ -647,8 +657,9 @@ async fn fire(
         " Check what you were waiting for and act on it. If it is still not settled, arm another \
          wakeup (`fleet agent wake set --in <interval> --note \"...\"`); after a few rounds, say \
          where it stands and stop instead of waiting forever. A merge request you are following \
-         is the exception: keep following it until it is merged or closed, more slowly when \
-         nothing moves.",
+         is the exception: keep following it until it is merged or closed or the owner tells you \
+         to stop, more slowly when nothing moves, and ask the owner whether to go on once it has \
+         sat for a few days with nothing for you to do.",
     );
     o.audit(
         "orchestrator",

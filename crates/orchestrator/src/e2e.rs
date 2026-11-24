@@ -3307,6 +3307,20 @@ async fn wakeup_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool) {
     let at: chrono::DateTime<chrono::Utc> =
         serde_json::from_value(card["wakeup"]["at"].clone()).expect("the next check's time");
     assert_eq!(at.timestamp(), w.fires_at.unwrap().timestamp(), "{card}");
+    // And a task with nothing armed has nothing to show.
+    let napping: Vec<String> = sqlx::query_scalar(
+        "select distinct task_id from wakeups where state in ('armed', 'drafting')",
+    )
+    .fetch_all(db)
+    .await
+    .unwrap();
+    let other = board["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| !napping.iter().any(|id| c["id"] == id.as_str()))
+        .unwrap_or_else(|| panic!("another task is on the board: {board}"));
+    assert!(other["wakeup"].is_null(), "{other}");
     crate::wakeups::run_due(o).await.unwrap();
     assert_eq!(
         sqlx::query_scalar::<_, i32>("select fires from wakeups where id = $1")
@@ -3463,15 +3477,20 @@ async fn wakeup_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool) {
     }
     let e = set(json!({"note": "n", "in": "30m"})).await.unwrap_err();
     assert!(e.to_string().contains("already armed"), "{e}");
-    sqlx::query("update wakeups set state = 'cancelled' where task_id = $1 and state = 'armed'")
-        .bind(&worker.id)
-        .execute(db)
-        .await
-        .unwrap();
     // Waking resumed Alice's session, and an agent runs one session at a time: leave her free
-    // for whatever the test does next.
+    // for whatever the test does next. A stop is also the end of what she armed: an agent
+    // following its merge request always has a wakeup armed, and a stopped task must not resume
+    // on its own twenty minutes later.
     let woken = o.task(&worker.id).await.unwrap().unwrap();
     tasks::stop(o, &woken, false).await.unwrap();
+    let still: i64 = sqlx::query_scalar(
+        "select count(*) from wakeups where task_id = $1 and state in ('armed', 'drafting')",
+    )
+    .bind(&worker.id)
+    .fetch_one(db)
+    .await
+    .unwrap();
+    assert_eq!(still, 0, "a stop cancels the task's wakeups");
     wait_for("the woken session ends", || async {
         o.task(&worker.id).await.unwrap().filter(|t| !t.running)
     })

@@ -1764,6 +1764,15 @@ pub async fn stop(o: &Orchestrator, task: &TaskRow, graceful: bool) -> Result<()
     // find the task stopped, not running (which would read as a failure).
     if !graceful {
         sqlx::query("update tasks set status = 'stopped', updated_at = now() where id = $1 and status <> 'done'").bind(&task.id).execute(&o.db).await?;
+        // A stop means stop: what the agent armed to wake itself would otherwise resume the task
+        // later (an agent following its merge request always has one armed), and a stopped task
+        // whose plan was approved resumes without asking.
+        sqlx::query(
+            "update wakeups set state = 'cancelled' where task_id = $1 and state in ('armed', 'drafting')",
+        )
+        .bind(&task.id)
+        .execute(&o.db)
+        .await?;
     }
     stop_run(o, &task, graceful)
 }
