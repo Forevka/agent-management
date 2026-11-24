@@ -2813,6 +2813,59 @@ async fn jira_mirror_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool) {
         keys(&api_get(o, "/api/jira?project=mir").await),
         ["MIR-1", "MIR-6", "MIR-8"]
     );
+
+    // The people on the tickets reach the retrospective, never the owner's own Jira account, and
+    // a record keeps them by their Jira account id.
+    let section = crate::people::jira_section(o, 7).await.unwrap();
+    assert!(
+        section.contains("u-2") && section.contains("u-3") && section.contains("u-4"),
+        "{section}"
+    );
+    assert!(
+        !section.contains("me-1"),
+        "the owner is nobody's colleague: {section}"
+    );
+    let run: i64 = sqlx::query_scalar(
+        "insert into retro_runs (day, verdict) values ('jira-people', 'test') returning id",
+    )
+    .fetch_one(db)
+    .await
+    .unwrap();
+    let e = crate::people::retro_write(
+        o,
+        run,
+        &json!({"name": "Not A Colleague",
+                "add_contacts": [{"source": "jira", "handle": "Owner", "native_id": "me-1"}]}),
+    )
+    .await
+    .expect_err("the owner's Jira account is not a contact");
+    assert!(e.to_string().contains("owner's own account"), "{e:#}");
+    let made = crate::people::retro_write(
+        o,
+        run,
+        &json!({"name": "Uma Assignee", "projects": ["mir"],
+                "add_observations": ["Holds the MIR backlog work"],
+                "add_contacts": [{"source": "jira", "handle": "Uma Assignee", "native_id": "u-2"}]}),
+    )
+    .await
+    .unwrap();
+    assert!(made.contains('#'), "{made}");
+    let section = crate::people::jira_section(o, 7).await.unwrap();
+    assert!(
+        section.contains("Uma Assignee") && section.contains("· #"),
+        "{section}"
+    );
+    // Gone again: a later flow counts the people records from none.
+    sqlx::query(
+        "delete from person_contacts where person_id in (select id from people where name = 'Uma Assignee')",
+    )
+    .execute(db)
+    .await
+    .unwrap();
+    sqlx::query("delete from people where name = 'Uma Assignee'")
+        .execute(db)
+        .await
+        .unwrap();
 }
 
 /// The Integrations page (see `integrations`): every service with its keys (never their values),

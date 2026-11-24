@@ -701,7 +701,12 @@ pub async fn digest_over(o: &Orchestrator, day: &str, days: i64) -> Result<Strin
     }
     // Who the fleet dealt with, for the people records it keeps after its review: bounded on its
     // own and kept whole, so a busy day cannot clip away the section the opening line points at.
-    let people = crate::people::digest_section(o, days).await?;
+    let mut people = crate::people::digest_section(o, days).await?;
+    // And who the owner's projects' Jira tickets name, kept whole with it.
+    match crate::people::jira_section(o, days).await {
+        Ok(j) => people.push_str(&j),
+        Err(e) => tracing::warn!("listing the people seen in Jira failed: {e:#}"),
+    }
     Ok(assemble(&s, &people, DIGEST_TAIL))
 }
 

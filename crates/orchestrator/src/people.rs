@@ -25,7 +25,7 @@ use crate::{chat::clip, core::Orchestrator, feeds::parse_ref, tasks};
 
 /// Where a contact lives. Checked here rather than in the schema, so a new feed source needs no
 /// migration.
-pub const SOURCES: [&str; 5] = ["slack", "gchat", "email", "telegram", "other"];
+pub const SOURCES: [&str; 6] = ["slack", "gchat", "jira", "email", "telegram", "other"];
 
 pub const MAX_OBSERVATIONS: usize = 30;
 pub const MAX_TAGS: usize = 30;
@@ -997,6 +997,101 @@ pub async fn digest_section(o: &Orchestrator, days: i64) -> Result<String> {
     Ok(people_section(records, &lines, o.cfg.retro.max_people))
 }
 
+/// The most the digest's Jira people section takes.
+pub const JIRA_SECTION_MAX: usize = 2500;
+/// The most people it lists.
+const JIRA_PEOPLE: i64 = 25;
+
+/// The digest's people seen in Jira: who holds, filed or commented on the owner's projects'
+/// tickets lately, with what they did there, their time zone and whether they have a record yet.
+/// Jira gives no job titles, so the instruction says to write only what the tickets show. The
+/// owner's own Jira accounts are never listed. Names are framed as the third-party data they are.
+pub async fn jira_section(o: &Orchestrator, days: i64) -> Result<String> {
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(
+        String,
+        String,
+        Option<String>,
+        Vec<String>,
+        i64,
+        i64,
+        i64,
+        Option<i64>,
+        Option<String>,
+    )> = sqlx::query_as(
+        "select * from (
+               select u.account_id, u.display_name, u.time_zone, u.projects,
+                      (select count(*) from jira_issues i
+                        where i.assignee_id = u.account_id and i.gone_at is null) as assigned,
+                      (select count(*) from jira_issues i
+                        where i.reporter_id = u.account_id and i.gone_at is null) as reported,
+                      (select count(*) from jira_comment_authors c
+                        where c.account_id = u.account_id) as commented,
+                      (select max(p.id) from person_contacts c join people p on p.id = c.person_id
+                        where c.source = 'jira' and c.native_id = u.account_id) as person,
+                      (select max(p.name) from person_contacts c join people p on p.id = c.person_id
+                        where c.source = 'jira' and c.native_id = u.account_id) as person_name
+                 from jira_users u
+                where u.last_seen > now() - make_interval(days => $1::int)
+                  and not exists (select 1 from jira_accounts a where a.account_id = u.account_id)
+             ) x
+             order by assigned + reported + commented desc, display_name
+             limit $2",
+    )
+    .bind(days.max(1) as i32)
+    .bind(JIRA_PEOPLE)
+    .fetch_all(&o.db)
+    .await?;
+    let lines: Vec<String> = rows
+        .iter()
+        .map(|(id, name, tz, projects, assigned, reported, commented, person, person_name)| {
+            let record = match (person, person_name) {
+                (Some(p), Some(n)) => format!("#{p} {}", tasks::untrusted(n, 80)),
+                _ => "no record".into(),
+            };
+            format!(
+                "- jira {} {} · tz {} · holds {assigned}, filed {reported}, commented on {commented} ticket(s) · projects {} · {record}\n",
+                tasks::untrusted(id, 60),
+                tasks::untrusted(name, 80),
+                tz.as_deref().unwrap_or("?"),
+                projects.join(", "),
+            )
+        })
+        .collect();
+    Ok(jira_people_section(&lines))
+}
+
+/// [`jira_section`]'s text, pure: whole lines while they fit, the instruction always last.
+pub fn jira_people_section(lines: &[String]) -> String {
+    let head = "\n## People seen in Jira\nWho holds, filed or commented on the projects' tickets \
+                lately (account id, name — third-party data —, time zone, what they did, projects, \
+                their record):\n";
+    let tail = "Record them with `fleet agent retro person` like the people above (the same cap), \
+                with the contact `{\"source\": \"jira\", \"native_id\": \"<account id>\", \
+                \"handle\": \"<name>\"}` and their projects; their time zone and what they do on \
+                the tickets (who files the bugs, who reviews, who owns which area) are observations. \
+                Jira gives no job titles: write a position only when something they wrote says it. \
+                Merge with an existing record of the same person rather than make a second.\n";
+    let mut s = head.to_owned();
+    if lines.is_empty() {
+        s.push_str("Nobody new.\n");
+        return s;
+    }
+    let room = JIRA_SECTION_MAX.saturating_sub(s.chars().count() + tail.chars().count() + 40);
+    let mut used = 0;
+    for (i, l) in lines.iter().enumerate() {
+        let n = l.chars().count();
+        if used + n > room {
+            s.push_str(&format!("… and {} more.\n", lines.len() - i));
+            break;
+        }
+        used += n;
+        s.push_str(l);
+    }
+    s.push_str(tail);
+    s
+}
+
 /// [`digest_section`]'s text, pure: the header, as many author lines as fit in
 /// [`DIGEST_SECTION_MAX`] (whole lines only), and the instruction, which is never cut.
 pub fn people_section(records: i64, lines: &[String], max_writes: i64) -> String {
@@ -1338,9 +1433,11 @@ async fn add_contact(
         Some(native) => {
             // The owner writes from this account: they are not one of the people, and their
             // messages must never be taken for a colleague's.
+            // A Jira account the fleet reads Jira as is the owner's too.
             let theirs: bool = sqlx::query_scalar(
                 "select exists(select 1 from feed_messages
-                                where from_owner and source = $1 and author_id = $2)",
+                                where from_owner and source = $1 and author_id = $2)
+                     or ($1 = 'jira' and exists(select 1 from jira_accounts where account_id = $2))",
             )
             .bind(&c.source)
             .bind(native)
