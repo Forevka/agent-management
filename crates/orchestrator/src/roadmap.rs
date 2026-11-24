@@ -111,6 +111,13 @@ pub struct ItemRow {
     pub jira_review_at: Option<chrono::DateTime<Utc>>,
     /// Why the last start failed, while it keeps failing (shown on the page).
     pub start_error: Option<String>,
+    /// Its Jira sprint, and when a sprint not started yet starts (it waits until then).
+    pub jira_sprint_id: Option<i64>,
+    pub jira_sprint_name: Option<String>,
+    pub jira_sprint_state: Option<String>,
+    pub not_before: Option<chrono::DateTime<Utc>>,
+    /// `owner`: added by hand on the Jira page; null: one of the owner's own tickets.
+    pub origin: Option<String>,
     /// The status of its task, when [`items`] read it (not a column of the table).
     #[sqlx(default)]
     pub task_status: Option<String>,
@@ -370,9 +377,39 @@ async fn items(o: &Orchestrator, sprint: i32) -> Result<Vec<ItemRow>> {
     .await?)
 }
 
-/// Whether the plan takes an item: approved and not done in Jira yet, or started.
+/// Whether an item may start yet: a ticket of a Jira sprint that has not started waits for that
+/// sprint's start date (the owner's rule), and one with no start date waits until Jira says the
+/// sprint is active.
+pub fn eligible(
+    sprint_state: Option<&str>,
+    not_before: Option<chrono::DateTime<Utc>>,
+    now: chrono::DateTime<Utc>,
+) -> bool {
+    sprint_state != Some("future") || not_before.is_some_and(|t| t <= now)
+}
+
+fn item_eligible(i: &ItemRow) -> bool {
+    eligible(i.jira_sprint_state.as_deref(), i.not_before, Utc::now())
+}
+
+/// Whether the plan takes an item: started, or approved, not done in Jira, and its sprint begun.
 fn planned(i: &ItemRow) -> bool {
-    i.state == "started" || (i.state == "approved" && !i.jira_done)
+    i.state == "started" || (i.state == "approved" && !i.jira_done && item_eligible(i))
+}
+
+/// When a waiting item may start, as the card and the page say it: "from Mon 7 Dec", or "when
+/// <sprint> starts" when Jira gave no date.
+fn waits_for(i: &ItemRow) -> Option<String> {
+    if item_eligible(i) {
+        return None;
+    }
+    Some(match i.not_before {
+        Some(t) => format!("from {}", t.format("%a %-d %b")),
+        None => format!(
+            "when {} starts",
+            i.jira_sprint_name.as_deref().unwrap_or("its sprint")
+        ),
+    })
 }
 
 /// How much of the plan an item takes: its estimate, except that a ticket whose task is over
@@ -487,32 +524,87 @@ async fn sync_due(o: &Orchestrator, s: &SprintRow) -> Result<bool> {
     }))
 }
 
-/// Reads every project's sprint from Jira into `s`. A project whose Jira fails keeps what it had
-/// (nothing is marked as having left on a failed read) and says why on the roadmap page.
+/// Reads every project's tickets of the owner into `s`, from the local copy of Jira
+/// (`jira_sync`, which keeps it fresh): tickets assigned to the owner's account in an active or a
+/// future sprint. Owner-added tickets are refreshed from the copy too, and carried into a new
+/// sprint. A project the copy cannot answer for (its account not read yet, its read failing)
+/// keeps what it had, and says why on the roadmap page.
 pub async fn sync(o: &Orchestrator, s: &SprintRow) -> Result<Value> {
     let projects: Vec<String> =
         sqlx::query_scalar("select slug from projects where jira_key is not null order by slug")
             .fetch_all(&o.db)
             .await?;
+    carry_owner_items(o, s).await?;
     let mut report = serde_json::Map::new();
     for p in projects {
         let outcome = match sync_project(o, s, &p).await {
             Ok(n) => json!({"ok": true, "tickets": n}),
             Err(e) => {
-                tracing::warn!("reading {p}'s sprint from Jira failed: {e:#}");
+                tracing::warn!("reading {p}'s tickets for the roadmap failed: {e:#}");
                 json!({"ok": false, "error": clip(&format!("{e:#}"), 300)})
             }
         };
         report.insert(p, outcome);
     }
+    refresh_owner_items(o, s).await?;
     let v = json!({"at": Utc::now().to_rfc3339(), "sprint": s.id, "projects": report});
     o.kv_set(SYNC_KEY, v.clone()).await?;
     Ok(v)
 }
 
+/// A ticket of the owner's, as the local copy has it.
+#[derive(Debug, FromRow)]
+struct CopyRow {
+    jira_key: String,
+    summary: String,
+    status: Option<String>,
+    done: bool,
+    issue_type: Option<String>,
+    priority: Option<String>,
+    url: String,
+    sprint_id: Option<i64>,
+    sprint_name: Option<String>,
+    sprint_state: Option<String>,
+    starts_at: Option<chrono::DateTime<Utc>>,
+}
+
+/// What the copy says about a project's tickets: `$1` project; `$2` only those assigned to the
+/// account the fleet reads its Jira as, in an active or future sprint (else: `$3` these keys).
+const COPY_ROWS: &str = "
+    select i.jira_key, i.summary, i.status, coalesce(i.status_category = 'done', false) as done,
+           i.issue_type, i.priority, 'https://' || i.site || '/browse/' || i.jira_key as url,
+           s.sprint_id, s.name as sprint_name, s.state as sprint_state, s.starts_at
+    from jira_issues i
+    join projects p on p.slug = i.project
+    left join jira_accounts a on a.folder = coalesce(nullif(p.jira_folder, ''), 'jira')
+    left join jira_sprints s on s.site = i.site and s.sprint_id = i.sprint_id
+    where i.project = $1 and i.gone_at is null
+      and (($2 and i.assignee_id = a.account_id and s.state in ('active', 'future')
+            and coalesce(i.issue_type, '') not ilike 'epic')
+           or (not $2 and i.jira_key = any($3)))
+    order by case s.state when 'active' then 0 else 1 end, s.starts_at nulls last,
+             i.rank nulls last, i.jira_key";
+
 async fn sync_project(o: &Orchestrator, s: &SprintRow, project: &str) -> Result<usize> {
-    let j = crate::jira::for_project(o, project).await?;
-    let issues = j.sprint_issues().await?;
+    // Until the copy knows who the owner is in this Jira, "mine" means nothing: change nothing.
+    let me: Option<Option<String>> = sqlx::query_scalar(
+        "select a.account_id from projects p
+         join jira_accounts a on a.folder = coalesce(nullif(p.jira_folder, ''), $2)
+         where p.slug = $1",
+    )
+    .bind(project)
+    .bind(crate::jira::DEFAULT_FOLDER)
+    .fetch_optional(&o.db)
+    .await?;
+    if me.flatten().is_none() {
+        bail!("the fleet has not read this project's Jira yet (see the Jira page)");
+    }
+    let rows: Vec<CopyRow> = sqlx::query_as(COPY_ROWS)
+        .bind(project)
+        .bind(true)
+        .bind(Vec::<String>::new())
+        .fetch_all(&o.db)
+        .await?;
     let began: chrono::DateTime<Utc> = sqlx::query_scalar("select clock_timestamp()")
         .fetch_one(&o.db)
         .await?;
@@ -522,12 +614,11 @@ async fn sync_project(o: &Orchestrator, s: &SprintRow, project: &str) -> Result<
     .bind(s.id)
     .fetch_one(&o.db)
     .await?;
-    for i in &issues {
+    for i in &rows {
         // A ticket that leaves and comes back is where it was: approved stays approved. One that
         // carries over from an earlier sprint keeps the owner's approval (or skip) and its
         // estimate, so the owner is not asked about it again every fortnight; a "not now" lapses
-        // with its sprint. (One that started there is adopted
-        // again through its task's link.)
+        // with its sprint. (One that started there is adopted again through its task's link.)
         sqlx::query(
             "with prev as (
                 select state, approved_at, usage, usage_note, estimated_by, asked_at
@@ -535,7 +626,9 @@ async fn sync_project(o: &Orchestrator, s: &SprintRow, project: &str) -> Result<
                 order by sprint_id desc limit 1)
              insert into roadmap_items (sprint_id, project, jira_key, title, jira_status, jira_done,
                                         issue_type, priority, url, usage, position, state,
-                                        approved_at, usage_note, estimated_by, asked_at)
+                                        approved_at, usage_note, estimated_by, asked_at,
+                                        jira_sprint_id, jira_sprint_name, jira_sprint_state,
+                                        not_before)
              select $1, $2, $3, $4, $5, $6, $7, $8, $9,
                     coalesce((select usage from prev), $10), $11,
                     coalesce((select case when state in ('approved', 'skipped') then state
@@ -543,11 +636,15 @@ async fn sync_project(o: &Orchestrator, s: &SprintRow, project: &str) -> Result<
                                           then 'approved' end from prev), 'new'),
                     (select approved_at from prev where state in ('approved', 'left')),
                     (select usage_note from prev), (select estimated_by from prev),
-                    (select asked_at from prev)
+                    (select asked_at from prev),
+                    $12, $13, $14, $15
              on conflict (sprint_id, jira_key) do update set
                 title = excluded.title, jira_status = excluded.jira_status,
                 jira_done = excluded.jira_done, issue_type = excluded.issue_type,
                 priority = excluded.priority, url = excluded.url, last_seen = now(),
+                jira_sprint_id = excluded.jira_sprint_id,
+                jira_sprint_name = excluded.jira_sprint_name,
+                jira_sprint_state = excluded.jira_sprint_state, not_before = excluded.not_before,
                 state = case when roadmap_items.state <> 'left' then roadmap_items.state
                              when roadmap_items.approved_at is not null then 'approved'
                              else 'new' end
@@ -555,23 +652,31 @@ async fn sync_project(o: &Orchestrator, s: &SprintRow, project: &str) -> Result<
         )
         .bind(s.id)
         .bind(project)
-        .bind(&i.key)
+        .bind(&i.jira_key)
         .bind(&i.summary)
         .bind(&i.status)
         .bind(i.done)
         .bind(&i.issue_type)
         .bind(&i.priority)
-        .bind(j.browse_url(&i.key))
+        .bind(&i.url)
         .bind(default_usage(i.issue_type.as_deref()))
         .bind(next)
+        .bind(i.sprint_id)
+        .bind(&i.sprint_name)
+        .bind(&i.sprint_state)
+        .bind(
+            i.starts_at
+                .filter(|_| i.sprint_state.as_deref() == Some("future")),
+        )
         .execute(&o.db)
         .await?;
         next += 1;
     }
-    // Out of the owner's sprint now (moved, reassigned): off the plan, unless work began on it.
+    // Out of the owner's sprints now (moved, reassigned): off the plan, unless work began on it.
+    // A ticket the owner added by hand is theirs to keep (`refresh_owner_items` watches it).
     sqlx::query(
         "update roadmap_items set state = 'left'
-         where sprint_id = $1 and project = $2 and last_seen < $3
+         where sprint_id = $1 and project = $2 and last_seen < $3 and origin is null
            and state in ('new', 'approved', 'declined')",
     )
     .bind(s.id)
@@ -579,7 +684,132 @@ async fn sync_project(o: &Orchestrator, s: &SprintRow, project: &str) -> Result<
     .bind(began)
     .execute(&o.db)
     .await?;
-    Ok(issues.len())
+    Ok(rows.len())
+}
+
+/// Tickets the owner added by hand follow the copy too: their title, status and sprint. One
+/// gone from the copy (closed outside a sprint, moved, deleted) leaves the plan.
+async fn refresh_owner_items(o: &Orchestrator, s: &SprintRow) -> Result<()> {
+    sqlx::query(
+        "update roadmap_items r set title = i.summary, jira_status = i.status,
+                jira_done = coalesce(i.status_category = 'done', false),
+                jira_sprint_id = sp.sprint_id, jira_sprint_name = sp.name,
+                jira_sprint_state = sp.state,
+                not_before = case when sp.state = 'future' then sp.starts_at end,
+                last_seen = now()
+         from jira_issues i
+         left join jira_sprints sp on sp.site = i.site and sp.sprint_id = i.sprint_id
+         where r.sprint_id = $1 and r.origin = 'owner' and i.project = r.project
+           and i.jira_key = r.jira_key",
+    )
+    .bind(s.id)
+    .execute(&o.db)
+    .await?;
+    sqlx::query(
+        "update roadmap_items r set state = 'left'
+         where r.sprint_id = $1 and r.origin = 'owner' and r.state in ('new', 'approved', 'declined')
+           and not exists (select 1 from jira_issues i where i.project = r.project
+                           and i.jira_key = r.jira_key and i.gone_at is null)",
+    )
+    .bind(s.id)
+    .execute(&o.db)
+    .await?;
+    Ok(())
+}
+
+/// A new sprint takes over the tickets the owner added by hand to the last one and that never
+/// started: added by hand is approved, and stays so until it is done.
+async fn carry_owner_items(o: &Orchestrator, s: &SprintRow) -> Result<()> {
+    sqlx::query(
+        "insert into roadmap_items (sprint_id, project, jira_key, title, jira_status, jira_done,
+                                    issue_type, priority, url, usage, usage_note, estimated_by,
+                                    asked_at, position, state, approved_at, origin,
+                                    jira_sprint_id, jira_sprint_name, jira_sprint_state, not_before)
+         select $1, r.project, r.jira_key, r.title, r.jira_status, r.jira_done, r.issue_type,
+                r.priority, r.url, r.usage, r.usage_note, r.estimated_by, r.asked_at, r.position,
+                'approved', r.approved_at, 'owner', r.jira_sprint_id, r.jira_sprint_name,
+                r.jira_sprint_state, r.not_before
+         from roadmap_items r
+         where r.sprint_id = (select max(id) from sprints where id < $1)
+           and r.origin = 'owner' and r.state = 'approved' and not r.jira_done
+         on conflict (sprint_id, jira_key) do nothing",
+    )
+    .bind(s.id)
+    .execute(&o.db)
+    .await?;
+    Ok(())
+}
+
+/// The owner puts a ticket of any project's Jira on the roadmap by hand (the Jira page): one
+/// assigned to someone else, unassigned, or in the backlog. It is approved as it is added — the
+/// owner chose it — and waits for its Jira sprint like any other. The brain is asked to estimate
+/// it. Audited. Owner only: nothing an agent or a ticket says can put work on the roadmap.
+pub async fn add(o: &Arc<Orchestrator>, project: &str, key: &str, actor: &str) -> Result<String> {
+    let s = current_sprint(o).await?;
+    let key = key.trim().to_uppercase();
+    let rows: Vec<CopyRow> = sqlx::query_as(COPY_ROWS)
+        .bind(project)
+        .bind(false)
+        .bind(vec![key.clone()])
+        .fetch_all(&o.db)
+        .await?;
+    let i = rows
+        .first()
+        .with_context(|| format!("{key} is not in the fleet's copy of {project}'s Jira"))?;
+    ensure!(!i.done, "{key} is done in Jira");
+    let position: i32 = sqlx::query_scalar(
+        "select coalesce(max(position), 0) + 1 from roadmap_items where sprint_id = $1",
+    )
+    .bind(s.id)
+    .fetch_one(&o.db)
+    .await?;
+    let state: Option<String> = sqlx::query_scalar(
+        "insert into roadmap_items (sprint_id, project, jira_key, title, jira_status, jira_done,
+                                    issue_type, priority, url, usage, position, state, approved_at,
+                                    origin, jira_sprint_id, jira_sprint_name, jira_sprint_state,
+                                    not_before)
+         values ($1, $2, $3, $4, $5, false, $6, $7, $8, $9, $10, 'approved', now(), 'owner',
+                 $11, $12, $13, $14)
+         on conflict (sprint_id, jira_key) do update set
+            state = case when roadmap_items.state in ('started') then roadmap_items.state
+                         else 'approved' end,
+            approved_at = coalesce(roadmap_items.approved_at, now()),
+            origin = coalesce(roadmap_items.origin, 'owner'), last_seen = now()
+         where roadmap_items.project = excluded.project
+         returning state",
+    )
+    .bind(s.id)
+    .bind(project)
+    .bind(&key)
+    .bind(&i.summary)
+    .bind(&i.status)
+    .bind(&i.issue_type)
+    .bind(&i.priority)
+    .bind(&i.url)
+    .bind(default_usage(i.issue_type.as_deref()))
+    .bind(position)
+    .bind(i.sprint_id)
+    .bind(&i.sprint_name)
+    .bind(&i.sprint_state)
+    .bind(
+        i.starts_at
+            .filter(|_| i.sprint_state.as_deref() == Some("future")),
+    )
+    .fetch_optional(&o.db)
+    .await?;
+    let state = state.with_context(|| format!("{key} belongs to another project here"))?;
+    o.audit(
+        actor,
+        "roadmap.add",
+        json!({"sprint": s.name(), "project": project, "issue": key}),
+    )
+    .await;
+    tick_soon(o);
+    Ok(if state == "started" {
+        format!("{key} is already being worked on")
+    } else {
+        format!("{key} is on the roadmap of sprint {}", s.name())
+    })
 }
 
 /// Tickets the fleet is already working on another way (the owner said "do BIOINS-12", and the
@@ -630,9 +860,10 @@ async fn propose(o: &Arc<Orchestrator>, s: &SprintRow, now: usize) -> Result<()>
         .iter()
         .filter(|i| i.state == "new" && !i.jira_done)
         .collect();
-    let unasked: Vec<&ItemRow> = waiting
+    // New tickets, and those the owner added by hand (approved as added), go to the brain once.
+    let unasked: Vec<&ItemRow> = list
         .iter()
-        .copied()
+        .filter(|i| matches!(i.state.as_str(), "new" | "approved") && !i.jira_done)
         .filter(|i| i.asked_at.is_none() && i.estimated_by.is_none())
         .collect();
     if !unasked.is_empty() {
@@ -654,7 +885,8 @@ async fn propose(o: &Arc<Orchestrator>, s: &SprintRow, now: usize) -> Result<()>
             })
             .collect();
         o.tell_brain(format!(
-            "[Roadmap] Sprint {} has {} new ticket{} for the owner to approve. Read each one \
+            "[Roadmap] Sprint {} has {} ticket{} to estimate (new ones wait for the owner's \
+             approval; ones the owner added by hand are approved already). Read each one \
              (`fleet agent jira issue <KEY>`) and estimate it: `fleet agent roadmap estimate <KEY> \
              --usage <percent of one five-hour window> --note \"<why, briefly>\"`. The owner's card \
              goes out once they are estimated, or in {ASK_WAIT_MINUTES} minutes with guesses by \
@@ -703,15 +935,21 @@ async fn propose(o: &Arc<Orchestrator>, s: &SprintRow, now: usize) -> Result<()>
     }
     let per_day = o.cfg.roadmap.sessions.len();
     let cells = s.days() as usize * per_day;
-    let plan = plan_items(&list, &waiting, per_day, cells, now);
+    let ready: Vec<&ItemRow> = waiting
+        .iter()
+        .copied()
+        .filter(|i| item_eligible(i))
+        .collect();
+    let plan = plan_items(&list, &ready, per_day, cells, now);
     let lines: Vec<Value> = waiting
         .iter()
         .map(|i| {
-            let at = plan
-                .iter()
-                .find(|(id, _)| *id == i.id)
-                .and_then(|(_, p)| p.first())
-                .map(|p| when(&o.cfg.roadmap, s, p.cell));
+            let at = waits_for(i).or_else(|| {
+                plan.iter()
+                    .find(|(id, _)| *id == i.id)
+                    .and_then(|(_, p)| p.first())
+                    .map(|p| when(&o.cfg.roadmap, s, p.cell))
+            });
             json!({"id": i.id, "key": i.jira_key, "project": i.project, "title": i.title,
                    "usage": i.usage, "when": at})
         })
@@ -1179,6 +1417,47 @@ async fn move_in_jira(o: &Arc<Orchestrator>, id: i64, m: Move, mr: Option<String
         }
     };
     let Some(i) = claimed else { return };
+    // A ticket someone else holds in Jira is theirs to move: the owner put it on the roadmap to
+    // have it worked on, not to take it over in the tracker.
+    let theirs: Option<bool> = sqlx::query_scalar(
+        "select j.assignee_id is distinct from a.account_id
+         from jira_issues j join projects p on p.slug = j.project
+         join jira_accounts a on a.folder = coalesce(nullif(p.jira_folder, ''), 'jira')
+         where j.project = $1 and j.jira_key = $2 and a.account_id is not null",
+    )
+    .bind(&i.project)
+    .bind(&i.jira_key)
+    .fetch_optional(&o.db)
+    .await
+    .ok()
+    .flatten();
+    if theirs == Some(true) {
+        o.audit(
+            "orchestrator (roadmap)",
+            "jira.transition_skipped",
+            json!({"issue": i.jira_key, "to": label, "why": "assigned to someone else"}),
+        )
+        .await;
+        if let Some(t) = &i.task_id
+            && let Ok(Some(task)) = o.task(t).await
+        {
+            let _ = o
+                .chat
+                .send(
+                    From::Orchestrator,
+                    task.topic_id,
+                    &format!(
+                        "Jira: {} is not assigned to you, so the fleet leaves its status to whoever holds it.",
+                        esc(&i.jira_key)
+                    ),
+                    vec![],
+                    None,
+                    Notify::Silent,
+                )
+                .await;
+        }
+        return;
+    }
     let outcome: Result<String> = async {
         let j = crate::jira::for_project(o, &i.project).await?;
         let moved = j.transition_any(&i.jira_key, names).await?;
@@ -1376,7 +1655,7 @@ pub async fn board_json(o: &Orchestrator, sprint: Option<i32>) -> Result<Value> 
     let list = items(o, s.id).await?;
     let waiting: Vec<&ItemRow> = list
         .iter()
-        .filter(|i| i.state == "new" && !i.jira_done)
+        .filter(|i| i.state == "new" && !i.jira_done && item_eligible(i))
         .collect();
     let plan = plan_items(&list, &waiting, per_day, cells, now);
     let task_ids: Vec<String> = list.iter().filter_map(|i| i.task_id.clone()).collect();
@@ -1412,6 +1691,12 @@ pub async fn board_json(o: &Orchestrator, sprint: Option<i32>) -> Result<Value> 
                 // Exactly what the server's plan takes, so the page's board agrees with it.
                 "on_board": planned(i), "plan_usage": plan_usage(i),
                 "start_error": i.start_error,
+                "jira_sprint": i.jira_sprint_id.map(|id| json!({
+                    "id": id, "name": i.jira_sprint_name, "state": i.jira_sprint_state,
+                    "starts_at": i.not_before,
+                })),
+                "waits": waits_for(i),
+                "origin": i.origin,
                 "at": at,
                 "planned": pieces.iter().map(|p| json!({
                     "day": p.cell / per_day, "session": p.cell % per_day, "usage": p.usage,
@@ -1680,6 +1965,26 @@ mod tests {
         assert_eq!(
             number_url("ssh://git@gitlab.x:2222/g/r.git", "mr", "!4").as_deref(),
             Some("https://gitlab.x/g/r/-/merge_requests/4")
+        );
+    }
+
+    #[test]
+    fn a_ticket_of_a_sprint_not_started_waits_for_it() {
+        let now = Utc::now();
+        let day = chrono::Duration::days(1);
+        assert!(eligible(Some("active"), None, now));
+        assert!(
+            eligible(None, None, now),
+            "the backlog, or a ticket added by hand"
+        );
+        assert!(!eligible(Some("future"), Some(now + day), now), "not yet");
+        assert!(
+            eligible(Some("future"), Some(now - day), now),
+            "its start date passed"
+        );
+        assert!(
+            !eligible(Some("future"), None, now),
+            "no date: until Jira starts the sprint"
         );
     }
 

@@ -93,6 +93,8 @@ export default function Roadmap() {
 function Body({ d, reload, pick }: { d: RoadmapT; reload: () => void; pick: (id: number | null) => void }) {
   const waiting = d.items.filter((i) => i.state === 'new' && !i.jira_done)
   const onBoard = d.items.filter((i) => i.on_board)
+  // Approved (or added by hand), but their Jira sprint has not started: they join the plan then.
+  const later = d.items.filter((i) => !i.on_board && i.state === 'approved' && !i.jira_done && i.waits)
   const rest = d.items.filter((i) => !waiting.includes(i))
   return (
     <Stack gap="5">
@@ -118,10 +120,42 @@ function Body({ d, reload, pick }: { d: RoadmapT; reload: () => void; pick: (id:
 
       <Plan d={d} items={onBoard} reload={reload} />
 
+      {later.length > 0 && <Later items={later} />}
+
       <Section title="Every ticket" description="Everything this sprint has seen, in the order it waits in.">
         <Tickets d={d} items={[...waiting, ...rest]} reload={reload} />
       </Section>
     </Stack>
+  )
+}
+
+function Later({ items }: { items: RoadmapItem[] }) {
+  return (
+    <Section
+      title="Waiting for their Jira sprint"
+      description="Approved, but in a sprint that has not started in Jira: each joins the plan when its sprint begins."
+    >
+      <Stack gap="2">
+        {items.map((i) => (
+          <Row key={i.id} gap="3" justify="between">
+            <Stack gap="1">
+              <Row gap="2">
+                <JiraKey item={i} />
+                <ProjectTag slug={i.project}>{i.project}</ProjectTag>
+                {i.origin === 'owner' && <Badge>added by you</Badge>}
+              </Row>
+              <Text size="2" breakAll>
+                {i.title}
+              </Text>
+            </Stack>
+            <Text size="1" tone="muted">
+              {i.jira_sprint?.name ? `${i.jira_sprint.name} · ` : ''}
+              {i.waits}
+            </Text>
+          </Row>
+        ))}
+      </Stack>
+    </Section>
   )
 }
 
@@ -164,7 +198,7 @@ function Approvals({ d, items, reload }: { d: RoadmapT; items: RoadmapItem[]; re
                   <JiraKey item={i} />
                   <ProjectTag slug={i.project}>{i.project}</ProjectTag>
                   <Text size="1" tone="muted">
-                    {i.usage}% · {whenOf(d, i) ?? 'no room this sprint'}
+                    {i.usage}% · {i.waits ?? whenOf(d, i) ?? 'no room this sprint'}
                   </Text>
                 </Row>
                 <Text size="2" breakAll>

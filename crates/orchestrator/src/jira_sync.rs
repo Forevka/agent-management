@@ -4,42 +4,56 @@
 //! owner sees everything at once and nothing but this module calls Jira on a timer.
 //!
 //! Projects are read per credential folder (an account on one site; two sites with two accounts
-//! is the normal case). Every `FLEET_JIRA_SYNC_MINUTES` an account reads what changed lately in
-//! each of its projects (one paged JQL each, a ticket that closed comes back closed), asks its
-//! open sprints how they stand (a sprint can start without any of its tickets changing), and
-//! reads who commented on a few of the tickets that changed. Every `FLEET_JIRA_FULL_SYNC_HOURS`,
-//! or when the owner asks, it reads everything still open again: the only read that may mark a
-//! ticket gone, and never one that stopped at the cap or failed. Once a day it asks who it is
-//! (what "assigned to me" means on that site) and which fields hold sprints and rank there.
+//! is the normal case), each project on its own, so one that fails (a mistyped key, access
+//! lost) is named on the page and does not stop the others. Every `FLEET_JIRA_SYNC_MINUTES` an
+//! account reads what changed since its last good read (a ticket that closed comes back
+//! closed), asks its open sprints how they stand (a sprint can start without any of its tickets
+//! changing), and reads who commented on a few of the tickets that changed. Every
+//! `FLEET_JIRA_FULL_SYNC_HOURS`, or when the owner asks, it reads everything again in two parts:
+//! every ticket of an open sprint, then the open backlog newest first, up to
+//! `FLEET_JIRA_MAX_ISSUES` — so a cap never cuts the sprints the owner works from — and only a
+//! read Jira had nothing more to give for may mark a ticket gone. Once a day, or when the
+//! folder's site changed, it asks who it is there (what "assigned to me" means) and which fields
+//! hold sprints and rank on that site.
+//!
+//! It runs on its own, never inside the housekeeping loop's turn, and one sync at a time: a read
+//! the owner asks for while one runs is refused rather than queued.
 //!
 //! The credential stays here; everything this module stores is what any reader of those tickets
 //! sees, and it stores no ticket descriptions and no comments, only who wrote them.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashSet},
+    sync::Arc,
+};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
-use sqlx::FromRow;
+use sqlx::{FromRow, PgConnection};
 
 use crate::{
     chat::clip,
     core::Orchestrator,
-    jira::{self, Jira, JiraUser, MirrorIssue, SprintInfo},
+    jira::{self, Jira, JiraUser, MirrorIssue, MirrorRead, SprintInfo},
 };
 
 /// Open sprints asked about per account per sync.
 const SPRINT_CHECKS: i64 = 10;
+/// Minutes added to the incremental window, so a read that ran late misses nothing.
+const WINDOW_MARGIN_MINUTES: i64 = 5;
 
 #[derive(Debug, Clone, FromRow)]
 struct AccountRow {
     folder: String,
+    site: Option<String>,
     account_id: Option<String>,
     sprint_field: Option<String>,
     rank_field: Option<String>,
     fields_checked_at: Option<DateTime<Utc>>,
     last_sync_at: Option<DateTime<Utc>>,
     last_full_sync_at: Option<DateTime<Utc>>,
+    last_ok_at: Option<DateTime<Utc>>,
 }
 
 /// Each project with a Jira key, by the folder its credential is in.
@@ -62,38 +76,52 @@ async fn account(o: &Orchestrator, folder: &str) -> Result<AccountRow> {
     Ok(sqlx::query_as(
         "insert into jira_accounts (folder) values ($1)
          on conflict (folder) do update set folder = excluded.folder
-         returning folder, account_id, sprint_field, rank_field, fields_checked_at,
-                   last_sync_at, last_full_sync_at",
+         returning folder, site, account_id, sprint_field, rank_field, fields_checked_at,
+                   last_sync_at, last_full_sync_at, last_ok_at",
     )
     .bind(folder)
     .fetch_one(&o.db)
     .await?)
 }
 
-/// From housekeeping: every account whose sync is due.
-pub async fn tick(o: &Arc<Orchestrator>) -> Result<()> {
-    let folders = projects_by_folder(o).await?;
-    if folders.is_empty() {
-        return Ok(());
-    }
-    let lock = o.task_lock("~jira-sync");
-    let _held = lock.lock().await;
-    let every = chrono::Duration::minutes(o.cfg.jira.sync_minutes);
-    for (folder, projects) in folders {
-        let a = account(o, &folder).await?;
-        if a.last_sync_at.is_some_and(|at| Utc::now() - at < every) {
-            continue;
+/// From housekeeping: starts the sync of every account that is due, in the background, so a
+/// slow Jira never holds up the rest of housekeeping. Nothing starts while a sync runs.
+pub fn tick(o: &Arc<Orchestrator>) {
+    let o = o.clone();
+    tokio::spawn(async move {
+        let lock = o.task_lock("~jira-sync");
+        let Ok(_held) = lock.try_lock() else {
+            return;
+        };
+        let folders = match projects_by_folder(&o).await {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!("listing the projects to read from Jira failed: {e:#}");
+                return;
+            }
+        };
+        let every = chrono::Duration::minutes(o.cfg.jira.sync_minutes);
+        for (folder, projects) in folders {
+            match account(&o, &folder).await {
+                Ok(a) if a.last_sync_at.is_some_and(|at| Utc::now() - at < every) => {}
+                Ok(a) => {
+                    sync_account(&o, &a, &projects, false).await;
+                }
+                Err(e) => tracing::warn!("reading Jira ({folder}) failed: {e:#}"),
+            }
         }
-        sync_account(o, &a, &projects, false).await;
-    }
-    Ok(())
+    });
 }
 
-/// Reads every account now, in full when `full` (the owner's "Read Jira now"). Returns how each
-/// account went.
+/// Reads every account now, in full when `full`, and waits for it (the roadmap's own refresh,
+/// the brain's `roadmap sync`). Waits for a sync already running rather than refusing.
 pub async fn sync_all(o: &Arc<Orchestrator>, full: bool) -> Result<Value> {
     let lock = o.task_lock("~jira-sync");
     let _held = lock.lock().await;
+    sync_all_locked(o, full).await
+}
+
+async fn sync_all_locked(o: &Arc<Orchestrator>, full: bool) -> Result<Value> {
     let mut out = serde_json::Map::new();
     for (folder, projects) in projects_by_folder(o).await? {
         let a = account(o, &folder).await?;
@@ -102,32 +130,62 @@ pub async fn sync_all(o: &Arc<Orchestrator>, full: bool) -> Result<Value> {
     Ok(Value::Object(out))
 }
 
-/// One account's sync. Never fails: what went wrong is recorded on the account, where the Jira
-/// and Integrations pages show it.
+/// The owner's "Read Jira now": a full read in the background, answered at once. `false` when
+/// one is running already (the page shows it when it is done).
+pub fn sync_all_soon(
+    o: &Arc<Orchestrator>,
+    then: Option<Box<dyn FnOnce(Arc<Orchestrator>) + Send>>,
+) -> bool {
+    let lock = o.task_lock("~jira-sync");
+    let Ok(held) = lock.clone().try_lock_owned() else {
+        return false;
+    };
+    let o = o.clone();
+    tokio::spawn(async move {
+        let _held = held;
+        if let Err(e) = sync_all_locked(&o, true).await {
+            tracing::warn!("reading Jira failed: {e:#}");
+        }
+        drop(_held);
+        if let Some(then) = then {
+            then(o);
+        }
+    });
+    true
+}
+
+/// One account's sync. Never fails: what went wrong is recorded on the account (each failing
+/// project named), where the Jira and Integrations pages show it.
 async fn sync_account(o: &Orchestrator, a: &AccountRow, projects: &[String], full: bool) -> Value {
     let full = full
         || a.last_full_sync_at.is_none_or(|at| {
             Utc::now() - at >= chrono::Duration::hours(o.cfg.jira.full_sync_hours)
         });
+    let began = Utc::now();
     let outcome = sync_account_inner(o, a, projects, full).await;
     let (ok, error, truncated) = match &outcome {
-        Ok(t) => (true, None, *t),
-        Err(e) => (false, Some(clip(&format!("{e:#}"), 400)), false),
+        Ok((errors, truncated)) if errors.is_empty() => (true, None, *truncated),
+        Ok((errors, truncated)) => (false, Some(clip(&errors.join("; "), 600)), *truncated),
+        Err(e) => (false, Some(clip(&format!("{e:#}"), 600)), false),
     };
+    // A full read that ran counts as done even if a project failed in it: that project says
+    // so, and the others are not read in full again every few minutes because of it.
+    let full_ran = full && outcome.is_ok();
     if let Err(e) = sqlx::query(
         "update jira_accounts set last_sync_at = now(),
-                last_full_sync_at = case when $2 and $3 then now() else last_full_sync_at end,
-                last_ok_at = case when $3 then now() else last_ok_at end,
+                last_full_sync_at = case when $2 then now() else last_full_sync_at end,
+                last_ok_at = case when $3 then $6 else last_ok_at end,
                 last_error = $4,
                 last_error_at = case when $3 then last_error_at else now() end,
-                truncated = case when $2 and $3 then $5 else truncated end
+                truncated = case when $2 then $5 else truncated end
          where folder = $1",
     )
     .bind(&a.folder)
-    .bind(full)
+    .bind(full_ran)
     .bind(ok)
     .bind(&error)
     .bind(truncated)
+    .bind(began)
     .execute(&o.db)
     .await
     {
@@ -139,23 +197,31 @@ async fn sync_account(o: &Orchestrator, a: &AccountRow, projects: &[String], ful
     json!({"ok": ok, "full": full, "error": error, "truncated": truncated})
 }
 
-/// Returns whether a full read stopped at the cap.
+/// Each failing project's error, and whether a full read stopped at the cap.
 async fn sync_account_inner(
     o: &Orchestrator,
     a: &AccountRow,
     projects: &[String],
     full: bool,
-) -> Result<bool> {
+) -> Result<(Vec<String>, bool)> {
     let acc = jira::for_folder(o, &a.folder).await?;
     let site = acc.site().to_owned();
-    // Once a day: who we are there, and which fields hold sprints and rank on that site.
+    // Once a day, or as soon as the folder points elsewhere: who we are there, and which fields
+    // hold sprints and rank on that site.
     let (mut sprint_field, mut rank_field) = (a.sprint_field.clone(), a.rank_field.clone());
     if a.account_id.is_none()
+        || a.site.as_deref() != Some(site.as_str())
         || a.fields_checked_at
             .is_none_or(|at| Utc::now() - at >= chrono::Duration::hours(24))
     {
-        let me = acc.myself().await?;
-        let (sf, rf) = acc.discover_fields().await?;
+        let me = acc
+            .myself()
+            .await
+            .context("asking Jira who this account is")?;
+        let (sf, rf) = acc
+            .discover_fields()
+            .await
+            .context("reading the site's fields")?;
         sqlx::query(
             "update jira_accounts set site = $2, account_id = $3, account_name = $4,
                     sprint_field = $5, rank_field = $6, fields_checked_at = now()
@@ -171,51 +237,121 @@ async fn sync_account_inner(
         .await?;
         (sprint_field, rank_field) = (sf, rf);
     }
-    // Twice the interval, so a sync that ran late misses nothing.
-    let since = (!full).then(|| o.cfg.jira.sync_minutes * 2);
+    // Since the start of the last good read (plus a margin), so a gap — a restart, a deploy, a
+    // run of failed reads — misses nothing; never less than twice the interval.
+    let since = a
+        .last_ok_at
+        .map(|at| (Utc::now() - at).num_minutes() + WINDOW_MARGIN_MINUTES)
+        .unwrap_or(i64::MAX)
+        .max(o.cfg.jira.sync_minutes * 2)
+        .min(o.cfg.jira.full_sync_hours * 60 + WINDOW_MARGIN_MINUTES);
+    let mut errors = Vec::new();
     let mut truncated = false;
-    let mut changed: Vec<(String, String)> = Vec::new();
     for project in projects {
-        let j = jira::for_project(o, project).await?;
-        let began: DateTime<Utc> = sqlx::query_scalar("select clock_timestamp()")
-            .fetch_one(&o.db)
-            .await?;
-        let (issues, more) = j
-            .mirror_issues(
+        let read = async {
+            let j = jira::for_project(o, project).await?;
+            read_project(
+                o,
+                &j,
+                project,
+                &site,
+                full,
                 since,
                 sprint_field.as_deref(),
                 rank_field.as_deref(),
-                o.cfg.jira.max_issues,
             )
-            .await?;
-        for i in &issues {
-            store_issue(o, project, &site, i).await?;
-            changed.push((project.clone(), i.key.clone()));
+            .await
         }
-        if full && !more {
-            // Not in a complete read of everything open: closed outside a sprint, moved away,
-            // or deleted. Off the page, still in the table.
-            sqlx::query(
-                "update jira_issues set gone_at = now()
-                 where project = $1 and site = $2 and last_seen < $3 and gone_at is null",
-            )
-            .bind(project)
-            .bind(&site)
-            .bind(began)
-            .execute(&o.db)
-            .await?;
+        .await;
+        match read {
+            Ok(t) => truncated |= t,
+            Err(e) => errors.push(format!("{project}: {}", clip(&format!("{e:#}"), 300))),
         }
-        truncated |= full && more;
     }
     refresh_sprints(o, &acc, &site).await;
-    read_commenters(o, &changed).await;
-    Ok(truncated)
+    read_commenters(o, projects, since.min(o.cfg.jira.sync_minutes * 2)).await;
+    Ok((errors, truncated))
 }
 
-async fn store_issue(o: &Orchestrator, project: &str, site: &str, i: &MirrorIssue) -> Result<()> {
-    for s in &i.sprints {
-        store_sprint(o, site, s).await?;
+/// One project's read: what changed lately, or (full) its open sprints and then its backlog,
+/// stored in one transaction. Returns whether the full read stopped at the cap.
+#[allow(clippy::too_many_arguments)]
+async fn read_project(
+    o: &Orchestrator,
+    j: &Jira,
+    project: &str,
+    site: &str,
+    full: bool,
+    since: i64,
+    sprint_field: Option<&str>,
+    rank_field: Option<&str>,
+) -> Result<bool> {
+    let cap = o.cfg.jira.max_issues;
+    let began: DateTime<Utc> = sqlx::query_scalar("select clock_timestamp()")
+        .fetch_one(&o.db)
+        .await?;
+    let mut issues = Vec::new();
+    let mut complete = true;
+    if full {
+        if sprint_field.is_some() {
+            let (s, c) = j
+                .mirror_issues(MirrorRead::OpenSprints, sprint_field, rank_field, cap)
+                .await?;
+            complete &= c;
+            issues.extend(s);
+        }
+        let room = cap.saturating_sub(issues.len()).max(1);
+        let (b, c) = j
+            .mirror_issues(MirrorRead::Backlog, sprint_field, rank_field, room)
+            .await?;
+        complete &= c;
+        let seen: HashSet<String> = issues.iter().map(|i: &MirrorIssue| i.key.clone()).collect();
+        issues.extend(b.into_iter().filter(|i| !seen.contains(&i.key)));
+    } else {
+        let (r, _) = j
+            .mirror_issues(MirrorRead::Recent(since), sprint_field, rank_field, cap)
+            .await?;
+        issues = r;
     }
+    let mut tx = o.db.begin().await?;
+    let mut sprints = HashSet::new();
+    let mut users = HashSet::new();
+    for i in &issues {
+        for s in &i.sprints {
+            if sprints.insert(s.id) {
+                store_sprint(&mut tx, site, s).await?;
+            }
+        }
+        store_issue(&mut tx, project, site, i).await?;
+        for u in [&i.assignee, &i.reporter].into_iter().flatten() {
+            if users.insert(u.account_id.clone()) {
+                store_user(&mut tx, project, site, u).await?;
+            }
+        }
+    }
+    if full && complete {
+        // Not in a complete read of everything open: closed outside a sprint, moved away, or
+        // deleted. Off the page, still in the table. By project, whatever site it was read from
+        // before (a project moved to another site leaves nothing behind).
+        sqlx::query(
+            "update jira_issues set gone_at = now()
+             where project = $1 and last_seen < $2 and gone_at is null",
+        )
+        .bind(project)
+        .bind(began)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(full && !complete)
+}
+
+async fn store_issue(
+    c: &mut PgConnection,
+    project: &str,
+    site: &str,
+    i: &MirrorIssue,
+) -> Result<()> {
     sqlx::query(
         "insert into jira_issues (project, site, jira_key, jira_id, summary, status, status_category,
                                   issue_type, priority, labels, parent_key, assignee_id,
@@ -252,15 +388,12 @@ async fn store_issue(o: &Orchestrator, project: &str, site: &str, i: &MirrorIssu
     .bind(&i.rank)
     .bind(i.created)
     .bind(i.updated)
-    .execute(&o.db)
+    .execute(&mut *c)
     .await?;
-    for u in [&i.assignee, &i.reporter].into_iter().flatten() {
-        store_user(o, project, site, u).await?;
-    }
     Ok(())
 }
 
-async fn store_sprint(o: &Orchestrator, site: &str, s: &SprintInfo) -> Result<()> {
+async fn store_sprint(c: &mut PgConnection, site: &str, s: &SprintInfo) -> Result<()> {
     sqlx::query(
         "insert into jira_sprints (site, sprint_id, board_id, name, state, starts_at, ends_at, goal)
          values ($1, $2, $3, $4, $5, $6, $7, $8)
@@ -277,12 +410,12 @@ async fn store_sprint(o: &Orchestrator, site: &str, s: &SprintInfo) -> Result<()
     .bind(s.starts_at)
     .bind(s.ends_at)
     .bind(&s.goal)
-    .execute(&o.db)
+    .execute(&mut *c)
     .await?;
     Ok(())
 }
 
-async fn store_user(o: &Orchestrator, project: &str, site: &str, u: &JiraUser) -> Result<()> {
+async fn store_user(c: &mut PgConnection, project: &str, site: &str, u: &JiraUser) -> Result<()> {
     sqlx::query(
         "insert into jira_users (account_id, display_name, time_zone, avatar_url, sites, projects)
          values ($1, $2, $3, $4, array[$5], array[$6])
@@ -302,18 +435,19 @@ async fn store_user(o: &Orchestrator, project: &str, site: &str, u: &JiraUser) -
     .bind(&u.avatar_url)
     .bind(site)
     .bind(project)
-    .execute(&o.db)
+    .execute(&mut *c)
     .await?;
     Ok(())
 }
 
 /// Open sprints asked how they stand: one that started (or ended) changes no ticket, so the
-/// ticket reads alone would not notice. A site whose account may not read the agile API is
-/// corrected by the next full read instead.
+/// ticket reads alone would not notice. The least recently checked first, so one that keeps
+/// failing (deleted, on a board the account cannot see) never stops the others being checked;
+/// a sprint Jira no longer has is closed here.
 async fn refresh_sprints(o: &Orchestrator, acc: &Jira, site: &str) {
     let ids: Vec<i64> = sqlx::query_scalar(
         "select sprint_id from jira_sprints where site = $1 and state in ('active', 'future')
-         order by starts_at nulls last limit $2",
+         order by last_seen limit $2",
     )
     .bind(site)
     .bind(SPRINT_CHECKS)
@@ -321,42 +455,77 @@ async fn refresh_sprints(o: &Orchestrator, acc: &Jira, site: &str) {
     .await
     .unwrap_or_default();
     for id in ids {
-        match acc.sprint_info(id).await {
-            Ok(s) => {
-                if let Err(e) = store_sprint(o, site, &s).await {
-                    tracing::warn!("storing sprint {id} failed: {e:#}");
-                }
-            }
+        let stored = match acc.sprint_info(id).await {
+            Ok(s) => match o.db.acquire().await {
+                Ok(mut c) => store_sprint(&mut c, site, &s).await,
+                Err(e) => Err(e.into()),
+            },
             Err(e) => {
                 tracing::debug!("asking Jira about sprint {id} failed: {e:#}");
-                break;
+                let gone = format!("{e:#}").contains("answered 404");
+                sqlx::query(
+                    "update jira_sprints set last_seen = now(),
+                            state = case when $3 then 'closed' else state end
+                     where site = $1 and sprint_id = $2",
+                )
+                .bind(site)
+                .bind(id)
+                .bind(gone)
+                .execute(&o.db)
+                .await
+                .map(|_| ())
+                .map_err(Into::into)
             }
+        };
+        if let Err(e) = stored {
+            tracing::warn!("storing sprint {id} failed: {e:#}");
         }
     }
 }
 
-/// Who commented on the tickets that changed, a few per sync: people the ticket fields alone
-/// would never name.
-async fn read_commenters(o: &Orchestrator, changed: &[(String, String)]) {
-    for (project, key) in changed.iter().take(o.cfg.jira.comment_fetches as usize) {
-        let Ok(j) = jira::for_project(o, project).await else {
-            continue;
-        };
-        let site = j.site().to_owned();
-        match j.comment_authors(key, 20).await {
+/// Who commented on tickets that changed lately, a few per sync: people the ticket fields alone
+/// would never name. Only tickets updated within `minutes`, so a full read does not reread the
+/// same lowest keys every time.
+async fn read_commenters(o: &Orchestrator, projects: &[String], minutes: i64) {
+    let changed: Vec<(String, String, String)> = sqlx::query_as(
+        "select project, site, jira_key from jira_issues
+         where project = any($1) and gone_at is null
+           and jira_updated > now() - make_interval(mins => $2::int)
+         order by jira_updated desc limit $3",
+    )
+    .bind(projects)
+    .bind(minutes.clamp(1, i32::MAX as i64) as i32)
+    .bind(o.cfg.jira.comment_fetches)
+    .fetch_all(&o.db)
+    .await
+    .unwrap_or_default();
+    let mut clients: BTreeMap<String, Jira> = BTreeMap::new();
+    for (project, site, key) in changed {
+        if !clients.contains_key(&project) {
+            match jira::for_project(o, &project).await {
+                Ok(j) => {
+                    clients.insert(project.clone(), j);
+                }
+                Err(_) => continue,
+            }
+        }
+        let j = &clients[&project];
+        match j.comment_authors(&key, 20).await {
             Ok(list) => {
                 for u in list {
                     let stored = async {
-                        store_user(o, project, &site, &u).await?;
+                        let mut c = o.db.acquire().await?;
+                        store_user(&mut c, &project, &site, &u).await?;
                         sqlx::query(
-                            "insert into jira_comment_authors (jira_key, account_id, project)
-                             values ($1, $2, $3)
-                             on conflict (jira_key, account_id) do update set last_at = now()",
+                            "insert into jira_comment_authors (site, jira_key, account_id, project)
+                             values ($1, $2, $3, $4)
+                             on conflict (site, jira_key, account_id) do update set last_at = now()",
                         )
-                        .bind(key)
+                        .bind(&site)
+                        .bind(&key)
                         .bind(&u.account_id)
-                        .bind(project)
-                        .execute(&o.db)
+                        .bind(&project)
+                        .execute(&mut *c)
                         .await?;
                         anyhow::Ok(())
                     }
@@ -371,7 +540,7 @@ async fn read_commenters(o: &Orchestrator, changed: &[(String, String)]) {
     }
 }
 
-/// How each account's last read went, for the Jira and Integrations pages.
+/// How each account in use went at its last read, for the Jira and Integrations pages.
 pub async fn accounts_json(o: &Orchestrator) -> Result<Value> {
     #[allow(clippy::type_complexity)]
     let rows: Vec<(
@@ -385,10 +554,14 @@ pub async fn accounts_json(o: &Orchestrator) -> Result<Value> {
         Option<DateTime<Utc>>,
         bool,
     )> = sqlx::query_as(
-        "select folder, site, account_name, last_sync_at, last_full_sync_at, last_ok_at,
-                last_error, last_error_at, truncated
-         from jira_accounts order by folder",
+        "select a.folder, a.site, a.account_name, a.last_sync_at, a.last_full_sync_at, a.last_ok_at,
+                a.last_error, a.last_error_at, a.truncated
+         from jira_accounts a
+         where exists (select 1 from projects p where p.jira_key is not null
+                       and coalesce(nullif(p.jira_folder, ''), $1) = a.folder)
+         order by a.folder",
     )
+    .bind(jira::DEFAULT_FOLDER)
     .fetch_all(&o.db)
     .await?;
     Ok(Value::Object(
@@ -462,7 +635,7 @@ const ISSUE_WHERE: &str = "
        where r.project = i.project and r.jira_key = i.jira_key
        order by r.sprint_id desc limit 1) r on true
     left join tasks t on t.id = r.task_id
-    where i.gone_at is null
+    where i.gone_at is null and p.jira_key is not null
       and ($1::text is null or i.project = $1)
       and coalesce(case $2::text
             when 'active' then s.state = 'active'
@@ -509,7 +682,7 @@ pub async fn issues_json(o: &Orchestrator, f: &IssueFilter) -> Result<Value> {
                 t.status as task_status
          {ISSUE_WHERE}
          order by case s.state when 'active' then 0 when 'future' then 1 else 2 end,
-                  s.starts_at nulls last, i.sprint_id nulls last, i.rank nulls last, i.jira_key
+                  s.starts_at nulls last, i.sprint_id nulls last, i.rank collate \"C\" nulls last, i.jira_key
          limit $6"
     ))
     .bind(&f.project)
@@ -558,7 +731,7 @@ pub async fn issues_json(o: &Orchestrator, f: &IssueFilter) -> Result<Value> {
             "select s.sprint_id, s.name, s.state, s.starts_at, s.ends_at, count(i.id)
              from jira_sprints s join jira_issues i on i.site = s.site and i.sprint_id = s.sprint_id
              where i.gone_at is null and ($1::text is null or i.project = $1)
-               and s.state in ('active', 'future')
+               and s.state in ('active', 'future') and coalesce(i.status_category, '') <> 'done'
              group by s.sprint_id, s.name, s.state, s.starts_at, s.ends_at
              order by case s.state when 'active' then 0 else 1 end, s.starts_at nulls last, s.sprint_id",
         )
@@ -578,7 +751,9 @@ pub async fn issues_json(o: &Orchestrator, f: &IssueFilter) -> Result<Value> {
     let statuses: Vec<(Option<String>, Option<String>, i64)> = sqlx::query_as(
         "select status, max(status_category), count(*) from jira_issues
          where gone_at is null and ($1::text is null or project = $1)
-         group by status order by max(status_category), status",
+         group by status
+         order by case max(status_category) when 'new' then 0 when 'indeterminate' then 1 else 2 end,
+                  status",
     )
     .bind(&f.project)
     .fetch_all(&o.db)

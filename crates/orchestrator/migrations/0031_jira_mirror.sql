@@ -87,9 +87,10 @@ create table jira_users (
 );
 
 create table jira_comment_authors (
+    site text not null,
     jira_key text not null,
     account_id text not null,
     project text not null,
     last_at timestamptz not null default now(),
-    primary key (jira_key, account_id)
+    primary key (site, jira_key, account_id)
 );

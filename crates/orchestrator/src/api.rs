@@ -1846,10 +1846,23 @@ async fn jira_issues(State(o): State<O>, h: HeaderMap, Query(q): Query<JiraQuery
 async fn jira_act(State(o): State<O>, h: HeaderMap, Json(a): Json<Act>) -> Api {
     guard!(o, h, write);
     match a.op.as_str() {
+        // In the background: a full read of every account can take a while, and the page shows
+        // the result when it comes.
         "refresh" => {
-            let v = crate::jira_sync::sync_all(&o, true).await?;
+            if !crate::jira_sync::sync_all_soon(&o, None) {
+                return Ok(Json(json!({"done": "already reading Jira"})));
+            }
             o.audit("owner", "jira.refresh", json!({})).await;
-            Ok(Json(json!({"done": "read from Jira", "accounts": v})))
+            Ok(Json(
+                json!({"done": "reading Jira; this page updates when it is done"}),
+            ))
+        }
+        // Any ticket onto the roadmap: one someone else holds, unassigned, or in the backlog.
+        "roadmap_add" => {
+            let project = a.body["project"].as_str().context("project is required")?;
+            let key = a.body["key"].as_str().context("key is required")?;
+            let done = crate::roadmap::add(&o, project, key, "owner").await?;
+            Ok(Json(json!({"done": done})))
         }
         other => Err(ApiError(
             StatusCode::BAD_REQUEST,
@@ -1905,11 +1918,26 @@ async fn roadmap_act(State(o): State<O>, h: HeaderMap, Json(a): Json<Act>) -> Ap
                 json!({"done": format!("{} is {}%", row.jira_key, row.usage)}),
             ))
         }
+        // Jira first, so the roadmap reads what Jira says now; both in the background.
         "sync" => {
-            let s = crate::roadmap::current_sprint(&o).await?;
-            crate::roadmap::sync(&o, &s).await?;
-            crate::roadmap::tick_soon(&o);
-            Ok(Json(json!({"done": "read from Jira"})))
+            let then: Box<dyn FnOnce(O) + Send> = Box::new(|o: O| {
+                tokio::spawn(async move {
+                    let read = async {
+                        let s = crate::roadmap::current_sprint(&o).await?;
+                        crate::roadmap::sync(&o, &s).await
+                    };
+                    if let Err(e) = read.await {
+                        tracing::warn!("reading the roadmap failed: {e:#}");
+                    }
+                    crate::roadmap::tick_soon(&o);
+                });
+            });
+            let started = crate::jira_sync::sync_all_soon(&o, Some(then));
+            Ok(Json(json!({"done": if started {
+                "reading Jira; this page updates when it is done"
+            } else {
+                "already reading Jira"
+            }})))
         }
         other => Err(ApiError(
             StatusCode::BAD_REQUEST,

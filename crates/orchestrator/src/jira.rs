@@ -339,64 +339,6 @@ impl Jira {
         self.search(&jql, limit).await
     }
 
-    /// Every ticket of the owner's sprint (as [`Jira::sprint`] means it), for the roadmap: up to
-    /// [`ROADMAP_MAX`], with the status category that says whether it is done. Epics are left out:
-    /// they are containers, and their stories are what gets worked on.
-    pub async fn sprint_issues(&self) -> Result<Vec<SprintIssue>> {
-        let jql = scoped_jql(
-            &self.key,
-            &sprint_jql(self.active_sprint().await?).replace(
-                " ORDER BY status, priority DESC",
-                " ORDER BY priority DESC, rank",
-            ),
-        );
-        let mut out = Vec::new();
-        let mut page: Option<String> = None;
-        // A bounded number of pages: a Jira that keeps handing out tokens must not hold the
-        // roadmap for ever.
-        for _ in 0..(ROADMAP_MAX / MAX_RESULTS as usize + 2) {
-            let mut body = json!({
-                "jql": jql,
-                "maxResults": MAX_RESULTS,
-                "fields": ["summary", "status", "issuetype", "priority"],
-            });
-            if let Some(t) = &page {
-                body["nextPageToken"] = json!(t);
-            }
-            let v = self
-                .call_at(reqwest::Method::POST, "rest/api/3/search/jql", Some(body))
-                .await?;
-            for i in v["issues"].as_array().into_iter().flatten() {
-                let f = &i["fields"];
-                let Some(key) = i["key"].as_str() else {
-                    continue;
-                };
-                let issue_type = f["issuetype"]["name"].as_str().map(str::to_owned);
-                if issue_type
-                    .as_deref()
-                    .is_some_and(|t| t.eq_ignore_ascii_case("epic"))
-                {
-                    continue;
-                }
-                out.push(SprintIssue {
-                    key: key.to_owned(),
-                    summary: clip(f["summary"].as_str().unwrap_or(key), 300),
-                    status: f["status"]["name"].as_str().map(str::to_owned),
-                    done: f["status"]["statusCategory"]["key"].as_str() == Some("done"),
-                    issue_type,
-                    priority: f["priority"]["name"].as_str().map(str::to_owned),
-                });
-            }
-            let empty = v["issues"].as_array().is_none_or(|a| a.is_empty());
-            page = v["nextPageToken"].as_str().map(str::to_owned);
-            if page.is_none() || empty || out.len() >= ROADMAP_MAX {
-                break;
-            }
-        }
-        out.truncate(ROADMAP_MAX);
-        Ok(out)
-    }
-
     /// Who this account is on its site: the account id (what "assigned to me" means there), its
     /// name and its time zone.
     pub async fn myself(&self) -> Result<JiraUser> {
@@ -429,18 +371,18 @@ impl Jira {
         sprint_of(&v).context("Jira sent a sprint without an id")
     }
 
-    /// The issues of this project for the local copy (`jira_sync`): with `since`, those updated in
-    /// the last minutes (whatever their state, so one that was closed comes back closed);
-    /// without it, everything still open plus whatever is in an open sprint. At most `cap`, and
-    /// whether there were more. Always scoped to this project's key.
+    /// The issues of this project for the local copy (`jira_sync`), as `read` says, at most `cap`
+    /// of them, and whether that was all of them: `false` whenever Jira still had a page to give
+    /// (a read stopped short is never taken for a complete one). Only this project's own tickets
+    /// are kept, whatever came back.
     pub async fn mirror_issues(
         &self,
-        since_minutes: Option<i64>,
+        read: MirrorRead,
         sprint_field: Option<&str>,
         rank_field: Option<&str>,
         cap: usize,
     ) -> Result<(Vec<MirrorIssue>, bool)> {
-        let jql = scoped_jql(&self.key, &mirror_jql(since_minutes));
+        let jql = scoped_jql(&self.key, &mirror_jql(read, sprint_field.is_some()));
         let mut fields: Vec<&str> = vec![
             "summary",
             "status",
@@ -457,8 +399,9 @@ impl Jira {
         fields.extend(rank_field);
         let mut out = Vec::new();
         let mut page: Option<String> = None;
-        let mut more = false;
-        for _ in 0..(cap / MIRROR_PAGE + 2) {
+        // Bounded by what was kept, and by a page count no honest read reaches (Jira may hand out
+        // fewer than asked per page), so a token that never ends cannot hold the sync for ever.
+        for _ in 0..MIRROR_MAX_PAGES {
             let mut body = json!({"jql": jql, "maxResults": MIRROR_PAGE, "fields": fields});
             if let Some(tok) = &page {
                 body["nextPageToken"] = json!(tok);
@@ -466,24 +409,21 @@ impl Jira {
             let v = self
                 .call_at(reqwest::Method::POST, "rest/api/3/search/jql", Some(body))
                 .await?;
-            let issues = v["issues"].as_array().cloned().unwrap_or_default();
-            for i in &issues {
-                if let Some(m) = mirror_of(i, sprint_field, rank_field) {
+            for i in v["issues"].as_array().into_iter().flatten() {
+                if let Some(m) = mirror_of(i, sprint_field, rank_field)
+                    && is_own_key(&self.key, &m.key)
+                {
                     out.push(m);
                 }
             }
             page = v["nextPageToken"].as_str().map(str::to_owned);
-            if page.is_none() || issues.is_empty() {
-                break;
-            }
-            if out.len() >= cap {
-                more = true;
+            if page.is_none() || out.len() >= cap {
                 break;
             }
         }
-        more |= page.is_some() && out.len() >= cap;
+        let complete = page.is_none() && out.len() <= cap;
         out.truncate(cap);
-        Ok((out, more))
+        Ok((out, complete))
     }
 
     /// Who commented on an issue lately: the authors only, never what they wrote.
@@ -681,13 +621,30 @@ impl Jira {
 
 /// Issues per page of the local copy's reads.
 const MIRROR_PAGE: usize = 100;
+/// The most pages one read asks for.
+const MIRROR_MAX_PAGES: usize = 200;
 
-/// What the local copy reads: everything updated lately, or (a full sweep) everything still open
-/// plus whatever sits in an open sprint, done or not.
-pub fn mirror_jql(since_minutes: Option<i64>) -> String {
-    match since_minutes {
-        Some(m) => format!("updated >= -{}m ORDER BY updated DESC", m.max(1)),
-        None => "statusCategory != Done OR sprint in openSprints() ORDER BY key".into(),
+/// What one read of the local copy asks Jira for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MirrorRead {
+    /// Everything updated in the last minutes, whatever its state: a ticket that closed comes
+    /// back closed.
+    Recent(i64),
+    /// Every ticket of an open sprint (active or future), done or not: the part of a full read
+    /// that a cap never cuts first, so the sprints the owner works from are whole.
+    OpenSprints,
+    /// Every ticket still open outside the open sprints, the most recently updated first: the
+    /// rest of a full read, which a cap cuts at the stalest end.
+    Backlog,
+}
+
+/// The JQL of a read. A site without sprints (no sprint field) has no open sprints to ask about.
+pub fn mirror_jql(read: MirrorRead, has_sprints: bool) -> String {
+    match (read, has_sprints) {
+        (MirrorRead::Recent(m), _) => format!("updated >= -{}m ORDER BY updated DESC", m.max(1)),
+        (MirrorRead::OpenSprints, _) => "sprint in openSprints() ORDER BY Rank".into(),
+        (MirrorRead::Backlog, true) => "statusCategory != Done AND (sprint is EMPTY OR sprint not in openSprints()) ORDER BY updated DESC".into(),
+        (MirrorRead::Backlog, false) => "statusCategory != Done ORDER BY updated DESC".into(),
     }
 }
 
@@ -837,22 +794,6 @@ fn mirror_of(
         created: date(&f["created"]),
         updated: date(&f["updated"]),
     })
-}
-
-/// The most tickets of one project's sprint the roadmap takes: a sprint is a fortnight of one
-/// person's work, and past this a misconfigured board (every open ticket) is the likelier story.
-pub const ROADMAP_MAX: usize = 200;
-
-/// One ticket of the owner's sprint, as the roadmap keeps it.
-#[derive(Debug, Clone, PartialEq)]
-pub struct SprintIssue {
-    pub key: String,
-    pub summary: String,
-    pub status: Option<String>,
-    /// Jira's status category is `done`.
-    pub done: bool,
-    pub issue_type: Option<String>,
-    pub priority: Option<String>,
 }
 
 /// The fields of an issue worth an agent's tokens, with its text clipped.
@@ -1165,13 +1106,15 @@ mod tests {
     #[test]
     fn the_local_copy_reads_recent_changes_or_everything_open() {
         assert_eq!(
-            mirror_jql(Some(30)),
+            mirror_jql(MirrorRead::Recent(30), true),
             "updated >= -30m ORDER BY updated DESC"
         );
         assert_eq!(
-            scoped_jql("DAP", &mirror_jql(None)),
-            "project = DAP AND (statusCategory != Done OR sprint in openSprints()) ORDER BY key"
+            scoped_jql("DAP", &mirror_jql(MirrorRead::OpenSprints, true)),
+            "project = DAP AND (sprint in openSprints()) ORDER BY Rank"
         );
+        assert!(mirror_jql(MirrorRead::Backlog, true).contains("sprint not in openSprints()"));
+        assert!(!mirror_jql(MirrorRead::Backlog, false).contains("sprint"));
         let i = json!({"key": "DAP-1", "id": "100", "fields": {
             "summary": "Do it", "status": {"name": "To Do", "statusCategory": {"key": "new"}},
             "assignee": {"accountId": "u-1", "displayName": "Ann", "timeZone": "Europe/Kyiv"},

@@ -382,6 +382,11 @@ export type RoadmapItem = {
   plan_usage: number
   /** Why its last start failed, while it keeps failing. */
   start_error: string | null
+  /** Its Jira sprint, and, while that sprint has not started, when it may ("from Mon 7 Dec"). */
+  jira_sprint: { id: number; name: string | null; state: string | null; starts_at: string | null } | null
+  waits: string | null
+  /** `owner`: put on the roadmap by hand from the Jira page. */
+  origin: string | null
 }
 
 export type SprintRef = { id: number; name: string; starts_on: string; ends_on: string; span: string; current: boolean }

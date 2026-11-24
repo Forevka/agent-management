@@ -782,6 +782,7 @@ pub async fn handle(
             ))
         }
         "roadmap_sync" => {
+            crate::jira_sync::sync_all(o, true).await?;
             let s = crate::roadmap::current_sprint(o).await?;
             let v = crate::roadmap::sync(o, &s).await?;
             crate::roadmap::tick_soon(o);

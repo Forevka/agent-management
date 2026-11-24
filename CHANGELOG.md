@@ -7,6 +7,13 @@ below is one release. How to add to this file is in `CLAUDE.md`
 
 ## Unreleased
 
+- **The roadmap takes your next sprint too, and anything you add.** It reads your tickets in
+  the active **and the future** Jira sprints from the fleet's copy of Jira; one of a sprint that
+  has not started waits on the roadmap (a section of its own) until that sprint's start date,
+  so you can approve it now and it starts when its sprint does. On the Jira page, "Add to
+  roadmap" puts any other ticket on it — someone else's, unassigned, the backlog: approved as
+  added, and the fleet works it without moving it in Jira (it never moves a ticket that is not
+  yours). Migration `0032` adds nullable columns only. Run `/brain_reset` after the deploy.
 - **A Jira page with every ticket of every Jira you connected.** The fleet keeps a copy of each
   project's tickets in its active sprint, the sprints after it and its backlog, whoever holds
   them, read every 15 minutes (only what changed) and in full every 6 hours or when you press

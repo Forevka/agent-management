@@ -40,9 +40,11 @@ function groupOf(i: JiraIssue): { key: string; title: string; note: string | nul
   const note =
     s.state === 'active'
       ? `Active${to ? ` · ends ${to}` : ''}`
-      : from
-        ? `Starts ${from}${to ? ` · ends ${to}` : ''}`
-        : 'Not started, no start date yet'
+      : s.state === 'closed'
+        ? `Closed${to ? ` · ended ${to}` : ''}`
+        : from
+          ? `Starts ${from}${to ? ` · ends ${to}` : ''}`
+          : 'Not started, no start date yet'
   return { key: `sprint:${s.id}`, title: s.name ?? `Sprint ${s.id}`, note }
 }
 
@@ -159,7 +161,7 @@ export default function Jira() {
             Showing the first {d.issues.length}; narrow the filters to see the rest.
           </Text>
         )}
-        <Loaded state={state}>{(data) => <Groups d={data} />}</Loaded>
+        <Loaded state={state}>{(data) => <Groups d={data} reload={() => void state.reload()} />}</Loaded>
       </Stack>
     </Page>
   )
@@ -196,7 +198,7 @@ function SyncLine({ d }: { d: JiraPage }) {
   )
 }
 
-function Groups({ d }: { d: JiraPage }) {
+function Groups({ d, reload }: { d: JiraPage; reload: () => void }) {
   if (d.issues.length === 0) {
     return <EmptyState title="No ticket matches" text="Change the filters, or read Jira now." />
   }
@@ -212,14 +214,14 @@ function Groups({ d }: { d: JiraPage }) {
     <Stack gap="5">
       {groups.map((g) => (
         <Section key={g.key} title={`${g.title} · ${g.issues.length}`} description={g.note ?? undefined}>
-          <IssueTable issues={g.issues} />
+          <IssueTable issues={g.issues} reload={reload} />
         </Section>
       ))}
     </Stack>
   )
 }
 
-function IssueTable({ issues }: { issues: JiraIssue[] }) {
+function IssueTable({ issues, reload }: { issues: JiraIssue[]; reload: () => void }) {
   return (
     <Table
       dense
@@ -283,12 +285,25 @@ function IssueTable({ issues }: { issues: JiraIssue[] }) {
           cell: (i) =>
             i.roadmap?.task ? (
               <TaskLink id={i.roadmap.task.id}>{i.roadmap.task.key}</TaskLink>
-            ) : i.roadmap ? (
+            ) : i.roadmap && !['left', 'skipped', 'declined'].includes(i.roadmap.state) ? (
               <Badge tone="info">on the roadmap</Badge>
-            ) : (
+            ) : i.status_category === 'done' ? (
               <Text size="1" tone="muted">
                 —
               </Text>
+            ) : (
+              // Any ticket the owner wants worked on, whoever holds it in Jira: approved as it is
+              // added, and it waits for its sprint like any other.
+              <ActionButton
+                op="roadmap_add"
+                path={PATH}
+                body={{ project: i.project, key: i.key }}
+                size="sm"
+                variant="ghost"
+                onDone={reload}
+              >
+                Add to roadmap
+              </ActionButton>
             ),
         },
         { key: 'updated', header: 'Updated', align: 'end', secondary: true, cell: (i) => <When at={i.updated} /> },

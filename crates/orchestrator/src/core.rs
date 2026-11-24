@@ -1091,10 +1091,9 @@ impl Orchestrator {
             if let Err(e) = crate::usage::release_lapsed(&self).await {
                 tracing::warn!("releasing nodes whose usage limit reset failed: {e:#}");
             }
-            // The local copy of every connected Jira, which the roadmap then reads.
-            if let Err(e) = crate::jira_sync::tick(&self).await {
-                tracing::warn!("reading Jira failed: {e:#}");
-            }
+            // The local copy of every connected Jira, which the roadmap reads: in the background,
+            // so a slow Jira never holds up the rest of this loop.
+            crate::jira_sync::tick(&self);
             // The roadmap: Jira's sprint read, the owner's card, and tickets whose window came.
             if let Err(e) = crate::roadmap::tick(&self).await {
                 tracing::warn!("the roadmap failed: {e:#}");
