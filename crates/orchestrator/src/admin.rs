@@ -53,7 +53,16 @@ pub const PRESETS: &[(&str, &[&str])] = &[
     ("jira", &["JIRA_URL", "JIRA_EMAIL", "JIRA_API_TOKEN"]),
     ("github", &["GITHUB_TOKEN"]),
     ("gitlab", &["GITLAB_URL", "GITLAB_TOKEN"]),
-    ("slack", &["SLACK_USER_TOKEN"]),
+    ("slack", &["SLACK_USER_TOKEN", "SLACK_APP_TOKEN"]),
+    // Google Chat: the owner's OAuth client and refresh token (see `feeds`).
+    (
+        "gchat",
+        &[
+            "GOOGLE_CLIENT_ID",
+            "GOOGLE_CLIENT_SECRET",
+            "GOOGLE_REFRESH_TOKEN",
+        ],
+    ),
     ("ssh", &["SSH_HOST", "SSH_USER", "SSH_PRIVATE_KEY"]),
 ];
 
@@ -2868,7 +2877,7 @@ fn link_allowed(page: &str) -> bool {
     match (first, second, third) {
         (
             "" | "projects" | "secrets" | "nodes" | "agents" | "tasks" | "sessions" | "inbox"
-            | "habits" | "retro" | "roadmap" | "jira" | "people" | "kit",
+            | "habits" | "retro" | "roadmap" | "jira" | "integrations" | "people" | "kit",
             None,
             None,
         ) => true,
@@ -2891,7 +2900,7 @@ pub async fn send_link(o: &Orchestrator, page: &str, text: Option<&str>) -> Resu
     let page = page.trim();
     ensure!(
         link_allowed(page),
-        "page must be one of /, /tasks[/<id>[/session]], /sessions, /projects[/<slug>[/tasks|/sessions|/agents|/settings]], /inbox, /agents, /nodes[/<node-id>], /secrets[/<folder-id>], /kit[/<item-id>], /habits, /retro, /roadmap, /jira, /people[/<id>], /items/<id>, optionally with a filter query such as /tasks?project=bioins&status=failed"
+        "page must be one of /, /tasks[/<id>[/session]], /sessions, /projects[/<slug>[/tasks|/sessions|/agents|/settings]], /inbox, /agents, /nodes[/<node-id>], /secrets[/<folder-id>], /kit[/<item-id>], /habits, /retro, /roadmap, /jira, /integrations, /people[/<id>], /items/<id>, optionally with a filter query such as /tasks?project=bioins&status=failed"
     );
     let text = clip(
         text.map(str::trim)

@@ -307,6 +307,7 @@ pub async fn run_updates(o: Arc<Orchestrator>, bot: Bot, chat_id: i64) {
     loop {
         match bot.get_updates(offset, 50, kinds).await {
             Ok(updates) => {
+                crate::integrations::report("telegram", "connected", None);
                 for u in updates {
                     offset = Some(u.update_id + 1);
                     handle_update(&o, &bot, chat_id, u).await;
@@ -333,6 +334,7 @@ pub async fn run_updates(o: Arc<Orchestrator>, bot: Bot, chat_id: i64) {
                     continue;
                 }
                 tracing::warn!("telegram getUpdates failed: {e}");
+                crate::integrations::report("telegram", "error", Some(e.to_string()));
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
         }

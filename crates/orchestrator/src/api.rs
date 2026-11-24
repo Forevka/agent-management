@@ -64,6 +64,10 @@ pub fn router() -> Router<O> {
         .route("/api/retro", get(retro).post(retro_act))
         .route("/api/roadmap", get(roadmap).post(roadmap_act))
         .route("/api/jira", get(jira_issues).post(jira_act))
+        .route(
+            "/api/integrations",
+            get(integrations).post(integrations_act),
+        )
         .route("/api/people", get(people).post(people_act))
         .route("/api/people/{id}", get(person).post(person_act))
         .route("/api/kit", get(kit).post(kit_act))
@@ -1809,6 +1813,42 @@ async fn habits_act(State(o): State<O>, h: HeaderMap, Json(a): Json<Act>) -> Api
     };
     let note = crate::habits::button(&o, &format!("hb|{id}|{action}")).await?;
     Ok(Json(json!({"done": note})))
+}
+
+// ---------------------------------------------------------------- integrations
+
+async fn integrations(State(o): State<O>, h: HeaderMap) -> Api {
+    guard!(o, h);
+    Ok(Json(crate::integrations::json(&o).await?))
+}
+
+/// The owner's credentials for an integration: set or remove one key (values are write-only,
+/// and only the keys that integration reads), or test the stored credential.
+async fn integrations_act(State(o): State<O>, h: HeaderMap, Json(a): Json<Act>) -> Api {
+    guard!(o, h, write);
+    let id = need(&a.body, "id")?;
+    match a.op.as_str() {
+        "set" => {
+            let key = need(&a.body, "key")?;
+            let value = a.body["value"].as_str().context("value is required")?;
+            let done = crate::integrations::set_key(&o, &id, &key, value).await?;
+            Ok(Json(json!({"done": done})))
+        }
+        "unset" => {
+            let key = need(&a.body, "key")?;
+            let done = crate::integrations::unset_key(&o, &id, &key).await?;
+            Ok(Json(json!({"done": done})))
+        }
+        // A failed test is an answer, not an error: the page shows what the service said.
+        "test" => Ok(Json(match crate::integrations::test(&o, &id).await {
+            Ok(v) => v,
+            Err(e) => json!({"ok": false, "detail": crate::chat::clip(&format!("{e:#}"), 400)}),
+        })),
+        other => Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("unknown operation {other:?}"),
+        )),
+    }
 }
 
 // ---------------------------------------------------------------- jira

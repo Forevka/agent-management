@@ -2815,6 +2815,99 @@ async fn jira_mirror_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool) {
     );
 }
 
+/// The Integrations page (see `integrations`): every service with its keys (never their values),
+/// a credential set from the page into the integration's own folder, only that integration's
+/// keys, nothing for what lives in `deploy/.env`, and a Test that names the account, not the
+/// credential.
+async fn integrations_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool) {
+    let find = |v: &Value, id: &str| -> Value {
+        v["integrations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["id"] == id)
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    let page = api_get(o, "/api/integrations").await;
+    let slack = find(&page, "slack");
+    assert_eq!(slack["configured"], json!(false), "{slack}");
+    assert_eq!(slack["status"]["state"], json!("not_configured"));
+    let mir = find(&page, "jira:jira-mir");
+    assert_eq!(mir["meta"]["projects"][0]["slug"], json!("mir"), "{mir}");
+    assert_eq!(mir["status"]["state"], json!("ok"), "{mir}");
+    assert_eq!(find(&page, "telegram")["editable"], json!(false));
+
+    // A token set here lands in Slack's folder, made with Slack's preset; the page says it is
+    // set, and nothing ever shows it again.
+    let secret = "xoxp-integration-flow-secret";
+    let r = api_post(
+        o,
+        "/api/integrations",
+        json!({"op": "set", "body": {"id": "slack", "key": "SLACK_USER_TOKEN", "value": secret}}),
+    )
+    .await;
+    assert!(r["done"].as_str().unwrap().contains("is set"), "{r}");
+    let preset: String =
+        sqlx::query_scalar("select preset from secret_folders where name = 'slack'")
+            .fetch_one(db)
+            .await
+            .unwrap();
+    assert_eq!(preset, "slack");
+    let page = api_get(o, "/api/integrations").await;
+    assert!(
+        !page.to_string().contains(secret),
+        "a value never comes back"
+    );
+    let slack = find(&page, "slack");
+    let user_key = slack["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|k| k["key"] == "SLACK_USER_TOKEN")
+        .unwrap()
+        .clone();
+    assert_eq!(user_key["set"], json!(true));
+    // Only Slack's keys go into Slack's folder, and nothing set in deploy/.env is set here.
+    for (id, key) in [
+        ("slack", "JIRA_API_TOKEN"),
+        ("telegram", "TELEGRAM_ORCHESTRATOR_TOKEN"),
+    ] {
+        let (status, _) = api_post_status(
+            o,
+            "/api/integrations",
+            json!({"op": "set", "body": {"id": id, "key": key, "value": "x"}}),
+        )
+        .await;
+        assert_ne!(status, 200, "{id} {key}");
+    }
+    api_post(
+        o,
+        "/api/integrations",
+        json!({"op": "unset", "body": {"id": "slack", "key": "SLACK_USER_TOKEN"}}),
+    )
+    .await;
+
+    // A Jira test signs in with the stored credential and names who it is, never the token.
+    let t = api_post(
+        o,
+        "/api/integrations",
+        json!({"op": "test", "body": {"id": "jira:jira-mir"}}),
+    )
+    .await;
+    assert_eq!(t["ok"], json!(true), "{t}");
+    assert!(t["detail"].as_str().unwrap().contains("as Owner"), "{t}");
+    assert!(!t.to_string().contains("tok"), "{t}");
+    // At most one test every few seconds.
+    let again = api_post(
+        o,
+        "/api/integrations",
+        json!({"op": "test", "body": {"id": "jira:jira-mir"}}),
+    )
+    .await;
+    assert_eq!(again["ok"], json!(false), "{again}");
+}
+
 /// A read of the web API as the owner, for flows that want to check what the UI is shown.
 /// Mints its own session row, so it does not depend on another flow having run.
 async fn api_get(o: &Arc<Orchestrator>, uri: &str) -> Value {
@@ -11124,6 +11217,8 @@ async fn lifecycle() {
     // 21a'''. The local copy of every Jira: active and future sprints and the backlog, any
     //         assignee, the people on the tickets, and the page that filters them.
     Box::pin(jira_mirror_flow(&o, &db)).await;
+    // 21a''''. Every third-party access on one page: credentials set write-only, tested.
+    Box::pin(integrations_flow(&o, &db)).await;
 
     // 21b. The kit: imported from a node, installed there without touching the owner's own
     //      items, the exact MCP allowlist of a worker's session, and the owner's alone. On node

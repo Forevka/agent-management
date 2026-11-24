@@ -53,7 +53,26 @@ impl Hindsight {
         if let Some(b) = body {
             req = req.json(&b);
         }
-        let resp = req.send().await.context("Hindsight is unreachable")?;
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                crate::integrations::report(
+                    "hindsight",
+                    "error",
+                    Some(format!("unreachable: {e}")),
+                );
+                return Err(e).context("Hindsight is unreachable");
+            }
+        };
+        if resp.status().is_server_error() {
+            crate::integrations::report(
+                "hindsight",
+                "error",
+                Some(format!("answered {}", resp.status())),
+            );
+        } else {
+            crate::integrations::report("hindsight", "ok", None);
+        }
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
@@ -80,7 +99,26 @@ impl Hindsight {
         if let Some(b) = body {
             req = req.json(&b);
         }
-        let resp = req.send().await.context("Hindsight is unreachable")?;
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                crate::integrations::report(
+                    "hindsight",
+                    "error",
+                    Some(format!("unreachable: {e}")),
+                );
+                return Err(e).context("Hindsight is unreachable");
+            }
+        };
+        if resp.status().is_server_error() {
+            crate::integrations::report(
+                "hindsight",
+                "error",
+                Some(format!("answered {}", resp.status())),
+            );
+        } else {
+            crate::integrations::report("hindsight", "ok", None);
+        }
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }

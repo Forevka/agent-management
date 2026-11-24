@@ -7,6 +7,18 @@ below is one release. How to add to this file is in `CLAUDE.md`
 
 ## Unreleased
 
+- **An Integrations page with every third-party access the fleet has** (Settings →
+  Integrations): Slack, Google Chat, each Jira account with the projects that use it, Telegram,
+  Hindsight, the projects' repositories and the kit's MCP servers, by category, with a search.
+  Each says how it stands right now (connected, disconnected, stopped, failing, with the
+  service's own error) and what it is connected as. Slack's, Google Chat's and each Jira
+  account's credential is set right there: only the keys that integration reads, write-only
+  (never shown again), and a Test that signs in and says as whom. Telegram and Hindsight are
+  set in `deploy/.env` and only shown. The `slack` folder preset now lists `SLACK_APP_TOKEN`,
+  and there is a `gchat` preset.
+
+## v0.2.25 — 2026-11-24
+
 - **The roadmap takes your next sprint too, and anything you add.** It reads your tickets in
   the active **and the future** Jira sprints from the fleet's copy of Jira; one of a sprint that
   has not started waits on the roadmap (a section of its own) until that sprint's start date,

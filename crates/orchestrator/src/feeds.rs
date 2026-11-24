@@ -279,6 +279,7 @@ pub async fn run_feeds(o: Arc<Orchestrator>) {
                 (
                     cfg,
                     tokio::spawn(async move {
+                        crate::integrations::report(name, "running", None);
                         let mut src = match c.build() {
                             Ok(s) => s,
                             Err(e) => return source_stopped(&o, name, &e).await,
@@ -297,6 +298,7 @@ pub async fn run_feeds(o: Arc<Orchestrator>) {
 /// hears it once, with a sound: messages stop arriving until they fix its settings.
 async fn source_stopped(o: &Orchestrator, kind: &str, e: &FeedError) {
     tracing::error!("feed source {kind} stopped: {e}");
+    crate::integrations::report(kind, "stopped", Some(e.to_string()));
     let html = format!(
         "⚠️ The {} feed stopped: {}\nNo messages arrive from it until its settings change (web UI → Secrets → its folder).",
         esc(&source_name(kind)),
@@ -429,9 +431,11 @@ where
                 }
                 FeedEvent::Status(SourceStatus::Connected) => {
                     tracing::info!("feed source {kind} connected");
+                    crate::integrations::report(kind, "connected", None);
                 }
                 FeedEvent::Status(SourceStatus::Disconnected { reason }) => {
                     tracing::warn!("feed source {kind} disconnected: {reason}");
+                    crate::integrations::report(kind, "disconnected", Some(reason.to_string()));
                 }
                 _ => {}
             }

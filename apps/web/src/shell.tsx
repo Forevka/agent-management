@@ -6,6 +6,7 @@ import {
   AiBrain01Icon,
   Calendar03Icon,
   Ticket01Icon,
+  PlugSocketIcon,
   CheckListIcon,
   ComputerIcon,
   Folder01Icon,
@@ -70,6 +71,7 @@ const MAIN: Page[] = [
 const SETTINGS: Page[] = [
   { label: 'Agents', path: '/agents', icon: RoboticIcon },
   { label: 'Nodes', path: '/nodes', icon: HardDriveIcon, match: ['/nodes/:id'] },
+  { label: 'Integrations', path: '/integrations', icon: PlugSocketIcon },
   { label: 'Kit', path: '/kit', icon: PackageIcon, match: ['/kit/:id'] },
   { label: 'Secrets', path: '/secrets', icon: Key01Icon, match: ['/secrets/:id'] },
   { label: 'Habits', path: '/habits', icon: RepeatIcon },

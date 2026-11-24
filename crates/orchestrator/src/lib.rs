@@ -20,6 +20,7 @@ pub mod disk;
 pub mod feeds;
 pub mod habits;
 pub mod human;
+pub mod integrations;
 pub mod jira;
 pub mod jira_sync;
 pub mod kit;

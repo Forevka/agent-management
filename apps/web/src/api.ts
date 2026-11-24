@@ -307,6 +307,36 @@ export type Inbox = {
 
 /// The daily retrospective: what the fleet concluded about its own days, and what it proposes
 /// doing about it. `detail` is a session's own prose — rendered as text, never as markup.
+/// One third-party access (see `integrations.rs`). Keys say whether they are set, never a value.
+export type Integration = {
+  id: string
+  kind: 'slack' | 'gchat' | 'jira' | 'telegram' | 'hindsight' | 'repo' | 'mcp' | string
+  category: 'messaging' | 'trackers' | 'code' | 'memory' | 'mcp' | string
+  name: string
+  description: string
+  folder?: string
+  editable: boolean
+  configured: boolean
+  keys: { key: string; set: boolean; required: boolean }[]
+  status: { state: string; detail?: string | null; since?: string | null; last_ok?: string | null; last_error?: string | null }
+  meta: {
+    mode?: string | null
+    channels?: number
+    last_message?: string | null
+    site?: string | null
+    account?: string | null
+    last_read?: string | null
+    projects?: { slug: string; name: string; key: string | null; color: string }[]
+    bots?: number
+    link?: string
+    nodes?: number | unknown[]
+    installed?: number
+    project?: string
+  }
+}
+
+export type Integrations = { integrations: Integration[] }
+
 /// A sprint as Jira names it (not the fleet's own roadmap sprints).
 export type JiraSprint = {
   id: number
