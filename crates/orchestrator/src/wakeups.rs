@@ -646,7 +646,9 @@ async fn fire(
     text.push_str(
         " Check what you were waiting for and act on it. If it is still not settled, arm another \
          wakeup (`fleet agent wake set --in <interval> --note \"...\"`); after a few rounds, say \
-         where it stands and stop instead of waiting forever.",
+         where it stands and stop instead of waiting forever. A merge request you are following \
+         is the exception: keep following it until it is merged or closed, more slowly when \
+         nothing moves.",
     );
     o.audit(
         "orchestrator",

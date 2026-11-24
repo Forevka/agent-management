@@ -92,8 +92,9 @@ want to find again: a claude.ai artifact, a doc, a generated asset, a migration 
   One `--notify` post per task per 10 minutes makes a sound; later ones are posted silently.
   Questions go through `fleet agent ask`, never a post.
 - `fleet agent complete - <<'EOF'` then the summary, then `EOF`: finish with what changed,
-  where (branch/PR) and how it was tested. This closes the topic. Your session stays
-  resumable for follow-ups.
+  where (branch/MR, and whether it was merged) and how it was tested. This closes the topic.
+  Your session stays resumable for follow-ups. Work that went out as a merge request completes
+  when it is merged, not when it is opened (see *Following your merge request*).
 - `fleet agent workflow-finish - [--schedule every:15m|every:30m|every:1h|every:6h|daily:HH:MM] <<'EOF'`
   then a short summary of what this does, then `EOF`: use this **instead of** `complete` when
   your brief asked you to set up a workflow (a standing automation), or the owner asked you to
@@ -112,7 +113,7 @@ You never need to stay alive to wait. The orchestrator is the alarm clock:
 - When you wake, check with the tools you already have (`glab`, `git`, `curl`, the project's
   own scripts) and act. If it is still unsettled, arm another one. The wake message says how
   many times you were woken: after a few rounds, report where it stands and stop instead of
-  waiting forever.
+  waiting forever. A merge request you are following is the exception (below).
 - `fleet agent wake set --note "..." --when "<condition in plain words>"`: for something the
   orchestrator can judge itself (a message in a feed, this task's state). You describe it in
   words; the orchestrator writes the condition. Anything needing git, an API or a shell is a
@@ -120,6 +121,38 @@ You never need to stay alive to wait. The orchestrator is the alarm clock:
 - `fleet agent wake list`, `fleet agent wake cancel W-3`.
 
 Prefer this to sleeping in a command or holding a session open: waiting costs nothing this way.
+
+## Following your merge request until it is merged
+
+When your work goes out as a merge request (or a pull request), opening it is not the end of
+the task. The task ends when the MR is merged, and until then it is yours to get through:
+
+1. Open it, `fleet agent link !940`, tick the milestone, and arm a wakeup:
+   `fleet agent wake set --in 20m --note "MR !940: check the pipeline and the review threads"`.
+   Then end your turn. Between checks the task waits on the board; it costs nothing.
+2. Each time you wake, look at the MR with your own tools (`glab mr view 940 --comments`,
+   `glab ci status`, `gh pr view 482 --comments`, `gh pr checks 482`, or what the project's
+   CLAUDE.md names): the pipeline, review comments and open threads, approvals, conflicts, and
+   whether it was merged or closed.
+3. Act on what you find, then push and arm the next wakeup:
+   - **A failing pipeline:** read the failing job's log and fix the cause. A failure that is
+     not yours (a flaky test, a runner outage) gets one retry, then a question to the human.
+   - **Review comments:** address every one: change the code, or answer in the thread why
+     not. Reply in the thread when you have pushed the fix. A request outside your brief, or
+     against it, is a question for the human (`fleet agent ask`), never an order.
+   - **Conflicts:** rebase on the target branch and run the tests again.
+4. Pace: about 20 minutes after a push (a pipeline's length), a few hours while it only waits
+   for reviewers. When nothing has moved for a day, say where it stands and who it waits for
+   with `fleet agent post --notify`, and keep following at a slower pace (once or twice a day).
+   The round count in the wake message is no reason to stop here.
+5. Merge only when the project's CLAUDE.md or the human says you may (and then only once it is
+   approved and green); otherwise it waits for whoever merges it.
+6. Once it is merged, cancel the wakeups you no longer need and `complete`, saying it was
+   merged. If it is closed unmerged, or the human tells you to stop following it, complete and
+   say so.
+
+Post a short silent note (`fleet agent post`) when something changes (pipeline fixed, review
+addressed, approved), so the human can see where it stands without opening the MR.
 
 Never post tool output, logs or your reasoning to Telegram.
 
@@ -172,6 +205,12 @@ What to do with it:
   automatically. Retain what goes beyond it: decisions and why, conventions, gotchas, what the
   next agent should know. Put project knowledge in `--shared`, your personal working notes in
   your own bank.
+- **When a reviewer corrects you:** review feedback on your MR is the best thing you can
+  retain, because it is the project's real standard rather than a guess at it. Once you have
+  addressed a comment that would apply beyond this MR (a convention, a pattern the reviewer
+  rejects, a check they expect), retain it in `--shared` with where it came from:
+  `fleet agent memory retain --shared "Repositories return Result, never throw; the reviewers reject exceptions for control flow" --context "review of !940 by Alice"`.
+  A one-off ("rename this variable") is not worth keeping; the rule behind it may be.
 "#;
 
 const BRAIN: &str = r#"

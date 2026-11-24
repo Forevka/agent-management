@@ -25,6 +25,13 @@ import { TaskLink, useTaskPeek } from '../peek'
  * again on its own. That is the column worth looking at first, so it comes first.
  */
 
+/**
+ * A task whose agent is asleep until a wakeup it armed: open work nobody is spending anything on,
+ * such as an agent following its merge request between checks. Its status stays `running` (the
+ * task is not finished), so without this it would sit under Running looking abandoned.
+ */
+const asleep = (t: BoardTask) => t.status === 'running' && !t.running && t.wakeup !== null
+
 /** A column, and which tasks fall into it. A task lands in the first one that takes it. */
 const COLUMNS: {
   key: string
@@ -52,9 +59,15 @@ const COLUMNS: {
     tone: 'success',
     always: true,
     empty: 'No agent is working.',
-    takes: (t) => t.status === 'running',
+    takes: (t) => t.status === 'running' && !asleep(t),
   },
-  { key: 'waiting', title: 'Waiting', tone: 'default', empty: 'Nothing on a timer.', takes: (t) => t.status === 'waiting' },
+  {
+    key: 'waiting',
+    title: 'Waiting',
+    tone: 'default',
+    empty: 'Nothing on a timer.',
+    takes: (t) => t.status === 'waiting' || asleep(t),
+  },
   { key: 'done', title: 'Done', tone: 'success', always: true, empty: 'Nothing finished today.', takes: (t) => t.status === 'done' },
   { key: 'stopped', title: 'Stopped', tone: 'default', empty: 'Nothing stopped.', takes: (t) => t.status === 'stopped' },
 ]
@@ -218,8 +231,16 @@ function CardState({ task: t }: { task: BoardTask }) {
   if (t.status === 'stopped') return <><BoardDot />Stopped · <When at={t.since} /></>
   if (t.status === 'done') return <><BoardDot tone="success" />Done · <When at={t.since} /></>
   if (t.running) return <><BoardDot tone="success" spin /><Elapsed since={t.since} /></>
+  // Asleep until a wakeup: when it will look again matters more than how long it has slept.
+  if (asleep(t) && t.wakeup) {
+    return t.wakeup.at ? (
+      <><BoardDot />Next check <When at={t.wakeup.at} /></>
+    ) : (
+      <><BoardDot />Waiting for a condition</>
+    )
+  }
   // Nothing is being spent on the work right now, but for three different reasons: no agent is
-  // free, the agent is asleep until a wakeup fires, or its session is simply between turns.
+  // free, the agent is waiting on a question, or its session is simply between turns.
   const idle = t.status === 'queued' ? 'Queued' : t.status === 'waiting' ? 'Waiting' : 'Idle'
   return <><BoardDot />{idle} · <Elapsed since={t.since} /></>
 }

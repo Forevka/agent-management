@@ -3289,6 +3289,24 @@ async fn wakeup_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool) {
             .await
             .unwrap();
     assert_eq!((w.kind.as_str(), w.state.as_str()), ("timer", "armed"));
+    // The board says when it will look again, which is what puts an agent following its merge
+    // request under Waiting rather than looking abandoned under Running.
+    let board = api_get(o, "/api/board").await;
+    let card = board["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "demo-BS-1")
+        .unwrap_or_else(|| panic!("the napping task is on the board: {board}"))
+        .clone();
+    assert_eq!(
+        card["wakeup"]["condition"],
+        json!(false),
+        "a timer, no condition: {card}"
+    );
+    let at: chrono::DateTime<chrono::Utc> =
+        serde_json::from_value(card["wakeup"]["at"].clone()).expect("the next check's time");
+    assert_eq!(at.timestamp(), w.fires_at.unwrap().timestamp(), "{card}");
     crate::wakeups::run_due(o).await.unwrap();
     assert_eq!(
         sqlx::query_scalar::<_, i32>("select fires from wakeups where id = $1")

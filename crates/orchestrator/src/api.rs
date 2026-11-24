@@ -314,6 +314,18 @@ async fn board(State(o): State<O>, h: HeaderMap) -> Api {
     .bind(&ids)
     .fetch_all(&o.db)
     .await?;
+    // Whether its agent is asleep until something wakes it: the next timer, and whether it also
+    // waits on a condition (which has no time to show). An agent following its merge request
+    // spends most of its life this way, and "Idle" would say nobody is on it.
+    let wakeups: Vec<(String, Option<chrono::DateTime<chrono::Utc>>, bool)> = sqlx::query_as(
+        "select task_id, min(fires_at) filter (where kind = 'timer'),
+                coalesce(bool_or(kind = 'script'), false)
+         from wakeups where task_id = any($1) and state in ('armed', 'drafting')
+         group by task_id",
+    )
+    .bind(&ids)
+    .fetch_all(&o.db)
+    .await?;
     let milestones: Vec<(String, i64, i64)> = sqlx::query_as(
         "select task_id, count(*) filter (where done), count(*)
          from milestones where task_id = any($1) group by task_id",
@@ -358,6 +370,10 @@ async fn board(State(o): State<O>, h: HeaderMap) -> Api {
                 .map_or((0, 0), |(_, d, n)| (*d, *n));
             v["milestones_done"] = json!(done);
             v["milestones"] = json!(total);
+            v["wakeup"] = match wakeups.iter().find(|(id, _, _)| *id == t.id) {
+                Some((_, at, condition)) => json!({"at": at, "condition": condition}),
+                None => Value::Null,
+            };
             v["brief"] = json!(crate::chat::clip(&t.brief, 240));
             // When the state on the card began, so it can count up: a run's own start while it
             // runs, and otherwise the last thing that happened to it.

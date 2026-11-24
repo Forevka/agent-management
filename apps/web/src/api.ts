@@ -209,6 +209,8 @@ export type BoardTask = Task & {
   since: string
   /** What this task wants from the owner, if anything. The blocking item wins. */
   needs_you: { id: number; kind: string; blocking: boolean; since: string } | null
+  /** Its agent is asleep until a wakeup: the next timer, if any, and whether it also waits on a condition. */
+  wakeup: { at: string | null; condition: boolean } | null
 }
 
 export type Overview = {

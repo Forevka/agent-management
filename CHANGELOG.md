@@ -7,6 +7,24 @@ below is one release. How to add to this file is in `CLAUDE.md`
 
 ## Unreleased
 
+- **An agent whose work goes out as a merge request follows it until it is merged.** Opening
+  the MR no longer ends the task: the agent links it, sleeps on a wakeup, and on each wake
+  checks the pipeline, review threads, approvals and conflicts, then fixes, answers and pushes
+  until the MR is merged (or closed, or the owner tells it to stop). It merges only where the
+  project's rules or the owner allow it, asks the owner when a reviewer wants something outside
+  its brief, and says so in the topic when nothing has moved for a day. The orchestrator's
+  briefs now define such work as done at merge. Nothing to configure; it uses the agent's own
+  `glab`/`gh` and the existing wakeups.
+- **Review feedback becomes project memory.** When an agent addresses a review comment that
+  applies beyond its MR (a convention, a pattern the reviewers reject), it keeps it in the
+  project's shared memory bank with the MR and reviewer it came from, so the next agent gets it
+  right the first time.
+- **The board's Waiting column shows tasks asleep on a wakeup**, with when they will look
+  again ("Next check 18 min from now", or "Waiting for a condition"), instead of listing them
+  as Idle under Running.
+
+## v0.2.19 — 2026-11-23
+
 - **The board's horizontal scrollbar is at the bottom of the window**, not under the shortest
   column: the board fills the room under its header and scrolls inside it, so the bar is always
   in reach, with or without a task open beside it.
