@@ -53,7 +53,6 @@ struct AccountRow {
     fields_checked_at: Option<DateTime<Utc>>,
     last_sync_at: Option<DateTime<Utc>>,
     last_full_sync_at: Option<DateTime<Utc>>,
-    last_ok_at: Option<DateTime<Utc>>,
 }
 
 /// Each project with a Jira key, by the folder its credential is in.
@@ -77,7 +76,7 @@ async fn account(o: &Orchestrator, folder: &str) -> Result<AccountRow> {
         "insert into jira_accounts (folder) values ($1)
          on conflict (folder) do update set folder = excluded.folder
          returning folder, site, account_id, sprint_field, rank_field, fields_checked_at,
-                   last_sync_at, last_full_sync_at, last_ok_at",
+                   last_sync_at, last_full_sync_at",
     )
     .bind(folder)
     .fetch_one(&o.db)
@@ -237,17 +236,26 @@ async fn sync_account_inner(
         .await?;
         (sprint_field, rank_field) = (sf, rf);
     }
-    // Since the start of the last good read (plus a margin), so a gap — a restart, a deploy, a
-    // run of failed reads — misses nothing; never less than twice the interval.
-    let since = a
-        .last_ok_at
-        .map(|at| (Utc::now() - at).num_minutes() + WINDOW_MARGIN_MINUTES)
-        .unwrap_or(i64::MAX)
-        .max(o.cfg.jira.sync_minutes * 2)
-        .min(o.cfg.jira.full_sync_hours * 60 + WINDOW_MARGIN_MINUTES);
     let mut errors = Vec::new();
     let mut truncated = false;
     for project in projects {
+        // Since the start of this project's last good read (plus a margin), so a gap — a restart,
+        // a deploy, a run of failed reads — misses nothing; never less than twice the interval.
+        // Per project: one that keeps failing does not widen the others' reads.
+        let last_ok: Option<DateTime<Utc>> =
+            sqlx::query_scalar("select ok_at from jira_project_reads where project = $1")
+                .bind(project)
+                .fetch_optional(&o.db)
+                .await?
+                .flatten();
+        let since = last_ok
+            .map(|at| (Utc::now() - at).num_minutes() + WINDOW_MARGIN_MINUTES)
+            .unwrap_or(i64::MAX)
+            .max(o.cfg.jira.sync_minutes * 2)
+            .min(o.cfg.jira.full_sync_hours * 60 + WINDOW_MARGIN_MINUTES);
+        // A project never read well is read in full.
+        let full = full || last_ok.is_none();
+        let began = Utc::now();
         let read = async {
             let j = jira::for_project(o, project).await?;
             read_project(
@@ -263,13 +271,36 @@ async fn sync_account_inner(
             .await
         }
         .await;
-        match read {
-            Ok(t) => truncated |= t,
-            Err(e) => errors.push(format!("{project}: {}", clip(&format!("{e:#}"), 300))),
-        }
+        let error = match read {
+            Ok(t) => {
+                truncated |= t;
+                None
+            }
+            Err(e) => {
+                let e = clip(&format!("{e:#}"), 300);
+                errors.push(format!("{project}: {e}"));
+                Some(e)
+            }
+        };
+        sqlx::query(
+            "insert into jira_project_reads (project, ok_at, error, error_at)
+             values ($1, case when $3::text is null then $2::timestamptz end, $3,
+                     case when $3::text is not null then now() end)
+             on conflict (project) do update set
+                ok_at = case when $3::text is null then $2::timestamptz
+                             else jira_project_reads.ok_at end,
+                error = $3,
+                error_at = case when $3::text is null then jira_project_reads.error_at
+                                else now() end",
+        )
+        .bind(project)
+        .bind(began)
+        .bind(&error)
+        .execute(&o.db)
+        .await?;
     }
     refresh_sprints(o, &acc, &site).await;
-    read_commenters(o, projects, since.min(o.cfg.jira.sync_minutes * 2)).await;
+    read_commenters(o, projects, o.cfg.jira.sync_minutes * 2).await;
     Ok((errors, truncated))
 }
 
@@ -633,7 +664,9 @@ const ISSUE_WHERE: &str = "
     left join lateral (
        select r.id, r.state, r.task_id from roadmap_items r
        where r.project = i.project and r.jira_key = i.jira_key
-       order by r.sprint_id desc limit 1) r on true
+         -- the current fleet sprint only: an item of an old one is history
+         and r.sprint_id = (select max(id) from sprints where starts_on <= current_date)
+       limit 1) r on true
     left join tasks t on t.id = r.task_id
     where i.gone_at is null and p.jira_key is not null
       and ($1::text is null or i.project = $1)

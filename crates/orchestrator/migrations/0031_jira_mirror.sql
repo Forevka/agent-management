@@ -25,6 +25,16 @@ create table jira_accounts (
     truncated boolean not null default false
 );
 
+-- Each project's own last read: when the last good one began (what the next one reads changes
+-- since), and its error while it keeps failing. The roadmap trusts a project's copy only once it
+-- has had a good read, and while its reads are not failing.
+create table jira_project_reads (
+    project text primary key,
+    ok_at timestamptz,
+    error text,
+    error_at timestamptz
+);
+
 create table jira_sprints (
     site text not null,
     sprint_id bigint not null,

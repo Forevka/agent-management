@@ -782,10 +782,10 @@ pub async fn handle(
             ))
         }
         "roadmap_sync" => {
-            crate::jira_sync::sync_all(o, true).await?;
+            // What changed in Jira, not a full read: the brain's call must answer in time.
+            crate::jira_sync::sync_all(o, false).await?;
             let s = crate::roadmap::current_sprint(o).await?;
-            let v = crate::roadmap::sync(o, &s).await?;
-            crate::roadmap::tick_soon(o);
+            let v = crate::roadmap::sync_now(o).await?;
             ok(format!(
                 "Read sprint {} from Jira: {}",
                 s.name(),

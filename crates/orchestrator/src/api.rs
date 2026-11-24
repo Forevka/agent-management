@@ -1922,17 +1922,21 @@ async fn roadmap_act(State(o): State<O>, h: HeaderMap, Json(a): Json<Act>) -> Ap
         "sync" => {
             let then: Box<dyn FnOnce(O) + Send> = Box::new(|o: O| {
                 tokio::spawn(async move {
-                    let read = async {
-                        let s = crate::roadmap::current_sprint(&o).await?;
-                        crate::roadmap::sync(&o, &s).await
-                    };
-                    if let Err(e) = read.await {
+                    if let Err(e) = crate::roadmap::sync_now(&o).await {
                         tracing::warn!("reading the roadmap failed: {e:#}");
                     }
-                    crate::roadmap::tick_soon(&o);
                 });
             });
             let started = crate::jira_sync::sync_all_soon(&o, Some(then));
+            // A read already running: the roadmap is read again from the copy as it stands.
+            if !started {
+                let o = o.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = crate::roadmap::sync_now(&o).await {
+                        tracing::warn!("reading the roadmap failed: {e:#}");
+                    }
+                });
+            }
             Ok(Json(json!({"done": if started {
                 "reading Jira; this page updates when it is done"
             } else {

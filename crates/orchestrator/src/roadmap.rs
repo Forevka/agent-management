@@ -121,6 +121,10 @@ pub struct ItemRow {
     /// The status of its task, when [`items`] read it (not a column of the table).
     #[sqlx(default)]
     pub task_status: Option<String>,
+    /// `not_before`'s date in the fleet's calendar, when [`items`] read it: a sprint starting at
+    /// midnight in Kyiv starts that day, not the one before.
+    #[sqlx(default)]
+    pub not_before_day: Option<NaiveDate>,
 }
 
 /// Where the clock is in a sprint: the window running now (`open`), or, between windows, the
@@ -368,11 +372,14 @@ async fn sprint_clock(o: &Orchestrator, s: &SprintRow) -> Result<Clock> {
 
 async fn items(o: &Orchestrator, sprint: i32) -> Result<Vec<ItemRow>> {
     Ok(sqlx::query_as(
-        "select i.*, t.status as task_status from roadmap_items i
+        "select i.*, t.status as task_status,
+                (i.not_before at time zone $2)::date as not_before_day
+         from roadmap_items i
          left join tasks t on t.id = i.task_id
          where i.sprint_id = $1 order by i.position, i.jira_key",
     )
     .bind(sprint)
+    .bind(&o.cfg.secretary.timezone)
     .fetch_all(&o.db)
     .await?)
 }
@@ -404,7 +411,12 @@ fn waits_for(i: &ItemRow) -> Option<String> {
         return None;
     }
     Some(match i.not_before {
-        Some(t) => format!("from {}", t.format("%a %-d %b")),
+        Some(t) => format!(
+            "from {}",
+            i.not_before_day
+                .unwrap_or_else(|| t.date_naive())
+                .format("%a %-d %b")
+        ),
         None => format!(
             "when {} starts",
             i.jira_sprint_name.as_deref().unwrap_or("its sprint")
@@ -499,6 +511,19 @@ pub async fn tick(o: &Arc<Orchestrator>) -> Result<()> {
     Ok(())
 }
 
+/// Reads the roadmap from the Jira copy now, under the roadmap's lock (so never alongside a
+/// tick), then runs a tick. For "Read Jira now" once the copy is fresh.
+pub async fn sync_now(o: &Arc<Orchestrator>) -> Result<Value> {
+    let v = {
+        let lock = o.task_lock("~roadmap");
+        let _held = lock.lock().await;
+        let s = current_sprint(o).await?;
+        sync(o, &s).await?
+    };
+    tick_soon(o);
+    Ok(v)
+}
+
 /// Starts [`tick`] in the background: an approval is answered at once, not after Jira.
 pub fn tick_soon(o: &Arc<Orchestrator>) {
     let o = o.clone();
@@ -580,24 +605,41 @@ const COPY_ROWS: &str = "
     left join jira_sprints s on s.site = i.site and s.sprint_id = i.sprint_id
     where i.project = $1 and i.gone_at is null
       and (($2 and i.assignee_id = a.account_id and s.state in ('active', 'future')
-            and coalesce(i.issue_type, '') not ilike 'epic')
+            and coalesce(i.issue_type, '') not ilike 'epic'
+            -- With a board set, its sprints are the project's (as for `jira sprint`).
+            and (p.jira_board is null or s.board_id = p.jira_board))
            or (not $2 and i.jira_key = any($3)))
     order by case s.state when 'active' then 0 else 1 end, s.starts_at nulls last,
-             i.rank nulls last, i.jira_key";
+             i.rank collate \"C\" nulls last, i.jira_key";
 
 async fn sync_project(o: &Orchestrator, s: &SprintRow, project: &str) -> Result<usize> {
-    // Until the copy knows who the owner is in this Jira, "mine" means nothing: change nothing.
-    let me: Option<Option<String>> = sqlx::query_scalar(
-        "select a.account_id from projects p
-         join jira_accounts a on a.folder = coalesce(nullif(p.jira_folder, ''), $2)
-         where p.slug = $1",
+    // Until the copy knows who the owner is in this Jira, and has read this project well, "mine"
+    // means nothing: change nothing. A project whose reads are failing keeps what it had too,
+    // rather than taking an empty or stale copy for "no tickets" and marking them all left.
+    let state: Option<(
+        Option<String>,
+        Option<chrono::DateTime<Utc>>,
+        Option<String>,
+        Option<chrono::DateTime<Utc>>,
+    )> = sqlx::query_as(
+        "select a.account_id, r.ok_at, r.error, r.error_at from projects p
+             join jira_accounts a on a.folder = coalesce(nullif(p.jira_folder, ''), $2)
+             left join jira_project_reads r on r.project = p.slug
+             where p.slug = $1",
     )
     .bind(project)
     .bind(crate::jira::DEFAULT_FOLDER)
     .fetch_optional(&o.db)
     .await?;
-    if me.flatten().is_none() {
-        bail!("the fleet has not read this project's Jira yet (see the Jira page)");
+    match state {
+        Some((Some(_), Some(ok), error, error_at)) => {
+            if let (Some(e), Some(at)) = (error, error_at)
+                && at > ok
+            {
+                bail!("reading this project's Jira fails: {e}");
+            }
+        }
+        _ => bail!("the fleet has not read this project's Jira yet (see the Jira page)"),
     }
     let rows: Vec<CopyRow> = sqlx::query_as(COPY_ROWS)
         .bind(project)
@@ -1403,6 +1445,51 @@ async fn move_in_jira(o: &Arc<Orchestrator>, id: i64, m: Move, mr: Option<String
             "In Review",
         ),
     };
+    // A ticket someone else holds in Jira is theirs to move: the owner put it on the roadmap to
+    // have it worked on, not to take it over in the tracker. Decided before the move is claimed,
+    // so a ticket the owner takes over later can still be moved by a later step. One nobody holds
+    // is the fleet's to move.
+    let Ok(item) = item(o, id).await else { return };
+    let theirs: Option<bool> = sqlx::query_scalar(
+        "select j.assignee_id is not null and j.assignee_id <> a.account_id
+         from jira_issues j join projects p on p.slug = j.project
+         join jira_accounts a on a.folder = coalesce(nullif(p.jira_folder, ''), $3)
+         where j.project = $1 and j.jira_key = $2 and a.account_id is not null",
+    )
+    .bind(&item.project)
+    .bind(&item.jira_key)
+    .bind(crate::jira::DEFAULT_FOLDER)
+    .fetch_optional(&o.db)
+    .await
+    .ok()
+    .flatten();
+    if theirs == Some(true) {
+        o.audit(
+            "orchestrator (roadmap)",
+            "jira.transition_skipped",
+            json!({"issue": item.jira_key, "to": label, "why": "assigned to someone else"}),
+        )
+        .await;
+        if let Some(t) = &item.task_id
+            && let Ok(Some(task)) = o.task(t).await
+        {
+            let _ = o
+                .chat
+                .send(
+                    From::Orchestrator,
+                    task.topic_id,
+                    &format!(
+                        "Jira: {} is assigned to someone else, so the fleet leaves its status to them.",
+                        esc(&item.jira_key)
+                    ),
+                    vec![],
+                    None,
+                    Notify::Silent,
+                )
+                .await;
+        }
+        return;
+    }
     let claimed: Option<ItemRow> = match sqlx::query_as(&format!(
         "update roadmap_items set {col} = now() where id = $1 and {col} is null returning *"
     ))
@@ -1417,47 +1504,6 @@ async fn move_in_jira(o: &Arc<Orchestrator>, id: i64, m: Move, mr: Option<String
         }
     };
     let Some(i) = claimed else { return };
-    // A ticket someone else holds in Jira is theirs to move: the owner put it on the roadmap to
-    // have it worked on, not to take it over in the tracker.
-    let theirs: Option<bool> = sqlx::query_scalar(
-        "select j.assignee_id is distinct from a.account_id
-         from jira_issues j join projects p on p.slug = j.project
-         join jira_accounts a on a.folder = coalesce(nullif(p.jira_folder, ''), 'jira')
-         where j.project = $1 and j.jira_key = $2 and a.account_id is not null",
-    )
-    .bind(&i.project)
-    .bind(&i.jira_key)
-    .fetch_optional(&o.db)
-    .await
-    .ok()
-    .flatten();
-    if theirs == Some(true) {
-        o.audit(
-            "orchestrator (roadmap)",
-            "jira.transition_skipped",
-            json!({"issue": i.jira_key, "to": label, "why": "assigned to someone else"}),
-        )
-        .await;
-        if let Some(t) = &i.task_id
-            && let Ok(Some(task)) = o.task(t).await
-        {
-            let _ = o
-                .chat
-                .send(
-                    From::Orchestrator,
-                    task.topic_id,
-                    &format!(
-                        "Jira: {} is not assigned to you, so the fleet leaves its status to whoever holds it.",
-                        esc(&i.jira_key)
-                    ),
-                    vec![],
-                    None,
-                    Notify::Silent,
-                )
-                .await;
-        }
-        return;
-    }
     let outcome: Result<String> = async {
         let j = crate::jira::for_project(o, &i.project).await?;
         let moved = j.transition_any(&i.jira_key, names).await?;
