@@ -128,7 +128,7 @@ export function SessionList({ project: fixed }: { project?: string }) {
                     <Text size="1">{r.agent ?? '—'}</Text>
                     {fixed === undefined && (
                       <Text size="1" tone="muted">
-                        <ProjectDot slug={r.project} /> {r.project}
+                        <ProjectDot slug={r.project} decorative /> {r.project}
                       </Text>
                     )}
                   </Stack>

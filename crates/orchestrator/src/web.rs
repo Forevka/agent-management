@@ -307,6 +307,35 @@ mod tests {
     /// are characters and not markup, *unless* someone reaches for `dangerouslySetInnerHTML`.
     /// Nothing in the UI may, and this is the check that keeps it that way.
     #[test]
+    fn every_project_colour_exists_in_the_ui() {
+        // A colour the orchestrator hands out but the UI does not know would draw nothing: no
+        // stripe, no dot, a transparent swatch.
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../apps/web/src");
+        let (Ok(css), Ok(tsx)) = (
+            std::fs::read_to_string(src.join("aui.css")),
+            std::fs::read_to_string(src.join("components/fx/project.tsx")),
+        ) else {
+            return;
+        };
+        for c in crate::admin::PROJECT_COLORS {
+            for needle in [
+                format!("--fx-hue-{c}:"),
+                format!("--fx-hue-{c}-soft:"),
+                format!("[data-project='{c}']"),
+            ] {
+                assert!(css.contains(&needle), "aui.css lacks {needle}");
+            }
+            // Both the light and the dark theme define it.
+            assert_eq!(
+                css.matches(&format!("--fx-hue-{c}:")).count(),
+                2,
+                "{c} in light and dark"
+            );
+            assert!(tsx.contains(&format!("'{c}'")), "fx/project.tsx lacks {c}");
+        }
+    }
+
+    #[test]
     fn the_ui_never_sets_html_directly() {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../apps/web/src");
         let Ok(entries) = std::fs::read_dir(&src) else {

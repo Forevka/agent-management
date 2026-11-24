@@ -346,8 +346,9 @@ export function ProjectSettings() {
           <CardContent>
             <ProjectColorPicker
               name={`color-${d.project.slug}`}
+              key={d.project.color ?? ''}
               value={d.project.color ?? ''}
-              disabled={saving === 'color'}
+              busy={saving === 'color'}
               onPick={(color) => void save('color', { color })}
             />
           </CardContent>

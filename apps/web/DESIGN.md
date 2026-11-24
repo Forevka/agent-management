@@ -186,7 +186,8 @@ still `npx shadcn@latest add @affectui/<slug>`.
   settings page, else picked from its slug), and everything of that project carries it, so the
   owner tells projects apart at a glance. It comes only from `--fx-hue-<name>` /
   `--fx-hue-<name>-soft` in `aui.css`, reached through `data-project` (`--fx-project`), and shows
-  only as a dot, a stripe down a card's edge, or a soft tag with ink text (`fx/project.tsx`:
-  `ProjectDot`, `ProjectTag`). Never as text colour, a filled control or a status.
+  only as a dot, a stripe down a card's edge, a soft tag with ink text (`fx/project.tsx`:
+  `ProjectDot`, `ProjectTag`), or the glyph of the project's own folder icon (the sidebar, the
+  Projects grid). Never as text colour, a filled control or a status.
 - **`npm ci && npm run build` before any Rust build that must serve the UI** — `build.rs` embeds a
   placeholder page when `dist` is missing.

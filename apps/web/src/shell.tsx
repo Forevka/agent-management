@@ -303,6 +303,8 @@ export function Shell() {
 
   return (
     <RevealTask.Provider value={() => ws.show('task')}>
+    {/* Around the whole shell: the task panel beside the page colours its project too. */}
+    <ProjectsProvider projects={projectList}>
     <div className="fx-shell">
       <style href="fx-shell" precedence="default">
         {css}
@@ -329,11 +331,10 @@ export function Shell() {
         workArea={peek.id ? ws : undefined}
         panelTitle="Task panel"
       >
-        <ProjectsProvider projects={projectList}>
-          <Outlet />
-        </ProjectsProvider>
+        <Outlet />
       </AppShell>
     </div>
+    </ProjectsProvider>
     </RevealTask.Provider>
   )
 }

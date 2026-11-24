@@ -1,4 +1,4 @@
-import { createContext, useContext, type ReactNode } from 'react'
+import { createContext, useContext, useMemo, type ReactNode } from 'react'
 
 /*
  * Project colours – everything that belongs to a project carries its hue, so the owner tells the
@@ -20,7 +20,12 @@ export const PROJECT_COLORS = [
 const Projects = createContext<Map<string, ProjectInfo>>(new Map())
 
 export function ProjectsProvider({ projects, children }: { projects: ProjectInfo[]; children: ReactNode }) {
-  return <Projects.Provider value={new Map(projects.map((p) => [p.slug, p]))}>{children}</Projects.Provider>
+  // Rebuilt only when a project, its name or its colour changes, not on every poll or render of
+  // the shell: every coloured thing on the page reads it.
+  const sig = projects.map((p) => `${p.slug}\u0000${p.name}\u0000${p.color}`).join('\u0001')
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const value = useMemo(() => new Map(projects.map((p) => [p.slug, p])), [sig])
+  return <Projects.Provider value={value}>{children}</Projects.Provider>
 }
 
 /** The project of this slug, as the shell knows it (null before the first overview arrives). */
@@ -41,8 +46,19 @@ export function useProjectAttrs(slug: string | null | undefined): { 'data-projec
   return p ? { 'data-project': p.color } : {}
 }
 
-/** A small dot in the project's hue, with the project's name for screen readers and on hover. */
-export function ProjectDot({ slug, size = 8 }: { slug: string | null | undefined; size?: number }) {
+/**
+ * A small dot in the project's hue, with the project's name for screen readers and on hover.
+ * `decorative` when the name is written right beside it, so it is not read out twice.
+ */
+export function ProjectDot({
+  slug,
+  size = 8,
+  decorative,
+}: {
+  slug: string | null | undefined
+  size?: number
+  decorative?: boolean
+}) {
   const p = useProject(slug)
   if (!slug) return null
   return (
@@ -54,8 +70,9 @@ export function ProjectDot({ slug, size = 8 }: { slug: string | null | undefined
         className="fx-project-dot"
         data-project={p?.color}
         style={{ width: size, height: size }}
-        role="img"
-        aria-label={p?.name ?? slug}
+        role={decorative ? undefined : 'img'}
+        aria-label={decorative ? undefined : (p?.name ?? slug)}
+        aria-hidden={decorative || undefined}
         title={p?.name ?? slug}
       />
     </>
@@ -81,35 +98,46 @@ export function ProjectTag({ slug, children }: { slug: string | null | undefined
 
 /**
  * The owner's choice of a project's colour: a row of swatches, the chosen one ringed. Each swatch
- * is a real radio button, so the arrow keys move along the row.
+ * is a real radio button, so the arrow keys move along the row; moving only looks, and the colour
+ * is kept on a click, Space or Enter. It never disables itself while saving, so the focus stays
+ * where it is (`busy` only says so).
  */
 export function ProjectColorPicker({
   value,
   name,
   onPick,
-  disabled,
+  busy,
 }: {
   value: string
   name: string
   onPick: (color: string) => void
-  disabled?: boolean
+  busy?: boolean
 }) {
+  const pick = (c: string) => {
+    if (!busy && c !== value) onPick(c)
+  }
   return (
     <>
       <style href="fx-project" precedence="default">
         {css}
       </style>
-      <div className="fx-project-picker" role="radiogroup" aria-label="Project colour">
+      <div className="fx-project-picker" role="radiogroup" aria-label="Project colour" aria-busy={busy || undefined}>
         {PROJECT_COLORS.map((c) => (
           <label key={c} className="fx-project-swatch" data-project={c} title={c}>
             <input
               type="radio"
               name={name}
               value={c}
-              checked={value === c}
-              disabled={disabled}
-              onChange={() => onPick(c)}
+              defaultChecked={value === c}
               aria-label={c}
+              // A pointer picks at once; the keyboard picks with Space or Enter, not by moving.
+              onClick={(e) => e.detail > 0 && pick(c)}
+              onKeyDown={(e) => {
+                if (e.key === ' ' || e.key === 'Enter') {
+                  e.preventDefault()
+                  pick(c)
+                }
+              }}
             />
           </label>
         ))}

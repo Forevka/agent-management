@@ -1184,10 +1184,6 @@ fn owner_only(actor: Actor) -> Result<()> {
     Ok(())
 }
 
-/// Sets (or with `None` or blank, clears) where a project's code lives. Refuses a URL with
-/// credentials in it: nodes clone with their own machine's git login. The nodes it is assigned
-/// to hear of it at once, and a clone that failed there is tried again (with the new URL) by the
-/// next task.
 /// The colours a project can have in the web UI (tokens `--fx-hue-<name>` in `aui.css`). A
 /// project is marked by its colour everywhere: its tasks, tickets and cards. Checked here rather
 /// than in the schema, so the palette can change without a migration.
@@ -1218,7 +1214,10 @@ pub async fn set_project_color(
     slug: &str,
     color: Option<&str>,
 ) -> Result<String> {
-    owner_only(actor)?;
+    ensure!(
+        actor == Actor::Owner,
+        "only the owner chooses a project's colour, on its settings page"
+    );
     let p = tasks::project(o, slug).await?;
     let color = color.map(str::trim).filter(|c| !c.is_empty());
     if let Some(c) = color {
@@ -1246,6 +1245,10 @@ pub async fn set_project_color(
     ))
 }
 
+/// Sets (or with `None` or blank, clears) where a project's code lives. Refuses a URL with
+/// credentials in it: nodes clone with their own machine's git login. The nodes it is assigned
+/// to hear of it at once, and a clone that failed there is tried again (with the new URL) by the
+/// next task.
 pub async fn set_repo_url(
     o: &Arc<Orchestrator>,
     actor: Actor,

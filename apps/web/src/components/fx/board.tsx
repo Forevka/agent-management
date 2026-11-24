@@ -412,6 +412,10 @@ const css = /* css */ `
   border-color: var(--aui-border-strong, #d4d4d8);
   box-shadow: var(--aui-shadow-popover, 0 0 0 1px rgba(0, 0, 0, 0.06), 0 12px 32px rgba(0, 0, 0, 0.12));
 }
+/* The hover's border colour must not take the project's stripe with it. */
+.fx-card[data-project]:hover {
+  border-left-color: var(--fx-project);
+}
 
 .fx-card:focus-visible {
   outline: 2px solid var(--aui-focus, rgba(0, 96, 226, 0.7));
