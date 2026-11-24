@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 import { ViewToggle } from '@/components/ui/app-shell'
 import { Board, BoardCard, BoardColumn, BoardDot } from '@/components/fx/board'
+import { ProjectDot, useProjectColors } from '@/components/fx/project'
 import type { BoardTone } from '@/components/fx/board'
 import { Page, PageHeader, Row, Stack, Text } from '@/components/fx/layout'
 import { Table } from '@/components/fx/table'
@@ -108,6 +109,7 @@ export default function BoardPage() {
   // The fleet moves while the page is open; the durations below tick on their own.
   const state = useApi<{ tasks: BoardTask[] }>('/api/board', 10_000)
   const peek = useTaskPeek()
+  const colorOf = useProjectColors()
   return (
     <Page fill={view === 'board'}>
       <PageHeader
@@ -159,6 +161,7 @@ export default function BoardPage() {
                       mark={<SparkIcon />}
                       text={t.brief}
                       tone={cardTone(t)}
+                      project={colorOf(t.project)}
                       state={<CardState task={t} />}
                       links={(t.links ?? []).map((l) => ({
                         key: `${l.kind}:${l.id}`,
@@ -297,6 +300,7 @@ function BoardList({ tasks }: { tasks: BoardTask[] }) {
             <Stack gap="1">
               <TaskLink id={t.id}>{t.title || t.id}</TaskLink>
               <Row gap="2">
+                <ProjectDot slug={t.project} />
                 <Text size="1" tone="muted" mono>
                   {t.key} · {t.id}
                 </Text>

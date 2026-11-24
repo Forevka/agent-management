@@ -4,6 +4,7 @@ import { FilterButton, MenuButton, SearchField, SectionHead } from '@/components
 import { Badge } from '@/components/ui/badge'
 import { Page, PageHeader, Stack, Text } from '@/components/fx/layout'
 import { Table } from '@/components/fx/table'
+import { ProjectTag } from '@/components/fx/project'
 import type { Overview, Task } from '../api'
 import { Loaded, StatusBadge, When, useApi } from '../ui'
 import { TaskLink } from '../peek'
@@ -162,7 +163,7 @@ export function TaskList({ project: fixed }: { project?: string }) {
                       secondary: true,
                       cell: (t: Task) => (
                         <Link to={`/projects/${t.project}`} className="fx-link" data-muted="">
-                          {t.project}
+                          <ProjectTag slug={t.project}>{t.project}</ProjectTag>
                         </Link>
                       ),
                     },

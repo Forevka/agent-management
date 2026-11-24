@@ -57,7 +57,7 @@ export default function Projects() {
                   <Card key={p.slug} interactive>
                     <Link to={`/projects/${encodeURIComponent(p.slug)}`} className="fx-item">
                       <Row gap="2" wrap={false}>
-                        <span className="fx-projects__folder" aria-hidden="true">
+                        <span className="fx-projects__folder" data-project={p.color} aria-hidden="true">
                           <Icon icon={Folder01Icon} size={18} />
                         </span>
                         <Stack gap="0">
@@ -133,6 +133,11 @@ export default function Projects() {
 }
 
 const css = /* css */ `
+/* The folder in its project's hue: a soft tile with the hue on the icon. */
+.fx-projects__folder[data-project] {
+  background: var(--fx-project-soft);
+  color: var(--fx-project);
+}
 .fx-projects__folder {
   display: grid;
   place-items: center;

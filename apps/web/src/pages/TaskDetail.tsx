@@ -13,6 +13,7 @@ import { Facts, Table } from '@/components/fx/table'
 import { ArrowLeftIcon, CheckIcon, ExternalIcon } from '@/components/fx/icons'
 import { AttachForm, AttachmentList } from '@/components/fx/attachments'
 import { Note } from '@/components/fx/note'
+import { ProjectTag } from '@/components/fx/project'
 import * as api from '../api'
 import type { Agents, Events, Item, Task, TaskDetail as Detail, TaskLink } from '../api'
 import { ActionButton, Duration, ErrorNote, Loaded, Pre, StatusBadge, When, useApi } from '../ui'
@@ -451,7 +452,7 @@ export default function TaskDetail() {
                     [
                       'Project',
                       <Link to={`/projects/${d.task.project}`} className="fx-link">
-                        {d.task.project}
+                        <ProjectTag slug={d.task.project}>{d.task.project}</ProjectTag>
                       </Link>,
                     ],
                     ['Agent', d.task.agent ?? '—'],

@@ -7,6 +7,7 @@ import { TextField } from '@/components/ui/text-field'
 import { Page, PageHeader, Row, Section, Stack, Text } from '@/components/fx/layout'
 import { Note } from '@/components/fx/note'
 import { Table } from '@/components/fx/table'
+import { ProjectTag } from '@/components/fx/project'
 import * as api from '../api'
 import type { Node } from '../api'
 import { DiskBadge } from '../disk'
@@ -96,7 +97,7 @@ export default function Nodes() {
                   ) : (
                     <Row gap="1">
                       {n.projects.map((p) => (
-                        <Badge key={p.project}>{p.project}</Badge>
+                        <ProjectTag key={p.project} slug={p.project}>{p.project}</ProjectTag>
                       ))}
                     </Row>
                   ),

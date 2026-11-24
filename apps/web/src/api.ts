@@ -235,7 +235,8 @@ export type Overview = {
   items: Item[]
   tasks: Task[]
   nodes: Node[]
-  projects: { slug: string; name: string; open: number; running: number; total: number }[]
+  /** `color` is one of the project palette's names (`--fx-hue-<color>`). */
+  projects: { slug: string; name: string; open: number; running: number; total: number; color: string }[]
   todos_open: number
   sessions_today: number
   /** This orchestrator's release (`v0.2.17`; `0.1.0-dev` for a hand build). */
@@ -253,6 +254,9 @@ export type Project = {
   plan_gate?: 'owner' | 'auto'
   /// Where its code lives, for the nodes it is assigned to that clone it.
   repo_url?: string | null
+  /// Its colour (a palette name), and whether the owner chose it or it is the slug's default.
+  color?: string
+  color_set?: boolean
 }
 
 /// A row of the project list, which is the brain's `admin_read` shape: here `jira` is just the
@@ -264,6 +268,7 @@ export type ProjectRow = {
   nodes: { node: string; online: boolean }[]
   open_tasks: number
   jira: string | null
+  color: string
 }
 
 export type ProjectDetail = {

@@ -5,6 +5,7 @@ import { Facts } from '@/components/fx/table'
 import { Row, Stack, Text } from '@/components/fx/layout'
 import { AttachmentList } from '@/components/fx/attachments'
 import { CheckIcon } from '@/components/fx/icons'
+import { ProjectTag } from '@/components/fx/project'
 import type { TaskDetail as Detail } from '../api'
 import { ActionButton, Loaded, Pre, StatusBadge, When, useApi } from '../ui'
 import { BUILTIN, FINISHED, ItemCard, MessageBox, isOpen } from './TaskDetail'
@@ -73,7 +74,7 @@ export function TaskPeek({ id, onKey }: { id: string; /** Its F-key once known, 
                   [
                     'Project',
                     <Link to={`/projects/${encodeURIComponent(t.project)}`} className="fx-link">
-                      {t.project}
+                      <ProjectTag slug={t.project}>{t.project}</ProjectTag>
                     </Link>,
                   ],
                   ['Agent', t.agent ?? '—'],

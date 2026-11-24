@@ -12,6 +12,7 @@ import { Grid, Page, PageHeader, Row, Section, Stack, Text } from '@/components/
 import { Stat } from '@/components/fx/stat'
 import { Table } from '@/components/fx/table'
 import { ArrowLeftIcon } from '@/components/fx/icons'
+import { ProjectColorPicker } from '@/components/fx/project'
 import * as api from '../api'
 import type { Agents as AgentsT, ProjectDetail as Detail } from '../api'
 import { ActionButton, ErrorNote, Loaded, StatusBadge, When, useApi } from '../ui'
@@ -332,6 +333,23 @@ export function ProjectSettings() {
                 </Row>
               </Stack>
             </form>
+          </CardContent>
+        </Card>
+      </Section>
+
+      <Section title="Colour">
+        <Card>
+          <CardHeader
+            title="This project's colour"
+            description="Everything of this project carries it: its cards on the board, its tasks, its tickets on the roadmap and the Jira page, its folder in the sidebar. Until you pick one, it has one chosen from its name."
+          />
+          <CardContent>
+            <ProjectColorPicker
+              name={`color-${d.project.slug}`}
+              value={d.project.color ?? ''}
+              disabled={saving === 'color'}
+              onPick={(color) => void save('color', { color })}
+            />
           </CardContent>
         </Card>
       </Section>

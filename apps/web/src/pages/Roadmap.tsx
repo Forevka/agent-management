@@ -8,6 +8,7 @@ import { TextField } from '@/components/ui/text-field'
 import { ScheduledRuns, type ScheduledTask } from '@/components/ui/scheduled-runs'
 import { Page, PageHeader, Row, Section, Stack, Text } from '@/components/fx/layout'
 import { Table } from '@/components/fx/table'
+import { ProjectDot, ProjectTag } from '@/components/fx/project'
 import * as api from '../api'
 import type { Roadmap as RoadmapT, RoadmapItem } from '../api'
 import { ActionButton, ErrorNote, Loaded, When, useApi } from '../ui'
@@ -161,7 +162,7 @@ function Approvals({ d, items, reload }: { d: RoadmapT; items: RoadmapItem[]; re
               <Stack gap="1">
                 <Row gap="2">
                   <JiraKey item={i} />
-                  <Badge>{i.project}</Badge>
+                  <ProjectTag slug={i.project}>{i.project}</ProjectTag>
                   <Text size="1" tone="muted">
                     {i.usage}% · {whenOf(d, i) ?? 'no room this sprint'}
                   </Text>
@@ -214,6 +215,7 @@ function Plan({ d, items, reload }: { d: RoadmapT; items: RoadmapItem[]; reload:
         title: `${i.key} · ${i.title}`,
         usage: i.plan_usage,
         agent: i.project,
+        logo: <ProjectDot slug={i.project} />,
         detail: [
           i.task ? `${i.task.key} · ${i.task.status}` : 'starts when its window opens',
           i.jira_status ? `Jira: ${i.jira_status}` : null,
@@ -252,6 +254,7 @@ function Plan({ d, items, reload }: { d: RoadmapT; items: RoadmapItem[]; reload:
           sessions={d.sessions}
           now={{ day: d.now.day, session: d.now.session }}
           limit={d.limit}
+          agents={[...new Set(items.map((i) => i.project))].map((p) => ({ name: p, logo: <ProjectDot slug={p} size={10} /> }))}
           title={`Sprint ${d.sprint.name}`}
           note={`${d.sprint.span} · ${windows}`}
           autoRun
@@ -343,7 +346,7 @@ function Tickets({ d, items, reload }: { d: RoadmapT; items: RoadmapItem[]; relo
             <Stack gap="1">
               <Row gap="2">
                 <JiraKey item={i} />
-                <Badge>{i.project}</Badge>
+                <ProjectTag slug={i.project}>{i.project}</ProjectTag>
               </Row>
               <Text size="1" tone="muted" breakAll>
                 {i.title}

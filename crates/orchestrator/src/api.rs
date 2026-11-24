@@ -254,13 +254,13 @@ async fn overview(State(o): State<O>, h: HeaderMap) -> Api {
         .await?;
     // One row per project for the landing page, so the owner sees where the work is without
     // opening anything.
-    let per_project: Vec<(String, String, i64, i64, i64)> = sqlx::query_as(
-        "select p.slug, p.name,
+    let per_project: Vec<(String, String, Option<String>, i64, i64, i64)> = sqlx::query_as(
+        "select p.slug, p.name, p.color,
                 count(t.id) filter (where t.status not in ('done','stopped','failed')) as open,
                 count(t.id) filter (where t.running) as running,
                 count(t.id) as total
          from projects p left join tasks t on t.project = p.slug and t.id not in ('brain','secretary','retro')
-         group by p.slug, p.name order by p.slug",
+         group by p.slug, p.name, p.color order by p.slug",
     )
     .fetch_all(&o.db)
     .await?;
@@ -274,8 +274,10 @@ async fn overview(State(o): State<O>, h: HeaderMap) -> Api {
         "items": items.iter().map(item_json).collect::<Vec<_>>(),
         "tasks": tasks.iter().map(task_json).collect::<Vec<_>>(),
         "nodes": nodes.iter().map(node_json).collect::<Vec<_>>(),
-        "projects": per_project.iter().map(|(slug, name, open, running, total)| json!({
+        // With each project's colour: the web UI marks everything of a project with it.
+        "projects": per_project.iter().map(|(slug, name, color, open, running, total)| json!({
             "slug": slug, "name": name, "open": open, "running": running, "total": total,
+            "color": crate::admin::project_color(slug, color.as_deref()),
         })).collect::<Vec<_>>(),
         "todos_open": todos,
         "sessions_today": sessions_today,
@@ -1335,6 +1337,13 @@ async fn project_act(
     if a.op == "repo_url" {
         let done =
             admin::set_repo_url(&o, Actor::Owner, &slug, s(&a.body, "url").as_deref()).await?;
+        return Ok(Json(json!({"done": done})));
+    }
+    // Its colour in this UI: the owner's, like the two above.
+    if a.op == "color" {
+        let done =
+            admin::set_project_color(&o, Actor::Owner, &slug, s(&a.body, "color").as_deref())
+                .await?;
         return Ok(Json(json!({"done": done})));
     }
     let action = match a.op.as_str() {

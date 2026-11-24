@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { ProjectsProvider } from '@/components/fx/project'
 import { Outlet, matchPath, useLocation, useNavigate, useNavigationType } from 'react-router-dom'
 import type { IconSvgElement } from '@hugeicons/react'
 import {
@@ -129,6 +130,12 @@ export function Shell() {
   const overview = useApi<Overview>('/api/overview', 20_000)
   const data = overview.data
 
+  // Every project with its colour, for the pages: whatever names a project is marked with its hue.
+  const projectList = useMemo(
+    () => (data?.projects ?? []).map((p) => ({ slug: p.slug, name: p.name || p.slug, color: p.color })),
+    [data?.projects],
+  )
+
   const inSettings = SETTINGS.some((p) => isAt(p, pathname))
   // The task in view: the one open beside the page, or the one whose page this is.
   const taskId = peek.id ?? matchPath({ path: '/tasks/:id/*' }, pathname)?.params.id ?? null
@@ -167,7 +174,8 @@ export function Shell() {
       const projects = (data?.projects ?? []).map((p) => {
         const label = take(p.name || p.slug, `/projects/${encodeURIComponent(p.slug)}`)
         if (p.slug === projectSlug) activeProject = label
-        return { label, icon: Folder01Icon, count: p.open, slug: p.slug, name: p.name || p.slug }
+        // The folder in its project's hue, as everything of that project is.
+        return { label, icon: Folder01Icon, count: p.open, slug: p.slug, name: p.name || p.slug, color: `var(--fx-hue-${p.color})` }
       })
       groups.push({
         label: 'Projects',
@@ -321,7 +329,9 @@ export function Shell() {
         workArea={peek.id ? ws : undefined}
         panelTitle="Task panel"
       >
-        <Outlet />
+        <ProjectsProvider projects={projectList}>
+          <Outlet />
+        </ProjectsProvider>
       </AppShell>
     </div>
     </RevealTask.Provider>

@@ -7,6 +7,13 @@ below is one release. How to add to this file is in `CLAUDE.md`
 
 ## Unreleased
 
+- **Every project has a colour.** Everything of a project carries it: a stripe down its cards on
+  the board, a tag on its tasks, tickets and sessions, its folder in the sidebar, its tickets on
+  the roadmap. Pick it on the project's settings page (twelve colours); until you do, each
+  project has one chosen from its name. Migration `0030` adds one nullable column.
+
+## v0.2.23 — 2026-11-24
+
 - **Next sprint's tickets are no longer taken as this sprint's.** For a project with no Jira
   board set, "my sprint" meant every sprint that is not closed, which in Jira includes the ones
   not started yet; so the roadmap could pick up, and once approved start, next sprint's tickets

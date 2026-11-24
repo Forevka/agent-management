@@ -70,6 +70,33 @@
      --aui-surface; this is the colour behind it while it loads. */
   --fx-page: #fafafa;
   --fx-page-width: 1200px;
+
+  /* Project hues: a project's identity, the one colour that is not status (DESIGN.md). Only ever
+     a dot, a stripe or a soft tag. */
+  --fx-hue-sky: #5fb4ea;
+  --fx-hue-sky-soft: #e6f4fd;
+  --fx-hue-blue: #4f7df0;
+  --fx-hue-blue-soft: #e9efff;
+  --fx-hue-indigo: #6366f1;
+  --fx-hue-indigo-soft: #eeeefe;
+  --fx-hue-violet: #9b5de5;
+  --fx-hue-violet-soft: #f3ebfc;
+  --fx-hue-pink: #e45ca5;
+  --fx-hue-pink-soft: #fcebf4;
+  --fx-hue-rose: #e5484d;
+  --fx-hue-rose-soft: #fdecec;
+  --fx-hue-orange: #e8833a;
+  --fx-hue-orange-soft: #fdf0e6;
+  --fx-hue-amber: #d9a400;
+  --fx-hue-amber-soft: #fbf4dc;
+  --fx-hue-lime: #7cb518;
+  --fx-hue-lime-soft: #f1f8e2;
+  --fx-hue-green: #2f9e5b;
+  --fx-hue-green-soft: #e6f5ec;
+  --fx-hue-teal: #1fa29a;
+  --fx-hue-teal-soft: #e2f5f3;
+  --fx-hue-slate: #6b7a90;
+  --fx-hue-slate-soft: #eef1f5;
 }
 
 /* Dark mode is a class or attribute on an ancestor, never a media query: that is the contract
@@ -112,6 +139,83 @@
   --aui-overlay: #19191b;
 
   --fx-page: #111113;
+
+  --fx-hue-sky: #6bb8ea;
+  --fx-hue-sky-soft: #15293a;
+  --fx-hue-blue: #7aa0ff;
+  --fx-hue-blue-soft: #19223f;
+  --fx-hue-indigo: #8b8ef7;
+  --fx-hue-indigo-soft: #1e1e3d;
+  --fx-hue-violet: #b98af0;
+  --fx-hue-violet-soft: #2a1c3d;
+  --fx-hue-pink: #f08bc2;
+  --fx-hue-pink-soft: #3a1a2b;
+  --fx-hue-rose: #f27a7e;
+  --fx-hue-rose-soft: #3b1a1c;
+  --fx-hue-orange: #f2a15c;
+  --fx-hue-orange-soft: #3a2414;
+  --fx-hue-amber: #e6c24d;
+  --fx-hue-amber-soft: #362c0f;
+  --fx-hue-lime: #a3d14a;
+  --fx-hue-lime-soft: #232f10;
+  --fx-hue-green: #6fcf97;
+  --fx-hue-green-soft: #12301f;
+  --fx-hue-teal: #4fc3b4;
+  --fx-hue-teal-soft: #0f2e2b;
+  --fx-hue-slate: #9aa7b8;
+  --fx-hue-slate-soft: #1f242c;
+}
+
+/* ---------- Project colours ---------- */
+
+/* Anything inside an element with `data-project` reads its project's hue from these two. */
+[data-project='sky'] {
+  --fx-project: var(--fx-hue-sky);
+  --fx-project-soft: var(--fx-hue-sky-soft);
+}
+[data-project='blue'] {
+  --fx-project: var(--fx-hue-blue);
+  --fx-project-soft: var(--fx-hue-blue-soft);
+}
+[data-project='indigo'] {
+  --fx-project: var(--fx-hue-indigo);
+  --fx-project-soft: var(--fx-hue-indigo-soft);
+}
+[data-project='violet'] {
+  --fx-project: var(--fx-hue-violet);
+  --fx-project-soft: var(--fx-hue-violet-soft);
+}
+[data-project='pink'] {
+  --fx-project: var(--fx-hue-pink);
+  --fx-project-soft: var(--fx-hue-pink-soft);
+}
+[data-project='rose'] {
+  --fx-project: var(--fx-hue-rose);
+  --fx-project-soft: var(--fx-hue-rose-soft);
+}
+[data-project='orange'] {
+  --fx-project: var(--fx-hue-orange);
+  --fx-project-soft: var(--fx-hue-orange-soft);
+}
+[data-project='amber'] {
+  --fx-project: var(--fx-hue-amber);
+  --fx-project-soft: var(--fx-hue-amber-soft);
+}
+[data-project='lime'] {
+  --fx-project: var(--fx-hue-lime);
+  --fx-project-soft: var(--fx-hue-lime-soft);
+}
+[data-project='green'] {
+  --fx-project: var(--fx-hue-green);
+  --fx-project-soft: var(--fx-hue-green-soft);
+}
+[data-project='teal'] {
+  --fx-project: var(--fx-hue-teal);
+  --fx-project-soft: var(--fx-hue-teal-soft);
+}
+[data-project='slate'] {
+  --fx-project: var(--fx-hue-slate);
+  --fx-project-soft: var(--fx-hue-slate-soft);
 }
 
 /* ---------- Base ---------- */

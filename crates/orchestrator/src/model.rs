@@ -76,6 +76,8 @@ pub struct ProjectRow {
     pub plan_gate: String,
     /// Where its code lives, for nodes it is assigned to that have to clone it (null: none set).
     pub repo_url: Option<String>,
+    /// Its colour in the web UI, one of `admin::PROJECT_COLORS` (null: the default for its slug).
+    pub color: Option<String>,
 }
 
 #[derive(Debug, Clone, FromRow)]

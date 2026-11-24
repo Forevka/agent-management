@@ -106,6 +106,8 @@ export type BoardCardProps = {
   facts?: { icon: ReactNode; value: ReactNode; title: string }[]
   /** What this task is about outside the fleet: tickets, merge requests, pages. */
   links?: { key: string; label: string; title: string; url?: string | null }[]
+  /** Its project's colour (a palette name): a stripe down the card's left edge. */
+  project?: string
 }
 
 /** How many chips fit a card before it stops being a card and starts being a list. */
@@ -122,11 +124,12 @@ export function BoardCard({
   facts,
   links,
   onClick,
+  project,
 }: BoardCardProps) {
   const chips = links?.slice(0, CHIPS) ?? []
   const more = (links?.length ?? 0) - chips.length
   return (
-    <Link className="fx-card" data-tone={tone} to={to} onClick={onClick}>
+    <Link className="fx-card" data-tone={tone} data-project={project} to={to} onClick={onClick}>
       <span className="fx-card__head">
         <span className="fx-card__title">
           {mark && <span className="fx-card__mark">{mark}</span>}
@@ -382,6 +385,11 @@ const css = /* css */ `
 
 /* ---------- card ---------- */
 
+/* Its project's hue, as a stripe down the left edge: the card says whose it is before it is read. */
+.fx-card[data-project] {
+  border-left: 3px solid var(--fx-project);
+  padding-left: 10px;
+}
 .fx-card {
   display: flex;
   flex-direction: column;

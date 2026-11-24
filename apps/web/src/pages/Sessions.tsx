@@ -4,6 +4,7 @@ import { MenuButton, SectionHead } from '@/components/ui/app-shell'
 import { Badge } from '@/components/ui/badge'
 import { Page, PageHeader, Row, Stack, Text } from '@/components/fx/layout'
 import { Table } from '@/components/fx/table'
+import { ProjectDot } from '@/components/fx/project'
 import type { Overview, Session } from '../api'
 import { Duration, Loaded, When, useApi } from '../ui'
 import { COST_NOTE, money } from '../usage'
@@ -127,7 +128,7 @@ export function SessionList({ project: fixed }: { project?: string }) {
                     <Text size="1">{r.agent ?? '—'}</Text>
                     {fixed === undefined && (
                       <Text size="1" tone="muted">
-                        {r.project}
+                        <ProjectDot slug={r.project} /> {r.project}
                       </Text>
                     )}
                   </Stack>

@@ -1188,6 +1188,64 @@ fn owner_only(actor: Actor) -> Result<()> {
 /// credentials in it: nodes clone with their own machine's git login. The nodes it is assigned
 /// to hear of it at once, and a clone that failed there is tried again (with the new URL) by the
 /// next task.
+/// The colours a project can have in the web UI (tokens `--fx-hue-<name>` in `aui.css`). A
+/// project is marked by its colour everywhere: its tasks, tickets and cards. Checked here rather
+/// than in the schema, so the palette can change without a migration.
+pub const PROJECT_COLORS: [&str; 12] = [
+    "sky", "blue", "indigo", "violet", "pink", "rose", "orange", "amber", "lime", "green", "teal",
+    "slate",
+];
+
+/// A project's colour: the one the owner chose, else one picked from its slug, the same every
+/// time (FNV-1a), so a project looks the same before anyone chooses.
+pub fn project_color(slug: &str, stored: Option<&str>) -> &'static str {
+    if let Some(c) = stored.and_then(|s| PROJECT_COLORS.iter().find(|c| **c == s)) {
+        return c;
+    }
+    let mut h: u32 = 0x811c_9dc5;
+    for b in slug.bytes() {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    PROJECT_COLORS[h as usize % PROJECT_COLORS.len()]
+}
+
+/// The owner's choice of a project's colour (`None`: back to the default). Owner only, like the
+/// repository URL: it is how the owner tells their projects apart, not something to propose.
+pub async fn set_project_color(
+    o: &Arc<Orchestrator>,
+    actor: Actor,
+    slug: &str,
+    color: Option<&str>,
+) -> Result<String> {
+    owner_only(actor)?;
+    let p = tasks::project(o, slug).await?;
+    let color = color.map(str::trim).filter(|c| !c.is_empty());
+    if let Some(c) = color {
+        ensure!(
+            PROJECT_COLORS.contains(&c),
+            "{c:?} is not a project colour; pick one of {}",
+            PROJECT_COLORS.join(", ")
+        );
+    }
+    sqlx::query("update projects set color = $2 where slug = $1")
+        .bind(&p.slug)
+        .bind(color)
+        .execute(&o.db)
+        .await?;
+    o.audit(
+        actor.audit_name(),
+        "project.color",
+        json!({"project": p.slug, "color": color}),
+    )
+    .await;
+    Ok(format!(
+        "{} is {} now",
+        p.slug,
+        project_color(&p.slug, color)
+    ))
+}
+
 pub async fn set_repo_url(
     o: &Arc<Orchestrator>,
     actor: Actor,
@@ -2938,15 +2996,16 @@ pub async fn read(o: &Orchestrator, what: &str, target: Option<&str>) -> Result<
 
 pub async fn projects_json(o: &Orchestrator) -> Result<Value> {
     // The Jira key comes along: the brain routes a ticket to the right project by it.
-    let projects: Vec<(String, String, String, Option<String>)> =
-        sqlx::query_as("select slug, name, description, jira_key from projects order by slug")
-            .fetch_all(&o.db)
-            .await?;
+    let projects: Vec<(String, String, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "select slug, name, description, jira_key, color from projects order by slug",
+    )
+    .fetch_all(&o.db)
+    .await?;
     let nodes: Vec<NodeRow> = sqlx::query_as("select * from nodes")
         .fetch_all(&o.db)
         .await?;
     let mut out = Vec::new();
-    for (slug, name, description, jira) in projects {
+    for (slug, name, description, jira, color) in projects {
         let on: Vec<Value> = nodes
             .iter()
             .filter(|n| n.has_project(&slug))
@@ -2964,7 +3023,8 @@ pub async fn projects_json(o: &Orchestrator) -> Result<Value> {
             .iter()
             .map(|a| json!({"node": a["node"], "online": a["online"], "status": a["status"]}))
             .collect();
-        out.push(json!({"slug": slug, "name": name, "description": description, "nodes": on, "assigned_nodes": assigned, "open_tasks": open, "jira": jira}));
+        out.push(json!({"slug": slug, "name": name, "description": description, "nodes": on, "assigned_nodes": assigned, "open_tasks": open, "jira": jira,
+                        "color": project_color(&slug, color.as_deref()), "color_set": color.is_some()}));
     }
     Ok(Value::Array(out))
 }
@@ -3015,6 +3075,8 @@ pub(crate) async fn project_json(o: &Orchestrator, slug: &str) -> Result<Value> 
         "slug": p.slug,
         "name": p.name,
         "description": p.description,
+        "color": project_color(&p.slug, p.color.as_deref()),
+        "color_set": p.color.is_some(),
         "jira": match &jira.0 {
             Some(key) => json!({
                 "key": key,
@@ -3163,6 +3225,19 @@ async fn status_json(o: &Orchestrator) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_project_has_a_colour_before_anyone_chooses_one() {
+        let c = super::project_color("dap", None);
+        assert!(super::PROJECT_COLORS.contains(&c));
+        assert_eq!(super::project_color("dap", None), c, "the same every time");
+        assert_eq!(super::project_color("dap", Some("sky")), "sky");
+        assert_eq!(
+            super::project_color("dap", Some("neon")),
+            c,
+            "an unknown colour is ignored"
+        );
+    }
+
     use super::*;
 
     #[test]

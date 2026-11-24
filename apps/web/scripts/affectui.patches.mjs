@@ -12,6 +12,17 @@ export const PATCHES = {
   // workspaceItems and accountItems replace the two menus, commands replaces the ⌘K menu's sample
   // groups (its "Go to" group stays), and onCommand is told when one of ours is run.
   'app-shell.tsx': [
+    // A sidebar item may carry a colour for its icon: a project folder shows its project's hue.
+    [
+      'export type ShellNavItem = { label: string; icon: IconSvgElement; /** Small number at the end, e.g. unread items */ count?: number };',
+      'export type ShellNavItem = { label: string; icon: IconSvgElement; /** Small number at the end, e.g. unread items */ count?: number; /** (fleet patch) The icon\'s colour, e.g. a project\'s hue */ color?: string };',
+    ],
+    [
+      '                      <Icon icon={item.icon} size={16} />\n                      <span className="ui-as-side__text" title={item.label}>',
+      // A CSS colour (a token's var()) cannot go in the SVG's stroke attribute, and the shell's CSS
+      // colours a sidebar icon with its own --muted / --ink; a wrapper redefines those two for it.
+      '                      <span style={item.color ? ({ "--muted": item.color, "--ink": item.color, display: "contents" } as CSSProperties) : undefined}><Icon icon={item.icon} size={16} /></span>\n                      <span className="ui-as-side__text" title={item.label}>',
+    ],
     [
       '  className?: string;\n};\n\nexport function AppShell({',
       '  className?: string;\n' +

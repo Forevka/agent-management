@@ -2,6 +2,7 @@ import { Badge } from '@/components/ui/badge'
 import { Card, CardContent, CardFooter, CardHeader } from '@/components/ui/card'
 import { EmptyState } from '@/components/ui/empty-state'
 import { Page, PageHeader, Row, Section, Stack, Text } from '@/components/fx/layout'
+import { ProjectTag } from '@/components/fx/project'
 import type { Habits as HabitsT } from '../api'
 import { ActionButton, Loaded, When, useApi } from '../ui'
 
@@ -72,7 +73,7 @@ export default function Habits() {
                         <Text size="1" tone="muted" mono>
                           H-{h.id}
                         </Text>
-                        {h.project && <Badge tone="info">{h.project}</Badge>}
+                        {h.project && <ProjectTag slug={h.project}>{h.project}</ProjectTag>}
                         <Text size="1" tone="muted">
                           up to {h.cap}/day
                         </Text>

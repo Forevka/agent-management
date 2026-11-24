@@ -143,7 +143,8 @@ Read `components/ui/button.tsx` once — it is the clearest example of all ten.
 
 `src/aui.css` is the whole theme: the `--aui-*` tokens in light, the same set under
 `[data-theme="dark"]`, the base element styles, and three app classes (`.fx-link`, `.fx-item`).
-Nothing else in the app sets a colour. The values are affectUI's own defaults, with two departures,
+Nothing else in the app sets a colour (the project hues, `--fx-hue-*`, live there too). The
+values are affectUI's own defaults, with two departures,
 both commented in the file:
 
 - `--aui-muted` is `#737373`, not their `#8f8f8f`: at 2.9:1 on white theirs fails WCAG AA for the
@@ -181,5 +182,11 @@ still `npx shadcn@latest add @affectui/<slug>`.
   orchestrator can send the owner a link to exactly what it is talking about.
 - **One accent.** affectUI's palette has a single near-black primary; colour means status
   (success, warning, danger, info), not decoration. Resist adding a brand hue.
+- **One exception: a project's hue.** Each project has a colour (`projects.color`, chosen on its
+  settings page, else picked from its slug), and everything of that project carries it, so the
+  owner tells projects apart at a glance. It comes only from `--fx-hue-<name>` /
+  `--fx-hue-<name>-soft` in `aui.css`, reached through `data-project` (`--fx-project`), and shows
+  only as a dot, a stripe down a card's edge, or a soft tag with ink text (`fx/project.tsx`:
+  `ProjectDot`, `ProjectTag`). Never as text colour, a filled control or a status.
 - **`npm ci && npm run build` before any Rust build that must serve the UI** — `build.rs` embeds a
   placeholder page when `dist` is missing.
