@@ -56,10 +56,11 @@ pub fn report(key: &str, state: &'static str, detail: Option<String>) {
             state,
             detail: detail.map(|d| clip(&d, 300)),
             since,
-            last_ok: if bad {
-                prev.as_ref().and_then(|p| p.last_ok)
-            } else {
+            // Only a state that says it worked counts: a source merely started has not.
+            last_ok: if matches!(state, "connected" | "ok") {
                 Some(now)
+            } else {
+                prev.as_ref().and_then(|p| p.last_ok)
             },
             last_error: if bad {
                 Some(now)
@@ -68,6 +69,13 @@ pub fn report(key: &str, state: &'static str, detail: Option<String>) {
             },
         },
     );
+}
+
+/// Forgets how a service stood: it is no longer configured, so nothing about it is live.
+pub fn forget(key: &str) {
+    if let Ok(mut map) = REGISTRY.write() {
+        map.remove(key);
+    }
 }
 
 pub fn status(key: &str) -> Option<Status> {
@@ -179,7 +187,8 @@ pub async fn json(o: &Orchestrator) -> Result<Value> {
         "folder": feeds::SLACK_FOLDER, "editable": true,
         "keys": keys_json(preset_keys("slack"), &[feeds::SLACK_TOKEN_KEY], &slack_keys),
         "configured": slack_configured,
-        "status": status_json(status("slack"), if slack_configured { "starting" } else { "not_configured" }),
+        // Not configured wins over whatever a source that ran before last said.
+        "status": if slack_configured { status_json(status("slack"), "starting") } else { json!({"state": "not_configured"}) },
         "meta": {
             "mode": if !slack_configured { None }
                     else if has(&slack_keys, feeds::SLACK_APP_TOKEN_KEY) { Some("Socket Mode: every conversation") }
@@ -197,20 +206,13 @@ pub async fn json(o: &Orchestrator) -> Result<Value> {
         "folder": feeds::GCHAT_FOLDER, "editable": true,
         "keys": keys_json(preset_keys("gchat"), preset_keys("gchat"), &gchat_keys),
         "configured": gchat_configured,
-        "status": status_json(status("gchat"), if gchat_configured { "starting" } else { "not_configured" }),
+        "status": if gchat_configured { status_json(status("gchat"), "starting") } else { json!({"state": "not_configured"}) },
         "meta": {"last_message": last_message(o, "gchat").await?},
     }));
 
     // Each Jira account: every folder a project reads, the shared one, and any folder made
     // with the Jira preset.
-    let folders: Vec<String> = sqlx::query_scalar(
-        "select distinct f from (
-            select coalesce(nullif(jira_folder, ''), $1) as f from projects where jira_key is not null
-            union select name from secret_folders where preset = 'jira') x order by f",
-    )
-    .bind(jira::DEFAULT_FOLDER)
-    .fetch_all(&o.db)
-    .await?;
+    let folders = jira_folders(o).await?;
     let accounts = crate::jira_sync::accounts_json(o).await?;
     for folder in folders {
         let (_, keys) = keys_set(o, &folder).await?;
@@ -227,8 +229,10 @@ pub async fn json(o: &Orchestrator) -> Result<Value> {
         let configured = preset_keys("jira").iter().all(|k| has(&keys, k));
         let state = if !configured {
             "not_configured"
-        } else if acc.is_null() {
+        } else if projects.is_empty() {
             "unused"
+        } else if acc.is_null() {
+            "starting"
         } else if acc["ok"].as_bool() == Some(true) {
             "ok"
         } else {
@@ -312,10 +316,52 @@ pub async fn json(o: &Orchestrator) -> Result<Value> {
     Ok(json!({"integrations": out}))
 }
 
+/// The Jira credential folders: each a project reads (the shared one when it names none) and any
+/// made with the Jira preset, one per name as the vault matches names (case aside).
+async fn jira_folders(o: &Orchestrator) -> Result<Vec<String>> {
+    Ok(sqlx::query_scalar(
+        "select min(f) from (
+            select coalesce(nullif(jira_folder, ''), $1) as f from projects where jira_key is not null
+            union select name from secret_folders where preset = 'jira') x
+         group by lower(f) order by min(f)",
+    )
+    .bind(jira::DEFAULT_FOLDER)
+    .fetch_all(&o.db)
+    .await?)
+}
+
+/// `id` as this page may act on it: a Jira folder only if it is one of the page's Jira accounts
+/// and no project hands it to its agents (a Jira token must never reach a session).
+async fn checked(o: &Orchestrator, id: &str) -> Result<Editable> {
+    let e = editable(id).with_context(|| format!("{id} is not set from this page"))?;
+    if id.starts_with("jira:") {
+        let listed = jira_folders(o)
+            .await?
+            .iter()
+            .any(|f| f.eq_ignore_ascii_case(&e.folder));
+        ensure!(listed, "{} is not a Jira account folder", e.folder);
+        let bound: bool = sqlx::query_scalar(
+            "select exists(select 1 from project_secrets s join secret_folders f on f.id = s.folder_id
+                            where lower(f.name) = lower($1))",
+        )
+        .bind(&e.folder)
+        .fetch_one(&o.db)
+        .await?;
+        ensure!(
+            !bound,
+            "{} is handed to a project's agents (Secrets page); a Jira token must not be in it",
+            e.folder
+        );
+    }
+    Ok(e)
+}
+
 /// Sets one key of an integration's credential, making its folder (with the right preset) when
 /// there is none. Only the keys that integration reads.
 pub async fn set_key(o: &Orchestrator, id: &str, key: &str, value: &str) -> Result<String> {
-    let e = editable(id).with_context(|| format!("{id} is not set from this page"))?;
+    let e = checked(o, id).await?;
+    // A pasted token often carries a space at either end, which the service then refuses.
+    let value = value.trim();
     ensure!(
         e.keys.contains(&key),
         "{id} reads {}, not {key}",
@@ -331,7 +377,7 @@ pub async fn set_key(o: &Orchestrator, id: &str, key: &str, value: &str) -> Resu
 }
 
 pub async fn unset_key(o: &Arc<Orchestrator>, id: &str, key: &str) -> Result<String> {
-    let e = editable(id).with_context(|| format!("{id} is not set from this page"))?;
+    let e = checked(o, id).await?;
     ensure!(e.keys.contains(&key), "{id} does not read {key}");
     let Some(folder) = keys_set(o, &e.folder).await?.0 else {
         return Ok(format!("{key} was not set"));
@@ -354,6 +400,8 @@ static LAST_TEST: LazyLock<std::sync::Mutex<HashMap<String, std::time::Instant>>
 /// One small call with the stored credential: who the service says we are. At most one per
 /// integration every few seconds.
 pub async fn test(o: &Orchestrator, id: &str) -> Result<Value> {
+    // Checked first, so only real integrations take a place in the rate limit.
+    checked(o, id).await?;
     {
         let mut last = LAST_TEST.lock().map_err(|_| anyhow::anyhow!("busy"))?;
         if last

@@ -254,6 +254,7 @@ pub async fn run_feeds(o: Arc<Orchestrator>) {
         for (name, (_, h)) in running.iter().filter(|(n, _)| !names.contains(n)) {
             tracing::info!("feed source {name} is no longer configured; stopping it");
             h.abort();
+            crate::integrations::forget(name);
         }
         running.retain(|n, _| names.contains(n));
         stopped.retain(|n, _| names.contains(n));

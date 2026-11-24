@@ -18,6 +18,16 @@ use serde_json::{Value, json};
 
 use crate::model::{AgentRow, BRAIN_AGENT, SECRETARY_AGENT};
 
+/// How Hindsight stands after a call, for the Integrations page: refused or failing is an error
+/// (a wrong key answers 401 on every call); a thing it does not have yet (404) is not.
+fn note_status(s: reqwest::StatusCode) {
+    if s.is_success() || s == reqwest::StatusCode::NOT_FOUND {
+        crate::integrations::report("hindsight", "ok", None);
+    } else {
+        crate::integrations::report("hindsight", "error", Some(format!("answered {s}")));
+    }
+}
+
 #[derive(Clone)]
 pub struct Hindsight {
     base: String,
@@ -56,23 +66,16 @@ impl Hindsight {
         let resp = match req.send().await {
             Ok(r) => r,
             Err(e) => {
+                let shown = e.without_url();
                 crate::integrations::report(
                     "hindsight",
                     "error",
-                    Some(format!("unreachable: {e}")),
+                    Some(format!("unreachable: {shown}")),
                 );
-                return Err(e).context("Hindsight is unreachable");
+                return Err(shown).context("Hindsight is unreachable");
             }
         };
-        if resp.status().is_server_error() {
-            crate::integrations::report(
-                "hindsight",
-                "error",
-                Some(format!("answered {}", resp.status())),
-            );
-        } else {
-            crate::integrations::report("hindsight", "ok", None);
-        }
+        note_status(resp.status());
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
@@ -102,23 +105,16 @@ impl Hindsight {
         let resp = match req.send().await {
             Ok(r) => r,
             Err(e) => {
+                let shown = e.without_url();
                 crate::integrations::report(
                     "hindsight",
                     "error",
-                    Some(format!("unreachable: {e}")),
+                    Some(format!("unreachable: {shown}")),
                 );
-                return Err(e).context("Hindsight is unreachable");
+                return Err(shown).context("Hindsight is unreachable");
             }
         };
-        if resp.status().is_server_error() {
-            crate::integrations::report(
-                "hindsight",
-                "error",
-                Some(format!("answered {}", resp.status())),
-            );
-        } else {
-            crate::integrations::report("hindsight", "ok", None);
-        }
+        note_status(resp.status());
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }

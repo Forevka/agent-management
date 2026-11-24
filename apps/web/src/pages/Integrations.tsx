@@ -46,7 +46,8 @@ const CATEGORIES: { tab: string; id: string; title: string }[] = [
 
 const STATE: Record<string, { label: string; tone: 'neutral' | 'info' | 'success' | 'warning' | 'danger' }> = {
   connected: { label: 'connected', tone: 'success' },
-  running: { label: 'running', tone: 'success' },
+  // Started; only a source that reports its connection says more.
+  running: { label: 'running', tone: 'info' },
   ok: { label: 'working', tone: 'success' },
   idle: { label: 'not used yet', tone: 'neutral' },
   starting: { label: 'starting', tone: 'info' },
@@ -230,10 +231,14 @@ function Summary({ i }: { i: Integration }) {
 function Manage({ i, reload }: { i: Integration; reload: () => void }) {
   const [test, setTest] = useState<{ ok: boolean; detail: string } | null>(null)
   const [busy, setBusy] = useState<string | null>(null)
+  const [failed, setFailed] = useState<string | null>(null)
   const run = async (key: string, f: () => Promise<unknown>) => {
     setBusy(key)
+    setFailed(null)
     try {
       await f()
+    } catch (e) {
+      setFailed(e instanceof Error ? e.message : String(e))
     } finally {
       setBusy(null)
     }
@@ -280,6 +285,7 @@ function Manage({ i, reload }: { i: Integration; reload: () => void }) {
           </Text>
         )}
       </Row>
+      {failed && <Note tone="danger">{failed}</Note>}
       {test && (
         <Note tone={test.ok ? 'success' : 'danger'} title={test.ok ? 'It works' : 'It does not work'}>
           {test.detail}
@@ -327,7 +333,7 @@ function KeyField({
         <TextField
           size="sm"
           type="password"
-          autoComplete="off"
+          autoComplete="new-password"
           label={
             <Row gap="2">
               <code>{k.key}</code>
