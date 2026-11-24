@@ -500,9 +500,10 @@ async fn runs(State(o): State<O>, h: HeaderMap, Query(q): Query<RunQuery>) -> Ap
         Option<f64>,
     )> = sqlx::query_as(&format!(
         "select r.run_id, r.task_id, r.project, r.agent_id, r.node_id, r.session_id, r.status,
-                r.outcome, r.started_at, r.ended_at, t.title, r.cost_usd
+                r.outcome, r.started_at, r.ended_at, t.title, {cost}::float8
          from runs r left join tasks t on t.id = r.task_id
-         {WHERE} order by r.started_at desc limit $4 offset $5"
+         {WHERE} order by r.started_at desc limit $4 offset $5",
+        cost = crate::usage::RUN_COST_SQL
     ))
     .bind(&q.project)
     .bind(&q.task)
@@ -544,10 +545,12 @@ async fn task(State(o): State<O>, h: HeaderMap, Path(id): Path<String>) -> Api {
         chrono::DateTime<chrono::Utc>,
         Option<chrono::DateTime<chrono::Utc>>,
         Option<f64>,
-    )> = sqlx::query_as(
-        "select run_id, node_id, session_id, status, outcome, started_at, ended_at, cost_usd
-         from runs where task_id = $1 order by started_at desc",
-    )
+    )> = sqlx::query_as(&format!(
+        "select r.run_id, r.node_id, r.session_id, r.status, r.outcome, r.started_at, r.ended_at,
+                    {}::float8
+             from runs r where r.task_id = $1 order by r.started_at desc",
+        crate::usage::RUN_COST_SQL
+    ))
     .bind(&id)
     .fetch_all(&o.db)
     .await?;

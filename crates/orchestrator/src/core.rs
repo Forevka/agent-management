@@ -320,8 +320,8 @@ impl Orchestrator {
             .execute(&self.db)
             .await?;
         sqlx::query(
-            "insert into nodes (id, name, os, app_version, online, last_seen) values ($1, $2, $3, $4, true, now())
-             on conflict (id) do update set name = $2, os = $3, app_version = $4, online = true, last_seen = now()",
+            "insert into nodes (id, name, os, app_version, online, last_seen, connected_at) values ($1, $2, $3, $4, true, now(), now())
+             on conflict (id) do update set name = $2, os = $3, app_version = $4, online = true, last_seen = now(), connected_at = now()",
         )
         .bind(&id)
         .bind(&hello.node_name)
@@ -532,9 +532,7 @@ impl Orchestrator {
                             }
                             crate::usage::turn_ended(self, peer, current_task, v).await
                         }
-                        Some("rate_limit_event") => {
-                            crate::usage::event(self, peer, current_task, v).await
-                        }
+                        Some("rate_limit_event") => crate::usage::event(self, peer, v).await,
                         _ => Ok(()),
                     };
                     if let Err(e) = done {

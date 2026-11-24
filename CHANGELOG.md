@@ -7,6 +7,23 @@ below is one release. How to add to this file is in `CLAUDE.md`
 
 ## Unreleased
 
+- **A node out of Claude usage holds its work until the limit resets, and the work carries on
+  by itself.** Claude reports its usage limits as it runs; when a node's limit is hit, new task
+  runs there wait in the queue (saying why), the owner is told once with when it resets, and
+  each task the limit cut off is woken two minutes after the reset to carry on. The fleet's own
+  sessions are never held. The Nodes page shows each node's use of its 5-hour and weekly
+  windows. Migration `0028` adds nullable columns only.
+- **What work costs.** Every run keeps what its turns cost and how many tokens they used, as
+  Claude reports them; a task's total is on its board card, its page and the task panel, and
+  each session's on the session lists. On a subscription this is a measure of use at API
+  prices, not a bill.
+- **Stuck runs are noticed.** An agent that writes nothing for 30 minutes in the middle of a
+  turn (not while it waits on the owner, not between turns) is reported once in its topic, and
+  stopped after 2 hours, as the owner's Stop would; a message resumes it.
+  `FLEET_RUN_SILENT_WARN_MINUTES` and `FLEET_RUN_SILENT_STOP_MINUTES` (0 turns either off).
+
+## v0.2.20 — 2026-11-24
+
 - **An agent whose work goes out as a merge request follows it until it is merged.** Opening
   the MR no longer ends the task: the agent links it, sleeps on a wakeup, and on each wake
   (about every 40 minutes after a push, every few hours while it waits for reviewers) checks
@@ -22,7 +39,7 @@ below is one release. How to add to this file is in `CLAUDE.md`
 - **Stopping a task cancels its wakeups.** Before, a stopped task whose agent had armed one
   resumed on its own when it fired, without asking for its plan again (Stop on a finished task
   cancels them too). `complete` and `workflow-finish` now
-  lists the wakeups still armed, so an agent cancels the ones it no longer needs.
+  list the wakeups still armed, so an agent cancels the ones it no longer needs.
 - **The wake message counts the task's rounds**, not the wakeup's own (which was always 0 for
   an agent that naps again and again), so "after a few rounds, report and stop" can work.
 - **Review feedback becomes project memory.** When one of the project's reviewers asked for a

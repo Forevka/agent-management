@@ -643,6 +643,11 @@ async fn fire(
     // The orchestrator's own wakeups (a usage limit that cut a turn off) carry its own words,
     // which need neither the agent's framing nor its advice about napping again.
     if w.created_by == BY_ORCHESTRATOR {
+        // Only work that was cut off and is still open: one finished or stopped since has
+        // nothing to carry on.
+        if crate::tasks::is_finished(&task) || task.status == "stopped" {
+            return Ok(());
+        }
         o.audit(
             "orchestrator",
             "wakeup.fire",

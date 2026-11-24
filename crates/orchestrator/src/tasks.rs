@@ -764,7 +764,16 @@ async fn dispatch_locked(
             .map(|(n, _)| n)
             .filter(|n| n.online && usage_held(n))
             .collect();
-        let note = if !held_for_usage.is_empty() && held_for_disk.is_empty() {
+        // The usage limit is the reason only when every node that could take it is out of usage;
+        // otherwise the task may well start sooner on one that is only busy.
+        let online = candidates
+            .iter()
+            .filter(|(n, _)| pinned.is_none_or(|id| n.id == id) && n.online)
+            .count();
+        let note = if !held_for_usage.is_empty()
+            && held_for_usage.len() == online
+            && held_for_disk.is_empty()
+        {
             let names = held_for_usage
                 .iter()
                 .map(|n| n.name.as_str())
@@ -1989,7 +1998,7 @@ pub async fn owner_edit(o: &Arc<Orchestrator>, id: &str, edit: TaskEdit) -> Resu
 }
 
 /// Over: done, stopped or failed. A message resumes such a task; nothing else should.
-fn is_finished(task: &TaskRow) -> bool {
+pub(crate) fn is_finished(task: &TaskRow) -> bool {
     matches!(
         task.status.as_str(),
         status::DONE | status::STOPPED | status::FAILED

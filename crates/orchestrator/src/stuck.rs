@@ -3,17 +3,24 @@
 //! process wedged on something it cannot see), and it holds its node slot and its agent while it
 //! is.
 //!
-//! Housekeeping looks at every running task's last line. When a turn is in progress (the last
-//! thing in or out of the session is not the `result` that ends a turn) and nothing has come for
-//! `FLEET_RUN_SILENT_WARN_MINUTES`, the owner is told once in the task's topic (and the session
-//! page shows it); after `FLEET_RUN_SILENT_STOP_MINUTES` the run is stopped, exactly as the
-//! owner's Stop would, and a message resumes the task later.
+//! Housekeeping looks at every running task. When a turn is in progress (something was sent in
+//! after the last `result` came out) and nothing has come for `FLEET_RUN_SILENT_WARN_MINUTES`, the
+//! owner is told once in the task's topic (and the session page shows it); after
+//! `FLEET_RUN_SILENT_STOP_MINUTES` the run is stopped, exactly as the owner's Stop would, and a
+//! message resumes the task later.
 //!
-//! Silence is not judged while the task waits on the owner (an open plan, question or
-//! permission holds a turn open on purpose), nor between turns (a session that has answered and
-//! waits to be written to is idle, not stuck; the node closes those itself). The thresholds are
-//! generous on purpose: Claude's own commands time out after ten minutes, so half an hour of
-//! nothing is not a long build.
+//! What is not silence:
+//! - waiting on the owner: an open plan, question or permission holds a turn open on purpose;
+//! - between turns: a session that has answered and waits to be written to is idle, and the node
+//!   closes those itself;
+//! - a node that is away: its run's output waits in the node's outbox, so silence is counted only
+//!   on a connected node and only from when its connection began (which also covers the
+//!   orchestrator's own restart, after which every node connects anew);
+//! - a task already stopped, whose run is only waiting for its node to confirm the exit.
+//!
+//! The thresholds are generous on purpose: Claude's own commands time out after ten minutes, so
+//! half an hour of nothing is not a long build. A run that keeps writing (the same failing
+//! command again and again) is not caught here.
 
 use std::sync::Arc;
 
@@ -26,11 +33,32 @@ use crate::{
     core::Orchestrator,
 };
 
-/// Whether `data`, the last line out of a session, is the `result` that ends a turn.
+/// How many of a task's latest lines in and out are looked at to tell whether a turn is in
+/// progress. A turn longer than this (many tool calls since the message that started it) counts as
+/// in progress, which it is.
+const LOOK_BACK: i64 = 40;
+
+/// Whether `data`, a line out of a session, is the `result` that ends a turn.
 fn ends_turn(kind: &str, data: &str) -> bool {
     kind == "out"
         && data.contains("result")
         && serde_json::from_str::<serde_json::Value>(data).is_ok_and(|v| v["type"] == "result")
+}
+
+/// Whether a turn is in progress, from a task's latest lines in and out, newest first: something
+/// was sent in after the last `result`. Other lines after a `result` (Claude's usage report, a
+/// background notice) do not reopen a turn; only a message in does.
+fn mid_turn<'a>(newest_first: impl IntoIterator<Item = (&'a str, &'a str)>) -> bool {
+    for (kind, data) in newest_first {
+        if kind == "in" {
+            return true;
+        }
+        if ends_turn(kind, data) {
+            return false;
+        }
+    }
+    // Nothing either way in the window: a long turn, or a run that has not said a word yet.
+    true
 }
 
 /// Called from housekeeping.
@@ -40,45 +68,50 @@ pub async fn check(o: &Arc<Orchestrator>) -> Result<()> {
     if warn == 0 && stop_after == 0 {
         return Ok(());
     }
-    // Per running task: when its current run last did anything (its start counts, so a run that
-    // never wrote a line is judged from its dispatch), and the last line in or out of it, which
-    // says whether a turn is in progress. Few tasks run at once, and each lookup walks the
-    // `(task_id, id)` index backwards.
-    let rows: Vec<(String, DateTime<Utc>, Option<String>, Option<String>)> = sqlx::query_as(
-        "select t.id,
+    // Per running task on a connected node: its run, and when it last did anything — its last
+    // line, its dispatch (a run that never wrote a line), or the node's connection, whichever is
+    // latest. Few tasks run at once, and each lookup walks the `(task_id, id)` index backwards.
+    let rows: Vec<(String, Option<String>, DateTime<Utc>)> = sqlx::query_as(
+        "select t.id, t.run_id,
                 greatest(coalesce(t.dispatched_at, t.updated_at),
+                         coalesce(n.connected_at, '-infinity'),
                          coalesce((select at from task_events
                                    where task_id = t.id and kind in ('in', 'out', 'err')
-                                   order by id desc limit 1), '-infinity')),
-                last.kind, last.data
-         from tasks t
-         left join lateral (select kind, data from task_events
-                            where task_id = t.id and kind in ('in', 'out')
-                            order by id desc limit 1) last on true
-         where t.running and t.id <> all($1)
+                                   order by id desc limit 1), '-infinity'))
+         from tasks t join nodes n on n.id = t.node_id
+         where t.running and n.online and t.status <> 'stopped' and t.id <> all($1)
            and not exists (select 1 from human_items h
                            where h.task_id = t.id and h.state = 'open' and h.blocking)",
     )
     .bind(crate::model::BUILTIN_TASKS)
     .fetch_all(&o.db)
     .await?;
-    for (task_id, last_at, kind, data) in rows {
-        // Between turns: idle, not stuck.
-        if let (Some(kind), Some(data)) = (&kind, &data)
-            && ends_turn(kind, data)
-        {
+    for (task_id, run_id, last_at) in rows {
+        let silent = (Utc::now() - last_at).num_minutes();
+        let due_warn = warn > 0 && silent >= warn;
+        let due_stop = stop_after > 0 && silent >= stop_after;
+        if !(due_warn || due_stop) {
             continue;
         }
-        let silent = (Utc::now() - last_at).num_minutes();
-        if stop_after > 0 && silent >= stop_after {
-            if let Err(e) = stop(o, &task_id, silent).await {
-                tracing::warn!(task = %task_id, "stopping a silent run failed: {e:#}");
-            }
-        } else if warn > 0
-            && silent >= warn
-            && let Err(e) = tell(o, &task_id, last_at, silent, stop_after).await
-        {
-            tracing::warn!(task = %task_id, "warning about a silent run failed: {e:#}");
+        let lines: Vec<(String, String)> = sqlx::query_as(
+            "select kind, data from task_events where task_id = $1 and kind in ('in', 'out')
+             order by id desc limit $2",
+        )
+        .bind(&task_id)
+        .bind(LOOK_BACK)
+        .fetch_all(&o.db)
+        .await?;
+        // Between turns: idle, not stuck.
+        if !mid_turn(lines.iter().map(|(k, d)| (k.as_str(), d.as_str()))) {
+            continue;
+        }
+        let done = if due_stop {
+            stop(o, &task_id, run_id.as_deref(), silent).await
+        } else {
+            tell(o, &task_id, last_at, silent, stop_after).await
+        };
+        if let Err(e) = done {
+            tracing::warn!(task = %task_id, "handling a silent run failed: {e:#}");
         }
     }
     Ok(())
@@ -105,13 +138,12 @@ async fn tell(
     let Some(task) = o.task(task_id).await? else {
         return Ok(());
     };
-    sqlx::query("insert into task_events (task_id, kind, data) values ($1, 'silent', $2)")
-        .bind(task_id)
-        .bind(format!(
-            "No output for {silent} min in the middle of a turn: it may be stuck"
-        ))
-        .execute(&o.db)
-        .await?;
+    o.record(
+        task_id,
+        "silent",
+        &format!("No output for {silent} min in the middle of a turn: it may be stuck"),
+    )
+    .await?;
     let then = if stop_after > 0 {
         format!(
             " It is stopped after {stop_after} min of silence; stop it sooner from its page if it is."
@@ -132,25 +164,34 @@ async fn tell(
     Ok(())
 }
 
-/// Stops the run as the owner's Stop would (its wakeups too), and says why.
-async fn stop(o: &Arc<Orchestrator>, task_id: &str, silent: i64) -> Result<()> {
+/// Stops the run as the owner's Stop would (its wakeups too), and says why. Only the run that was
+/// judged, and only while it is still running and still quiet: one that exited, or a fresh run
+/// dispatched since, is not this one.
+async fn stop(
+    o: &Arc<Orchestrator>,
+    task_id: &str,
+    run_id: Option<&str>,
+    silent: i64,
+) -> Result<()> {
     let Some(task) = o.task(task_id).await? else {
         return Ok(());
     };
+    if !task.running || task.status == "stopped" || task.run_id.as_deref() != run_id {
+        return Ok(());
+    }
     crate::tasks::stop(o, &task, false).await?;
     o.audit(
         "orchestrator",
         "task.stop_silent",
-        json!({"task": task.id, "silent_minutes": silent}),
+        json!({"task": task.id, "run": run_id, "silent_minutes": silent}),
     )
     .await;
-    sqlx::query("insert into task_events (task_id, kind, data) values ($1, 'silent', $2)")
-        .bind(&task.id)
-        .bind(format!(
-            "Stopped after {silent} min without output in the middle of a turn"
-        ))
-        .execute(&o.db)
-        .await?;
+    o.record(
+        &task.id,
+        "silent",
+        &format!("Stopped after {silent} min without output in the middle of a turn"),
+    )
+    .await?;
     o.post_task(
         &task,
         &format!(
@@ -184,7 +225,21 @@ mod tests {
             "out",
             r#"{"type":"user","message":{"content":"result: ok"}}"#
         ));
-        // What was sent in starts a turn.
         assert!(!ends_turn("in", r#"{"type":"result"}"#));
+    }
+
+    #[test]
+    fn a_turn_is_open_from_a_message_in_until_its_result() {
+        let result = r#"{"type":"result"}"#;
+        let tool = r#"{"type":"assistant","message":{"content":[]}}"#;
+        let usage = r#"{"type":"rate_limit_event","rate_limit_info":{}}"#;
+        // Answered, then Claude's usage report: still idle.
+        assert!(!mid_turn([("out", usage), ("out", result), ("in", "go")]));
+        // Written to again: a turn is open, whatever came before.
+        assert!(mid_turn([("in", "more"), ("out", result)]));
+        // Working through tools.
+        assert!(mid_turn([("out", tool), ("out", tool), ("in", "go")]));
+        // Nothing yet at all.
+        assert!(mid_turn([]));
     }
 }

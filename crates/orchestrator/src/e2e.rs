@@ -4322,14 +4322,26 @@ async fn habit_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) {
     })
     .await;
     assert_eq!(actor, format!("owner (via habit {})", habit.id));
-    assert!(
-        chat.ops.lock().unwrap().iter().any(|op| matches!(
-            op,
-            Op::Send { html, keyboard, .. }
-                if html.contains("Plan approved by your habit") && !keyboard.is_empty()
-        )),
-        "the task's topic says so, with the way back"
-    );
+    // The task's topic says so, with the way back. Waited for too: the post can land a moment
+    // after the audit row.
+    wait_for(
+        "the habit's note in the topic, with the way back",
+        || async {
+            chat.ops
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|op| {
+                    matches!(
+                        op,
+                        Op::Send { html, keyboard, .. }
+                            if html.contains("Plan approved by your habit") && !keyboard.is_empty()
+                    )
+                })
+                .then_some(())
+        },
+    )
+    .await;
 
     // 5. A plan that says the owner is wanted still waits for them — the stopper beats the habit.
     let unclear = review(5, "Review it. The acceptance criteria are unclear.").await;
@@ -8133,6 +8145,16 @@ async fn usage_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) {
             .execute(db)
             .await
             .unwrap();
+            // Silence counts only from the node's connection, which began seconds ago here.
+            sqlx::query(
+                "update nodes set connected_at = now() - make_interval(mins => $2)
+                 where id = (select node_id from tasks where id = $1)",
+            )
+            .bind(&id)
+            .bind(minutes)
+            .execute(db)
+            .await
+            .unwrap();
         }
     };
     sqlx::query(
@@ -8144,6 +8166,28 @@ async fn usage_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) {
     .unwrap();
     back(45).await;
     assert!(o.task(&id).await.unwrap().unwrap().running);
+    // A node that is away is not judged: its run's output waits in its outbox.
+    let node_of = |online: bool| {
+        let id = id.clone();
+        async move {
+            sqlx::query(
+                "update nodes set online = $2 where id = (select node_id from tasks where id = $1)",
+            )
+            .bind(&id)
+            .bind(online)
+            .execute(db)
+            .await
+            .unwrap();
+        }
+    };
+    node_of(false).await;
+    crate::stuck::check(o).await.unwrap();
+    assert_eq!(
+        told("no output from its agent"),
+        0,
+        "an away node is not judged"
+    );
+    node_of(true).await;
     crate::stuck::check(o).await.unwrap();
     crate::stuck::check(o).await.unwrap();
     assert_eq!(
@@ -8160,6 +8204,10 @@ async fn usage_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) {
     crate::stuck::check(o).await.unwrap();
     assert_eq!(told("stopped: no output from its agent"), 1);
     assert_eq!(o.task(&id).await.unwrap().unwrap().status, "stopped");
+    // Until its node confirms the exit the run still counts as running; it is not stopped again
+    // (a PC asleep overnight would otherwise ring every five minutes).
+    crate::stuck::check(o).await.unwrap();
+    assert_eq!(told("stopped: no output from its agent"), 1, "stopped once");
     wait_for("the silent run ends", || async {
         o.task(&id).await.unwrap().filter(|t| !t.running)
     })

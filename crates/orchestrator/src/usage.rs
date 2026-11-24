@@ -56,14 +56,11 @@ pub fn json(n: &NodeRow) -> Value {
     })
 }
 
-/// A `rate_limit_event` line of a run on `peer`. `task` is the run's task while the run is its
-/// current one (a replaced run's cut-off is nobody's to resume).
-pub async fn event(
-    o: &Arc<Orchestrator>,
-    peer: EndpointId,
-    task: Option<&TaskRow>,
-    line: &Value,
-) -> Result<()> {
+/// A `rate_limit_event` line of a run on `peer`: kept as the node's latest word on its usage.
+/// `rejected` holds the node (unless Claude is drawing on extra usage, so work still runs); an
+/// all-clear lifts a hold early (extra usage bought, the node's login changed). Resuming a task is
+/// left to the turn's own end ([`turn_ended`]): only a turn that actually failed was cut off.
+pub async fn event(o: &Arc<Orchestrator>, peer: EndpointId, line: &Value) -> Result<()> {
     let info = &line["rate_limit_info"];
     if !info.is_object() {
         return Ok(());
@@ -74,24 +71,33 @@ pub async fn event(
         .bind(sqlx::types::Json(info))
         .execute(&o.db)
         .await?;
-    if info["status"].as_str() == Some("rejected") {
-        let until = reset_of(info).unwrap_or_else(unknown_reset);
-        hit(o, &node_id, until, info["rateLimitType"].as_str(), task).await?;
+    let overage = info["isUsingOverage"] == json!(true);
+    match info["status"].as_str() {
+        Some("rejected") if !overage => {
+            let until = reset_of(info).unwrap_or_else(unknown_reset);
+            hit(o, &node_id, until, info["rateLimitType"].as_str(), None).await?;
+        }
+        Some("allowed" | "allowed_warning") if !any_rejected(info) => {
+            lift(o, &node_id).await?;
+        }
+        _ => {}
     }
     Ok(())
 }
 
-/// The `result` line that ends a turn: when it failed because the usage limit was reached, the
-/// same as a `rejected` event.
+/// The `result` line that ends a turn. A turn that failed because the usage limit was reached
+/// (its text says so, or it failed while the node is known to be out of usage) holds the node,
+/// and the task carries on after the reset.
 pub async fn turn_ended(
     o: &Arc<Orchestrator>,
     peer: EndpointId,
     task: Option<&TaskRow>,
     line: &Value,
 ) -> Result<()> {
-    if line["is_error"] != json!(true) || !is_limit_message(line["result"].as_str().unwrap_or("")) {
+    if line["is_error"] != json!(true) {
         return Ok(());
     }
+    let text = line["result"].as_str().unwrap_or("");
     let node_id = peer.to_string();
     let known: Option<(Option<sqlx::types::Json<Value>>, Option<DateTime<Utc>>)> =
         sqlx::query_as("select claude_usage, claude_limited_until from nodes where id = $1")
@@ -101,38 +107,82 @@ pub async fn turn_ended(
     let Some((usage, limited)) = known else {
         return Ok(());
     };
-    // The reset Claude gave last, if it is still ahead; otherwise a guess.
-    let until = limited
-        .filter(|t| *t > Utc::now())
+    let limited = limited.filter(|t| *t > Utc::now());
+    if !is_limit_message(text) && limited.is_none() {
+        return Ok(());
+    }
+    // The reset the message names, else the hold already in place, else the one Claude gave
+    // last, else a guess.
+    let until = reset_in_message(text)
+        .or(limited)
         .or_else(|| usage.and_then(|u| reset_of(&u.0)))
         .unwrap_or_else(unknown_reset);
     hit(o, &node_id, until, None, task).await
 }
 
-/// Whether a failed turn's text says the usage limit ended it. Claude words it as "Claude AI
-/// usage limit reached" or "You've hit your limit · resets 3pm"; an API rate limit (a 429, which
-/// Claude retries on its own) is not this and must not hold a node for an hour.
+/// Whether a failed turn's text says the subscription's usage limit ended it. Claude words it as
+/// "Claude AI usage limit reached|<reset>" or "You've hit your limit · resets 3pm". Neither an API
+/// rate limit (a 429, which Claude retries on its own) nor an API key's workspace spend limit is
+/// this, and neither may hold a node.
 fn is_limit_message(text: &str) -> bool {
     let t = text.to_lowercase();
-    t.contains("usage limit") || (t.contains("hit your") && t.contains("limit"))
+    if t.contains("workspace") || t.contains("api usage limit") {
+        return false;
+    }
+    t.contains("usage limit reached") || (t.contains("hit your") && t.contains("limit"))
 }
 
-/// When the limit in `info` resets, if Claude said and it is still ahead: the event's own
-/// `resetsAt`, else the latest of the windows it rejected.
+/// The reset some versions of Claude put in the message itself: `...usage limit reached|<unix>`.
+fn reset_in_message(text: &str) -> Option<DateTime<Utc>> {
+    let (_, tail) = text.rsplit_once('|')?;
+    let secs: i64 = tail.trim().parse().ok()?;
+    DateTime::from_timestamp(secs, 0).filter(|t| *t > Utc::now())
+}
+
+/// When the limit in `info` resets, if Claude said and it is still ahead: the latest of the
+/// event's own `resetsAt` and every window it rejected, since the node is out until all of them
+/// have reset.
 fn reset_of(info: &Value) -> Option<DateTime<Utc>> {
     let at = |v: &Value| v.as_i64().and_then(|s| DateTime::from_timestamp(s, 0));
-    let own = at(&info["resetsAt"]);
-    let windows = info["unifiedWindows"].as_object().and_then(|w| {
-        w.values()
-            .filter(|v| v["status"].as_str() == Some("rejected"))
-            .filter_map(|v| at(&v["resetsAt"]))
-            .max()
-    });
-    own.or(windows).filter(|t| *t > Utc::now())
+    let windows = info["unifiedWindows"]
+        .as_object()
+        .into_iter()
+        .flat_map(|w| {
+            w.values()
+                .filter(|v| v["status"].as_str() == Some("rejected"))
+                .filter_map(|v| at(&v["resetsAt"]))
+        });
+    at(&info["resetsAt"])
+        .into_iter()
+        .chain(windows)
+        .max()
+        .filter(|t| *t > Utc::now())
+}
+
+/// Whether any window in `info` is still rejected, which an overall `allowed` does not undo.
+fn any_rejected(info: &Value) -> bool {
+    info["unifiedWindows"]
+        .as_object()
+        .is_some_and(|w| w.values().any(|v| v["status"].as_str() == Some("rejected")))
 }
 
 fn unknown_reset() -> DateTime<Utc> {
     Utc::now() + chrono::Duration::minutes(UNKNOWN_RESET_MINUTES)
+}
+
+/// Posts to the owner without holding up the caller: [`event`] and [`turn_ended`] run inside the
+/// loop that handles every node's events, which must not wait on Telegram.
+fn tell_owner(o: &Arc<Orchestrator>, html: String, notify: Notify) {
+    let o = o.clone();
+    tokio::spawn(async move {
+        if let Err(e) = o
+            .chat
+            .send(From::Orchestrator, None, &html, vec![], None, notify)
+            .await
+        {
+            tracing::warn!("telling the owner about Claude usage failed: {e:#}");
+        }
+    });
 }
 
 /// `node_id` is out of usage until `until`: hold it, tell the owner if this is news, and have the
@@ -175,26 +225,64 @@ async fn hit(
             esc(&name),
             esc(&local_time(o, until).await)
         );
-        if let Err(e) = o
-            .chat
-            .send(From::Orchestrator, None, &html, vec![], None, Notify::Sound)
-            .await
-        {
-            tracing::warn!("telling the owner about {name}'s usage limit failed: {e:#}");
-        }
+        tell_owner(o, html, Notify::Sound);
     } else {
         // Already held: a later reset (another window ran out too) moves the hold, never an
-        // earlier one.
-        sqlx::query(
-            "update nodes set claude_limited_until = greatest(claude_limited_until, $2) where id = $1",
+        // earlier one; the owner hears quietly when it moves by more than a few minutes, since
+        // the time they were given is then wrong.
+        let old: Option<DateTime<Utc>> =
+            sqlx::query_scalar("select claude_limited_until from nodes where id = $1")
+                .bind(node_id)
+                .fetch_optional(&o.db)
+                .await?
+                .flatten();
+        let name: Option<String> = sqlx::query_scalar(
+            "update nodes set claude_limited_until = greatest(claude_limited_until, $2)
+             where id = $1 returning name",
         )
         .bind(node_id)
         .bind(until)
-        .execute(&o.db)
+        .fetch_optional(&o.db)
         .await?;
+        if let (Some(name), Some(old)) = (name, old)
+            && until > old + chrono::Duration::minutes(10)
+        {
+            let html = format!(
+                "⏸ <b>{}</b>: Claude usage is out for longer, until {}.",
+                esc(&name),
+                esc(&local_time(o, until).await)
+            );
+            tell_owner(o, html, Notify::Silent);
+        }
     }
     if let Some(task) = task.filter(|t| !crate::model::is_builtin_task(&t.id)) {
         resume_later(o, task, until).await?;
+    }
+    Ok(())
+}
+
+/// Lifts a hold before its time, when Claude says the node may work again.
+async fn lift(o: &Arc<Orchestrator>, node_id: &str) -> Result<()> {
+    let name: Option<String> = sqlx::query_scalar(
+        "update nodes set claude_limited_until = null
+         where id = $1 and claude_limited_until > now() returning name",
+    )
+    .bind(node_id)
+    .fetch_optional(&o.db)
+    .await?;
+    if let Some(name) = name {
+        o.audit(
+            "orchestrator",
+            "claude.limit_reset",
+            json!({"nodes": [name]}),
+        )
+        .await;
+        tell_owner(
+            o,
+            format!("▶️ <b>{}</b>: Claude usage is back.", esc(&name)),
+            Notify::Silent,
+        );
+        crate::tasks::dispatch_queued(o).await;
     }
     Ok(())
 }
@@ -206,16 +294,24 @@ const RESUME_NOTE: &str = "Your last turn was cut off by the Claude usage limit 
 
 /// Wakes `task` a little after `until`, through an ordinary wakeup armed by the orchestrator.
 /// One per task: a limit that cuts off several turns of one task in a row is still one cut-off.
+/// Not for a task that is over or stopped by now (read afresh: the row the caller holds may
+/// predate a stop).
 async fn resume_later(o: &Orchestrator, task: &TaskRow, until: DateTime<Utc>) -> Result<()> {
+    let Some(task) = o.task(&task.id).await? else {
+        return Ok(());
+    };
+    if crate::tasks::is_finished(&task) {
+        return Ok(());
+    }
     let at = until + chrono::Duration::seconds(RESUME_AFTER_RESET_SECS);
     let moved = sqlx::query(
-        "update wakeups set fires_at = greatest(fires_at, $2)
-         where task_id = $1 and created_by = $3 and state = 'armed' and note = $4",
+        "update wakeups set fires_at = greatest(fires_at, $2),
+                            expires_at = greatest(expires_at, $2 + interval '1 day')
+         where task_id = $1 and created_by = $3 and state = 'armed'",
     )
     .bind(&task.id)
     .bind(at)
     .bind(crate::wakeups::BY_ORCHESTRATOR)
-    .bind(RESUME_NOTE)
     .execute(&o.db)
     .await?
     .rows_affected();
@@ -235,16 +331,19 @@ async fn resume_later(o: &Orchestrator, task: &TaskRow, until: DateTime<Utc>) ->
 }
 
 /// What a turn cost, from the `result` line that ends it, added to its run. Claude counts
-/// `total_cost_usd` up across a process's turns (verified with 2.1.331: 0.0067, then 0.0113 after a
-/// second turn), so the run keeps the largest it has seen; `usage` is the turn's own tokens, so
-/// those are added. The cost is at API prices, which on a subscription is a measure of use
-/// rather than a bill.
+/// `total_cost_usd` up across a session's turns, and carries it over when a session is resumed in
+/// a new process (verified with 2.1.331: 0.0067, then 0.0113 after a second turn, then 0.0118 on
+/// the first turn after `--resume`). So a run keeps the largest total it has seen, which is its
+/// session's total so far, and a task's cost counts each session once ([`cost_of_tasks`]).
+/// `usage` is the turn's own tokens, so those are added. A line without a cost changes no cost.
+/// The cost is at API prices, which on a subscription is a measure of use rather than a bill.
 pub async fn record_turn(o: &Orchestrator, run_id: &str, line: &Value) -> Result<()> {
     let u = &line["usage"];
     let n = |k: &str| u[k].as_i64().unwrap_or(0);
     sqlx::query(
         "update runs set
-            cost_usd = greatest(coalesce(cost_usd, 0), coalesce($2, 0)),
+            cost_usd = case when $2::float8 is null then cost_usd
+                            else greatest(coalesce(cost_usd, 0), $2) end,
             input_tokens = coalesce(input_tokens, 0) + $3,
             output_tokens = coalesce(output_tokens, 0) + $4,
             cache_read_tokens = coalesce(cache_read_tokens, 0) + $5,
@@ -263,6 +362,11 @@ pub async fn record_turn(o: &Orchestrator, run_id: &str, line: &Value) -> Result
     Ok(())
 }
 
+/// What one run cost on its own, as SQL over a `runs` row `r`: its session's total so far, less
+/// what the session had cost before this run began (a resumed session carries its total over).
+pub const RUN_COST_SQL: &str = "(r.cost_usd - coalesce((select max(p.cost_usd) from runs p
+      where p.session_id = r.session_id and p.started_at < r.started_at), 0))";
+
 /// What a task's runs cost all together, for its page and its board card: `None` when no run
 /// has reported a turn yet.
 pub fn cost_json(row: Option<&(String, f64, i64, i64)>) -> Value {
@@ -272,17 +376,23 @@ pub fn cost_json(row: Option<&(String, f64, i64, i64)>) -> Value {
     }
 }
 
-/// Per task of `ids`: its runs' cost, tokens (all four kinds) and turns.
+/// Per task of `ids`: its cost (each Claude session counted once, at its largest total, since a
+/// resumed session carries its total into the next run), tokens (all four kinds, per turn, so
+/// added up) and turns.
 pub async fn cost_of_tasks(
     o: &Orchestrator,
     ids: &[String],
 ) -> Result<Vec<(String, f64, i64, i64)>> {
     Ok(sqlx::query_as(
-        "select task_id, coalesce(sum(cost_usd), 0)::float8,
-                coalesce(sum(coalesce(input_tokens, 0) + coalesce(output_tokens, 0)
-                             + coalesce(cache_read_tokens, 0) + coalesce(cache_write_tokens, 0)), 0)::bigint,
+        "select task_id, coalesce(sum(usd), 0)::float8, coalesce(sum(tokens), 0)::bigint,
                 coalesce(sum(turns), 0)::bigint
-         from runs where task_id = any($1) and turns is not null group by task_id",
+         from (select task_id, max(cost_usd) as usd,
+                      sum(coalesce(input_tokens, 0) + coalesce(output_tokens, 0)
+                          + coalesce(cache_read_tokens, 0) + coalesce(cache_write_tokens, 0)) as tokens,
+                      sum(turns) as turns
+               from runs where task_id = any($1) and turns is not null
+               group by task_id, coalesce(session_id, run_id)) per_session
+         group by task_id",
     )
     .bind(ids)
     .fetch_all(&o.db)
@@ -307,24 +417,14 @@ pub async fn release_lapsed(o: &Arc<Orchestrator>) -> Result<()> {
         json!({"nodes": names}),
     )
     .await;
-    let html = format!(
-        "▶️ <b>{}</b>: Claude usage is back. Queued work starts.",
-        esc(&names.join(", "))
+    tell_owner(
+        o,
+        format!(
+            "▶️ <b>{}</b>: Claude usage is back.",
+            esc(&names.join(", "))
+        ),
+        Notify::Silent,
     );
-    if let Err(e) = o
-        .chat
-        .send(
-            From::Orchestrator,
-            None,
-            &html,
-            vec![],
-            None,
-            Notify::Silent,
-        )
-        .await
-    {
-        tracing::warn!("telling the owner a usage limit reset failed: {e:#}");
-    }
     crate::tasks::dispatch_queued(o).await;
     Ok(())
 }
@@ -355,6 +455,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_message_may_carry_its_reset() {
+        let soon = (Utc::now() + chrono::Duration::hours(2)).timestamp();
+        let at = reset_in_message(&format!("Claude AI usage limit reached|{soon}")).unwrap();
+        assert_eq!(at.timestamp(), soon);
+        assert!(reset_in_message("You've hit your limit · resets 3pm").is_none());
+        assert!(reset_in_message("Claude AI usage limit reached|1000").is_none());
+    }
+
+    #[test]
     fn only_the_usage_limit_is_a_limit() {
         assert!(is_limit_message("Claude AI usage limit reached|1795483800"));
         assert!(is_limit_message(
@@ -366,6 +475,10 @@ mod tests {
             "API Error: 429 {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\"}}"
         ));
         assert!(!is_limit_message("Execution error"));
+        // An API key's spend limit is the owner's setting, not the subscription's window.
+        assert!(!is_limit_message(
+            "You have reached your specified workspace API usage limits"
+        ));
     }
 
     #[test]
@@ -379,6 +492,17 @@ mod tests {
             "seven_day": {"status": "rejected", "resetsAt": later},
         }});
         assert_eq!(reset_of(&windows).unwrap().timestamp(), later);
+        // The event's own reset is the 5-hour one, but the weekly window is out too: the node is
+        // out until both have reset.
+        let both = json!({"status": "rejected", "resetsAt": soon, "unifiedWindows": {
+            "five_hour": {"status": "rejected", "resetsAt": soon},
+            "seven_day": {"status": "rejected", "resetsAt": later},
+        }});
+        assert_eq!(reset_of(&both).unwrap().timestamp(), later);
+        assert!(any_rejected(&both));
+        assert!(!any_rejected(
+            &json!({"unifiedWindows": {"five_hour": {"status": "allowed"}}})
+        ));
         // A reset in the past is no reset: the caller guesses instead of holding nothing.
         assert!(reset_of(&json!({"resetsAt": 1_000_000})).is_none());
         assert!(reset_of(&json!({})).is_none());

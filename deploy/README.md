@@ -526,6 +526,25 @@ up to `FLEET_ATTACHMENT_MAX_MB` (50), and one task's files together up to
 uploader at most three in progress. A file containing one of the project's
 secret values is refused.
 
+### Claude usage limits, cost and stuck runs
+
+Nothing to set up. Each node's Claude reports its usage limits as it runs; when
+a node runs out, new task runs there wait in the queue until the limit resets,
+you are told once, and the tasks it cut off carry on by themselves after the
+reset. The Nodes page shows how much of each node's 5-hour and weekly windows is
+used. Every session's cost at API prices is kept and shown on its task (on a
+subscription that measures use; it is not a bill).
+
+A run that writes nothing for 30 minutes in the middle of a turn is reported in
+its topic as possibly stuck, and stopped after 2 hours (a message resumes it).
+It is not judged while it waits on you, between turns, or while its node is
+away. Change or turn off (`0`) either in `.env`:
+
+```sh
+FLEET_RUN_SILENT_WARN_MINUTES=30
+FLEET_RUN_SILENT_STOP_MINUTES=120
+```
+
 ## 7. Backups
 
 `deploy/scripts/backup.sh` dumps both databases and the roles, and archives
