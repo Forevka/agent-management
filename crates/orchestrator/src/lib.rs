@@ -21,6 +21,7 @@ pub mod feeds;
 pub mod habits;
 pub mod human;
 pub mod jira;
+pub mod jira_sync;
 pub mod kit;
 pub mod links;
 pub mod live;

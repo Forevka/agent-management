@@ -2521,6 +2521,191 @@ async fn roadmap_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool) {
     }
 }
 
+/// The local copy of a Jira (see `jira_sync`): one read finds the account ("me"), the site's
+/// sprint field, every open ticket of the project in its active sprint, its next sprint and its
+/// backlog whoever holds it, the sprints, and the people on them (commenters included); the Jira
+/// page filters that copy without calling Jira.
+async fn jira_mirror_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool) {
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path, path_regex},
+    };
+    let jira = MockServer::start().await;
+    let folder: i64 = sqlx::query_scalar(
+        "insert into secret_folders (name, preset) values ('jira-mir', 'jira') returning id",
+    )
+    .fetch_one(db)
+    .await
+    .unwrap();
+    for (key, value) in [
+        (crate::jira::URL_KEY, jira.uri()),
+        (crate::jira::EMAIL_KEY, "me@x.test".into()),
+        (crate::jira::TOKEN_KEY, "tok".into()),
+    ] {
+        sqlx::query("insert into secret_items (folder_id, key, value) values ($1, $2, $3)")
+            .bind(folder)
+            .bind(key)
+            .bind(o.vault.encrypt(&value))
+            .execute(db)
+            .await
+            .unwrap();
+    }
+    sqlx::query(
+        "insert into projects (slug, name, jira_key, jira_folder) values ('mir', 'Mir', 'MIR', 'jira-mir')",
+    )
+    .execute(db)
+    .await
+    .unwrap();
+    Mock::given(method("GET"))
+        .and(path("/rest/api/3/myself"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "accountId": "me-1", "displayName": "Owner", "timeZone": "Europe/Kyiv"})))
+        .mount(&jira)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/api/3/field"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {"id": "customfield_10020", "name": "Sprint",
+             "schema": {"custom": "com.pyxis.greenhopper.jira:gh-sprint"}},
+            {"id": "customfield_10019", "name": "Rank",
+             "schema": {"custom": "com.pyxis.greenhopper.jira:gh-lexo-rank"}},
+        ])))
+        .mount(&jira)
+        .await;
+    let soon = (chrono::Utc::now() + chrono::Duration::days(3)).to_rfc3339();
+    let active = json!({"id": 11, "name": "MIR Sprint 11", "state": "active", "boardId": 5,
+                        "startDate": "2026-11-23T09:00:00.000Z"});
+    let next = json!({"id": 12, "name": "MIR Sprint 12", "state": "future", "boardId": 5,
+                      "startDate": soon});
+    let user = |id: &str, name: &str| json!({"accountId": id, "displayName": name});
+    let issue = |key: &str, assignee: Value, sprints: Value, rank: &str| {
+        json!({"key": key, "id": key, "fields": {
+            "summary": format!("{key} work"),
+            "status": {"name": "To Do", "statusCategory": {"key": "new"}},
+            "issuetype": {"name": "Story"}, "priority": {"name": "Medium"},
+            "assignee": assignee, "reporter": user("u-3", "Rita Reporter"),
+            "customfield_10020": sprints, "customfield_10019": rank,
+            "updated": "2026-11-24T10:00:00.000+0000",
+        }})
+    };
+    Mock::given(method("POST"))
+        .and(path("/rest/api/3/search/jql"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"issues": [
+            issue("MIR-1", user("me-1", "Owner"), json!([active.clone()]), "0|a"),
+            issue("MIR-6", user("me-1", "Owner"), json!([next.clone()]), "0|b"),
+            issue("MIR-7", user("u-2", "Uma Assignee"), json!([]), "0|c"),
+            issue("MIR-8", Value::Null, json!([next.clone()]), "0|d"),
+        ]})))
+        .mount(&jira)
+        .await;
+    for (id, sprint) in [(11, &active), (12, &next)] {
+        Mock::given(method("GET"))
+            .and(path(format!("/rest/agile/1.0/sprint/{id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(sprint.clone()))
+            .mount(&jira)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/rest/api/3/issue/MIR-\d+/comment$"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"comments": [
+            {"author": user("u-4", "Dee Commenter"), "body": {"type": "doc"}}]})),
+        )
+        .mount(&jira)
+        .await;
+
+    let report = crate::jira_sync::sync_all(o, true).await.unwrap();
+    assert_eq!(report["jira-mir"]["ok"], json!(true), "{report}");
+    let account: (Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+        "select account_id, sprint_field, rank_field from jira_accounts where folder = 'jira-mir'",
+    )
+    .fetch_one(db)
+    .await
+    .unwrap();
+    assert_eq!(
+        account,
+        (
+            Some("me-1".into()),
+            Some("customfield_10020".into()),
+            Some("customfield_10019".into())
+        )
+    );
+    let open: Vec<(String, Option<i64>)> = sqlx::query_as(
+        "select jira_key, sprint_id from jira_issues where project = 'mir' and gone_at is null
+         order by jira_key",
+    )
+    .fetch_all(db)
+    .await
+    .unwrap();
+    assert_eq!(
+        open,
+        vec![
+            ("MIR-1".into(), Some(11)),
+            ("MIR-6".into(), Some(12)),
+            ("MIR-7".into(), None),
+            ("MIR-8".into(), Some(12)),
+        ]
+    );
+    let people: Vec<String> = sqlx::query_scalar(
+        "select account_id from jira_users where 'mir' = any(projects) order by account_id",
+    )
+    .fetch_all(db)
+    .await
+    .unwrap();
+    assert_eq!(people, vec!["me-1", "u-2", "u-3", "u-4"], "commenters too");
+
+    // The page filters the copy.
+    let keys = |v: &Value| -> Vec<String> {
+        v["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["key"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let all = api_get(o, "/api/jira?project=mir").await;
+    assert_eq!(
+        keys(&all),
+        ["MIR-1", "MIR-6", "MIR-8", "MIR-7"],
+        "active, next, backlog"
+    );
+    assert_eq!(all["issues"][0]["me"], json!(true));
+    assert_eq!(all["issues"][0]["sprint"]["name"], json!("MIR Sprint 11"));
+    assert_eq!(all["sync"]["jira-mir"]["ok"], json!(true));
+    assert_eq!(
+        keys(&api_get(o, "/api/jira?project=mir&assignee=me").await),
+        ["MIR-1", "MIR-6"]
+    );
+    assert_eq!(
+        keys(&api_get(o, "/api/jira?project=mir&assignee=none").await),
+        ["MIR-8"]
+    );
+    assert_eq!(
+        keys(&api_get(o, "/api/jira?project=mir&sprint=future").await),
+        ["MIR-6", "MIR-8"]
+    );
+    assert_eq!(
+        keys(&api_get(o, "/api/jira?project=mir&sprint=backlog").await),
+        ["MIR-7"]
+    );
+    assert_eq!(
+        keys(&api_get(o, "/api/jira?project=mir&q=uma").await),
+        ["MIR-7"]
+    );
+    assert_eq!(
+        keys(&api_get(o, "/api/jira?project=mir&q=100%25").await).len(),
+        0
+    );
+    let me = all["assignees"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["me"] == json!(true))
+        .unwrap()
+        .clone();
+    assert_eq!(me["count"], json!(2));
+}
+
 /// A read of the web API as the owner, for flows that want to check what the UI is shown.
 /// Mints its own session row, so it does not depend on another flow having run.
 async fn api_get(o: &Arc<Orchestrator>, uri: &str) -> Value {
@@ -10827,6 +11012,9 @@ async fn lifecycle() {
     // 21a''. The roadmap: the owner's Jira sprint read, estimated by the brain, approved by the
     //        owner, started window by window, and moved along in Jira.
     Box::pin(roadmap_flow(&o, &db)).await;
+    // 21a'''. The local copy of every Jira: active and future sprints and the backlog, any
+    //         assignee, the people on the tickets, and the page that filters them.
+    Box::pin(jira_mirror_flow(&o, &db)).await;
 
     // 21b. The kit: imported from a node, installed there without touching the owner's own
     //      items, the exact MCP allowlist of a worker's session, and the owner's alone. On node

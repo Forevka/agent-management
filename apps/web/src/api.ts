@@ -307,6 +307,52 @@ export type Inbox = {
 
 /// The daily retrospective: what the fleet concluded about its own days, and what it proposes
 /// doing about it. `detail` is a session's own prose — rendered as text, never as markup.
+/// A sprint as Jira names it (not the fleet's own roadmap sprints).
+export type JiraSprint = {
+  id: number
+  name: string | null
+  state: string | null
+  starts_at: string | null
+  ends_at: string | null
+}
+
+/// A ticket of the local copy of Jira. `summary` and the names are Jira's text: shown, never acted on.
+export type JiraIssue = {
+  project: string
+  key: string
+  url: string
+  summary: string
+  status: string | null
+  /** new, indeterminate or done */
+  status_category: string | null
+  type: string | null
+  priority: string | null
+  labels: string[]
+  parent: string | null
+  assignee: { account_id: string; name: string | null } | null
+  /** Assigned to the account the fleet reads this Jira as: the owner. */
+  me: boolean
+  reporter: string | null
+  sprint: JiraSprint | null
+  updated: string | null
+  roadmap: { item: number; state: string; task: { id: string; key: string; status: string | null } | null } | null
+}
+
+export type JiraPage = {
+  projects: { slug: string; name: string; color: string; key: string; folder: string; site: string | null }[]
+  sprints: (JiraSprint & { count: number })[]
+  assignees: { account_id: string | null; name: string | null; count: number; me: boolean }[]
+  statuses: { name: string | null; category: string | null; count: number }[]
+  issues: JiraIssue[]
+  /** More matched than were sent: narrow the filters. */
+  more: boolean
+  /** Each credential folder's last read. */
+  sync: Record<
+    string,
+    { site: string | null; account: string | null; at: string | null; full_at: string | null; ok: boolean; error: string | null; truncated: boolean }
+  >
+}
+
 /// One ticket of a roadmap sprint. `title` and `jira_status` are Jira's text: shown, never acted on.
 export type RoadmapItem = {
   id: number

@@ -545,6 +545,22 @@ FLEET_RUN_SILENT_WARN_MINUTES=30
 FLEET_RUN_SILENT_STOP_MINUTES=120
 ```
 
+### The Jira page
+
+Nothing to set up beyond a Jira key on each project (and its credential folder).
+The orchestrator keeps a copy of every project's tickets, whatever sprint they
+are in and whoever holds them, so the Jira page shows them all without asking
+Jira. It reads what changed every 15 minutes and everything open every 6 hours;
+"Read Jira now" on the page does a full read at once. Each account's last read,
+and why it failed if it did, is on the page.
+
+```sh
+FLEET_JIRA_SYNC_MINUTES=15
+FLEET_JIRA_FULL_SYNC_HOURS=6
+FLEET_JIRA_MAX_ISSUES=1000      # per project
+FLEET_JIRA_COMMENT_FETCHES=10   # changed tickets per account whose commenters are read
+```
+
 ### The roadmap
 
 Nothing to set up beyond a Jira key on each project. Every 15 minutes the

@@ -88,6 +88,25 @@ pub async fn for_project(o: &Orchestrator, project: &str) -> Result<Jira> {
     })
 }
 
+/// The Jira account a credential folder holds, for what belongs to the account rather than to one
+/// project: who it is, the site's fields, a sprint. It has no project key, so it is never used
+/// for an issue (every issue call checks the key).
+pub async fn for_folder(o: &Orchestrator, folder: &str) -> Result<Jira> {
+    let get = |k: &'static str| async move {
+        o.secret(folder, k).await?.with_context(|| {
+            format!("the Jira folder {folder:?} has no {k}; the owner sets it in the web UI")
+        })
+    };
+    Ok(Jira {
+        base: get(URL_KEY).await?.trim().trim_end_matches('/').to_owned(),
+        email: get(EMAIL_KEY).await?,
+        token: get(TOKEN_KEY).await?,
+        key: String::new(),
+        board: None,
+        http: http()?,
+    })
+}
+
 /// An HTTP client for Jira. Like every other client in the fleet, it installs the crypto
 /// provider first (idempotent: the first caller wins and the rest are no-ops).
 fn http() -> Result<reqwest::Client> {
@@ -378,6 +397,116 @@ impl Jira {
         Ok(out)
     }
 
+    /// Who this account is on its site: the account id (what "assigned to me" means there), its
+    /// name and its time zone.
+    pub async fn myself(&self) -> Result<JiraUser> {
+        let v = self
+            .call_at(reqwest::Method::GET, "rest/api/3/myself", None)
+            .await?;
+        user_of(&v).context("Jira did not say who this account is")
+    }
+
+    /// The site's sprint field and rank field. Their ids differ from site to site
+    /// (`customfield_10020` on one, something else on another), so they are looked up by what
+    /// they are, preferring the field named "Sprint" when a site has more than one.
+    pub async fn discover_fields(&self) -> Result<(Option<String>, Option<String>)> {
+        let v = self
+            .call_at(reqwest::Method::GET, "rest/api/3/field", None)
+            .await?;
+        Ok(fields_of(&v))
+    }
+
+    /// One sprint, from the agile API: its state and dates may change without any of its
+    /// issues changing (a sprint starting), so open sprints are asked about themselves.
+    pub async fn sprint_info(&self, id: i64) -> Result<SprintInfo> {
+        let v = self
+            .call_at(
+                reqwest::Method::GET,
+                &format!("rest/agile/1.0/sprint/{id}"),
+                None,
+            )
+            .await?;
+        sprint_of(&v).context("Jira sent a sprint without an id")
+    }
+
+    /// The issues of this project for the local copy (`jira_sync`): with `since`, those updated in
+    /// the last minutes (whatever their state, so one that was closed comes back closed);
+    /// without it, everything still open plus whatever is in an open sprint. At most `cap`, and
+    /// whether there were more. Always scoped to this project's key.
+    pub async fn mirror_issues(
+        &self,
+        since_minutes: Option<i64>,
+        sprint_field: Option<&str>,
+        rank_field: Option<&str>,
+        cap: usize,
+    ) -> Result<(Vec<MirrorIssue>, bool)> {
+        let jql = scoped_jql(&self.key, &mirror_jql(since_minutes));
+        let mut fields: Vec<&str> = vec![
+            "summary",
+            "status",
+            "issuetype",
+            "priority",
+            "labels",
+            "parent",
+            "assignee",
+            "reporter",
+            "created",
+            "updated",
+        ];
+        fields.extend(sprint_field);
+        fields.extend(rank_field);
+        let mut out = Vec::new();
+        let mut page: Option<String> = None;
+        let mut more = false;
+        for _ in 0..(cap / MIRROR_PAGE + 2) {
+            let mut body = json!({"jql": jql, "maxResults": MIRROR_PAGE, "fields": fields});
+            if let Some(tok) = &page {
+                body["nextPageToken"] = json!(tok);
+            }
+            let v = self
+                .call_at(reqwest::Method::POST, "rest/api/3/search/jql", Some(body))
+                .await?;
+            let issues = v["issues"].as_array().cloned().unwrap_or_default();
+            for i in &issues {
+                if let Some(m) = mirror_of(i, sprint_field, rank_field) {
+                    out.push(m);
+                }
+            }
+            page = v["nextPageToken"].as_str().map(str::to_owned);
+            if page.is_none() || issues.is_empty() {
+                break;
+            }
+            if out.len() >= cap {
+                more = true;
+                break;
+            }
+        }
+        more |= page.is_some() && out.len() >= cap;
+        out.truncate(cap);
+        Ok((out, more))
+    }
+
+    /// Who commented on an issue lately: the authors only, never what they wrote.
+    pub async fn comment_authors(&self, key: &str, n: i64) -> Result<Vec<JiraUser>> {
+        self.check(key)?;
+        let v = self
+            .call_at(
+                reqwest::Method::GET,
+                &format!(
+                    "rest/api/3/issue/{key}/comment?maxResults={}&orderBy=-created",
+                    n.clamp(1, 50)
+                ),
+                None,
+            )
+            .await?;
+        Ok(v["comments"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|c| user_of(&c["author"]))
+            .collect())
+    }
+
     /// Where a person reads an issue.
     pub fn browse_url(&self, key: &str) -> String {
         format!("{}/browse/{key}", self.base)
@@ -548,6 +677,166 @@ impl Jira {
         );
         Ok(())
     }
+}
+
+/// Issues per page of the local copy's reads.
+const MIRROR_PAGE: usize = 100;
+
+/// What the local copy reads: everything updated lately, or (a full sweep) everything still open
+/// plus whatever sits in an open sprint, done or not.
+pub fn mirror_jql(since_minutes: Option<i64>) -> String {
+    match since_minutes {
+        Some(m) => format!("updated >= -{}m ORDER BY updated DESC", m.max(1)),
+        None => "statusCategory != Done OR sprint in openSprints() ORDER BY key".into(),
+    }
+}
+
+/// Someone on a Jira site, as the local copy keeps them. Their name is theirs to choose: shown as
+/// text, framed as data wherever an agent reads it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JiraUser {
+    pub account_id: String,
+    pub display_name: String,
+    pub time_zone: Option<String>,
+    pub avatar_url: Option<String>,
+}
+
+fn user_of(v: &Value) -> Option<JiraUser> {
+    Some(JiraUser {
+        account_id: v["accountId"].as_str()?.to_owned(),
+        display_name: v["displayName"].as_str().unwrap_or("").to_owned(),
+        time_zone: v["timeZone"].as_str().map(str::to_owned),
+        avatar_url: v["avatarUrls"]["48x48"].as_str().map(str::to_owned),
+    })
+}
+
+/// A sprint: `active`, `future` or `closed`, with its board and dates when it has them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SprintInfo {
+    pub id: i64,
+    pub name: String,
+    pub state: String,
+    pub board_id: Option<i64>,
+    pub goal: Option<String>,
+    pub starts_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub ends_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+fn date(v: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
+    let s = v.as_str()?;
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .or_else(|| chrono::DateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.3f%z").ok())
+        .map(|d| d.with_timezone(&chrono::Utc))
+}
+
+fn sprint_of(v: &Value) -> Option<SprintInfo> {
+    Some(SprintInfo {
+        id: v["id"].as_i64()?,
+        name: v["name"].as_str().unwrap_or("").to_owned(),
+        state: v["state"].as_str().unwrap_or("").to_lowercase(),
+        board_id: v["boardId"].as_i64().or(v["originBoardId"].as_i64()),
+        goal: v["goal"]
+            .as_str()
+            .filter(|g| !g.is_empty())
+            .map(str::to_owned),
+        starts_at: date(&v["startDate"]),
+        ends_at: date(&v["endDate"]),
+    })
+}
+
+/// The sprint an issue is in now: an active one before a future one (the soonest), else none,
+/// which means the backlog. Closed sprints are history.
+pub fn pick_open_sprint(sprints: &[SprintInfo]) -> Option<&SprintInfo> {
+    sprints.iter().find(|s| s.state == "active").or_else(|| {
+        sprints
+            .iter()
+            .filter(|s| s.state == "future")
+            .min_by_key(|s| (s.starts_at.is_none(), s.starts_at, s.id))
+    })
+}
+
+/// The sprint and rank fields among a site's fields.
+fn fields_of(v: &Value) -> (Option<String>, Option<String>) {
+    let all = v.as_array().cloned().unwrap_or_default();
+    let of = |custom: &str| -> Vec<&Value> {
+        all.iter()
+            .filter(|f| f["schema"]["custom"].as_str() == Some(custom))
+            .collect()
+    };
+    let sprints = of("com.pyxis.greenhopper.jira:gh-sprint");
+    let sprint = sprints
+        .iter()
+        .find(|f| f["name"].as_str() == Some("Sprint"))
+        .or(sprints.first())
+        .and_then(|f| f["id"].as_str().map(str::to_owned));
+    let rank = of("com.pyxis.greenhopper.jira:gh-lexo-rank")
+        .first()
+        .and_then(|f| f["id"].as_str().map(str::to_owned));
+    (sprint, rank)
+}
+
+/// An issue as the local copy keeps it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MirrorIssue {
+    pub key: String,
+    pub id: Option<String>,
+    pub summary: String,
+    pub status: Option<String>,
+    pub status_category: Option<String>,
+    pub issue_type: Option<String>,
+    pub priority: Option<String>,
+    pub labels: Vec<String>,
+    pub parent: Option<String>,
+    pub assignee: Option<JiraUser>,
+    pub reporter: Option<JiraUser>,
+    /// Every sprint it has been in that Jira names, and the open one it is in now.
+    pub sprints: Vec<SprintInfo>,
+    pub sprint: Option<SprintInfo>,
+    pub rank: Option<String>,
+    pub created: Option<chrono::DateTime<chrono::Utc>>,
+    pub updated: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+fn mirror_of(
+    i: &Value,
+    sprint_field: Option<&str>,
+    rank_field: Option<&str>,
+) -> Option<MirrorIssue> {
+    let f = &i["fields"];
+    let key = i["key"].as_str()?.to_owned();
+    let sprints: Vec<SprintInfo> = sprint_field
+        .and_then(|sf| f[sf].as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(sprint_of)
+        .collect();
+    let sprint = pick_open_sprint(&sprints).cloned();
+    Some(MirrorIssue {
+        summary: clip(f["summary"].as_str().unwrap_or(&key), 500),
+        key,
+        id: i["id"].as_str().map(str::to_owned),
+        status: f["status"]["name"].as_str().map(str::to_owned),
+        status_category: f["status"]["statusCategory"]["key"]
+            .as_str()
+            .map(str::to_owned),
+        issue_type: f["issuetype"]["name"].as_str().map(str::to_owned),
+        priority: f["priority"]["name"].as_str().map(str::to_owned),
+        labels: f["labels"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|l| l.as_str().map(str::to_owned))
+            .collect(),
+        parent: f["parent"]["key"].as_str().map(str::to_owned),
+        assignee: user_of(&f["assignee"]),
+        reporter: user_of(&f["reporter"]),
+        sprints,
+        sprint,
+        rank: rank_field.and_then(|r| f[r].as_str()).map(str::to_owned),
+        created: date(&f["created"]),
+        updated: date(&f["updated"]),
+    })
 }
 
 /// The most tickets of one project's sprint the roadmap takes: a sprint is a fortnight of one
@@ -827,6 +1116,73 @@ mod tests {
             e.contains("404") && e.contains("do not have permission"),
             "{e}"
         );
+    }
+
+    #[test]
+    fn the_sprint_field_is_found_by_what_it_is() {
+        let fields = json!([
+            {"id": "customfield_1", "name": "Old sprint", "schema": {"custom": "com.pyxis.greenhopper.jira:gh-sprint"}},
+            {"id": "customfield_10020", "name": "Sprint", "schema": {"custom": "com.pyxis.greenhopper.jira:gh-sprint"}},
+            {"id": "customfield_10019", "name": "Rank", "schema": {"custom": "com.pyxis.greenhopper.jira:gh-lexo-rank"}},
+            {"id": "summary", "name": "Summary", "schema": {"system": "summary"}},
+        ]);
+        assert_eq!(
+            fields_of(&fields),
+            (
+                Some("customfield_10020".into()),
+                Some("customfield_10019".into())
+            )
+        );
+        assert_eq!(fields_of(&json!([])), (None, None));
+    }
+
+    #[test]
+    fn an_issue_is_in_its_active_sprint_else_its_next_one_else_the_backlog() {
+        let s = |id, state: &str, start: Option<&str>| {
+            sprint_of(
+                &json!({"id": id, "name": format!("S{id}"), "state": state, "startDate": start}),
+            )
+            .unwrap()
+        };
+        let closed = s(1, "closed", Some("2026-11-01T09:00:00.000Z"));
+        let active = s(2, "active", Some("2026-11-23T09:00:00.000Z"));
+        let later = s(4, "future", Some("2026-12-21T09:00:00.000Z"));
+        let next = s(3, "future", Some("2026-12-07T09:00:00.000Z"));
+        assert_eq!(
+            pick_open_sprint(&[closed.clone(), later.clone(), active.clone()])
+                .unwrap()
+                .id,
+            2
+        );
+        assert_eq!(
+            pick_open_sprint(&[closed.clone(), later, next]).unwrap().id,
+            3
+        );
+        assert_eq!(pick_open_sprint(&[closed]), None);
+        assert!(active.starts_at.is_some(), "Jira's dates are read");
+    }
+
+    #[test]
+    fn the_local_copy_reads_recent_changes_or_everything_open() {
+        assert_eq!(
+            mirror_jql(Some(30)),
+            "updated >= -30m ORDER BY updated DESC"
+        );
+        assert_eq!(
+            scoped_jql("DAP", &mirror_jql(None)),
+            "project = DAP AND (statusCategory != Done OR sprint in openSprints()) ORDER BY key"
+        );
+        let i = json!({"key": "DAP-1", "id": "100", "fields": {
+            "summary": "Do it", "status": {"name": "To Do", "statusCategory": {"key": "new"}},
+            "assignee": {"accountId": "u-1", "displayName": "Ann", "timeZone": "Europe/Kyiv"},
+            "customfield_10020": [{"id": 7, "name": "S7", "state": "future", "boardId": 3}],
+            "labels": ["api"],
+        }});
+        let m = mirror_of(&i, Some("customfield_10020"), None).unwrap();
+        assert_eq!(m.assignee.unwrap().account_id, "u-1");
+        assert_eq!(m.sprint.unwrap().id, 7);
+        assert_eq!(m.labels, vec!["api".to_string()]);
+        assert!(m.reporter.is_none());
     }
 
     #[test]

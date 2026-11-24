@@ -28,6 +28,7 @@ import Inbox from './pages/Inbox'
 import Habits from './pages/Habits'
 import Retro from './pages/Retro'
 import Roadmap from './pages/Roadmap'
+import Jira from './pages/Jira'
 import People from './pages/People'
 import Person from './pages/Person'
 import Kit from './pages/Kit'
@@ -68,6 +69,7 @@ createRoot(document.getElementById('root')!).render(
           <Route path="/habits" element={<Habits />} />
           <Route path="/retro" element={<Retro />} />
             <Route path="/roadmap" element={<Roadmap />} />
+            <Route path="/jira" element={<Jira />} />
           <Route path="/people" element={<People />} />
           <Route path="/people/:id" element={<Person />} />
           <Route path="/kit" element={<Kit />} />

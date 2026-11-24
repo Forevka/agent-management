@@ -56,6 +56,42 @@ pub struct Config {
     pub run_silent_stop_minutes: i64,
     /// The roadmap: Jira sprints worked through by the fleet (see `roadmap`).
     pub roadmap: RoadmapConfig,
+    /// The local copy of every connected Jira (see `jira_sync`).
+    pub jira: JiraConfig,
+}
+
+/// How the local copy of Jira is kept (see `jira_sync`).
+#[derive(Debug, Clone)]
+pub struct JiraConfig {
+    /// How often each account reads what changed.
+    pub sync_minutes: i64,
+    /// How often everything still open is read again, which is the only read that may mark a
+    /// ticket gone.
+    pub full_sync_hours: i64,
+    /// The most tickets one project keeps.
+    pub max_issues: usize,
+    /// The most tickets per account whose commenters are read in one sync.
+    pub comment_fetches: i64,
+}
+
+impl JiraConfig {
+    fn from_env(roadmap_sync_minutes: i64) -> Self {
+        Self {
+            sync_minutes: env_num("FLEET_JIRA_SYNC_MINUTES", roadmap_sync_minutes).max(1),
+            full_sync_hours: env_num("FLEET_JIRA_FULL_SYNC_HOURS", 6).max(1),
+            max_issues: env_num("FLEET_JIRA_MAX_ISSUES", 1000).clamp(50, 20_000) as usize,
+            comment_fetches: env_num("FLEET_JIRA_COMMENT_FETCHES", 10).clamp(0, 100),
+        }
+    }
+
+    pub fn test() -> Self {
+        Self {
+            sync_minutes: 15,
+            full_sync_hours: 6,
+            max_issues: 1000,
+            comment_fetches: 10,
+        }
+    }
 }
 
 /// The roadmap's calendar (see `roadmap`): a fleet sprint of `sprint_days` days, each day cut into
@@ -393,6 +429,7 @@ impl Config {
         }
         // The retrospective's default model is the fleet's own.
         let model_for_retro = model.clone();
+        let roadmap = RoadmapConfig::from_env()?;
         Ok(Self {
             public_url: std::env::var("FLEET_PUBLIC_URL")
                 .context("FLEET_PUBLIC_URL is required")?
@@ -436,7 +473,8 @@ impl Config {
                 * 1024,
             run_silent_warn_minutes: env_num("FLEET_RUN_SILENT_WARN_MINUTES", 30).max(0),
             run_silent_stop_minutes: env_num("FLEET_RUN_SILENT_STOP_MINUTES", 120).max(0),
-            roadmap: RoadmapConfig::from_env()?,
+            roadmap: roadmap.clone(),
+            jira: JiraConfig::from_env(roadmap.sync_minutes),
         })
     }
 
@@ -474,6 +512,7 @@ impl Config {
             run_silent_warn_minutes: 30,
             run_silent_stop_minutes: 120,
             roadmap: RoadmapConfig::test(),
+            jira: JiraConfig::test(),
         }
     }
 }

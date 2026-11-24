@@ -63,6 +63,7 @@ pub fn router() -> Router<O> {
         .route("/api/habits", get(habits).post(habits_act))
         .route("/api/retro", get(retro).post(retro_act))
         .route("/api/roadmap", get(roadmap).post(roadmap_act))
+        .route("/api/jira", get(jira_issues).post(jira_act))
         .route("/api/people", get(people).post(people_act))
         .route("/api/people/{id}", get(person).post(person_act))
         .route("/api/kit", get(kit).post(kit_act))
@@ -1808,6 +1809,53 @@ async fn habits_act(State(o): State<O>, h: HeaderMap, Json(a): Json<Act>) -> Api
     };
     let note = crate::habits::button(&o, &format!("hb|{id}|{action}")).await?;
     Ok(Json(json!({"done": note})))
+}
+
+// ---------------------------------------------------------------- jira
+
+#[derive(Deserialize)]
+struct JiraQuery {
+    project: Option<String>,
+    sprint: Option<String>,
+    assignee: Option<String>,
+    status: Option<String>,
+    q: Option<String>,
+    limit: Option<i64>,
+}
+
+/// Every connected Jira's tickets, from the local copy (`jira_sync`): nothing here calls Jira.
+async fn jira_issues(State(o): State<O>, h: HeaderMap, Query(q): Query<JiraQuery>) -> Api {
+    guard!(o, h);
+    let pick = |v: Option<String>, default: &str| {
+        v.map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| default.to_owned())
+    };
+    let f = crate::jira_sync::IssueFilter {
+        project: q.project.filter(|p| !p.trim().is_empty()),
+        sprint: pick(q.sprint, "all"),
+        assignee: pick(q.assignee, "any"),
+        status: pick(q.status, "open"),
+        q: q.q.filter(|s| !s.trim().is_empty()),
+        limit: q.limit.unwrap_or(500),
+    };
+    Ok(Json(crate::jira_sync::issues_json(&o, &f).await?))
+}
+
+/// Reading every Jira again now, in full: what the owner presses when the page looks stale.
+async fn jira_act(State(o): State<O>, h: HeaderMap, Json(a): Json<Act>) -> Api {
+    guard!(o, h, write);
+    match a.op.as_str() {
+        "refresh" => {
+            let v = crate::jira_sync::sync_all(&o, true).await?;
+            o.audit("owner", "jira.refresh", json!({})).await;
+            Ok(Json(json!({"done": "read from Jira", "accounts": v})))
+        }
+        other => Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("unknown operation {other:?}"),
+        )),
+    }
 }
 
 // ---------------------------------------------------------------- roadmap

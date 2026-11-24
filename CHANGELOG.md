@@ -7,6 +7,18 @@ below is one release. How to add to this file is in `CLAUDE.md`
 
 ## Unreleased
 
+- **A Jira page with every ticket of every Jira you connected.** The fleet keeps a copy of each
+  project's tickets in its active sprint, the sprints after it and its backlog, whoever holds
+  them, read every 15 minutes (only what changed) and in full every 6 hours or when you press
+  "Read Jira now". The page groups them by sprint in working order, with filters for project,
+  sprint, assignee (you, unassigned, anyone or a person) and status, and a search; each shows
+  whether it is on the roadmap or has a task. It never waits on Jira and holds no credential.
+  It also keeps who appears on the tickets (assignees, reporters, commenters), which the people
+  network will use. `FLEET_JIRA_SYNC_MINUTES`, `FLEET_JIRA_FULL_SYNC_HOURS`,
+  `FLEET_JIRA_MAX_ISSUES`, `FLEET_JIRA_COMMENT_FETCHES`. Migration `0031` adds new tables only.
+
+## v0.2.24 — 2026-11-24
+
 - **Every project has a colour.** Everything of a project carries it: a stripe down its cards on
   the board, a tag on its tasks, tickets and sessions, its folder in the sidebar, its tickets on
   the roadmap. Pick it on the project's settings page (twelve colours); until you do, each

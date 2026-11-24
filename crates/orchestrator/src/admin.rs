@@ -2868,7 +2868,7 @@ fn link_allowed(page: &str) -> bool {
     match (first, second, third) {
         (
             "" | "projects" | "secrets" | "nodes" | "agents" | "tasks" | "sessions" | "inbox"
-            | "habits" | "retro" | "roadmap" | "people" | "kit",
+            | "habits" | "retro" | "roadmap" | "jira" | "people" | "kit",
             None,
             None,
         ) => true,
@@ -2891,7 +2891,7 @@ pub async fn send_link(o: &Orchestrator, page: &str, text: Option<&str>) -> Resu
     let page = page.trim();
     ensure!(
         link_allowed(page),
-        "page must be one of /, /tasks[/<id>[/session]], /sessions, /projects[/<slug>[/tasks|/sessions|/agents|/settings]], /inbox, /agents, /nodes[/<node-id>], /secrets[/<folder-id>], /kit[/<item-id>], /habits, /retro, /roadmap, /people[/<id>], /items/<id>, optionally with a filter query such as /tasks?project=bioins&status=failed"
+        "page must be one of /, /tasks[/<id>[/session]], /sessions, /projects[/<slug>[/tasks|/sessions|/agents|/settings]], /inbox, /agents, /nodes[/<node-id>], /secrets[/<folder-id>], /kit[/<item-id>], /habits, /retro, /roadmap, /jira, /people[/<id>], /items/<id>, optionally with a filter query such as /tasks?project=bioins&status=failed"
     );
     let text = clip(
         text.map(str::trim)
