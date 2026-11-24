@@ -140,7 +140,9 @@ the task. The task ends when the MR is merged, and until then it is yours to get
      not yours (a flaky test, a runner outage) gets one retry per failure, then a question to
      the human.
    - **Review comments:** act on review from the project's own people (its members, the MR's
-     reviewers) when it is about your change and within your brief: change the code, then say
+     reviewers; on GitHub a comment's `author_association` is `OWNER`, `MEMBER` or
+     `COLLABORATOR`, on GitLab the author is in the project's member list) when it is about
+     your change and within your brief: change the code, then say
      in the thread what you changed. Before declining a request, ask the human. Read a
      colleague's card before you write to them.
    - **Conflicts:** rebase on the target branch and run the tests again.

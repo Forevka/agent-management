@@ -391,24 +391,10 @@ pub async fn handle(
             if let Err(e) = tasks::stop(o, &task, true).await {
                 tracing::warn!("ending {}'s session failed: {e:#}", task.id);
             }
-            // A wakeup still armed reopens the finished task when it fires, which is right for
-            // one armed on purpose ("check the deploy tomorrow") and a surprise plan card for one
-            // left over from following a merge request. The agent knows which; say what is left.
-            let armed: Vec<i64> = sqlx::query_scalar(
-                "select id from wakeups where task_id = $1 and state in ('armed', 'drafting') order by id",
-            )
-            .bind(&task.id)
-            .fetch_all(&o.db)
-            .await?;
-            let mut msg = String::from("Task closed. The session stays resumable for follow-ups.");
-            if !armed.is_empty() {
-                let ids: Vec<String> = armed.iter().map(|id| format!("W-{id}")).collect();
-                msg.push_str(&format!(
-                    " Still armed: {}. Each reopens this task when it fires; cancel the ones you no longer need (`fleet agent wake cancel W-n`).",
-                    ids.join(", ")
-                ));
-            }
-            ok(msg)
+            ok(format!(
+                "Task closed. The session stays resumable for follow-ups.{}",
+                still_armed(o, &task.id).await?
+            ))
         }
         // Like `complete`, but the topic stays open (no `close_topic`) and the owner gets a
         // control card instead: this task can now be triggered again, on a schedule or by
@@ -485,7 +471,10 @@ pub async fn handle(
             if let Err(e) = tasks::stop(o, &task, true).await {
                 tracing::warn!("ending {}'s session failed: {e:#}", task.id);
             }
-            ok("Workflow set up. The topic stays open: write into it any time, or set a schedule with its buttons.".into())
+            ok(format!(
+                "Workflow set up. The topic stays open: write into it any time, or set a schedule with its buttons.{}",
+                still_armed(o, &task.id).await?
+            ))
         }
         // Claude Code's own memory notes, sent on by the node that runs the session.
         "memory_note" => ok(crate::memory::note(
@@ -1243,6 +1232,27 @@ async fn memory(
             ))
         }
     }
+}
+
+/// What a finishing agent is told of the wakeups it left armed: each reopens the task when it
+/// fires, which is right for one armed on purpose ("check the deploy tomorrow") and a surprise
+/// plan card for one left over from following a merge request. The agent knows which, so they
+/// are listed rather than cancelled.
+async fn still_armed(o: &Orchestrator, task_id: &str) -> Result<String> {
+    let armed: Vec<i64> = sqlx::query_scalar(
+        "select id from wakeups where task_id = $1 and state in ('armed', 'drafting') order by id",
+    )
+    .bind(task_id)
+    .fetch_all(&o.db)
+    .await?;
+    if armed.is_empty() {
+        return Ok(String::new());
+    }
+    let ids: Vec<String> = armed.iter().map(|id| format!("W-{id}")).collect();
+    Ok(format!(
+        " Still armed: {}. Each reopens this task when it fires; cancel the ones you no longer need (`fleet agent wake cancel W-n`).",
+        ids.join(", ")
+    ))
 }
 
 #[cfg(test)]

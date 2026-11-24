@@ -1981,6 +1981,13 @@ fn is_finished(task: &TaskRow) -> bool {
 pub async fn owner_stop(o: &Orchestrator, id: &str) -> Result<(TaskRow, bool)> {
     let task = owner_task(o, id).await?;
     if is_finished(&task) && !task.running {
+        // Nothing runs, but what it left armed would reopen it: the owner's Stop ends that too.
+        sqlx::query(
+            "update wakeups set state = 'cancelled' where task_id = $1 and state in ('armed', 'drafting')",
+        )
+        .bind(&task.id)
+        .execute(&o.db)
+        .await?;
         return Ok((task, false));
     }
     stop(o, &task, false).await?;

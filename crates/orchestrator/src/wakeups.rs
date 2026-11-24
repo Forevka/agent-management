@@ -628,20 +628,30 @@ async fn fire(
         .task(&w.task_id)
         .await?
         .with_context(|| format!("task {} is gone", w.task_id))?;
+    // A stopped task stays stopped. A stop cancels what is armed, but a wakeup already taken
+    // from the queue when the stop came would otherwise resume it, in auto mode. Only one armed
+    // before the stop, though: one armed since (a session the owner resumed, then let rest
+    // again) is a new wish.
+    if task.status == "stopped" && w.created_at < task.updated_at {
+        tracing::info!(task = %task.id, "wakeup W-{} not delivered: the task was stopped", w.id);
+        return Ok(());
+    }
     // Rounds are counted for the task, not for this one wakeup: an agent that keeps waiting arms
     // a new one-shot nap each time, so the wakeup's own count would always say 0, and the advice
-    // below to stop after a few rounds would never have a number to go by. This firing is
-    // already counted (`fire_and_rearm`), so it is taken off.
-    let total: i64 = sqlx::query_scalar(
-        "select coalesce(sum(fires), 0)::bigint from wakeups where task_id = $1",
+    // below to stop after a few rounds would never have a number to go by. Its other wakeups of
+    // the last week (an old wait is a different story), plus this one's earlier firings.
+    let others: i64 = sqlx::query_scalar(
+        "select coalesce(sum(fires), 0)::bigint from wakeups
+         where task_id = $1 and id <> $2 and last_at > now() - interval '7 days'",
     )
     .bind(&w.task_id)
+    .bind(w.id)
     .fetch_one(&o.db)
     .await?;
     let mut text = format!(
-        "[Wakeup W-{}; this task was woken {} time(s) before] You asked to be woken, in your own words: {}.",
+        "[Wakeup W-{}; this task was woken {} time(s) in the last week] You asked to be woken, in your own words: {}.",
         w.id,
-        (total - 1).max(0),
+        others + i64::from(w.fires),
         tasks::untrusted(&w.note, 1000)
     );
     if let Some(why) = why {

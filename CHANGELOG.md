@@ -20,7 +20,8 @@ below is one release. How to add to this file is in `CLAUDE.md`
   whether to keep following. The orchestrator's briefs now define such work as done at merge.
   Nothing to configure; it uses the agent's own `glab`/`gh` and the existing wakeups.
 - **Stopping a task cancels its wakeups.** Before, a stopped task whose agent had armed one
-  resumed on its own when it fired, without asking for its plan again. `complete` now also
+  resumed on its own when it fired, without asking for its plan again (Stop on a finished task
+  cancels them too). `complete` and `workflow-finish` now
   lists the wakeups still armed, so an agent cancels the ones it no longer needs.
 - **The wake message counts the task's rounds**, not the wakeup's own (which was always 0 for
   an agent that naps again and again), so "after a few rounds, report and stop" can work.
