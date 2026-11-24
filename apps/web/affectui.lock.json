@@ -1,6 +1,7 @@
 {
   "roots": [
     "app-shell",
+    "scheduled-runs",
     "stat-card"
   ],
   "items": {
@@ -49,6 +50,12 @@
       "tier": "free",
       "files": {
         "popover-clean.tsx": "1115cc51917c9d69ec2da53af5ee5dd1e95e8482ddbe754d585e5775c717ad5d"
+      }
+    },
+    "scheduled-runs": {
+      "tier": "pro",
+      "files": {
+        "scheduled-runs.tsx": "dc23b288bd70bf3e11777bf6fa39d7b72d1e22c792c5a27125879465458917e4"
       }
     },
     "setup-guide-clean": {

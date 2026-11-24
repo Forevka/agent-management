@@ -7,6 +7,25 @@ below is one release. How to add to this file is in `CLAUDE.md`
 
 ## Unreleased
 
+- **The roadmap: your Jira sprints, worked through by the fleet.** Every project with a Jira
+  key has its sprint read every 15 minutes (the tickets assigned to you, as `jira sprint`
+  means) into the fleet's own two-week sprint, `S-1`, `S-2`, … Each day has Claude usage
+  windows (07:00, 12:00 and 17:00, five hours each) and every ticket an estimate in percent of
+  one window, which the orchestrator sets after reading it. Nothing starts until you approve:
+  one card in the new 🗺 Roadmap topic (and the Roadmap page) lists what waits for you. Once
+  approved, a ticket starts on its own when its window opens, at most two per window, as a
+  task named after it with the ticket linked; the fleet moves the ticket to In Progress, and
+  to In Review with the merge request in a comment once the task links its MR. A ticket you
+  already gave the fleet is adopted, not started twice. The Roadmap page shows the sprint as a
+  week board (affectUI's Scheduled Runs): drag a ticket to a window to start it there, change
+  an estimate, skip a ticket. `FLEET_ROADMAP` (off with `0`), `FLEET_ROADMAP_SESSIONS`,
+  `FLEET_ROADMAP_WINDOW_MINUTES`, `FLEET_ROADMAP_SPRINT_DAYS`, `FLEET_ROADMAP_SYNC_MINUTES`,
+  `FLEET_ROADMAP_START`. Migration `0029` adds two new tables only. The brain's new
+  `fleet agent roadmap` commands live in the node binary, and its rules in its prompt: after
+  the deploy, run `/brain_reset`.
+
+## v0.2.21 — 2026-11-24
+
 - **A node out of Claude usage holds its work until the limit resets, and the work carries on
   by itself.** Claude reports its usage limits as it runs; when a node's limit is hit, new task
   runs there wait in the queue (saying why), the owner is told once with when it resets, and

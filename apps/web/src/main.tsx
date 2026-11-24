@@ -27,6 +27,7 @@ import Agents from './pages/Agents'
 import Inbox from './pages/Inbox'
 import Habits from './pages/Habits'
 import Retro from './pages/Retro'
+import Roadmap from './pages/Roadmap'
 import People from './pages/People'
 import Person from './pages/Person'
 import Kit from './pages/Kit'
@@ -66,6 +67,7 @@ createRoot(document.getElementById('root')!).render(
           <Route path="/inbox" element={<Inbox />} />
           <Route path="/habits" element={<Habits />} />
           <Route path="/retro" element={<Retro />} />
+            <Route path="/roadmap" element={<Roadmap />} />
           <Route path="/people" element={<People />} />
           <Route path="/people/:id" element={<Person />} />
           <Route path="/kit" element={<Kit />} />

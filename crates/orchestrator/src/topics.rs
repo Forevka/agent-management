@@ -8,7 +8,8 @@
 //! agents' messages to each other), which the owner can read but never has to;
 //! **Rules** is the log of the secretary's triage rules and the owner's habits, so everything
 //! standing is searchable in one place; **Retro** is the daily retrospective's: what the fleet
-//! concluded about its own day and what it proposes to do better.
+//! concluded about its own day and what it proposes to do better; **Roadmap** is the sprint
+//! plan's: the cards that approve tickets and a line for each ticket the fleet starts.
 //! A task's own topic stays that agent's work, and General stays what needs the owner.
 
 use anyhow::Result;
@@ -20,11 +21,13 @@ pub const INBOX: &str = "📋 Inbox";
 pub const AGENTS: &str = "🤖 agent-communication";
 pub const RULES: &str = "📜 Rules";
 pub const RETRO: &str = "📈 Retro";
+pub const ROADMAP: &str = "🗺 Roadmap";
 
 const INBOX_KEY: &str = "inbox_topic";
 const AGENTS_KEY: &str = "agents_topic";
 const RULES_KEY: &str = "rules_topic";
 const RETRO_KEY: &str = "retro_topic";
+const ROADMAP_KEY: &str = "roadmap_topic";
 
 /// The topic id remembered under `key`, if it was created already.
 async fn topic_if_any(o: &Orchestrator, key: &str) -> Result<Option<i64>> {
@@ -67,4 +70,9 @@ pub async fn rules(o: &Orchestrator) -> Result<i64> {
 /// Where the daily retrospective puts its verdict and its proposals.
 pub async fn retro(o: &Orchestrator) -> Result<i64> {
     topic(o, RETRO_KEY, RETRO).await
+}
+
+/// Where the roadmap asks the owner to approve tickets and says what it started.
+pub async fn roadmap(o: &Orchestrator) -> Result<i64> {
+    topic(o, ROADMAP_KEY, ROADMAP).await
 }

@@ -572,6 +572,7 @@ pub async fn handle(
                 });
             }
             let l = crate::links::add(o, target, reference, who).await?;
+            crate::roadmap::on_link(o, &l);
             ok(match &l.url {
                 Some(u) => format!("{target} is linked to {} ({u}).", l.ref_),
                 None => format!("{target} is linked to {}.", l.ref_),
@@ -761,6 +762,35 @@ pub async fn handle(
         )
         .await?),
         "admin_propose" => ok(admin::propose(o, &args).await?),
+        // The roadmap (see `roadmap`): reading it and estimating are the brain's; approving what
+        // starts is the owner's alone, so there is no tool for it.
+        "roadmap" => ok(crate::roadmap::describe(o).await?),
+        "roadmap_estimate" => {
+            let row = crate::roadmap::estimate(
+                o,
+                args["issue"].as_str().context("issue required")?,
+                args["usage"]
+                    .as_i64()
+                    .context("usage required: percent of one window")?,
+                args["note"].as_str(),
+                "orchestrator",
+            )
+            .await?;
+            ok(format!(
+                "{} is now estimated at {}% of one window.",
+                row.jira_key, row.usage
+            ))
+        }
+        "roadmap_sync" => {
+            let s = crate::roadmap::current_sprint(o).await?;
+            let v = crate::roadmap::sync(o, &s).await?;
+            crate::roadmap::tick_soon(o);
+            ok(format!(
+                "Read sprint {} from Jira: {}",
+                s.name(),
+                v["projects"]
+            ))
+        }
         // What the brain did with a standing request of the owner's, kept in that habit's log
         // so "did it run?" has an answer to read (see `habits`).
         "habit_report" => ok(crate::habits::report(o, &args).await?),

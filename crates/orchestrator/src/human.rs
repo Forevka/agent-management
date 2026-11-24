@@ -261,6 +261,7 @@ pub(crate) async fn announce(
             ]],
         ),
         "reply" => reply_card(row),
+        "sprint_plan" => crate::roadmap::card(p, row.id, link_placeholder(row.id)),
         "admin_change" => (
             format!(
                 "🛠 <b>Q-{}</b> The orchestrator asks to change the fleet:\n<b>{}</b>{}\n<i>Tap a button, or reply yes / no. Any other reply rejects it, with your words as the reason.</i>",
@@ -287,6 +288,7 @@ pub(crate) async fn announce(
     // A reply draft answers the owner in the Inbox, where they asked for it.
     let topic = match &row.project {
         _ if row.kind == "reply" => Some(crate::topics::inbox(o).await?),
+        _ if row.kind == "sprint_plan" => Some(crate::topics::roadmap(o).await?),
         Some(p) => Some(tasks::human_topic(o, p, row.blocking).await?),
         None => None,
     };
@@ -720,6 +722,16 @@ async fn apply(o: &Arc<Orchestrator>, row: &HumanItemRow, ans: Answer) -> Result
                 .await?;
             Ok(("sent to Slack".into(), json!({"ts": ts})))
         }
+        // The owner's answer to the roadmap's plan card: approve its tickets, or leave them off
+        // the plan for now (see `roadmap`).
+        ("sprint_plan", Answer::Accept | Answer::Approve) => {
+            let summary = crate::roadmap::answer_card(o, p, true).await?;
+            Ok((summary, json!({"approved": true})))
+        }
+        ("sprint_plan", Answer::Dismiss | Answer::Deny) => {
+            let summary = crate::roadmap::answer_card(o, p, false).await?;
+            Ok((summary, json!({"approved": false})))
+        }
         ("task_proposal" | "slack_reply", Answer::Dismiss) => {
             Ok(("dismissed".into(), json!({"dismissed": true})))
         }
@@ -900,7 +912,7 @@ fn tell_brain(o: &Orchestrator, id: i64, outcome: &str) {
     o.tell_brain(format!("[Admin change Q-{id}] {outcome}"));
 }
 
-async fn pick_implementor(o: &Orchestrator, project: &str) -> Result<Option<String>> {
+pub(crate) async fn pick_implementor(o: &Orchestrator, project: &str) -> Result<Option<String>> {
     Ok(sqlx::query_scalar(
         "select a.id from agents a where a.project = $1 and a.role = 'implementor'
          order by (select count(*) from tasks t where t.agent_id = a.id and t.status in ('running','planning','waiting')), a.last_active desc nulls last limit 1",

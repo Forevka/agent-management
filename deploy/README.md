@@ -545,6 +545,31 @@ FLEET_RUN_SILENT_WARN_MINUTES=30
 FLEET_RUN_SILENT_STOP_MINUTES=120
 ```
 
+### The roadmap
+
+Nothing to set up beyond a Jira key on each project. Every 15 minutes the
+orchestrator reads each project's sprint (the tickets assigned to the Jira
+account, on the project's board when one is set) into the fleet's own two-week
+sprint. New tickets go to the orchestrator to estimate, then to you as one card
+in the 🗺 Roadmap topic and on the Roadmap page. An approved ticket starts on its
+own when its usage window opens (at most two per window), and its Jira ticket is
+moved to In Progress, then to In Review with the merge request linked. Tune it
+in `.env`; the windows are local times in `FLEET_TIMEZONE`:
+
+```sh
+FLEET_ROADMAP=1                          # 0 turns it off
+FLEET_ROADMAP_SESSIONS=07:00,12:00,17:00 # when windows open
+FLEET_ROADMAP_WINDOW_MINUTES=300         # how long each lasts
+FLEET_ROADMAP_SPRINT_DAYS=14
+FLEET_ROADMAP_SYNC_MINUTES=15
+FLEET_ROADMAP_START=2026-11-23           # optional: the first sprint's first day
+```
+
+The account needs the transitions your workflow names *In Progress* and *In
+Review* (also accepted: *Start Progress*, *Code Review*, *Review*, *Ready for
+Review*). When a workflow has neither, the task's topic says so and the ticket
+is left where it is.
+
 ## 7. Backups
 
 `deploy/scripts/backup.sh` dumps both databases and the roles, and archives

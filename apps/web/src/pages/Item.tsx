@@ -73,7 +73,7 @@ function Questions({ item, answers, set }: { item: ItemT; answers: Answers; set:
 
 /// The kinds this page has a form for. Anything else still has to be readable, so it falls back
 /// to its payload as text: an item the owner cannot see is an item they cannot answer.
-const WITH_FORM = ['plan', 'question', 'permission', 'ask', 'admin_change', 'task_proposal', 'slack_reply', 'reply']
+const WITH_FORM = ['plan', 'question', 'permission', 'ask', 'admin_change', 'task_proposal', 'slack_reply', 'reply', 'sprint_plan']
 
 export default function Item() {
   const { id = '' } = useParams()
@@ -305,6 +305,42 @@ export default function Item() {
                       </Button>
                       <Button variant="secondary" onClick={() => void send('dismiss')} loading={busy === 'dismiss'}>
                         Dismiss
+                      </Button>
+                    </Row>
+                  </CardFooter>
+                </Card>
+              )}
+
+              {it.kind === 'sprint_plan' && (
+                <Card>
+                  <CardHeader
+                    title={`Sprint ${str(p.name)} · ${str(p.span)}`}
+                    description="Tickets from your Jira sprint, waiting for your approval. Once approved, each starts on its own when its window opens. Titles are Jira's text."
+                  />
+                  <CardContent>
+                    <Stack gap="2">
+                      {(Array.isArray(p.lines) ? p.lines : []).map((l: Record<string, unknown>) => (
+                        <Stack key={String(l.id)} gap="1">
+                          <Text size="2" weight="medium" mono>
+                            {str(l.key)} · {String(l.usage)}% · {typeof l.when === 'string' ? l.when : 'no room this sprint'}
+                          </Text>
+                          <Text size="1" tone="muted" breakAll>
+                            {str(l.title)}
+                          </Text>
+                        </Stack>
+                      ))}
+                      <Link to="/roadmap" className="fx-link">
+                        Open the roadmap
+                      </Link>
+                    </Stack>
+                  </CardContent>
+                  <CardFooter>
+                    <Row gap="2">
+                      <Button onClick={() => void send('accept')} loading={busy === 'accept'}>
+                        Approve
+                      </Button>
+                      <Button variant="secondary" onClick={() => void send('dismiss')} loading={busy === 'dismiss'}>
+                        Not now
                       </Button>
                     </Row>
                   </CardFooter>

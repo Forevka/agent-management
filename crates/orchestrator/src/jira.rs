@@ -319,6 +319,69 @@ impl Jira {
         self.search(&jql, limit).await
     }
 
+    /// Every ticket of the owner's sprint (as [`Jira::sprint`] means it), for the roadmap: up to
+    /// [`ROADMAP_MAX`], with the status category that says whether it is done. Epics are left out:
+    /// they are containers, and their stories are what gets worked on.
+    pub async fn sprint_issues(&self) -> Result<Vec<SprintIssue>> {
+        let jql = scoped_jql(
+            &self.key,
+            &sprint_jql(self.active_sprint().await?).replace(
+                " ORDER BY status, priority DESC",
+                " ORDER BY priority DESC, rank",
+            ),
+        );
+        let mut out = Vec::new();
+        let mut page: Option<String> = None;
+        // A bounded number of pages: a Jira that keeps handing out tokens must not hold the
+        // roadmap for ever.
+        for _ in 0..(ROADMAP_MAX / MAX_RESULTS as usize + 2) {
+            let mut body = json!({
+                "jql": jql,
+                "maxResults": MAX_RESULTS,
+                "fields": ["summary", "status", "issuetype", "priority"],
+            });
+            if let Some(t) = &page {
+                body["nextPageToken"] = json!(t);
+            }
+            let v = self
+                .call_at(reqwest::Method::POST, "rest/api/3/search/jql", Some(body))
+                .await?;
+            for i in v["issues"].as_array().into_iter().flatten() {
+                let f = &i["fields"];
+                let Some(key) = i["key"].as_str() else {
+                    continue;
+                };
+                let issue_type = f["issuetype"]["name"].as_str().map(str::to_owned);
+                if issue_type
+                    .as_deref()
+                    .is_some_and(|t| t.eq_ignore_ascii_case("epic"))
+                {
+                    continue;
+                }
+                out.push(SprintIssue {
+                    key: key.to_owned(),
+                    summary: clip(f["summary"].as_str().unwrap_or(key), 300),
+                    status: f["status"]["name"].as_str().map(str::to_owned),
+                    done: f["status"]["statusCategory"]["key"].as_str() == Some("done"),
+                    issue_type,
+                    priority: f["priority"]["name"].as_str().map(str::to_owned),
+                });
+            }
+            let empty = v["issues"].as_array().is_none_or(|a| a.is_empty());
+            page = v["nextPageToken"].as_str().map(str::to_owned);
+            if page.is_none() || empty || out.len() >= ROADMAP_MAX {
+                break;
+            }
+        }
+        out.truncate(ROADMAP_MAX);
+        Ok(out)
+    }
+
+    /// Where a person reads an issue.
+    pub fn browse_url(&self, key: &str) -> String {
+        format!("{}/browse/{key}", self.base)
+    }
+
     /// The id of the active sprint of this project's board, if a board was configured.
     async fn active_sprint(&self) -> Result<Option<i64>> {
         let Some(board) = self.board else {
@@ -387,6 +450,39 @@ impl Jira {
         Ok(json!({"issue": key, "moved_to": name}))
     }
 
+    /// Moves an issue by the first of `names` its workflow offers (a transition or the status it
+    /// leads to), since workflows name the same step differently ("In Review", "Code Review").
+    /// Returns the name used.
+    pub async fn transition_any(&self, key: &str, names: &[&str]) -> Result<String> {
+        self.check(key)?;
+        let offered = self
+            .call(
+                reqwest::Method::GET,
+                &format!("issue/{key}/transitions"),
+                None,
+            )
+            .await?;
+        let (name, id) = names
+            .iter()
+            .find_map(|n| transition_id(&offered, n).ok().map(|id| (*n, id)))
+            .with_context(|| {
+                let named: Vec<&str> = offered["transitions"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|t| t["name"].as_str())
+                    .collect();
+                format!("{key}'s workflow offers none of {names:?} now (it offers {named:?})")
+            })?;
+        self.call(
+            reqwest::Method::POST,
+            &format!("issue/{key}/transitions"),
+            Some(json!({"transition": {"id": id}})),
+        )
+        .await?;
+        Ok(name.to_owned())
+    }
+
     /// A new issue in this project. Only ever run once the owner has approved it (see `admin`).
     pub async fn create(
         &self,
@@ -451,6 +547,22 @@ impl Jira {
         );
         Ok(())
     }
+}
+
+/// The most tickets of one project's sprint the roadmap takes: a sprint is a fortnight of one
+/// person's work, and past this a misconfigured board (every open ticket) is the likelier story.
+pub const ROADMAP_MAX: usize = 200;
+
+/// One ticket of the owner's sprint, as the roadmap keeps it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SprintIssue {
+    pub key: String,
+    pub summary: String,
+    pub status: Option<String>,
+    /// Jira's status category is `done`.
+    pub done: bool,
+    pub issue_type: Option<String>,
+    pub priority: Option<String>,
 }
 
 /// The fields of an issue worth an agent's tokens, with its text clipped.

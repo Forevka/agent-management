@@ -62,6 +62,7 @@ pub fn router() -> Router<O> {
         .route("/api/inbox", get(inbox).post(inbox_act))
         .route("/api/habits", get(habits).post(habits_act))
         .route("/api/retro", get(retro).post(retro_act))
+        .route("/api/roadmap", get(roadmap).post(roadmap_act))
         .route("/api/people", get(people).post(people_act))
         .route("/api/people/{id}", get(person).post(person_act))
         .route("/api/kit", get(kit).post(kit_act))
@@ -722,6 +723,7 @@ async fn task_link(
         return Ok(Json(json!({"removed": gone})));
     }
     let l = crate::links::add(&o, &id, &reference, "owner").await?;
+    crate::roadmap::on_link(&o, &l);
     Ok(Json(json!({"link": crate::links::json(&l)})))
 }
 
@@ -1184,10 +1186,10 @@ async fn item_answer(
         }),
         ("permission", "allow") => Some(Answer::Allow),
         ("permission", "deny") => Some(Answer::Deny),
-        ("task_proposal" | "slack_reply" | "reply" | "admin_change", "accept") => {
+        ("task_proposal" | "slack_reply" | "reply" | "admin_change" | "sprint_plan", "accept") => {
             Some(Answer::Accept)
         }
-        ("task_proposal" | "slack_reply" | "reply" | "admin_change", "dismiss") => {
+        ("task_proposal" | "slack_reply" | "reply" | "admin_change" | "sprint_plan", "dismiss") => {
             Some(Answer::Dismiss)
         }
         // Only the questions above were asked for.
@@ -1797,6 +1799,66 @@ async fn habits_act(State(o): State<O>, h: HeaderMap, Json(a): Json<Act>) -> Api
     };
     let note = crate::habits::button(&o, &format!("hb|{id}|{action}")).await?;
     Ok(Json(json!({"done": note})))
+}
+
+// ---------------------------------------------------------------- roadmap
+
+#[derive(Deserialize)]
+struct RoadmapQuery {
+    sprint: Option<i32>,
+}
+
+async fn roadmap(State(o): State<O>, h: HeaderMap, Query(q): Query<RoadmapQuery>) -> Api {
+    guard!(o, h);
+    Ok(Json(crate::roadmap::board_json(&o, q.sprint).await?))
+}
+
+/// The owner's decisions on the roadmap (see `roadmap`): which tickets go on the plan, where one
+/// goes by hand, how big one is, and reading Jira now. Straight through, audited there: nobody
+/// but the owner can approve what starts, so there is no proposal to wait for.
+async fn roadmap_act(State(o): State<O>, h: HeaderMap, Json(a): Json<Act>) -> Api {
+    guard!(o, h, write);
+    let ids = || -> Result<Vec<i64>, ApiError> {
+        match (&a.body["ids"], a.body["id"].as_i64()) {
+            (Value::Array(list), _) => Ok(list.iter().filter_map(Value::as_i64).collect()),
+            (_, Some(id)) => Ok(vec![id]),
+            _ => Err(ApiError(StatusCode::BAD_REQUEST, "ids is required".into())),
+        }
+    };
+    match a.op.as_str() {
+        "approve" | "decline" | "skip" | "restore" => {
+            let n = crate::roadmap::set_state(&o, &ids()?, &a.op, "owner").await?;
+            Ok(Json(json!({"done": format!("{n} changed")})))
+        }
+        "place" => {
+            let id = a.body["id"].as_i64().context("id is required")?;
+            let at = match (a.body["day"].as_i64(), a.body["session"].as_i64()) {
+                (Some(d), Some(s)) => Some((d as i32, s as i32)),
+                _ => None,
+            };
+            crate::roadmap::place(&o, id, at).await?;
+            Ok(Json(json!({"done": "placed"})))
+        }
+        "estimate" => {
+            let id = a.body["id"].as_i64().context("id is required")?;
+            let usage = a.body["usage"].as_i64().context("usage is required")?;
+            let row = crate::roadmap::estimate(&o, &id.to_string(), usage, None, "owner").await?;
+            crate::roadmap::tick_soon(&o);
+            Ok(Json(
+                json!({"done": format!("{} is {}%", row.jira_key, row.usage)}),
+            ))
+        }
+        "sync" => {
+            let s = crate::roadmap::current_sprint(&o).await?;
+            crate::roadmap::sync(&o, &s).await?;
+            crate::roadmap::tick_soon(&o);
+            Ok(Json(json!({"done": "read from Jira"})))
+        }
+        other => Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("unknown operation {other:?}"),
+        )),
+    }
 }
 
 // ---------------------------------------------------------------- retrospective

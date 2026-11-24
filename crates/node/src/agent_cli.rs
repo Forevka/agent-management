@@ -194,6 +194,9 @@ pub enum AgentCmd {
     /// The owner's habits: report what you did with a standing request.
     #[command(subcommand)]
     Habit(HabitCmd),
+    /// The roadmap: the fleet's sprint of Jira tickets, what is planned when, and estimates.
+    #[command(subcommand)]
+    Roadmap(RoadmapCmd),
     // Secretary only.
     /// The owner's todo list.
     #[command(subcommand)]
@@ -575,6 +578,26 @@ pub enum HabitCmd {
         #[arg(long)]
         skipped: Vec<String>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RoadmapCmd {
+    /// The current sprint: every ticket, its state, its estimate and the window it is planned in.
+    Show,
+    /// How much of one Claude usage window (five hours) a ticket will take, in percent: 30 for a
+    /// small fix, 100 for a full window, 250 for one that spans several windows.
+    Estimate {
+        /// The ticket: BIOINS-5702.
+        issue: String,
+        /// Percent of one window.
+        #[arg(long)]
+        usage: i64,
+        /// Why, in a few words (shown to the owner beside the estimate).
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Read every project's sprint from Jira now instead of at the next sync.
+    Sync,
 }
 
 #[derive(Debug, Subcommand)]
@@ -994,6 +1017,12 @@ pub fn to_call(cmd: AgentCmd) -> Result<(&'static str, Value)> {
                 "skipped": skipped,
             }),
         ),
+        AgentCmd::Roadmap(RoadmapCmd::Show) => ("roadmap", json!({})),
+        AgentCmd::Roadmap(RoadmapCmd::Estimate { issue, usage, note }) => (
+            "roadmap_estimate",
+            json!({"issue": issue, "usage": usage, "note": note}),
+        ),
+        AgentCmd::Roadmap(RoadmapCmd::Sync) => ("roadmap_sync", json!({})),
         AgentCmd::Todo(TodoCmd::Add {
             title,
             detail,
@@ -1703,6 +1732,10 @@ mod tests {
             json!("In Review")
         );
         assert_eq!(call(&["jira", "sprint"]).0, "jira_sprint");
+        assert_eq!(call(&["roadmap", "show"]).0, "roadmap");
+        let (tool, args) = call(&["roadmap", "estimate", "BIOINS-7", "--usage", "60"]);
+        assert_eq!(tool, "roadmap_estimate");
+        assert_eq!(args["usage"], json!(60));
         // Creating and editing go through the owner's approval, not straight to Jira.
         let (tool, args) = call(&["jira", "create", "--summary", "Fix it", "--type", "Bug"]);
         assert_eq!(tool, "admin_propose");

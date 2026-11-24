@@ -3,6 +3,7 @@ import { Outlet, matchPath, useLocation, useNavigate, useNavigationType } from '
 import type { IconSvgElement } from '@hugeicons/react'
 import {
   AiBrain01Icon,
+  Calendar03Icon,
   CheckListIcon,
   ComputerIcon,
   Folder01Icon,
@@ -56,6 +57,7 @@ type Page = { label: string; path: string; icon: IconSvgElement; /** other paths
 const MAIN: Page[] = [
   { label: 'Board', path: '/', icon: KanbanIcon, match: ['/items/:id'] },
   { label: 'Inbox', path: '/inbox', icon: InboxIcon },
+  { label: 'Roadmap', path: '/roadmap', icon: Calendar03Icon },
   { label: 'Tasks', path: '/tasks', icon: CheckListIcon, match: ['/tasks/:id', '/tasks/:id/session'] },
   { label: 'Sessions', path: '/sessions', icon: PlayCircleIcon },
   { label: 'People', path: '/people', icon: UserGroupIcon, match: ['/people/:id'] },

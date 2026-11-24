@@ -302,6 +302,57 @@ export type Inbox = {
 
 /// The daily retrospective: what the fleet concluded about its own days, and what it proposes
 /// doing about it. `detail` is a session's own prose — rendered as text, never as markup.
+/// One ticket of a roadmap sprint. `title` and `jira_status` are Jira's text: shown, never acted on.
+export type RoadmapItem = {
+  id: number
+  key: string
+  project: string
+  title: string
+  url: string | null
+  jira_status: string | null
+  jira_done: boolean
+  type: string | null
+  priority: string | null
+  /** Percent of one usage window. */
+  usage: number
+  usage_note: string | null
+  estimated_by: string | null
+  /** new, approved, declined, skipped, started, left */
+  state: string
+  approved: boolean
+  pinned: boolean
+  /** The window it is settled in (placed by hand, or where it started). */
+  at: { day: number; session: number } | null
+  /** Where the plan puts it, piece by piece; empty when there is no room this sprint. */
+  planned: { day: number; session: number; usage: number }[]
+  task: { id: string; key: string; status: string; title: string } | null
+  /** Whether the server's plan takes it, and how much of it: the board must agree with both. */
+  on_board: boolean
+  plan_usage: number
+  /** Why its last start failed, while it keeps failing. */
+  start_error: string | null
+}
+
+export type SprintRef = { id: number; name: string; starts_on: string; ends_on: string; span: string; current: boolean }
+
+export type Roadmap = {
+  enabled: boolean
+  sprint: SprintRef
+  sprints: SprintRef[]
+  days: { name: string; date: string }[]
+  sessions: string[]
+  window_minutes: number
+  limit: number
+  now: { day: number; session: number; open: boolean }
+  items: RoadmapItem[]
+  open_card: number | null
+  sync: {
+    at: string
+    sprint: number
+    projects: Record<string, { ok: boolean; tickets?: number; error?: string }>
+  } | null
+}
+
 export type Retro = {
   proposals: {
     id: number

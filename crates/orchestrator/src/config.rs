@@ -54,6 +54,93 @@ pub struct Config {
     pub run_silent_warn_minutes: i64,
     /// ...and stopped after this many. `0` never stops one.
     pub run_silent_stop_minutes: i64,
+    /// The roadmap: Jira sprints worked through by the fleet (see `roadmap`).
+    pub roadmap: RoadmapConfig,
+}
+
+/// The roadmap's calendar (see `roadmap`): a fleet sprint of `sprint_days` days, each day cut into
+/// Claude usage windows that start at `sessions` (local time in `secretary.timezone`) and last
+/// `window_minutes`. What one window can take is 100 (percent of its usage limit).
+#[derive(Debug, Clone)]
+pub struct RoadmapConfig {
+    /// Off: no Jira is read for it and nothing starts on its own. On by default; it does nothing
+    /// for a project without a Jira key, and nothing anywhere until the owner approves a plan.
+    pub enabled: bool,
+    pub sprint_days: i64,
+    /// Window start times, as minutes after local midnight, ascending.
+    pub sessions: Vec<u32>,
+    pub window_minutes: u32,
+    /// How often every project's sprint is read from Jira.
+    pub sync_minutes: i64,
+    /// The first sprint's first day (a Monday, say). Unset: the Monday of the week the roadmap
+    /// first runs.
+    pub start: Option<chrono::NaiveDate>,
+}
+
+impl RoadmapConfig {
+    fn from_env() -> Result<Self> {
+        let sessions = std::env::var("FLEET_ROADMAP_SESSIONS")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "07:00,12:00,17:00".into());
+        let sessions = parse_sessions(&sessions).context("FLEET_ROADMAP_SESSIONS")?;
+        let start = match std::env::var("FLEET_ROADMAP_START")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+        {
+            Some(s) => Some(
+                chrono::NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d")
+                    .context("FLEET_ROADMAP_START must be a date: 2026-11-23")?,
+            ),
+            None => None,
+        };
+        Ok(Self {
+            enabled: !matches!(
+                std::env::var("FLEET_ROADMAP")
+                    .ok()
+                    .as_deref()
+                    .map(str::trim),
+                Some("0" | "off" | "false")
+            ),
+            sprint_days: env_num("FLEET_ROADMAP_SPRINT_DAYS", 14).clamp(1, 60),
+            sessions,
+            window_minutes: env_num("FLEET_ROADMAP_WINDOW_MINUTES", 300).clamp(30, 24 * 60) as u32,
+            sync_minutes: env_num("FLEET_ROADMAP_SYNC_MINUTES", 15).max(1),
+            start,
+        })
+    }
+
+    pub fn test() -> Self {
+        Self {
+            enabled: true,
+            sprint_days: 14,
+            // One window a day, open all day: the end-to-end test is never between windows.
+            sessions: vec![0],
+            window_minutes: 24 * 60,
+            sync_minutes: 15,
+            start: None,
+        }
+    }
+}
+
+/// `07:00,12:00,17:00` as minutes after midnight, ascending and distinct.
+pub fn parse_sessions(s: &str) -> Result<Vec<u32>> {
+    let mut out = Vec::new();
+    for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let (h, m) = part
+            .split_once(':')
+            .with_context(|| format!("{part:?} is not a time like 07:00"))?;
+        let (h, m): (u32, u32) = (h.trim().parse()?, m.trim().parse()?);
+        anyhow::ensure!(h < 24 && m < 60, "{part:?} is not a time of day");
+        out.push(h * 60 + m);
+    }
+    out.sort_unstable();
+    out.dedup();
+    anyhow::ensure!(
+        !out.is_empty(),
+        "name at least one window start, like 07:00"
+    );
+    Ok(out)
 }
 
 /// When finished tasks are moved out of sight (see `archive`).
@@ -349,6 +436,7 @@ impl Config {
                 * 1024,
             run_silent_warn_minutes: env_num("FLEET_RUN_SILENT_WARN_MINUTES", 30).max(0),
             run_silent_stop_minutes: env_num("FLEET_RUN_SILENT_STOP_MINUTES", 120).max(0),
+            roadmap: RoadmapConfig::from_env()?,
         })
     }
 
@@ -385,6 +473,7 @@ impl Config {
             attachment_task_max_bytes: 9 * 1024 * 1024,
             run_silent_warn_minutes: 30,
             run_silent_stop_minutes: 120,
+            roadmap: RoadmapConfig::test(),
         }
     }
 }

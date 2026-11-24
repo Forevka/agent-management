@@ -1091,6 +1091,10 @@ impl Orchestrator {
             if let Err(e) = crate::usage::release_lapsed(&self).await {
                 tracing::warn!("releasing nodes whose usage limit reset failed: {e:#}");
             }
+            // The roadmap: Jira's sprint read, the owner's card, and tickets whose window came.
+            if let Err(e) = crate::roadmap::tick(&self).await {
+                tracing::warn!("the roadmap failed: {e:#}");
+            }
             // A run that has gone silent in the middle of a turn (see `stuck`).
             if let Err(e) = crate::stuck::check(&self).await {
                 tracing::warn!("looking for stuck runs failed: {e:#}");

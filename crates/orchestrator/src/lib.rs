@@ -33,6 +33,7 @@ pub mod preflight;
 pub mod prompts;
 pub mod releases;
 pub mod retro;
+pub mod roadmap;
 pub mod search;
 pub mod secretary;
 pub mod stuck;
