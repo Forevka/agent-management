@@ -2866,6 +2866,10 @@ async fn jira_mirror_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool) {
         .execute(db)
         .await
         .unwrap();
+    sqlx::query("delete from retro_runs where day = 'jira-people'")
+        .execute(db)
+        .await
+        .unwrap();
 }
 
 /// The Integrations page (see `integrations`): every service with its keys (never their values),

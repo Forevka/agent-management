@@ -316,6 +316,8 @@ export type Integration = {
   description: string
   folder?: string
   editable: boolean
+  /** A Jira folder a project hands its agents: not edited from this page. */
+  bound?: boolean
   configured: boolean
   keys: { key: string; set: boolean; required: boolean }[]
   status: { state: string; detail?: string | null; since?: string | null; last_ok?: string | null; last_error?: string | null }

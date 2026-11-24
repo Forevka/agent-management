@@ -1035,7 +1035,9 @@ pub async fn jira_section(o: &Orchestrator, days: i64) -> Result<String> {
                 where u.last_seen > now() - make_interval(days => $1::int)
                   and not exists (select 1 from jira_accounts a where a.account_id = u.account_id)
              ) x
-             order by assigned + reported + commented desc, display_name
+             -- People without a record first, so the section keeps surfacing new ones rather
+             -- than the same busiest, already recorded, every day.
+             order by (person is null) desc, assigned + reported + commented desc, display_name
              limit $2",
     )
     .bind(days.max(1) as i32)
@@ -1053,7 +1055,7 @@ pub async fn jira_section(o: &Orchestrator, days: i64) -> Result<String> {
                 "- jira {} {} · tz {} · holds {assigned}, filed {reported}, commented on {commented} ticket(s) · projects {} · {record}\n",
                 tasks::untrusted(id, 60),
                 tasks::untrusted(name, 80),
-                tz.as_deref().unwrap_or("?"),
+                tasks::untrusted(tz.as_deref().unwrap_or("?"), 40),
                 projects.join(", "),
             )
         })
@@ -1071,7 +1073,9 @@ pub fn jira_people_section(lines: &[String]) -> String {
                 \"handle\": \"<name>\"}` and their projects; their time zone and what they do on \
                 the tickets (who files the bugs, who reviews, who owns which area) are observations. \
                 Jira gives no job titles: write a position only when something they wrote says it. \
-                Merge with an existing record of the same person rather than make a second.\n";
+                Merge with an existing record of the same person rather than make a second. \
+                Skip automation, bots and app accounts (Jira Automation, integrations): they \
+                are nobody.\n";
     let mut s = head.to_owned();
     if lines.is_empty() {
         s.push_str("Nobody new.\n");
@@ -1752,6 +1756,27 @@ pub async fn owner_delete(o: &Orchestrator, id: i64) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_jira_people_section_keeps_its_bound_and_its_instruction() {
+        let lines: Vec<String> = (0..500)
+            .map(|n| {
+                format!("- jira \"u-{n}\" \"Someone {n}\" · tz \"UTC\" · holds 1 · no record\n")
+            })
+            .collect();
+        let s = super::jira_people_section(&lines);
+        assert!(
+            s.chars().count() <= super::JIRA_SECTION_MAX,
+            "{}",
+            s.chars().count()
+        );
+        assert!(s.contains("more."), "the rest is counted");
+        assert!(
+            s.contains("Skip automation"),
+            "the instruction is never cut"
+        );
+        assert!(super::jira_people_section(&[]).contains("Nobody new."));
+    }
+
     use super::*;
 
     fn person() -> Person {

@@ -225,7 +225,22 @@ pub async fn json(o: &Orchestrator) -> Result<Value> {
         .bind(jira::DEFAULT_FOLDER)
         .fetch_all(&o.db)
         .await?;
-        let acc = &accounts[&folder];
+        // The account row is keyed by the projects' spelling of the folder; names match case aside.
+        let acc = accounts
+            .as_object()
+            .and_then(|m| m.iter().find(|(k, _)| k.eq_ignore_ascii_case(&folder)))
+            .map(|(_, v)| v.clone())
+            .unwrap_or(Value::Null);
+        let acc = &acc;
+        // A folder a project hands to its agents is not edited here (a Jira token must not be in
+        // it): shown, tested, managed on the Secrets page.
+        let bound: bool = sqlx::query_scalar(
+            "select exists(select 1 from project_secrets s join secret_folders f on f.id = s.folder_id
+                            where lower(f.name) = lower($1))",
+        )
+        .bind(&folder)
+        .fetch_one(&o.db)
+        .await?;
         let configured = preset_keys("jira").iter().all(|k| has(&keys, k));
         let state = if !configured {
             "not_configured"
@@ -242,7 +257,7 @@ pub async fn json(o: &Orchestrator) -> Result<Value> {
             "id": format!("jira:{folder}"), "kind": "jira", "category": "trackers",
             "name": acc["site"].as_str().map(|s| format!("Jira · {s}")).unwrap_or_else(|| format!("Jira · {folder}")),
             "description": "Tickets of the projects below, read into the fleet's copy for the Jira page and the roadmap.",
-            "folder": folder, "editable": true,
+            "folder": folder, "editable": !bound, "bound": bound,
             "keys": keys_json(preset_keys("jira"), preset_keys("jira"), &keys),
             "configured": configured,
             "status": {"state": state, "detail": acc["error"], "last_ok": acc["ok_at"], "since": acc["at"]},
@@ -333,6 +348,12 @@ async fn jira_folders(o: &Orchestrator) -> Result<Vec<String>> {
 /// `id` as this page may act on it: a Jira folder only if it is one of the page's Jira accounts
 /// and no project hands it to its agents (a Jira token must never reach a session).
 async fn checked(o: &Orchestrator, id: &str) -> Result<Editable> {
+    checked_for(o, id, true).await
+}
+
+/// [`checked`], with `writing` false for a test: reading a folder a project hands its agents is
+/// fine, writing a Jira token into it is not.
+async fn checked_for(o: &Orchestrator, id: &str, writing: bool) -> Result<Editable> {
     let e = editable(id).with_context(|| format!("{id} is not set from this page"))?;
     if id.starts_with("jira:") {
         let listed = jira_folders(o)
@@ -348,7 +369,7 @@ async fn checked(o: &Orchestrator, id: &str) -> Result<Editable> {
         .fetch_one(&o.db)
         .await?;
         ensure!(
-            !bound,
+            !(bound && writing),
             "{} is handed to a project's agents (Secrets page); a Jira token must not be in it",
             e.folder
         );
@@ -401,7 +422,7 @@ static LAST_TEST: LazyLock<std::sync::Mutex<HashMap<String, std::time::Instant>>
 /// integration every few seconds.
 pub async fn test(o: &Orchestrator, id: &str) -> Result<Value> {
     // Checked first, so only real integrations take a place in the rate limit.
-    checked(o, id).await?;
+    checked_for(o, id, false).await?;
     {
         let mut last = LAST_TEST.lock().map_err(|_| anyhow::anyhow!("busy"))?;
         if last

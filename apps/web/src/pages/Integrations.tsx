@@ -201,6 +201,13 @@ function IntegrationRow({
 /** One line of what it is connected as, or why it is not working. */
 function Summary({ i }: { i: Integration }) {
   const m = i.meta
+  if (i.bound) {
+    return (
+      <Text size="1" tone="warning">
+        Its folder is handed to a project's agents, so it is managed on the Secrets page.
+      </Text>
+    )
+  }
   if (i.status.detail && ['error', 'stopped', 'disconnected'].includes(i.status.state)) {
     return (
       <Text size="1" tone="danger" breakAll>
