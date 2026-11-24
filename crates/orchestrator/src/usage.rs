@@ -197,7 +197,7 @@ async fn hit(
     // News only when the node was not already held: one limit cuts off every run on the node,
     // and each says so. Decided by the update itself, so two at once still make one notice.
     let fresh: Option<String> = sqlx::query_scalar(
-        "update nodes set claude_limited_until = $2
+        "update nodes set claude_limited_until = $2, claude_limited_at = now()
          where id = $1 and (claude_limited_until is null or claude_limited_until <= now())
          returning name",
     )
@@ -261,13 +261,20 @@ async fn hit(
     Ok(())
 }
 
+/// How long a hold stands before an all-clear may lift it: a run whose request began before the
+/// limit can still report `allowed` just after another reported `rejected`.
+const LIFT_AFTER_MINUTES: i32 = 5;
+
 /// Lifts a hold before its time, when Claude says the node may work again.
 async fn lift(o: &Arc<Orchestrator>, node_id: &str) -> Result<()> {
     let name: Option<String> = sqlx::query_scalar(
         "update nodes set claude_limited_until = null
-         where id = $1 and claude_limited_until > now() returning name",
+         where id = $1 and claude_limited_until > now()
+           and coalesce(claude_limited_at, '-infinity') < now() - make_interval(mins => $2)
+         returning name",
     )
     .bind(node_id)
+    .bind(LIFT_AFTER_MINUTES)
     .fetch_optional(&o.db)
     .await?;
     if let Some(name) = name {
@@ -364,8 +371,12 @@ pub async fn record_turn(o: &Orchestrator, run_id: &str, line: &Value) -> Result
 
 /// What one run cost on its own, as SQL over a `runs` row `r`: its session's total so far, less
 /// what the session had cost before this run began (a resumed session carries its total over).
-pub const RUN_COST_SQL: &str = "(r.cost_usd - coalesce((select max(p.cost_usd) from runs p
-      where p.session_id = r.session_id and p.started_at < r.started_at), 0))";
+/// When the run's total is below that, the total was not carried over (Claude restores it only
+/// when it can), and the run's whole total is its own.
+pub const RUN_COST_SQL: &str = "(select case when r.cost_usd >= coalesce(prev.m, 0)
+                     then r.cost_usd - coalesce(prev.m, 0) else r.cost_usd end
+      from (select max(p.cost_usd) as m from runs p
+            where p.session_id = r.session_id and p.started_at < r.started_at) prev)";
 
 /// What a task's runs cost all together, for its page and its board card: `None` when no run
 /// has reported a turn yet.
@@ -376,24 +387,19 @@ pub fn cost_json(row: Option<&(String, f64, i64, i64)>) -> Value {
     }
 }
 
-/// Per task of `ids`: its cost (each Claude session counted once, at its largest total, since a
-/// resumed session carries its total into the next run), tokens (all four kinds, per turn, so
-/// added up) and turns.
+/// Per task of `ids`: its cost (each run's own share, see [`RUN_COST_SQL`], so a resumed
+/// session is not counted twice), tokens (all four kinds, per turn, so added up) and turns.
 pub async fn cost_of_tasks(
     o: &Orchestrator,
     ids: &[String],
 ) -> Result<Vec<(String, f64, i64, i64)>> {
-    Ok(sqlx::query_as(
-        "select task_id, coalesce(sum(usd), 0)::float8, coalesce(sum(tokens), 0)::bigint,
-                coalesce(sum(turns), 0)::bigint
-         from (select task_id, max(cost_usd) as usd,
-                      sum(coalesce(input_tokens, 0) + coalesce(output_tokens, 0)
-                          + coalesce(cache_read_tokens, 0) + coalesce(cache_write_tokens, 0)) as tokens,
-                      sum(turns) as turns
-               from runs where task_id = any($1) and turns is not null
-               group by task_id, coalesce(session_id, run_id)) per_session
-         group by task_id",
-    )
+    Ok(sqlx::query_as(&format!(
+        "select r.task_id, coalesce(sum({RUN_COST_SQL}), 0)::float8,
+                coalesce(sum(coalesce(r.input_tokens, 0) + coalesce(r.output_tokens, 0)
+                             + coalesce(r.cache_read_tokens, 0) + coalesce(r.cache_write_tokens, 0)), 0)::bigint,
+                coalesce(sum(r.turns), 0)::bigint
+         from runs r where r.task_id = any($1) and r.turns is not null group by r.task_id"
+    ))
     .bind(ids)
     .fetch_all(&o.db)
     .await?)

@@ -17,6 +17,8 @@ alter table runs add column turns integer;
 alter table nodes add column claude_usage jsonb;
 alter table nodes add column claude_usage_at timestamptz;
 alter table nodes add column claude_limited_until timestamptz;
+-- When that hold began: an all-clear from a run that started before it does not lift it.
+alter table nodes add column claude_limited_at timestamptz;
 
 -- When the node's current connection began: a run on it can only be judged silent (see `stuck`)
 -- from then, since its output waits in the node's outbox while it is away.

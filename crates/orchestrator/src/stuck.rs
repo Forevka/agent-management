@@ -179,6 +179,19 @@ async fn stop(
     if !task.running || task.status == "stopped" || task.run_id.as_deref() != run_id {
         return Ok(());
     }
+    // Once per run: a task whose status a stop leaves as it is (a done task written to again)
+    // would otherwise be stopped, and the owner told, on every tick until its exit arrives.
+    let stopped_before: bool = sqlx::query_scalar(
+        "select exists(select 1 from audit_log where action = 'task.stop_silent'
+                       and detail->>'task' = $1 and detail->>'run' = $2)",
+    )
+    .bind(&task.id)
+    .bind(run_id)
+    .fetch_one(&o.db)
+    .await?;
+    if stopped_before {
+        return Ok(());
+    }
     crate::tasks::stop(o, &task, false).await?;
     o.audit(
         "orchestrator",
