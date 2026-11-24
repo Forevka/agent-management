@@ -7,6 +7,12 @@ below is one release. How to add to this file is in `CLAUDE.md`
 
 ## Unreleased
 
+- **The people network learns the people on your Jira tickets.** The daily retrospective now
+  also reads who holds, filed or commented on your projects' tickets lately (from the fleet's
+  copy of Jira), with their time zone and projects, and keeps their records as it does for
+  Slack: quietly, within its cap, never changing what you set. Their Jira account is kept as a
+  `jira` contact. Jira gives no job titles, so a position is written only when something they
+  wrote says it. Your own Jira accounts are never anyone's contact.
 - **An Integrations page with every third-party access the fleet has** (Settings →
   Integrations): Slack, Google Chat, each Jira account with the projects that use it, Telegram,
   Hindsight, the projects' repositories and the kit's MCP servers, by category, with a search.
