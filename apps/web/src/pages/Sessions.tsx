@@ -6,6 +6,7 @@ import { Page, PageHeader, Row, Stack, Text } from '@/components/fx/layout'
 import { Table } from '@/components/fx/table'
 import type { Overview, Session } from '../api'
 import { Duration, Loaded, When, useApi } from '../ui'
+import { COST_NOTE, money } from '../usage'
 
 /// Every agent process the fleet has started, newest first — the fleet's session history,
 /// filterable by project. This is the view that did not exist before: a run used to leave only
@@ -148,6 +149,17 @@ export function SessionList({ project: fixed }: { project?: string }) {
                 header: 'Lasted',
                 align: 'end',
                 cell: (r) => <Duration from={r.started_at} to={r.ended_at} />,
+              },
+              {
+                key: 'cost',
+                header: 'Cost',
+                align: 'end',
+                secondary: true,
+                cell: (r) => (
+                  <Text size="1" tone="muted" title={COST_NOTE}>
+                    {r.cost_usd != null ? money(r.cost_usd) : '—'}
+                  </Text>
+                ),
               },
               {
                 key: 'ended',

@@ -201,6 +201,7 @@ fn node_json(n: &NodeRow) -> Value {
         "running": n.running.0,
         "projects": n.projects.0.iter().map(|p| json!({"project": p.project, "path": p.path})).collect::<Vec<_>>(),
         "disk": crate::disk::json(n),
+        "claude_usage": crate::usage::json(n),
         // Where it clones assigned projects (null: its default, ~/fleet-projects).
         "projects_root": n.projects_root,
     })
@@ -333,6 +334,8 @@ async fn board(State(o): State<O>, h: HeaderMap) -> Api {
     .bind(&ids)
     .fetch_all(&o.db)
     .await?;
+    // What each has cost so far, all its runs together.
+    let costs = crate::usage::cost_of_tasks(&o, &ids).await?;
     // What each task is waiting on, if anything. The blocking one wins: it is the one that has
     // actually stopped an agent, and a card has room to name one thing.
     let open = human::open_items(&o).await?;
@@ -370,6 +373,7 @@ async fn board(State(o): State<O>, h: HeaderMap) -> Api {
                 .map_or((0, 0), |(_, d, n)| (*d, *n));
             v["milestones_done"] = json!(done);
             v["milestones"] = json!(total);
+            v["cost"] = crate::usage::cost_json(costs.iter().find(|c| c.0 == t.id));
             v["wakeup"] = match wakeups.iter().find(|(id, _, _)| *id == t.id) {
                 Some((_, at, condition)) => json!({"at": at, "condition": condition}),
                 None => Value::Null,
@@ -493,9 +497,10 @@ async fn runs(State(o): State<O>, h: HeaderMap, Query(q): Query<RunQuery>) -> Ap
         chrono::DateTime<chrono::Utc>,
         Option<chrono::DateTime<chrono::Utc>>,
         Option<String>,
+        Option<f64>,
     )> = sqlx::query_as(&format!(
         "select r.run_id, r.task_id, r.project, r.agent_id, r.node_id, r.session_id, r.status,
-                r.outcome, r.started_at, r.ended_at, t.title
+                r.outcome, r.started_at, r.ended_at, t.title, r.cost_usd
          from runs r left join tasks t on t.id = r.task_id
          {WHERE} order by r.started_at desc limit $4 offset $5"
     ))
@@ -516,7 +521,7 @@ async fn runs(State(o): State<O>, h: HeaderMap, Query(q): Query<RunQuery>) -> Ap
         "runs": rows.iter().map(|r| json!({
             "run_id": r.0, "task": r.1, "project": r.2, "agent": r.3, "node": r.4,
             "session": r.5, "status": r.6, "outcome": r.7,
-            "started_at": r.8, "ended_at": r.9, "title": r.10,
+            "started_at": r.8, "ended_at": r.9, "title": r.10, "cost_usd": r.11,
         })).collect::<Vec<_>>(),
         "total": total,
     })))
@@ -538,8 +543,9 @@ async fn task(State(o): State<O>, h: HeaderMap, Path(id): Path<String>) -> Api {
         Option<String>,
         chrono::DateTime<chrono::Utc>,
         Option<chrono::DateTime<chrono::Utc>>,
+        Option<f64>,
     )> = sqlx::query_as(
-        "select run_id, node_id, session_id, status, outcome, started_at, ended_at
+        "select run_id, node_id, session_id, status, outcome, started_at, ended_at, cost_usd
          from runs where task_id = $1 order by started_at desc",
     )
     .bind(&id)
@@ -578,12 +584,17 @@ async fn task(State(o): State<O>, h: HeaderMap, Path(id): Path<String>) -> Api {
             .fetch_one(&o.db)
             .await?
     );
+    v["cost"] = crate::usage::cost_json(
+        crate::usage::cost_of_tasks(&o, std::slice::from_ref(&t.id))
+            .await?
+            .first(),
+    );
     Ok(Json(json!({
         "task": v,
         "milestones": milestones.iter().map(|(i, title, done)| json!({"idx": i, "title": title, "done": done})).collect::<Vec<_>>(),
         "sessions": sessions.iter().map(|r| json!({
             "run_id": r.0, "node": r.1, "session": r.2, "status": r.3,
-            "outcome": r.4, "started_at": r.5, "ended_at": r.6,
+            "outcome": r.4, "started_at": r.5, "ended_at": r.6, "cost_usd": r.7,
         })).collect::<Vec<_>>(),
         "items": items.iter().map(item_json).collect::<Vec<_>>(),
     })))

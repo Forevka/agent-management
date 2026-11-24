@@ -16,6 +16,7 @@ import { Note } from '@/components/fx/note'
 import * as api from '../api'
 import type { Agents, Events, Item, Task, TaskDetail as Detail, TaskLink } from '../api'
 import { ActionButton, Duration, ErrorNote, Loaded, Pre, StatusBadge, When, useApi } from '../ui'
+import { COST_NOTE, costLine, money } from '../usage'
 
 /// The fleet's own standing sessions. They are not work the owner edits, stops or writes to from
 /// here (the server refuses it too); they have their own resets in Telegram.
@@ -460,6 +461,10 @@ export default function TaskDetail() {
                       `${d.task.model ?? 'the agent’s model'}${d.task.effort ? ` · ${d.task.effort}` : ''}`,
                     ],
                     ['Created', <When at={d.task.created_at} />],
+                    [
+                      'Cost',
+                      <span title={COST_NOTE}>{costLine(d.task.cost)}</span>,
+                    ],
                   ]}
                 />
               </CardContent>
@@ -579,6 +584,16 @@ export default function TaskDetail() {
                       header: 'Lasted',
                       align: 'end',
                       cell: (r) => <Duration from={r.started_at} to={r.ended_at} />,
+                    },
+                    {
+                      key: 'cost',
+                      header: 'Cost',
+                      align: 'end',
+                      cell: (r) => (
+                        <Text size="1" tone="muted" title={COST_NOTE}>
+                          {r.cost_usd != null ? money(r.cost_usd) : '—'}
+                        </Text>
+                      ),
                     },
                     {
                       key: 'node',

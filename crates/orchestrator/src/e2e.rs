@@ -7963,6 +7963,209 @@ async fn kit_state(
     .unwrap()
 }
 
+/// What runs cost, Claude's usage limit, and a run gone silent. The fake reports two turns' cost
+/// (counted up, as Claude does) and then the usage limit cutting the next turn off: the run
+/// keeps the cost, the node is held until the reset with one notice to the owner, and the task is
+/// woken after the reset to carry on. Then the same session is made to look stuck mid-turn: the
+/// owner is warned once, and the run is stopped once the silence is long enough.
+async fn usage_flow(o: &Arc<Orchestrator>, db: &sqlx::PgPool, chat: &FakeChat) {
+    let task = tasks::create_task(
+        o,
+        CreateTask {
+            project: "demo".into(),
+            title: "Probe the limits".into(),
+            brief: "usage-probe: cost something, then run out.".into(),
+            ticket: None,
+            agent: Some("Alice".into()),
+            new_agent: None,
+            model: None,
+            effort: None,
+        },
+    )
+    .await
+    .unwrap();
+    let id = task.id.clone();
+    let w: crate::model::WakeupRow = wait_for("the cut-off task is to carry on later", || async {
+        sqlx::query_as("select * from wakeups where task_id = $1 and created_by = $2")
+            .bind(&id)
+            .bind(crate::wakeups::BY_ORCHESTRATOR)
+            .fetch_optional(db)
+            .await
+            .unwrap()
+    })
+    .await;
+    let (cost, input, turns): (Option<f64>, Option<i64>, Option<i32>) =
+        wait_for("the run's last turn is counted", || async {
+            sqlx::query_as::<_, (Option<f64>, Option<i64>, Option<i32>)>(
+                "select cost_usd, input_tokens, turns from runs where task_id = $1",
+            )
+            .bind(&id)
+            .fetch_optional(db)
+            .await
+            .unwrap()
+            .filter(|r| r.2 == Some(3))
+        })
+        .await;
+    assert_eq!(
+        cost,
+        Some(0.75),
+        "the cost is Claude's running total, not a sum of totals"
+    );
+    assert_eq!(
+        (input, turns),
+        (Some(20), Some(3)),
+        "tokens are per turn, so added up"
+    );
+    // Both the event and the failed turn said so; it is still one cut-off.
+    let resumes: i64 = sqlx::query_scalar("select count(*) from wakeups where task_id = $1")
+        .bind(&id)
+        .fetch_one(db)
+        .await
+        .unwrap();
+    assert_eq!(resumes, 1, "one wakeup for one cut-off");
+    let card = api_get(o, &format!("/api/tasks/{id}")).await;
+    assert_eq!(card["task"]["cost"]["usd"], json!(0.75), "{card}");
+    assert_eq!(
+        card["task"]["cost"]["tokens"],
+        json!(2 * (10 + 20 + 300 + 400)),
+        "{card}"
+    );
+    assert_eq!(card["sessions"][0]["cost_usd"], json!(0.75), "{card}");
+
+    // The node is out of usage until the reset Claude gave, and the owner heard it once.
+    let (node_id, until): (String, chrono::DateTime<chrono::Utc>) = sqlx::query_as(
+        "select id, claude_limited_until from nodes where claude_limited_until is not null",
+    )
+    .fetch_one(db)
+    .await
+    .unwrap();
+    assert!(
+        until > chrono::Utc::now() + chrono::Duration::minutes(50),
+        "{until}"
+    );
+    assert_eq!(
+        (w.fires_at.unwrap() - until).num_seconds(),
+        120,
+        "woken two minutes after the reset"
+    );
+    let told = |what: &'static str| {
+        chat.sent()
+            .iter()
+            .filter(|(_, _, html, _)| html.contains(what))
+            .count()
+    };
+    assert_eq!(told("reached its Claude usage limit"), 1);
+    let nodes = api_get(o, "/api/nodes").await;
+    let node = nodes["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["id"] == node_id.as_str())
+        .unwrap()
+        .clone();
+    assert!(node["claude_usage"]["limited_until"].is_string(), "{node}");
+    assert_eq!(node["claude_usage"]["five_hour"], json!(1.0), "{node}");
+    let row: crate::model::NodeRow = sqlx::query_as("select * from nodes where id = $1")
+        .bind(&node_id)
+        .fetch_one(db)
+        .await
+        .unwrap();
+    assert!(crate::usage::held(&row), "no new task run starts there");
+
+    // The reset: the node takes work again, and the task carries on.
+    sqlx::query(
+        "update nodes set claude_limited_until = now() - interval '1 second' where id = $1",
+    )
+    .bind(&node_id)
+    .execute(db)
+    .await
+    .unwrap();
+    crate::usage::release_lapsed(o).await.unwrap();
+    assert_eq!(told("Claude usage is back"), 1);
+    sqlx::query("update wakeups set fires_at = now() - interval '1 second' where id = $1")
+        .bind(w.id)
+        .execute(db)
+        .await
+        .unwrap();
+    crate::wakeups::run_due(o).await.unwrap();
+    let heard = format!("[Wakeup W-{} from the orchestrator]", w.id);
+    wait_for("the cut-off task is told to carry on", || async {
+        (task_heard(db, &id, &heard).await > 0).then_some(())
+    })
+    .await;
+    // Between turns: the session is idle, not stuck.
+    wait_for("the woken turn ends", || async {
+        let last: Option<String> = sqlx::query_scalar(
+            "select data from task_events where task_id = $1 and kind in ('in', 'out')
+             order by id desc limit 1",
+        )
+        .bind(&id)
+        .fetch_optional(db)
+        .await
+        .unwrap();
+        last.filter(|d| d.contains("\"result\"")).map(drop)
+    })
+    .await;
+    crate::stuck::check(o).await.unwrap();
+    assert_eq!(
+        told("no output from its agent"),
+        0,
+        "an idle session is not stuck"
+    );
+
+    // A turn that started 45 minutes ago and has said nothing since: one warning, not two.
+    let back = |minutes: i32| {
+        let id = id.clone();
+        async move {
+            sqlx::query(
+                "update task_events set at = now() - make_interval(mins => $2) where task_id = $1",
+            )
+            .bind(&id)
+            .bind(minutes)
+            .execute(db)
+            .await
+            .unwrap();
+            sqlx::query(
+                "update tasks set dispatched_at = now() - make_interval(mins => $2) where id = $1",
+            )
+            .bind(&id)
+            .bind(minutes)
+            .execute(db)
+            .await
+            .unwrap();
+        }
+    };
+    sqlx::query(
+        "insert into task_events (task_id, kind, data) values ($1, 'in', 'a turn that never ends')",
+    )
+    .bind(&id)
+    .execute(db)
+    .await
+    .unwrap();
+    back(45).await;
+    assert!(o.task(&id).await.unwrap().unwrap().running);
+    crate::stuck::check(o).await.unwrap();
+    crate::stuck::check(o).await.unwrap();
+    assert_eq!(
+        told("no output from its agent for 45 min"),
+        1,
+        "told once per silence"
+    );
+    assert!(
+        o.task(&id).await.unwrap().unwrap().running,
+        "warned, not stopped"
+    );
+    // Three hours: stopped, as the owner's Stop would.
+    back(180).await;
+    crate::stuck::check(o).await.unwrap();
+    assert_eq!(told("stopped: no output from its agent"), 1);
+    assert_eq!(o.task(&id).await.unwrap().unwrap().status, "stopped");
+    wait_for("the silent run ends", || async {
+        o.task(&id).await.unwrap().filter(|t| !t.running)
+    })
+    .await;
+}
+
 /// The kit: imported from a node with its MCP secret moved into the vault, installed on the
 /// node without ever touching the owner's own items there, the exact MCP allowlist of a worker's
 /// session (in a per-run file that goes with the run), and the owner's alone to change.
@@ -10244,6 +10447,9 @@ async fn lifecycle() {
     // 21a. The owner edits, stops, writes to and links a task from the web.
     Box::pin(task_edit_flow(&o, &db, &chat)).await;
     Box::pin(live_session_flow(&o, &db, &chat)).await;
+
+    // 21a'. What runs cost, Claude's usage limit, and a run that went silent mid-turn.
+    Box::pin(usage_flow(&o, &db, &chat)).await;
 
     // 21b. The kit: imported from a node, installed there without touching the owner's own
     //      items, the exact MCP allowlist of a worker's session, and the owner's alone. On node

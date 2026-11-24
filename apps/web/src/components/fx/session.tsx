@@ -158,6 +158,7 @@ export function buildEntries(lines: Line[]): Entry[] {
         break
       case 'notice':
       case 'waiting':
+      case 'silent':
         out.push({ t: 'note', key: `${l.id}`, at: l.at, tone: 'warning', text: l.data })
         break
       // `owner` (the brain's copy of the owner's request, kept for habits), `settings` and

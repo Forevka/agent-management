@@ -6,6 +6,7 @@ import type { BoardTone } from '@/components/fx/board'
 import { Page, PageHeader, Row, Stack, Text } from '@/components/fx/layout'
 import { Table } from '@/components/fx/table'
 import {
+  CoinIcon,
   MilestoneIcon,
   PaperclipIcon,
   SessionsIcon,
@@ -15,6 +16,7 @@ import {
 import type { BoardTask } from '../api'
 import { Loaded, StatusBadge, When, useApi } from '../ui'
 import { TaskLink, useTaskPeek } from '../peek'
+import { COST_NOTE, costLine, money } from '../usage'
 
 /*
  * The fleet's work, as a board.
@@ -186,6 +188,16 @@ export default function BoardPage() {
                                 icon: <PaperclipIcon />,
                                 value: (t.attachments ?? []).length,
                                 title: (t.attachments ?? []).map((a) => a.title).join('\n'),
+                              },
+                            ]
+                          : []),
+                        // What it cost so far, once a turn has ended.
+                        ...(t.cost
+                          ? [
+                              {
+                                icon: <CoinIcon />,
+                                value: money(t.cost.usd),
+                                title: `${costLine(t.cost)}\n${COST_NOTE}`,
                               },
                             ]
                           : []),

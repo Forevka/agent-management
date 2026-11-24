@@ -514,6 +514,9 @@ mod tests {
             disk_state: state.as_str().into(),
             disk_levels: sqlx::types::Json(stored(&levels)),
             projects_root: None,
+            claude_usage: None,
+            claude_usage_at: None,
+            claude_limited_until: None,
             clonable: vec![],
         }
     }

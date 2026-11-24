@@ -517,12 +517,32 @@ impl Orchestrator {
                 {
                     self.working.said(&task_id, &run_id, &text);
                 }
-                // The end of a turn ends "typing…" (a cheap check first: most lines are not).
-                if current
-                    && json.contains("\"result\"")
-                    && serde_json::from_str::<serde_json::Value>(&json)
-                        .is_ok_and(|v| v["type"] == "result")
-                {
+                // Lines about the run rather than the work: the `result` that ends a turn (what
+                // it cost) and Claude's word on its usage limits. Cheap checks first, parsed once.
+                let meta = (json.contains("\"result\"") || json.contains("rate_limit_event"))
+                    .then(|| serde_json::from_str::<serde_json::Value>(&json).ok())
+                    .flatten();
+                // A replaced run's cut-off is nobody's to resume; its cost is still real.
+                let current_task = task.as_ref().filter(|_| current);
+                if let Some(v) = &meta {
+                    let done = match v["type"].as_str() {
+                        Some("result") => {
+                            if let Err(e) = crate::usage::record_turn(self, &run_id, v).await {
+                                tracing::warn!(run = %run_id, "recording a turn's cost failed: {e:#}");
+                            }
+                            crate::usage::turn_ended(self, peer, current_task, v).await
+                        }
+                        Some("rate_limit_event") => {
+                            crate::usage::event(self, peer, current_task, v).await
+                        }
+                        _ => Ok(()),
+                    };
+                    if let Err(e) = done {
+                        tracing::warn!(run = %run_id, "reading Claude's usage limits failed: {e:#}");
+                    }
+                }
+                // The end of a turn ends "typing…".
+                if current && meta.as_ref().is_some_and(|v| v["type"] == "result") {
                     // A turn that ended without a word reaching the owner: they wrote into the
                     // topic and would be looking at silence, while the answer sits in a
                     // transcript only the web UI shows. Post what the agent said. The agents
@@ -1068,6 +1088,14 @@ impl Orchestrator {
                 tracing::warn!(
                     "looking at work held for a disk whose reports stopped failed: {e:#}"
                 );
+            }
+            // A node whose Claude usage limit has reset takes work again (see `usage`).
+            if let Err(e) = crate::usage::release_lapsed(&self).await {
+                tracing::warn!("releasing nodes whose usage limit reset failed: {e:#}");
+            }
+            // A run that has gone silent in the middle of a turn (see `stuck`).
+            if let Err(e) = crate::stuck::check(&self).await {
+                tracing::warn!("looking for stuck runs failed: {e:#}");
             }
             if let Err(e) = crate::tasks::prune_topics(&self).await {
                 tracing::warn!("deleting finished tasks' topics failed: {e:#}");

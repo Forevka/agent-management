@@ -207,6 +207,21 @@ for line in sys.stdin:
     # A recurring job (the habits flow): present a plan and finish, nothing else. The plan says
     # the owner is needed only when the brief says the job is unclear, which is what lets the
     # test show that a habit never answers such a plan.
+    # The usage flow: a turn that costs something (two turns' worth, as Claude counts the cost up
+    # across a process), then the usage limit cutting the next one off, as 2.1.331 reports it: a
+    # `rate_limit_event` saying `rejected`, and a turn that ends in an error saying so.
+    if text.startswith("# Task") and "usage-probe" in text:
+        usage = {"input_tokens": 10, "output_tokens": 20, "cache_read_input_tokens": 300,
+                 "cache_creation_input_tokens": 400}
+        out({"type": "result", "subtype": "success", "total_cost_usd": 0.25, "usage": usage})
+        out({"type": "result", "subtype": "success", "total_cost_usd": 0.75, "usage": usage})
+        out({"type": "rate_limit_event", "rate_limit_info": {
+            "status": "rejected", "resetsAt": int(time.time()) + 3600, "rateLimitType": "five_hour",
+            "unifiedWindows": {"five_hour": {"utilization": 1.0, "status": "rejected"},
+                               "seven_day": {"utilization": 0.4, "status": "allowed"}}}})
+        out({"type": "result", "subtype": "success", "is_error": True,
+             "result": "You've hit your limit · resets 3pm", "total_cost_usd": 0.75})
+        continue
     # The live session flow's task: it only waits to be written to.
     if text.startswith("# Task") and "live-session" in text:
         out({"type": "result", "subtype": "success", "total_cost_usd": 0.0})

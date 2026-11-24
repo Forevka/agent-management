@@ -29,6 +29,10 @@ use crate::{
     tasks, topics,
 };
 
+/// `created_by` of a wakeup the orchestrator armed itself rather than an agent (see `usage`).
+/// No agent id can be this: those are slugs without a colon (the brain's own is `orchestrator`).
+pub const BY_ORCHESTRATOR: &str = "orchestrator:usage";
+
 /// How often due wakeups are looked at. Its own tick, not the 5-minute housekeeping one, so
 /// `--in 5m` means five minutes.
 const TICK: Duration = Duration::from_secs(60);
@@ -635,6 +639,20 @@ async fn fire(
     if task.status == "stopped" && w.created_at < task.updated_at {
         tracing::info!(task = %task.id, "wakeup W-{} not delivered: the task was stopped", w.id);
         return Ok(());
+    }
+    // The orchestrator's own wakeups (a usage limit that cut a turn off) carry its own words,
+    // which need neither the agent's framing nor its advice about napping again.
+    if w.created_by == BY_ORCHESTRATOR {
+        o.audit(
+            "orchestrator",
+            "wakeup.fire",
+            json!({"wakeup": w.id, "task": w.task_id, "fires": w.fires + 1}),
+        )
+        .await;
+        let text = format!("[Wakeup W-{} from the orchestrator] {}", w.id, w.note);
+        return tasks::deliver_as(o, &task, text, tasks::Origin::Other)
+            .await
+            .map(drop);
     }
     // Rounds are counted for the task, not for this one wakeup: an agent that keeps waiting arms
     // a new one-shot nap each time, so the wakeup's own count would always say 0, and the advice

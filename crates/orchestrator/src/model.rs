@@ -28,6 +28,15 @@ pub struct NodeRow {
     pub disk_levels: sqlx::types::Json<std::collections::HashMap<String, String>>,
     /// Where the node clones assigned projects (null: its default, `~/fleet-projects`).
     pub projects_root: Option<String>,
+    /// Claude's last word on this node's usage limits (`rate_limit_info` of a
+    /// `rate_limit_event`), and until when it is out of usage (see `crate::usage`). Defaulted so
+    /// a query that names its columns need not name these.
+    #[sqlx(default)]
+    pub claude_usage: Option<sqlx::types::Json<serde_json::Value>>,
+    #[sqlx(default)]
+    pub claude_usage_at: Option<DateTime<Utc>>,
+    #[sqlx(default)]
+    pub claude_limited_until: Option<DateTime<Utc>>,
     /// Projects assigned to this node that have a repository URL, so it would clone them for a
     /// task (see `crate::node_projects`). Filled only by `tasks::node_load`, for placement;
     /// empty wherever else a node is read.

@@ -14,6 +14,7 @@ import { ArrowLeftIcon } from '@/components/fx/icons'
 import * as api from '../api'
 import type { Node, NodeAssignment, NodeDisk } from '../api'
 import { DiskBadge } from '../disk'
+import { UsageBadge } from '../usage'
 import { ActionButton, ErrorNote, Loaded, When, useApi } from '../ui'
 import { TaskLink } from '../peek'
 
@@ -424,6 +425,25 @@ export default function NodeDetail() {
 
             <Section title="Disk">
               <DiskSection disk={n.disk} />
+            </Section>
+
+            <Section title="Claude usage">
+              <Stack gap="2">
+                {n.claude_usage?.limited_until && (
+                  <Note tone="danger" title="Out of Claude usage">
+                    New task runs here wait until the limit resets, and the work it cut off carries
+                    on then. The fleet&apos;s own sessions are not held.
+                  </Note>
+                )}
+                <Row gap="2">
+                  <UsageBadge usage={n.claude_usage} />
+                  {n.claude_usage?.at && (
+                    <Text size="1" tone="muted">
+                      as of <When at={n.claude_usage.at} />
+                    </Text>
+                  )}
+                </Row>
+              </Stack>
             </Section>
 
             <Section title="Settings">

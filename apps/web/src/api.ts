@@ -116,6 +116,21 @@ export type Task = {
   effort?: string | null
   run_id?: string | null
   topic_id?: number | null
+  /** What its runs have cost so far, all together; `null` before the first turn ended. */
+  cost?: TaskCost | null
+}
+
+/** What a task's runs cost: dollars at API prices, every kind of token, turns. */
+export type TaskCost = { usd: number; tokens: number; turns: number }
+
+/** A node's Claude usage, from Claude's last word on it. Shares are 0..1. */
+export type ClaudeUsage = {
+  at: string | null
+  status: string | null
+  five_hour: number | null
+  seven_day: number | null
+  /** Until when it is out of usage: new task runs there wait. */
+  limited_until: string | null
 }
 
 /// A session is one agent process the fleet started. The fleet-wide list carries the task and
@@ -132,6 +147,8 @@ export type Session = {
   started_at: string
   ended_at: string | null
   title?: string | null
+  /** What it cost at API prices, once a turn ended. */
+  cost_usd?: number | null
 }
 
 export type Node = {
@@ -149,6 +166,7 @@ export type Node = {
   projects: { project: string; path: string }[]
   /** Free space where its sessions write; `null` before the node's first report. */
   disk: NodeDisk | null
+  claude_usage?: ClaudeUsage
   /** Where it clones assigned projects; `null` for its default, `~/fleet-projects`. */
   projects_root: string | null
   known_projects?: { slug: string; name: string; repo_url: string | null }[]

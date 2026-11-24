@@ -49,6 +49,11 @@ pub struct Config {
     pub attachment_max_bytes: i64,
     /// The most bytes all of one task's files may add up to, uploads in progress included.
     pub attachment_task_max_bytes: i64,
+    /// A run that has written nothing for this many minutes in the middle of a turn is reported
+    /// to the owner as possibly stuck (see `stuck`). `0` turns the warning off.
+    pub run_silent_warn_minutes: i64,
+    /// ...and stopped after this many. `0` never stops one.
+    pub run_silent_stop_minutes: i64,
 }
 
 /// When finished tasks are moved out of sight (see `archive`).
@@ -342,6 +347,8 @@ impl Config {
             .clamp(1, 16384)
                 * 1024
                 * 1024,
+            run_silent_warn_minutes: env_num("FLEET_RUN_SILENT_WARN_MINUTES", 30).max(0),
+            run_silent_stop_minutes: env_num("FLEET_RUN_SILENT_STOP_MINUTES", 120).max(0),
         })
     }
 
@@ -376,6 +383,8 @@ impl Config {
             attachment_max_bytes: 4 * 1024 * 1024,
             // Room for what the e2e attaches, and small enough to show the cap refusing.
             attachment_task_max_bytes: 9 * 1024 * 1024,
+            run_silent_warn_minutes: 30,
+            run_silent_stop_minutes: 120,
         }
     }
 }

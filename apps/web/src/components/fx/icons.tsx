@@ -142,6 +142,15 @@ export const FileIcon = (p: IconProps) => (
   </Icon>
 )
 
+/** What something cost: a coin. */
+export const CoinIcon = (p: IconProps) => (
+  <Icon {...p}>
+    <circle cx="12" cy="12" r="8.4" />
+    <path d="M14.6 9.4c-.5-.8-1.5-1.3-2.6-1.3-1.5 0-2.6.8-2.6 1.9 0 2.6 5.4 1.4 5.4 4 0 1.1-1.2 2-2.8 2-1.2 0-2.2-.5-2.7-1.3" />
+    <path d="M12 6.6v1.5M12 15.9v1.5" />
+  </Icon>
+)
+
 /** How many times a task has run: stacked sessions. */
 export const SessionsIcon = (p: IconProps) => (
   <Icon {...p}>

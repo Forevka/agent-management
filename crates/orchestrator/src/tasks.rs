@@ -321,6 +321,7 @@ async fn project_has_room(o: &Orchestrator, project: &str) -> Result<bool> {
             && n.can_run(project)
             && *load < i64::from(n.max_agents.max(1))
             && !crate::disk::held(n, project)
+            && !crate::usage::held(n)
     }))
 }
 
@@ -712,7 +713,11 @@ async fn dispatch_locked(
     let disk_held = |n: &NodeRow| {
         !crate::model::is_builtin_task(&task.id) && crate::disk::held(n, &task.project)
     };
-    let free = |c: &&(NodeRow, i64)| has_slot(c) && !disk_held(&c.0);
+    // Likewise a node out of Claude usage: the run would end at its first request. The fleet's
+    // own sessions are not held here either; they fail and say so, which the owner can read.
+    let usage_held =
+        |n: &NodeRow| !crate::model::is_builtin_task(&task.id) && crate::usage::held(n);
+    let free = |c: &&(NodeRow, i64)| has_slot(c) && !disk_held(&c.0) && !usage_held(&c.0);
     let chosen = match pinned {
         Some(node_id) => candidates
             .iter()
@@ -753,7 +758,23 @@ async fn dispatch_locked(
             .map(|(n, _)| n)
             .filter(|n| n.online && disk_held(n))
             .collect();
-        let note = if held_for_disk.is_empty() {
+        let held_for_usage: Vec<&NodeRow> = candidates
+            .iter()
+            .filter(|(n, _)| pinned.is_none_or(|id| n.id == id))
+            .map(|(n, _)| n)
+            .filter(|n| n.online && usage_held(n))
+            .collect();
+        let note = if !held_for_usage.is_empty() && held_for_disk.is_empty() {
+            let names = held_for_usage
+                .iter()
+                .map(|n| n.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "⏳ Queued: {} reached its Claude usage limit. It starts once the limit resets.",
+                esc(&names)
+            )
+        } else if held_for_disk.is_empty() {
             format!(
                 "⏳ Queued: waiting for {} (offline or at capacity).",
                 esc(&waiting_for)
@@ -2145,7 +2166,7 @@ pub async fn dispatch_queued(o: &Arc<Orchestrator>) {
                     && *load < i64::from(n.max_agents.max(1))
                     && session_node.is_none_or(|id| id == n.id)
                     && (crate::model::is_builtin_task(&task.id)
-                        || !crate::disk::held(n, &task.project))
+                        || (!crate::disk::held(n, &task.project) && !crate::usage::held(n)))
             });
         if !can_run {
             continue;

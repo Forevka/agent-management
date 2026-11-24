@@ -8,6 +8,7 @@ import { CheckIcon } from '@/components/fx/icons'
 import type { TaskDetail as Detail } from '../api'
 import { ActionButton, Loaded, Pre, StatusBadge, When, useApi } from '../ui'
 import { BUILTIN, FINISHED, ItemCard, MessageBox, isOpen } from './TaskDetail'
+import { COST_NOTE, costLine } from '../usage'
 
 /*
  * A task in the work area: what the owner needs to see without leaving the page they are on —
@@ -78,6 +79,7 @@ export function TaskPeek({ id, onKey }: { id: string; /** Its F-key once known, 
                   ['Agent', t.agent ?? '—'],
                   ['Node', t.node ?? '—'],
                   ['Created', <When at={t.created_at} />],
+                  ['Cost', <span title={COST_NOTE}>{costLine(t.cost)}</span>],
                 ]}
               />
 
